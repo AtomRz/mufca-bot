@@ -16,7 +16,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 CHANNEL_NAME  = os.getenv("CHANNEL_NAME", "general")
 
-TICKERS    = ["BTC/USDT", "ETH/USDT"]
+TICKERS    = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 TIMEFRAMES = ["1h", "4h"]
 
 # Параметры — идентичны дефолтам индикатора
