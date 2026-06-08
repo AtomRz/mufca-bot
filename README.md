@@ -27,7 +27,7 @@ Discord-бот для сканирования крипто пар на Gate.io 
 
 ### 1. Клонировать репозиторий
 ```bash
-git clone https://github.com/ВАШ_ЮЗЕРНЕЙМ/mufca-bot.git
+git clone https://github.com/atomrz/mufca-bot.git
 cd mufca-bot
 ```
 
