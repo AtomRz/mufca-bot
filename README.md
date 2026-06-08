@@ -62,7 +62,7 @@ docker compose down
 ## 🖥️ TrueNAS Scale (Custom App)
 
 1. Apps → Custom App
-2. **Repository:** `ghcr.io/ВАШ_ЮЗЕРНЕЙМ/mufca-bot` или собрать локально
+2. **Repository:** `ghcr.io/atomrz/mufca-bot` или собрать локально
 3. **Environment Variables:**
    - `DISCORD_TOKEN` = твой токен
    - `CHANNEL_NAME` = general
