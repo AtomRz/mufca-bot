@@ -16,8 +16,32 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 CHANNEL_NAME  = os.getenv("CHANNEL_NAME", "general")
 
-TICKERS    = ["BTC/USDT", "ETH/USDT"]
-TIMEFRAMES = ["1h", "4h"]
+DEFAULT_TICKERS = ["BTC/USDT", "ETH/USDT"]
+TIMEFRAMES      = ["1h", "4h"]
+PAIRS_FILE      = "pairs.json"
+
+# =====================================================================
+# 💾 ДИНАМИЧЕСКИЙ СПИСОК ПАР — сохраняется в файл
+# =====================================================================
+import json
+
+def load_tickers() -> list[str]:
+    try:
+        with open(PAIRS_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("tickers", DEFAULT_TICKERS)
+    except Exception:
+        return DEFAULT_TICKERS.copy()
+
+def save_tickers(tickers: list[str]):
+    try:
+        with open(PAIRS_FILE, "w") as f:
+            json.dump({"tickers": tickers}, f)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить пары: {e}")
+
+# Глобальный список пар — изменяется командами
+TICKERS: list[str] = load_tickers()
 
 ATR_PERIOD      = 14
 ATR_MIN         = 0.3
@@ -59,7 +83,12 @@ def make_state():
         "last_bar_time":    None,
     }
 
-state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
+state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
+
+def ensure_state(ticker: str):
+    """Добавить состояние для новой пары если его нет."""
+    if ticker not in state:
+        state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
 # =====================================================================
 # 📊 ИНДИКАТОРЫ
@@ -472,7 +501,65 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         await ctx.send(f"⏳ Сигналов по `{ticker}` `{tf}` нет. Режим: **{regime}**")
 
 
-@tasks.loop(seconds=20)
+@bot.command(name="pairs")
+async def pairs_cmd(ctx):
+    """!pairs — показать текущий список пар"""
+    if not TICKERS:
+        await ctx.send("📭 Список пар пуст.")
+        return
+    lines = ["**📋 Сканируемые пары:**\n"]
+    for t in TICKERS:
+        lines.append(f"• `{t}`")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="add")
+async def add_cmd(ctx, ticker: str = ""):
+    """!add SOL/USDT — добавить пару в сканер"""
+    if not ticker:
+        await ctx.send("❌ Укажи пару. Пример: `!add SOL/USDT`")
+        return
+    ticker = ticker.upper()
+    if ticker in TICKERS:
+        await ctx.send(f"⚠️ `{ticker}` уже в списке.")
+        return
+    # Проверяем что пара существует на бирже
+    await ctx.send(f"🔍 Проверяю `{ticker}` на Gate.io…")
+    try:
+        markets = exchange.load_markets()
+        if ticker not in markets:
+            await ctx.send(f"❌ Пара `{ticker}` не найдена на Gate.io.")
+            return
+    except Exception as e:
+        await ctx.send(f"❌ Ошибка проверки: {e}")
+        return
+    TICKERS.append(ticker)
+    ensure_state(ticker)
+    save_tickers(TICKERS)
+    await ctx.send(f"✅ `{ticker}` добавлен! Сканируется: {' | '.join(TICKERS)}")
+    print(f"[PAIRS] Добавлена пара: {ticker}")
+
+
+@bot.command(name="remove")
+async def remove_cmd(ctx, ticker: str = ""):
+    """!remove SOL/USDT — убрать пару из сканера"""
+    if not ticker:
+        await ctx.send("❌ Укажи пару. Пример: `!remove SOL/USDT`")
+        return
+    ticker = ticker.upper()
+    if ticker not in TICKERS:
+        await ctx.send(f"⚠️ `{ticker}` нет в списке.")
+        return
+    if len(TICKERS) == 1:
+        await ctx.send("❌ Нельзя удалить последнюю пару.")
+        return
+    TICKERS.remove(ticker)
+    save_tickers(TICKERS)
+    await ctx.send(f"🗑️ `{ticker}` удалён. Осталось: {' | '.join(TICKERS)}")
+    print(f"[PAIRS] Удалена пара: {ticker}")
+
+
+
 async def market_scanner():
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
     if channel is None:
