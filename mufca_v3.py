@@ -61,7 +61,30 @@ UT_PERIOD       = 10
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
 
-exchange = ccxt.gate({"enableRateLimit": True})
+MODE_FILE = "mode.json"
+
+def load_mode() -> str:
+    try:
+        with open(MODE_FILE, "r") as f:
+            return json.load(f).get("mode", "spot")
+    except Exception:
+        return "spot"
+
+def save_mode(mode: str):
+    try:
+        with open(MODE_FILE, "w") as f:
+            json.dump({"mode": mode}, f)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить режим: {e}")
+
+def make_exchange(mode: str) -> ccxt.gate:
+    if mode == "futures":
+        return ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    return ccxt.gate({"enableRateLimit": True})
+
+# Текущий режим: "spot" или "futures"
+MARKET_MODE: str = load_mode()
+exchange = make_exchange(MARKET_MODE)
 
 # =====================================================================
 # 🗂️  СОСТОЯНИЕ
@@ -446,9 +469,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     is_long     = "BUY" in signal_type
     is_a_track  = "Andean" in signal_type
     htf_name    = "4H FRAMA" if tf == "1h" else "1D FRAMA"
-    coin_emoji  = "🟡" if "BTC" in ticker else "🔷"
+    coin_emoji  = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
     track_emoji = "🔵" if is_a_track else "🟢"
     conf_color  = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
+    mode_label  = "Spot" if MARKET_MODE == "spot" else "Futures"
 
     embed = discord.Embed(
         title=f"🚨 MUFCA v3.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
@@ -462,14 +486,48 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     embed.add_field(name="⚙️ Режим",              value=regime,                         inline=True)
     embed.add_field(name="⚠️ Плечо",              value=f"x{leverage}",                inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%",              inline=True)
-    embed.set_footer(text="MUFCA [AtomDC] v3.0 • Идентичная логика индикатора")
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label}")
     return embed
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user.name} запущен! Пары: {' | '.join(TICKERS)}")
+    mode_emoji = "📊" if MARKET_MODE == "spot" else "📈"
+    print(f"✅ {bot.user.name} запущен! Режим: {MARKET_MODE.upper()} | Пары: {' | '.join(TICKERS)}")
     market_scanner.start()
+
+
+@bot.command(name="mode")
+async def mode_cmd(ctx, new_mode: str = ""):
+    """!mode spot | !mode futures — переключить режим биржи"""
+    global MARKET_MODE, exchange
+
+    if not new_mode:
+        mode_emoji = "🔵 Спот" if MARKET_MODE == "spot" else "🟠 Фьючерсы"
+        await ctx.send(f"Текущий режим: **{mode_emoji}**\nДля смены: `!mode spot` или `!mode futures`")
+        return
+
+    new_mode = new_mode.lower()
+    if new_mode not in ("spot", "futures"):
+        await ctx.send("❌ Допустимые режимы: `spot` или `futures`")
+        return
+
+    if new_mode == MARKET_MODE:
+        await ctx.send(f"⚠️ Уже в режиме **{MARKET_MODE}**.")
+        return
+
+    MARKET_MODE = new_mode
+    exchange    = make_exchange(MARKET_MODE)
+    save_mode(MARKET_MODE)
+
+    # Сбрасываем состояния — смена биржи = новый старт
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            state[ticker][tf] = make_state()
+
+    mode_label = "🔵 Спот (Gate.io Spot)" if MARKET_MODE == "spot" else "🟠 Фьючерсы (Gate.io Perpetual)"
+    await ctx.send(f"✅ Режим переключён на **{mode_label}**\n⚠️ Состояния позиций сброшены.")
+    print(f"[MODE] Переключён на {MARKET_MODE}")
 
 
 @bot.command(name="status")
