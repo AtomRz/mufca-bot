@@ -560,6 +560,7 @@ async def remove_cmd(ctx, ticker: str = ""):
 
 
 
+@tasks.loop(seconds=20)
 async def market_scanner():
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
     if channel is None:
