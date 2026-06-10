@@ -12,6 +12,7 @@ Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals bas
 | **HTF Bias** | Higher timeframe filter (4H for 1H, 1D for 4H) |
 | **Andean + MFI (A-track)** | KMeans clustering of MFI + Andean Oscillator crossovers |
 | **UT Bot (U-track)** | ATR Trailing Stop — fast trend entries |
+| **Heikin Ashi (UT Bot)** | Optional HA candles for smoother UT Bot signals |
 | **CHOP Filter** | Blocks signals during sideways market |
 | **ATR Filter** | Volatility filter (min/max ATR%) |
 | **Fake Breakout Filter** | Blocks false breakout signals |
@@ -35,7 +36,7 @@ Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals bas
 | Command | Description | Example |
 |---|---|---|
 | `!scan TICKER TF` | Manual signal request | `!scan ETH/USDT 1h` |
-| `!status` | Show all pairs, positions and last bar times | `!status` |
+| `!status` | Show all pairs, positions, HA status and last bar times | `!status` |
 
 ### ⚙️ Exchange Settings
 | Command | Description | Example |
@@ -44,7 +45,15 @@ Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals bas
 | `!mode spot` | Switch to Gate.io spot market | `!mode spot` |
 | `!mode futures` | Switch to Gate.io perpetual futures | `!mode futures` |
 
+### 🕯️ UT Bot Settings
+| Command | Description | Example |
+|---|---|---|
+| `!utha` | Show current Heikin Ashi status for UT Bot | `!utha` |
+| `!utha on` | Enable Heikin Ashi candles for UT Bot | `!utha on` |
+| `!utha off` | Disable Heikin Ashi candles for UT Bot | `!utha off` |
+
 > ⚠️ Switching market mode resets all position states. Pair list and tickers remain unchanged.
+> 💡 Heikin Ashi smooths UT Bot signals — fewer but more reliable entries.
 
 ---
 
@@ -106,7 +115,8 @@ mufca-bot/
 ├── .env.example       # Example .env file
 ├── .gitignore         # Git ignore rules
 ├── pairs.json         # Saved pairs list (auto-created)
-└── mode.json          # Saved market mode (auto-created)
+├── mode.json          # Saved market mode (auto-created)
+└── ut_ha.json         # Saved UT Bot HA setting (auto-created)
 ```
 
 ---
@@ -143,6 +153,7 @@ python-dotenv==1.0.1
 | Cooldown Bars | 2 |
 | UT Sensitivity | 1.0 |
 | UT ATR Period | 10 |
+| UT Heikin Ashi | off (default) |
 | Max Leverage | 10x |
 
 ---
