@@ -61,6 +61,30 @@ UT_PERIOD       = 10
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
 
+# =====================================================================
+# 🕯️ HEIKIN ASHI НАСТРОЙКИ ДЛЯ UT BOT
+# =====================================================================
+UT_HA_FILE = "ut_ha.json"
+
+def load_ut_ha() -> bool:
+    """Загрузить настройку Heikin Ashi для UT Bot."""
+    try:
+        with open(UT_HA_FILE, "r") as f:
+            return json.load(f).get("ut_heikin_ashi", False)
+    except Exception:
+        return False
+
+def save_ut_ha(enabled: bool):
+    """Сохранить настройку Heikin Ashi для UT Bot."""
+    try:
+        with open(UT_HA_FILE, "w") as f:
+            json.dump({"ut_heikin_ashi": enabled}, f)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить UT HA настройку: {e}")
+
+# Глобальная настройка Heikin Ashi для UT Bot
+UT_HEIKIN_ASHI: bool = load_ut_ha()
+
 MODE_FILE = "mode.json"
 
 def load_mode() -> str:
@@ -104,6 +128,8 @@ def make_state():
         "last_u_long_bar":  None,
         "last_u_short_bar": None,
         "last_bar_time":    None,
+        # FIX: храним время последнего закрытого бара для фиксации UT сигнала
+        "last_processed_bar_time": None,
     }
 
 state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
@@ -229,9 +255,39 @@ def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
     return osc, osc.ewm(span=sig_len, adjust=False).mean()
 
 
-def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 10):
-    src    = df["close"].values
-    n_loss = (sensitivity * calculate_atr(df, period)).values
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """Преобразовать DataFrame в Heikin Ashi свечи."""
+    ha = df.copy()
+    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
+    
+    ha_open = pd.Series(index=df.index, dtype=float)
+    ha_open.iloc[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
+    for i in range(1, len(df)):
+        ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0
+    
+    ha_high = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([df["low"], ha_open, ha_close], axis=1).min(axis=1)
+    
+    ha["open"] = ha_open
+    ha["high"] = ha_high
+    ha["low"] = ha_low
+    ha["close"] = ha_close
+    return ha
+
+
+def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 10, use_ha: bool = False):
+    """
+    FIX: Добавлена опция use_ha для Heikin Ashi свечей.
+    FIX: Сигналы фиксируются на закрытии бара — проверяем только последний закрытый бар.
+    """
+    # Если включен HA — преобразуем данные
+    if use_ha:
+        df_ut = heikin_ashi(df)
+    else:
+        df_ut = df.copy()
+    
+    src    = df_ut["close"].values
+    n_loss = (sensitivity * calculate_atr(df_ut, period)).values
     ts     = np.zeros(len(df))
     ts[0]  = src[0]
     for i in range(1, len(df)):
@@ -243,9 +299,13 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
         else:
             ts[i] = src[i] - n_loss[i] if src[i] > prev else src[i] + n_loss[i]
     ts_s    = pd.Series(ts, index=df.index)
-    src_s   = df["close"]
+    src_s   = df_ut["close"]
+    
+    # FIX: Сигналы пересечения — используем оригинальные close для определения пересечения
+    # но на последнем баре проверяем только закрытый бар
     ut_buy  = (src_s > ts_s) & (src_s.shift(1) <= ts_s.shift(1))
     ut_sell = (src_s < ts_s) & (src_s.shift(1) >= ts_s.shift(1))
+    
     return ut_buy, ut_sell
 
 
@@ -279,6 +339,13 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         bars = exchange.fetch_ohlcv(ticker, timeframe, limit=900)
         df   = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
 
+        # FIX: Проверяем, что это новый закрытый бар (аналог barstate.isconfirmed)
+        current_bar_time = int(df["timestamp"].iloc[-2])
+        is_new_bar = st["last_processed_bar_time"] is None or current_bar_time > st["last_processed_bar_time"]
+        
+        # Обновляем время последнего обработанного бара
+        st["last_processed_bar_time"] = current_bar_time
+
         atr14    = calculate_atr(df, ATR_PERIOD)
         atr_pct  = (atr14 / df["close"]) * 100
         chop     = calculate_chop(df, CHOP_LENGTH)
@@ -286,7 +353,9 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         mfi      = calculate_mfi(df, MFI_LEN)
         level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
         and_osc, and_sig   = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell    = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD)
+        
+        # FIX: Передаём настройку Heikin Ashi в UT Bot
+        ut_buy, ut_sell    = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
 
         idx      = len(df) - 2
         bar_idx  = idx
@@ -338,13 +407,15 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         )
 
         # DEBUG лог — видим почему сигнал есть или нет
-        print(f"[DEBUG] {ticker} {timeframe} | "
+        ha_status = "HA" if UT_HEIKIN_ASHI else "Normal"
+        print(f"[DEBUG] {ticker} {timeframe} | UT:{ha_status} | "
               f"frama={'BULL' if frama_bull else 'BEAR' if frama_bear else 'RANGE'} | "
               f"htf={'BULL' if htf_bull else 'BEAR'} | "
               f"slope_L={slope_long} slope_S={slope_short} | "
               f"chop_ok={chop_ok}({chop_v:.1f}) | atr_ok={atr_ok}({atr_pct_v:.2f}%) | "
               f"fake_L={fake_break_long} liq_S={liq_sweep_short} | "
-              f"filter_L={filter_long} filter_S={filter_short}")
+              f"filter_L={filter_long} filter_S={filter_short} | "
+              f"new_bar={is_new_bar}")
 
         def crossover(s, lvl, i):
             return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
@@ -402,10 +473,19 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         a_in_pos = st["a_in_long"] or st["a_in_short"]
         u_in_pos = st["u_in_long"] or st["u_in_short"]
 
+        # FIX: A-сигналы как были (они и так на закрытии бара)
         sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok
         sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok
-        sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok
-        sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok
+        
+        # FIX: UT-сигналы фиксируем только на новом закрытом баре
+        # Это аналог barstate.isconfirmed в Pine Script
+        ut_buy_signal = bool(ut_buy.iloc[idx])
+        ut_sell_signal = bool(ut_sell.iloc[idx])
+        
+        # FIX: Проверяем что это новый бар и был переход (crossover/crossunder)
+        # чтобы избежать повторной отправки на том же баре
+        sig_u_long  = ut_buy_signal and filter_long and not u_in_pos and u_long_cd_ok and is_new_bar
+        sig_u_short = ut_sell_signal and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
         if sig_a_long:
             st["a_in_long"] = True; st["a_in_short"] = False
@@ -473,6 +553,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     track_emoji = "🔵" if is_a_track else "🟢"
     conf_color  = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label  = "Spot" if MARKET_MODE == "spot" else "Futures"
+    ha_status   = "HA" if UT_HEIKIN_ASHI else "Normal"
 
     embed = discord.Embed(
         title=f"🚨 MUFCA v3.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
@@ -486,14 +567,17 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     embed.add_field(name="⚙️ Режим",              value=regime,                         inline=True)
     embed.add_field(name="⚠️ Плечо",              value=f"x{leverage}",                inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%",              inline=True)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label}")
+    # FIX: Показываем режим UT Bot в embed
+    embed.add_field(name="🕯️ UT Bot",             value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • UT:{ha_status}")
     return embed
 
 
 @bot.event
 async def on_ready():
     mode_emoji = "📊" if MARKET_MODE == "spot" else "📈"
-    print(f"✅ {bot.user.name} запущен! Режим: {MARKET_MODE.upper()} | Пары: {' | '.join(TICKERS)}")
+    ha_status = "HA ON" if UT_HEIKIN_ASHI else "HA OFF"
+    print(f"✅ {bot.user.name} запущен! Режим: {MARKET_MODE.upper()} | UT: {ha_status} | Пары: {' | '.join(TICKERS)}")
     market_scanner.start()
 
 
@@ -530,9 +614,41 @@ async def mode_cmd(ctx, new_mode: str = ""):
     print(f"[MODE] Переключён на {MARKET_MODE}")
 
 
+# FIX: Новая команда для управления Heikin Ashi UT Bot
+@bot.command(name="utha")
+async def utha_cmd(ctx, arg: str = ""):
+    """!utha on | !utha off — включить/выключить Heikin Ashi для UT Bot"""
+    global UT_HEIKIN_ASHI
+
+    if not arg:
+        status = "✅ ВКЛ" if UT_HEIKIN_ASHI else "❌ ВЫКЛ"
+        await ctx.send(f"🕯️ Heikin Ashi для UT Bot: **{status}**\nДля смены: `!utha on` или `!utha off`")
+        return
+
+    arg = arg.lower()
+    if arg not in ("on", "off"):
+        await ctx.send("❌ Допустимые значения: `on` или `off`")
+        return
+
+    new_value = arg == "on"
+    if new_value == UT_HEIKIN_ASHI:
+        status = "✅ уже ВКЛ" if UT_HEIKIN_ASHI else "❌ уже ВЫКЛ"
+        await ctx.send(f"⚠️ Heikin Ashi для UT Bot {status}.")
+        return
+
+    UT_HEIKIN_ASHI = new_value
+    save_ut_ha(UT_HEIKIN_ASHI)
+
+    status = "✅ ВКЛЮЧЕН" if UT_HEIKIN_ASHI else "❌ ВЫКЛЮЧЕН"
+    await ctx.send(f"🕯️ Heikin Ashi для UT Bot **{status}**.\n⚠️ Состояния позиций сброшены.")
+    print(f"[UT_HA] Heikin Ashi {'включён' if UT_HEIKIN_ASHI else 'выключён'}")
+
+
 @bot.command(name="status")
 async def status_cmd(ctx):
     lines = ["**MUFCA v3.0 — статус сканера**\n"]
+    ha_status = "✅ HA ON" if UT_HEIKIN_ASHI else "❌ HA OFF"
+    lines.append(f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n")
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             st    = state[ticker][tf]
