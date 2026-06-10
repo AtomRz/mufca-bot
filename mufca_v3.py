@@ -7,11 +7,12 @@ import ccxt
 import discord
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
 # =====================================================================
-# ⚙️  НАСТРОЙКИ
+# ⚙️  SETTINGS
 # =====================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 CHANNEL_NAME  = os.getenv("CHANNEL_NAME", "general")
@@ -21,10 +22,8 @@ TIMEFRAMES      = ["1h", "4h"]
 PAIRS_FILE      = "pairs.json"
 
 # =====================================================================
-# 💾 ДИНАМИЧЕСКИЙ СПИСОК ПАР — сохраняется в файл
+# 💾 DYNAMIC PAIRS LIST — persisted to file
 # =====================================================================
-import json
-
 def load_tickers() -> list[str]:
     try:
         with open(PAIRS_FILE, "r") as f:
@@ -38,11 +37,13 @@ def save_tickers(tickers: list[str]):
         with open(PAIRS_FILE, "w") as f:
             json.dump({"tickers": tickers}, f)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить пары: {e}")
+        print(f"[WARN] Failed to save pairs: {e}")
 
-# Глобальный список пар — изменяется командами
 TICKERS: list[str] = load_tickers()
 
+# =====================================================================
+# ⚙️  INDICATOR PARAMETERS (matching Pine Script defaults)
+# =====================================================================
 ATR_PERIOD      = 14
 ATR_MIN         = 0.3
 ATR_MAX         = 4.5
@@ -62,12 +63,11 @@ MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
 
 # =====================================================================
-# 🕯️ HEIKIN ASHI НАСТРОЙКИ ДЛЯ UT BOT
+# 🕯️  HEIKIN ASHI SETTING FOR UT BOT
 # =====================================================================
 UT_HA_FILE = "ut_ha.json"
 
 def load_ut_ha() -> bool:
-    """Загрузить настройку Heikin Ashi для UT Bot."""
     try:
         with open(UT_HA_FILE, "r") as f:
             return json.load(f).get("ut_heikin_ashi", False)
@@ -75,16 +75,17 @@ def load_ut_ha() -> bool:
         return False
 
 def save_ut_ha(enabled: bool):
-    """Сохранить настройку Heikin Ashi для UT Bot."""
     try:
         with open(UT_HA_FILE, "w") as f:
             json.dump({"ut_heikin_ashi": enabled}, f)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить UT HA настройку: {e}")
+        print(f"[WARN] Failed to save UT HA setting: {e}")
 
-# Глобальная настройка Heikin Ashi для UT Bot
 UT_HEIKIN_ASHI: bool = load_ut_ha()
 
+# =====================================================================
+# 📡  MARKET MODE — spot or futures
+# =====================================================================
 MODE_FILE = "mode.json"
 
 def load_mode() -> str:
@@ -99,48 +100,46 @@ def save_mode(mode: str):
         with open(MODE_FILE, "w") as f:
             json.dump({"mode": mode}, f)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить режим: {e}")
+        print(f"[WARN] Failed to save mode: {e}")
 
 def make_exchange(mode: str) -> ccxt.gate:
     if mode == "futures":
         return ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     return ccxt.gate({"enableRateLimit": True})
 
-# Текущий режим: "spot" или "futures"
 MARKET_MODE: str = load_mode()
 exchange = make_exchange(MARKET_MODE)
 
 # =====================================================================
-# 🗂️  СОСТОЯНИЕ
+# 🗂️  STATE — positions and cooldown per pair/timeframe
 # =====================================================================
 def make_state():
     return {
-        "a_in_long":        False,
-        "a_in_short":       False,
-        "a_long_bar":       None,
-        "a_short_bar":      None,
-        "u_in_long":        False,
-        "u_in_short":       False,
-        "u_long_bar":       None,
-        "u_short_bar":      None,
-        "last_a_long_bar":  None,
-        "last_a_short_bar": None,
-        "last_u_long_bar":  None,
-        "last_u_short_bar": None,
-        "last_bar_time":    None,
-        # FIX: храним время последнего закрытого бара для фиксации UT сигнала
+        "a_in_long":               False,
+        "a_in_short":              False,
+        "a_long_bar":              None,
+        "a_short_bar":             None,
+        "u_in_long":               False,
+        "u_in_short":              False,
+        "u_long_bar":              None,
+        "u_short_bar":             None,
+        "last_a_long_bar":         None,
+        "last_a_short_bar":        None,
+        "last_u_long_bar":         None,
+        "last_u_short_bar":        None,
+        "last_bar_time":           None,
         "last_processed_bar_time": None,
     }
 
 state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
 
 def ensure_state(ticker: str):
-    """Добавить состояние для новой пары если его нет."""
+    """Add state for a new pair if it doesn't exist."""
     if ticker not in state:
         state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
 # =====================================================================
-# 📊 ИНДИКАТОРЫ
+# 📊  INDICATORS — identical to Pine Script
 # =====================================================================
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -182,22 +181,20 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1):
         )
     alpha = np.clip(np.exp(-4.6 * (dimen - 1.0)), 0.01, 1.0)
 
-    close = df["close"].values
+    close    = df["close"].values
     frama_ma = np.zeros(len(df))
     frama_ma[0] = close[0]
     for i in range(1, len(df)):
         frama_ma[i] = alpha[i] * close[i] + (1.0 - alpha[i]) * frama_ma[i - 1]
 
-    fs = pd.Series(frama_ma, index=df.index)
-
-    hl  = df["high"] - df["low"]
-    hc  = (df["high"] - df["close"].shift()).abs()
-    lc  = (df["low"]  - df["close"].shift()).abs()
-    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    fs   = pd.Series(frama_ma, index=df.index)
+    hl   = df["high"] - df["low"]
+    hc   = (df["high"] - df["close"].shift()).abs()
+    lc   = (df["low"]  - df["close"].shift()).abs()
+    tr   = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     fatr = tr.rolling(window=length).mean()
-
-    fu = fs + fatr * mult
-    fl = fs - fatr * mult
+    fu   = fs + fatr * mult
+    fl   = fs - fatr * mult
 
     fdir = np.zeros(len(df))
     for i in range(1, len(df)):
@@ -223,6 +220,7 @@ def calculate_mfi(df: pd.DataFrame, length: int = 8) -> pd.Series:
 
 
 def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800):
+    """KMeans clustering identical to Pine Script: init min/max, 10 iterations."""
     vals = mfi.dropna().tail(training_size).values
     if len(vals) < 2:
         return 20.0, 80.0
@@ -236,6 +234,7 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800):
 
 
 def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
+    """Andean Oscillator — identical to Pine Script."""
     alpha = 2.0 / (length + 1)
     c = df["close"].values
     o = df["open"].values
@@ -256,36 +255,23 @@ def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
 
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    """Преобразовать DataFrame в Heikin Ashi свечи."""
-    ha = df.copy()
+    """Convert OHLCV DataFrame to Heikin Ashi candles."""
+    ha       = df.copy()
     ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
-    
-    ha_open = pd.Series(index=df.index, dtype=float)
+    ha_open  = pd.Series(index=df.index, dtype=float)
     ha_open.iloc[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
     for i in range(1, len(df)):
         ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0
-    
-    ha_high = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1)
-    ha_low = pd.concat([df["low"], ha_open, ha_close], axis=1).min(axis=1)
-    
-    ha["open"] = ha_open
-    ha["high"] = ha_high
-    ha["low"] = ha_low
+    ha["open"]  = ha_open
+    ha["high"]  = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1)
+    ha["low"]   = pd.concat([df["low"],  ha_open, ha_close], axis=1).min(axis=1)
     ha["close"] = ha_close
     return ha
 
 
 def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 10, use_ha: bool = False):
-    """
-    FIX: Добавлена опция use_ha для Heikin Ashi свечей.
-    FIX: Сигналы фиксируются на закрытии бара — проверяем только последний закрытый бар.
-    """
-    # Если включен HA — преобразуем данные
-    if use_ha:
-        df_ut = heikin_ashi(df)
-    else:
-        df_ut = df.copy()
-    
+    """UT Bot — identical to Pine Script. Optional Heikin Ashi source."""
+    df_ut  = heikin_ashi(df) if use_ha else df.copy()
     src    = df_ut["close"].values
     n_loss = (sensitivity * calculate_atr(df_ut, period)).values
     ts     = np.zeros(len(df))
@@ -300,19 +286,15 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
             ts[i] = src[i] - n_loss[i] if src[i] > prev else src[i] + n_loss[i]
     ts_s    = pd.Series(ts, index=df.index)
     src_s   = df_ut["close"]
-    
-    # FIX: Сигналы пересечения — используем оригинальные close для определения пересечения
-    # но на последнем баре проверяем только закрытый бар
     ut_buy  = (src_s > ts_s) & (src_s.shift(1) <= ts_s.shift(1))
     ut_sell = (src_s < ts_s) & (src_s.shift(1) >= ts_s.shift(1))
-    
     return ut_buy, ut_sell
 
 
 def get_htf_bias(ticker: str, timeframe: str) -> int:
     """
-    FIX: HTF всегда 4H для 1H и 1D для 4H — идентично Pine дефолту.
-    htf_bull = htf_close > htf_frama
+    HTF Bias — identical to Pine: htf_bull = htf_close > htf_frama.
+    Returns 1 (bull), -1 (bear), 0 (unknown).
     """
     htf = "4h" if timeframe == "1h" else "1d"
     try:
@@ -330,33 +312,35 @@ def get_htf_bias(ticker: str, timeframe: str) -> int:
 
 
 # =====================================================================
-# 🧠 ГЛАВНАЯ ЛОГИКА СИГНАЛОВ
+# 🧠  SIGNAL LOGIC — identical to Pine Script sections 7-9
 # =====================================================================
 
 def check_signals(ticker: str, timeframe: str, st: dict):
+    """
+    Returns: (signals list, bar_time, regime, leverage)
+    signals: [(signal_type, price, regime, leverage, bar_time, confidence), ...]
+    """
     try:
         htf_bias = get_htf_bias(ticker, timeframe)
         bars = exchange.fetch_ohlcv(ticker, timeframe, limit=900)
         df   = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
 
-        # FIX: Проверяем, что это новый закрытый бар (аналог barstate.isconfirmed)
+        # Track new confirmed bars (equivalent to barstate.isconfirmed in Pine)
         current_bar_time = int(df["timestamp"].iloc[-2])
         is_new_bar = st["last_processed_bar_time"] is None or current_bar_time > st["last_processed_bar_time"]
-        
-        # Обновляем время последнего обработанного бара
         st["last_processed_bar_time"] = current_bar_time
 
-        atr14    = calculate_atr(df, ATR_PERIOD)
-        atr_pct  = (atr14 / df["close"]) * 100
-        chop     = calculate_chop(df, CHOP_LENGTH)
+        # Indicators
+        atr14            = calculate_atr(df, ATR_PERIOD)
+        atr_pct          = (atr14 / df["close"]) * 100
+        chop             = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        mfi      = calculate_mfi(df, MFI_LEN)
+        mfi              = calculate_mfi(df, MFI_LEN)
         level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
-        and_osc, and_sig   = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        
-        # FIX: Передаём настройку Heikin Ashi в UT Bot
-        ut_buy, ut_sell    = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
+        and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
+        ut_buy, ut_sell  = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
 
+        # Last confirmed bar
         idx      = len(df) - 2
         bar_idx  = idx
         bar_time = int(df["timestamp"].iloc[idx])
@@ -367,9 +351,11 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         atr_pct_v = float(atr_pct.iloc[idx])
         chop_v    = float(chop.iloc[idx])
 
+        # Base filters
         atr_ok  = ATR_MIN <= atr_pct_v <= ATR_MAX
         chop_ok = chop_v < CHOP_THRESHOLD
 
+        # FRAMA slope filter
         frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
         slope_long  = frama_slope > 0
         slope_short = frama_slope < 0
@@ -382,8 +368,8 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         htf_bear = htf_bias == -1
 
         # Fake Breakout Filter
-        hh10_prev = float(df["high"].iloc[max(0, idx-10):idx].max())
-        ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())
+        hh10_prev    = float(df["high"].iloc[max(0, idx-10):idx].max())
+        ll10_prev    = float(df["low"].iloc[max(0, idx-10):idx].min())
         fake_break_long  = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
         fake_break_short = float(df["low"].iloc[idx])  < ll10_prev and close_v > ll10_prev
 
@@ -393,6 +379,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         liq_sweep_long  = float(df["low"].iloc[idx])  < ll5_prev and close_v > ll5_prev and close_v > open_v
         liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+        # Combined filters (Pine Script section 8)
         filter_long = (
             frama_bull and chop_ok and atr_ok and slope_long
             and htf_bull
@@ -406,7 +393,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
             and not liq_sweep_long
         )
 
-        # DEBUG лог — видим почему сигнал есть или нет
+        # Debug log
         ha_status = "HA" if UT_HEIKIN_ASHI else "Normal"
         print(f"[DEBUG] {ticker} {timeframe} | UT:{ha_status} | "
               f"frama={'BULL' if frama_bull else 'BEAR' if frama_bear else 'RANGE'} | "
@@ -417,6 +404,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
               f"filter_L={filter_long} filter_S={filter_short} | "
               f"new_bar={is_new_bar}")
 
+        # Crossover helpers
         def crossover(s, lvl, i):
             return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
         def crossunder(s, lvl, i):
@@ -431,6 +419,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         and_bull_sig = crossover2(and_osc, and_sig, idx)
         and_bear_sig = crossunder2(and_osc, and_sig, idx)
 
+        # Bars since crossover (confirmation window)
         def bars_since_crossover(s, lvl, cur):
             for k in range(cur, max(cur - LOOKBACK - 1, 0), -1):
                 if float(s.iloc[k]) > lvl and float(s.iloc[k-1]) <= lvl:
@@ -462,6 +451,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or \
                           (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
+        # Cooldown check
         def cooldown_ok(last_bar):
             return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
 
@@ -470,38 +460,36 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         u_long_cd_ok  = cooldown_ok(st["last_u_long_bar"])
         u_short_cd_ok = cooldown_ok(st["last_u_short_bar"])
 
+        # Position guard
         a_in_pos = st["a_in_long"] or st["a_in_short"]
         u_in_pos = st["u_in_long"] or st["u_in_short"]
 
-        # FIX: A-сигналы как были (они и так на закрытии бара)
+        # Final signals (Pine Script section 12)
         sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok
         sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok
-        
-        # FIX: UT-сигналы фиксируем только на новом закрытом баре
-        # Это аналог barstate.isconfirmed в Pine Script
-        ut_buy_signal = bool(ut_buy.iloc[idx])
-        ut_sell_signal = bool(ut_sell.iloc[idx])
-        
-        # FIX: Проверяем что это новый бар и был переход (crossover/crossunder)
-        # чтобы избежать повторной отправки на том же баре
-        sig_u_long  = ut_buy_signal and filter_long and not u_in_pos and u_long_cd_ok and is_new_bar
-        sig_u_short = ut_sell_signal and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
+        # UT signals only fire on a new confirmed bar (barstate.isconfirmed equivalent)
+        sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
+        sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
+
+        # Update state
         if sig_a_long:
-            st["a_in_long"] = True; st["a_in_short"] = False
+            st["a_in_long"] = True;  st["a_in_short"] = False
             st["a_long_bar"] = bar_idx; st["last_a_long_bar"] = bar_idx
         if sig_a_short:
             st["a_in_short"] = True; st["a_in_long"] = False
             st["a_short_bar"] = bar_idx; st["last_a_short_bar"] = bar_idx
         if sig_u_long:
-            st["u_in_long"] = True; st["u_in_short"] = False
+            st["u_in_long"] = True;  st["u_in_short"] = False
             st["u_long_bar"] = bar_idx; st["last_u_long_bar"] = bar_idx
         if sig_u_short:
             st["u_in_short"] = True; st["u_in_long"] = False
             st["u_short_bar"] = bar_idx; st["last_u_short_bar"] = bar_idx
 
+        # Market regime
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
+        # Suggested leverage (Pine Script section 11)
         frama_sl_long  = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl  = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
@@ -509,6 +497,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         if regime == "CHAOS": sugg_lev = max(1, math.floor(sugg_lev * 0.5))
         if regime == "TREND": sugg_lev = min(MAX_ALLOWED_LEV, math.floor(sugg_lev * 1.2))
 
+        # AI Confidence score (Pine Script section 12)
         def calc_confidence(is_long: bool) -> int:
             score  = 20 if chop_ok else 0
             score += 20 if atr_ok  else 0
@@ -538,7 +527,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
 
 # =====================================================================
-# 🤖 DISCORD БОТ
+# 🤖  DISCORD BOT
 # =====================================================================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -553,118 +542,54 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     track_emoji = "🔵" if is_a_track else "🟢"
     conf_color  = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label  = "Spot" if MARKET_MODE == "spot" else "Futures"
-    ha_status   = "HA" if UT_HEIKIN_ASHI else "Normal"
+    ha_label    = "HA" if UT_HEIKIN_ASHI else "Normal"
 
     embed = discord.Embed(
         title=f"🚨 MUFCA v3.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
         color=discord.Color.green() if is_long else discord.Color.red(),
     )
-    embed.add_field(name="📈 Пара",               value=f"**{ticker}**",               inline=True)
-    embed.add_field(name="⏱ ТФ",                 value=tf.upper(),                     inline=True)
-    embed.add_field(name=f"{track_emoji} Трек",   value=signal_type.strip(),            inline=True)
-    embed.add_field(name="🧬 HTF Bias",           value=f"✅ {htf_name} подтверждён",  inline=True)
-    embed.add_field(name="💵 Цена входа",          value=f"${price:,.4f}",              inline=True)
-    embed.add_field(name="⚙️ Режим",              value=regime,                         inline=True)
-    embed.add_field(name="⚠️ Плечо",              value=f"x{leverage}",                inline=True)
+    embed.add_field(name="📈 Pair",               value=f"**{ticker}**",               inline=True)
+    embed.add_field(name="⏱ TF",                 value=tf.upper(),                     inline=True)
+    embed.add_field(name=f"{track_emoji} Track",  value=signal_type.strip(),            inline=True)
+    embed.add_field(name="🧬 HTF Bias",           value=f"✅ {htf_name} confirmed",    inline=True)
+    embed.add_field(name="💵 Entry Price",         value=f"${price:,.4f}",              inline=True)
+    embed.add_field(name="⚙️ Regime",             value=regime,                         inline=True)
+    embed.add_field(name="⚠️ Leverage",           value=f"x{leverage}",                inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%",              inline=True)
-    # FIX: Показываем режим UT Bot в embed
     embed.add_field(name="🕯️ UT Bot",             value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • UT:{ha_status}")
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • UT:{ha_label}")
     return embed
 
 
 @bot.event
 async def on_ready():
-    mode_emoji = "📊" if MARKET_MODE == "spot" else "📈"
     ha_status = "HA ON" if UT_HEIKIN_ASHI else "HA OFF"
-    print(f"✅ {bot.user.name} запущен! Режим: {MARKET_MODE.upper()} | UT: {ha_status} | Пары: {' | '.join(TICKERS)}")
+    print(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | UT: {ha_status} | Pairs: {' | '.join(TICKERS)}")
     market_scanner.start()
-
-
-@bot.command(name="mode")
-async def mode_cmd(ctx, new_mode: str = ""):
-    """!mode spot | !mode futures — переключить режим биржи"""
-    global MARKET_MODE, exchange
-
-    if not new_mode:
-        mode_emoji = "🔵 Спот" if MARKET_MODE == "spot" else "🟠 Фьючерсы"
-        await ctx.send(f"Текущий режим: **{mode_emoji}**\nДля смены: `!mode spot` или `!mode futures`")
-        return
-
-    new_mode = new_mode.lower()
-    if new_mode not in ("spot", "futures"):
-        await ctx.send("❌ Допустимые режимы: `spot` или `futures`")
-        return
-
-    if new_mode == MARKET_MODE:
-        await ctx.send(f"⚠️ Уже в режиме **{MARKET_MODE}**.")
-        return
-
-    MARKET_MODE = new_mode
-    exchange    = make_exchange(MARKET_MODE)
-    save_mode(MARKET_MODE)
-
-    # Сбрасываем состояния — смена биржи = новый старт
-    for ticker in TICKERS:
-        for tf in TIMEFRAMES:
-            state[ticker][tf] = make_state()
-
-    mode_label = "🔵 Спот (Gate.io Spot)" if MARKET_MODE == "spot" else "🟠 Фьючерсы (Gate.io Perpetual)"
-    await ctx.send(f"✅ Режим переключён на **{mode_label}**\n⚠️ Состояния позиций сброшены.")
-    print(f"[MODE] Переключён на {MARKET_MODE}")
-
-
-# FIX: Новая команда для управления Heikin Ashi UT Bot
-@bot.command(name="utha")
-async def utha_cmd(ctx, arg: str = ""):
-    """!utha on | !utha off — включить/выключить Heikin Ashi для UT Bot"""
-    global UT_HEIKIN_ASHI
-
-    if not arg:
-        status = "✅ ВКЛ" if UT_HEIKIN_ASHI else "❌ ВЫКЛ"
-        await ctx.send(f"🕯️ Heikin Ashi для UT Bot: **{status}**\nДля смены: `!utha on` или `!utha off`")
-        return
-
-    arg = arg.lower()
-    if arg not in ("on", "off"):
-        await ctx.send("❌ Допустимые значения: `on` или `off`")
-        return
-
-    new_value = arg == "on"
-    if new_value == UT_HEIKIN_ASHI:
-        status = "✅ уже ВКЛ" if UT_HEIKIN_ASHI else "❌ уже ВЫКЛ"
-        await ctx.send(f"⚠️ Heikin Ashi для UT Bot {status}.")
-        return
-
-    UT_HEIKIN_ASHI = new_value
-    save_ut_ha(UT_HEIKIN_ASHI)
-
-    status = "✅ ВКЛЮЧЕН" if UT_HEIKIN_ASHI else "❌ ВЫКЛЮЧЕН"
-    await ctx.send(f"🕯️ Heikin Ashi для UT Bot **{status}**.\n⚠️ Состояния позиций сброшены.")
-    print(f"[UT_HA] Heikin Ashi {'включён' if UT_HEIKIN_ASHI else 'выключён'}")
 
 
 @bot.command(name="status")
 async def status_cmd(ctx):
-    lines = ["**MUFCA v3.0 — статус сканера**\n"]
-    ha_status = "✅ HA ON" if UT_HEIKIN_ASHI else "❌ HA OFF"
-    lines.append(f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n")
+    """!status — show scanner status for all pairs"""
+    ha_status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
+    lines = [f"**MUFCA v3.0 — Scanner Status**\n",
+             f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n"]
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             st    = state[ticker][tf]
             last  = st["last_bar_time"]
-            ts    = f"<t:{last // 1000}:R>" if last else "нет данных"
+            ts    = f"<t:{last // 1000}:R>" if last else "no data"
             a_pos = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else "—"
             u_pos = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else "—"
-            lines.append(f"• `{ticker}` `{tf}` — бар: {ts} | A: **{a_pos}** | U: **{u_pos}**")
+            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**")
     await ctx.send("\n".join(lines))
 
 
 @bot.command(name="scan")
 async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
-    """!scan [TICKER] [TF]  пример: !scan ETH/USDT 4h"""
+    """!scan [TICKER] [TF] — manual signal request. Example: !scan ETH/USDT 4h"""
     ticker = ticker.upper(); tf = tf.lower()
-    await ctx.send(f"🔍 Сканирую `{ticker}` `{tf}`…")
+    await ctx.send(f"🔍 Scanning `{ticker}` `{tf}`…")
     st = state.get(ticker, {}).get(tf) or make_state()
     signals, bar_time, regime, lev = check_signals(ticker, tf, st)
     if signals:
@@ -672,16 +597,16 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf)
             await ctx.send(embed=embed)
     else:
-        await ctx.send(f"⏳ Сигналов по `{ticker}` `{tf}` нет. Режим: **{regime}**")
+        await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**")
 
 
 @bot.command(name="pairs")
 async def pairs_cmd(ctx):
-    """!pairs — показать текущий список пар"""
+    """!pairs — show current scanned pairs"""
     if not TICKERS:
-        await ctx.send("📭 Список пар пуст.")
+        await ctx.send("📭 Pair list is empty.")
         return
-    lines = ["**📋 Сканируемые пары:**\n"]
+    lines = ["**📋 Scanned Pairs:**\n"]
     for t in TICKERS:
         lines.append(f"• `{t}`")
     await ctx.send("\n".join(lines))
@@ -689,56 +614,113 @@ async def pairs_cmd(ctx):
 
 @bot.command(name="add")
 async def add_cmd(ctx, ticker: str = ""):
-    """!add SOL/USDT — добавить пару в сканер"""
+    """!add SOL/USDT — add a pair to the scanner"""
     if not ticker:
-        await ctx.send("❌ Укажи пару. Пример: `!add SOL/USDT`")
+        await ctx.send("❌ Please specify a pair. Example: `!add SOL/USDT`")
         return
     ticker = ticker.upper()
     if ticker in TICKERS:
-        await ctx.send(f"⚠️ `{ticker}` уже в списке.")
+        await ctx.send(f"⚠️ `{ticker}` is already in the list.")
         return
-    # Проверяем что пара существует на бирже
-    await ctx.send(f"🔍 Проверяю `{ticker}` на Gate.io…")
+    await ctx.send(f"🔍 Checking `{ticker}` on Gate.io…")
     try:
         markets = exchange.load_markets()
         if ticker not in markets:
-            await ctx.send(f"❌ Пара `{ticker}` не найдена на Gate.io.")
+            await ctx.send(f"❌ Pair `{ticker}` not found on Gate.io.")
             return
     except Exception as e:
-        await ctx.send(f"❌ Ошибка проверки: {e}")
+        await ctx.send(f"❌ Check failed: {e}")
         return
     TICKERS.append(ticker)
     ensure_state(ticker)
     save_tickers(TICKERS)
-    await ctx.send(f"✅ `{ticker}` добавлен! Сканируется: {' | '.join(TICKERS)}")
-    print(f"[PAIRS] Добавлена пара: {ticker}")
+    await ctx.send(f"✅ `{ticker}` added! Scanning: {' | '.join(TICKERS)}")
+    print(f"[PAIRS] Added pair: {ticker}")
 
 
 @bot.command(name="remove")
 async def remove_cmd(ctx, ticker: str = ""):
-    """!remove SOL/USDT — убрать пару из сканера"""
+    """!remove SOL/USDT — remove a pair from the scanner"""
     if not ticker:
-        await ctx.send("❌ Укажи пару. Пример: `!remove SOL/USDT`")
+        await ctx.send("❌ Please specify a pair. Example: `!remove SOL/USDT`")
         return
     ticker = ticker.upper()
     if ticker not in TICKERS:
-        await ctx.send(f"⚠️ `{ticker}` нет в списке.")
+        await ctx.send(f"⚠️ `{ticker}` is not in the list.")
         return
     if len(TICKERS) == 1:
-        await ctx.send("❌ Нельзя удалить последнюю пару.")
+        await ctx.send("❌ Cannot remove the last pair.")
         return
     TICKERS.remove(ticker)
     save_tickers(TICKERS)
-    await ctx.send(f"🗑️ `{ticker}` удалён. Осталось: {' | '.join(TICKERS)}")
-    print(f"[PAIRS] Удалена пара: {ticker}")
+    await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}")
+    print(f"[PAIRS] Removed pair: {ticker}")
 
+
+@bot.command(name="mode")
+async def mode_cmd(ctx, new_mode: str = ""):
+    """!mode spot | !mode futures — switch exchange market type"""
+    global MARKET_MODE, exchange
+
+    if not new_mode:
+        label = "🔵 Spot" if MARKET_MODE == "spot" else "🟠 Futures"
+        await ctx.send(f"Current mode: **{label}**\nTo switch: `!mode spot` or `!mode futures`")
+        return
+
+    new_mode = new_mode.lower()
+    if new_mode not in ("spot", "futures"):
+        await ctx.send("❌ Valid modes: `spot` or `futures`")
+        return
+    if new_mode == MARKET_MODE:
+        await ctx.send(f"⚠️ Already in **{MARKET_MODE}** mode.")
+        return
+
+    MARKET_MODE = new_mode
+    exchange    = make_exchange(MARKET_MODE)
+    save_mode(MARKET_MODE)
+
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            state[ticker][tf] = make_state()
+
+    label = "🔵 Spot (Gate.io Spot)" if MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
+    await ctx.send(f"✅ Switched to **{label}**\n⚠️ Position states have been reset.")
+    print(f"[MODE] Switched to {MARKET_MODE}")
+
+
+@bot.command(name="utha")
+async def utha_cmd(ctx, arg: str = ""):
+    """!utha on | !utha off — enable/disable Heikin Ashi for UT Bot"""
+    global UT_HEIKIN_ASHI
+
+    if not arg:
+        status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
+        await ctx.send(f"🕯️ Heikin Ashi for UT Bot: **{status}**\nTo change: `!utha on` or `!utha off`")
+        return
+
+    arg = arg.lower()
+    if arg not in ("on", "off"):
+        await ctx.send("❌ Valid values: `on` or `off`")
+        return
+
+    new_value = arg == "on"
+    if new_value == UT_HEIKIN_ASHI:
+        status = "✅ already ON" if UT_HEIKIN_ASHI else "❌ already OFF"
+        await ctx.send(f"⚠️ Heikin Ashi for UT Bot is {status}.")
+        return
+
+    UT_HEIKIN_ASHI = new_value
+    save_ut_ha(UT_HEIKIN_ASHI)
+    status = "✅ ENABLED" if UT_HEIKIN_ASHI else "❌ DISABLED"
+    await ctx.send(f"🕯️ Heikin Ashi for UT Bot **{status}**.")
+    print(f"[UT_HA] Heikin Ashi {'enabled' if UT_HEIKIN_ASHI else 'disabled'}")
 
 
 @tasks.loop(seconds=20)
 async def market_scanner():
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
     if channel is None:
-        print(f"[WARN] Канал '{CHANNEL_NAME}' не найден!")
+        print(f"[WARN] Channel '{CHANNEL_NAME}' not found!")
         return
 
     for ticker in TICKERS:
@@ -753,10 +735,10 @@ async def market_scanner():
                     await channel.send(embed=embed)
                     print(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f} | conf={conf}%")
 
-            await asyncio.sleep(0.5)  # FIX: был time.sleep — блокировал async loop
+            await asyncio.sleep(0.5)
 
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise RuntimeError("Не задан DISCORD_TOKEN в .env файле!")
+        raise RuntimeError("DISCORD_TOKEN is not set in .env file!")
     bot.run(DISCORD_TOKEN)
