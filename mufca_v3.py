@@ -84,6 +84,27 @@ def save_ut_ha(enabled: bool):
 UT_HEIKIN_ASHI: bool = load_ut_ha()
 
 # =====================================================================
+# 🧬  HTF BIAS SETTING — persisted to file
+# =====================================================================
+HTF_FILE = "htf_bias.json"
+
+def load_htf() -> str:
+    try:
+        with open(HTF_FILE, "r") as f:
+            return json.load(f).get("htf", "1d")
+    except Exception:
+        return "1d"
+
+def save_htf(htf: str):
+    try:
+        with open(HTF_FILE, "w") as f:
+            json.dump({"htf": htf}, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save HTF setting: {e}")
+
+HTF_BIAS: str = load_htf()
+
+# =====================================================================
 # 📡  MARKET MODE — spot or futures
 # =====================================================================
 MODE_FILE = "mode.json"
@@ -294,10 +315,10 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
 def get_htf_bias(ticker: str, timeframe: str) -> int:
     """
     HTF Bias — identical to Pine: htf_bull = htf_close > htf_frama.
-    HTF is ALWAYS Daily ("1d"), matching Pine Script default "D".
+    HTF is configurable via !htf command, default is "1d".
     Returns 1 (bull), -1 (bear), 0 (unknown).
     """
-    htf = "1d"  # Всегда дневной таймфрейм, как в индикаторе по умолчанию
+    htf = HTF_BIAS  # Используем глобальную настройку
     try:
         bars   = exchange.fetch_ohlcv(ticker, htf, limit=150)
         df_htf = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
@@ -551,20 +572,20 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     embed.add_field(name="📈 Pair",               value=f"**{ticker}**",               inline=True)
     embed.add_field(name="⏱ TF",                 value=tf.upper(),                     inline=True)
     embed.add_field(name=f"{track_emoji} Track",  value=signal_type.strip(),            inline=True)
-    embed.add_field(name="🧬 HTF Bias",           value="✅ 1D FRAMA confirmed",        inline=True)
+    embed.add_field(name="🧬 HTF Bias",           value=f"✅ {HTF_BIAS.upper()} FRAMA confirmed", inline=True)
     embed.add_field(name="💵 Entry Price",         value=f"${price:,.4f}",              inline=True)
     embed.add_field(name="⚙️ Regime",             value=regime,                         inline=True)
     embed.add_field(name="⚠️ Leverage",           value=f"x{leverage}",                inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%",              inline=True)
     embed.add_field(name="🕯️ UT Bot",             value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • UT:{ha_label}")
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • HTF:{HTF_BIAS.upper()} • UT:{ha_label}")
     return embed
 
 
 @bot.event
 async def on_ready():
     ha_status = "HA ON" if UT_HEIKIN_ASHI else "HA OFF"
-    print(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | UT: {ha_status} | Pairs: {' | '.join(TICKERS)}")
+    print(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {HTF_BIAS.upper()} | UT: {ha_status} | Pairs: {' | '.join(TICKERS)}")
     market_scanner.start()
 
 
@@ -573,6 +594,7 @@ async def status_cmd(ctx):
     """!status — show scanner status for all pairs"""
     ha_status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
     lines = [f"**MUFCA v3.0 — Scanner Status**\n",
+             f"🧬 HTF Bias: **{HTF_BIAS.upper()}**\n",
              f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n"]
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -714,6 +736,40 @@ async def utha_cmd(ctx, arg: str = ""):
     status = "✅ ENABLED" if UT_HEIKIN_ASHI else "❌ DISABLED"
     await ctx.send(f"🕯️ Heikin Ashi for UT Bot **{status}**.")
     print(f"[UT_HA] Heikin Ashi {'enabled' if UT_HEIKIN_ASHI else 'disabled'}")
+
+
+@bot.command(name="htf")
+async def htf_cmd(ctx, new_htf: str = ""):
+    """!htf 1d | !htf 4h | !htf 1h — change HTF Bias timeframe"""
+    global HTF_BIAS
+
+    if not new_htf:
+        await ctx.send(f"🧬 Current HTF Bias: **{HTF_BIAS.upper()}**\n"
+                       f"Available: `1d`, `4h`, `1h`, `1w`\n"
+                       f"To change: `!htf 4h`")
+        return
+
+    new_htf = new_htf.lower()
+    valid_htfs = ("1d", "4h", "1h", "2h", "6h", "12h", "1w", "3d")
+    if new_htf not in valid_htfs:
+        await ctx.send(f"❌ Valid HTF values: {', '.join(valid_htfs)}")
+        return
+    if new_htf == HTF_BIAS:
+        await ctx.send(f"⚠️ HTF Bias is already **{HTF_BIAS.upper()}**.")
+        return
+
+    old_htf = HTF_BIAS
+    HTF_BIAS = new_htf
+    save_htf(HTF_BIAS)
+
+    # Reset states since HTF changed
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            state[ticker][tf] = make_state()
+
+    await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{HTF_BIAS.upper()}**\n"
+                   f"⚠️ Position states have been reset.")
+    print(f"[HTF] Changed from {old_htf} to {HTF_BIAS}")
 
 
 @tasks.loop(seconds=20)
