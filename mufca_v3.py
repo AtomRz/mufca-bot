@@ -294,9 +294,10 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
 def get_htf_bias(ticker: str, timeframe: str) -> int:
     """
     HTF Bias — identical to Pine: htf_bull = htf_close > htf_frama.
+    HTF is ALWAYS Daily ("1d"), matching Pine Script default "D".
     Returns 1 (bull), -1 (bear), 0 (unknown).
     """
-    htf = "4h" if timeframe == "1h" else "1d"
+    htf = "1d"  # Всегда дневной таймфрейм, как в индикаторе по умолчанию
     try:
         bars   = exchange.fetch_ohlcv(ticker, htf, limit=150)
         df_htf = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
@@ -304,7 +305,7 @@ def get_htf_bias(ticker: str, timeframe: str) -> int:
         htf_close = df_htf["close"].iloc[-2]
         htf_frama = fs.iloc[-2]
         bias = 1 if htf_close > htf_frama else -1
-        print(f"[HTF] {ticker} {timeframe} → {htf} | close={htf_close:.2f} frama={htf_frama:.2f} bias={'BULL' if bias==1 else 'BEAR'}")
+        print(f"[HTF] {ticker} → {htf} | close={htf_close:.2f} frama={htf_frama:.2f} bias={'BULL' if bias==1 else 'BEAR'}")
         return bias
     except Exception as e:
         print(f"[WARN] HTF Bias ({ticker} {htf}): {e}")
@@ -537,7 +538,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) -> discord.Embed:
     is_long     = "BUY" in signal_type
     is_a_track  = "Andean" in signal_type
-    htf_name    = "4H FRAMA" if tf == "1h" else "1D FRAMA"
     coin_emoji  = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
     track_emoji = "🔵" if is_a_track else "🟢"
     conf_color  = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
@@ -551,7 +551,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence) ->
     embed.add_field(name="📈 Pair",               value=f"**{ticker}**",               inline=True)
     embed.add_field(name="⏱ TF",                 value=tf.upper(),                     inline=True)
     embed.add_field(name=f"{track_emoji} Track",  value=signal_type.strip(),            inline=True)
-    embed.add_field(name="🧬 HTF Bias",           value=f"✅ {htf_name} confirmed",    inline=True)
+    embed.add_field(name="🧬 HTF Bias",           value="✅ 1D FRAMA confirmed",        inline=True)
     embed.add_field(name="💵 Entry Price",         value=f"${price:,.4f}",              inline=True)
     embed.add_field(name="⚙️ Regime",             value=regime,                         inline=True)
     embed.add_field(name="⚠️ Leverage",           value=f"x{leverage}",                inline=True)
