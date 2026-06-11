@@ -298,7 +298,7 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
 # 🔙  BACKTEST — populate signal history from historical bars
 # =====================================================================
 
-def backtest_history(ticker: str, tf: str, num_bars: int = 2000) -> int:
+def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
     """
     Scan historical bars to find past signals and simulate their outcomes.
     Populates signals_history.json with synthetic data for adaptive TP.
@@ -327,7 +327,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 2000) -> int:
         signals_found = 0
 
         # Scan from bar 50 to len-20 (need room for future bars to check TP/SL)
-        for idx in range(50, len(df) - 60):
+        for idx in range(50, len(df) - 100):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
@@ -395,7 +395,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 2000) -> int:
                 exit_price = close_v
                 bars_held = 0
 
-                for future_idx in range(idx + 1, min(idx + 61, len(df))):
+                for future_idx in range(idx + 1, min(idx + 101, len(df))):
                     future_high = float(df["high"].iloc[future_idx])
                     future_low = float(df["low"].iloc[future_idx])
                     future_close = float(df["close"].iloc[future_idx])
@@ -464,7 +464,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 2000) -> int:
                 exit_price = close_v
                 bars_held = 0
 
-                for future_idx in range(idx + 1, min(idx + 61, len(df))):
+                for future_idx in range(idx + 1, min(idx + 101, len(df))):
                     future_high = float(df["high"].iloc[future_idx])
                     future_low = float(df["low"].iloc[future_idx])
                     future_close = float(df["close"].iloc[future_idx])
@@ -534,7 +534,7 @@ def run_startup_backtest():
     total_signals = 0
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            count = backtest_history(ticker, tf, num_bars=2000)
+            count = backtest_history(ticker, tf, num_bars=3000)
             total_signals += count
             # Small delay to avoid rate limits
             import time
@@ -1603,6 +1603,45 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
 
     except Exception as e:
         await ctx.send("Error: " + str(e))
+
+
+
+@bot.command(name="reset")
+async def reset_cmd(ctx, confirm: str = ""):
+    """!reset yes - clear all signal history and trade history (cannot be undone!)"""
+    if confirm.lower() != "yes":
+        await ctx.send("⚠️ This will DELETE all signal history and trade data!" + chr(10) +
+                       "To confirm, type: `!reset yes`" + chr(10) +
+                       "Current stats: " + str(sum(len(history.get(t, {}).get(tf, {}).get(side, [])) 
+                           for t in (load_signals_history() or {})
+                           for tf in history.get(t, {})
+                           for side in ("long", "short"))) + " signal records")
+        return
+
+    # Clear signals_history.json
+    if os.path.exists(SIGNALS_HISTORY_FILE):
+        os.remove(SIGNALS_HISTORY_FILE)
+
+    # Clear trade history in state
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            state[ticker][tf]["trade_history"] = []
+            state[ticker][tf]["active_trade"] = None
+            state[ticker][tf]["bars_in_trade"] = 0
+
+    # Re-run backtest to populate fresh history
+    await ctx.send("🗑️ History cleared. Running fresh backtest...")
+    total = 0
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            count = backtest_history(ticker, tf, num_bars=3000)
+            total += count
+            await ctx.send(f"✅ `{ticker}` `{tf}`: {count} signals found")
+            import time
+            time.sleep(0.5)
+
+    await ctx.send("🎓 Fresh backtest complete! Total signals: **" + str(total) + "**" + chr(10) +
+                   "Run `!signals` to see new statistics.")
 
 @tasks.loop(seconds=20)
 async def market_scanner():
