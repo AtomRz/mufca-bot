@@ -295,6 +295,257 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
     }
 
 # =====================================================================
+# 🔙  BACKTEST — populate signal history from historical bars
+# =====================================================================
+
+def backtest_history(ticker: str, tf: str, num_bars: int = 500) -> int:
+    """
+    Scan historical bars to find past signals and simulate their outcomes.
+    Populates signals_history.json with synthetic data for adaptive TP.
+    Returns number of signals found.
+    """
+    print(f"[BACKTEST] Starting backtest for {ticker} {tf} ({num_bars} bars)...")
+
+    try:
+        bars = exchange.fetch_ohlcv(ticker, tf, limit=num_bars)
+        df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+
+        if len(df) < 100:
+            print(f"[BACKTEST] Not enough bars for {ticker} {tf}")
+            return 0
+
+        # Pre-calculate indicators for all bars
+        atr14 = calculate_atr(df, ATR_PERIOD)
+        atr_pct = (atr14 / df["close"]) * 100
+        chop = calculate_chop(df, CHOP_LENGTH)
+        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+        mfi = calculate_mfi(df, MFI_LEN)
+        level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
+        and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
+        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
+
+        signals_found = 0
+
+        # Scan from bar 50 to len-20 (need room for future bars to check TP/SL)
+        for idx in range(50, len(df) - 20):
+            close_v = float(df["close"].iloc[idx])
+            open_v = float(df["open"].iloc[idx])
+            atr_v = max(float(atr14.iloc[idx]), 1e-8)
+            atr_pct_v = float(atr_pct.iloc[idx])
+            chop_v = float(chop.iloc[idx])
+
+            atr_ok = ATR_MIN <= atr_pct_v <= ATR_MAX
+            chop_ok = chop_v < CHOP_THRESHOLD
+
+            frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
+            slope_long = frama_slope > 0
+            slope_short = frama_slope < 0
+
+            frama_dir_v = int(fdir.iloc[idx])
+            frama_bull = frama_dir_v == 1
+            frama_bear = frama_dir_v == -1
+
+            # Skip HTF bias for backtest (assume aligned)
+            htf_bull = True
+            htf_bear = True
+
+            # Fake breakout filters
+            hh10_prev = float(df["high"].iloc[max(0, idx-10):idx].max())
+            ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())
+            fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
+            fake_break_short = float(df["low"].iloc[idx]) < ll10_prev and close_v > ll10_prev
+
+            ll5_prev = float(df["low"].iloc[max(0, idx-5):idx].min())
+            hh5_prev = float(df["high"].iloc[max(0, idx-5):idx].max())
+            liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
+            liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
+
+            filter_long = frama_bull and chop_ok and atr_ok and slope_long and not fake_break_long and not liq_sweep_short
+            filter_short = frama_bear and chop_ok and atr_ok and slope_short and not fake_break_short and not liq_sweep_long
+
+            # Signal detection
+            def crossover(s, lvl, i):
+                return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
+            def crossunder(s, lvl, i):
+                return float(s.iloc[i]) < lvl and float(s.iloc[i-1]) >= lvl
+            def crossover2(s1, s2, i):
+                return float(s1.iloc[i]) > float(s2.iloc[i]) and float(s1.iloc[i-1]) <= float(s2.iloc[i-1])
+            def crossunder2(s1, s2, i):
+                return float(s1.iloc[i]) < float(s2.iloc[i]) and float(s1.iloc[i-1]) >= float(s2.iloc[i-1])
+
+            mfi_bull_sig = crossover(mfi, level_os, idx)
+            mfi_bear_sig = crossunder(mfi, level_ob, idx)
+            and_bull_sig = crossover2(and_osc, and_sig, idx)
+            and_bear_sig = crossunder2(and_osc, and_sig, idx)
+
+            sig_a_long = mfi_bull_sig and filter_long
+            sig_a_short = mfi_bear_sig and filter_short
+            sig_u_long = bool(ut_buy.iloc[idx]) and filter_long
+            sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
+
+            if sig_a_long or sig_u_long:
+                side = "long"
+                sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
+
+                # Simulate future: check if TP or SL hit first in next 20 bars
+                tp_hit = False
+                sl_hit = False
+                max_favorable = 0.0
+                max_adverse = 0.0
+                exit_price = close_v
+                bars_held = 0
+
+                for future_idx in range(idx + 1, min(idx + 21, len(df))):
+                    future_high = float(df["high"].iloc[future_idx])
+                    future_low = float(df["low"].iloc[future_idx])
+                    future_close = float(df["close"].iloc[future_idx])
+
+                    # Track MFE/MAE
+                    favorable = (future_high - close_v) / close_v * 100
+                    adverse = (close_v - future_low) / close_v * 100
+                    max_favorable = max(max_favorable, favorable)
+                    max_adverse = max(max_adverse, adverse)
+
+                    # Check SL first (more conservative)
+                    if future_low <= sl:
+                        sl_hit = True
+                        exit_price = sl
+                        bars_held = future_idx - idx
+                        break
+
+                    # Then check if we can find a reasonable TP
+                    # Use the max favorable move as "optimal" TP
+                    # But cap it to avoid outliers
+                    optimal_tp_pct = min(max_favorable, MAX_TP_PCT)
+                    tp = close_v * (1 + optimal_tp_pct / 100)
+
+                    if future_high >= tp:
+                        tp_hit = True
+                        exit_price = tp
+                        bars_held = future_idx - idx
+                        break
+
+                    bars_held = future_idx - idx
+
+                # Record the signal
+                history = load_signals_history()
+                if ticker not in history:
+                    history[ticker] = {}
+                if tf not in history[ticker]:
+                    history[ticker][tf] = {"long": [], "short": []}
+
+                exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
+                moved_pct = (exit_price - close_v) / close_v * 100
+
+                history[ticker][tf][side].append({
+                    "entry": round(close_v, 4),
+                    "exit": round(exit_price, 4),
+                    "exit_type": exit_type,
+                    "bars_held": bars_held,
+                    "moved_pct": round(moved_pct, 4),
+                    "timestamp": str(int(df["timestamp"].iloc[idx])),
+                    "max_favorable_pct": round(max_favorable, 4),
+                    "max_adverse_pct": round(max_adverse, 4),
+                })
+
+                # Keep only last N*3
+                history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
+                save_signals_history(history)
+                signals_found += 1
+
+            elif sig_a_short or sig_u_short:
+                side = "short"
+                sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
+
+                tp_hit = False
+                sl_hit = False
+                max_favorable = 0.0
+                max_adverse = 0.0
+                exit_price = close_v
+                bars_held = 0
+
+                for future_idx in range(idx + 1, min(idx + 21, len(df))):
+                    future_high = float(df["high"].iloc[future_idx])
+                    future_low = float(df["low"].iloc[future_idx])
+                    future_close = float(df["close"].iloc[future_idx])
+
+                    favorable = (close_v - future_low) / close_v * 100
+                    adverse = (future_high - close_v) / close_v * 100
+                    max_favorable = max(max_favorable, favorable)
+                    max_adverse = max(max_adverse, adverse)
+
+                    if future_high >= sl:
+                        sl_hit = True
+                        exit_price = sl
+                        bars_held = future_idx - idx
+                        break
+
+                    optimal_tp_pct = min(max_favorable, MAX_TP_PCT)
+                    tp = close_v * (1 - optimal_tp_pct / 100)
+
+                    if future_low <= tp:
+                        tp_hit = True
+                        exit_price = tp
+                        bars_held = future_idx - idx
+                        break
+
+                    bars_held = future_idx - idx
+
+                history = load_signals_history()
+                if ticker not in history:
+                    history[ticker] = {}
+                if tf not in history[ticker]:
+                    history[ticker][tf] = {"long": [], "short": []}
+
+                exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
+                moved_pct = (close_v - exit_price) / close_v * 100
+
+                history[ticker][tf][side].append({
+                    "entry": round(close_v, 4),
+                    "exit": round(exit_price, 4),
+                    "exit_type": exit_type,
+                    "bars_held": bars_held,
+                    "moved_pct": round(moved_pct, 4),
+                    "timestamp": str(int(df["timestamp"].iloc[idx])),
+                    "max_favorable_pct": round(max_favorable, 4),
+                    "max_adverse_pct": round(max_adverse, 4),
+                })
+
+                history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
+                save_signals_history(history)
+                signals_found += 1
+
+        print(f"[BACKTEST] {ticker} {tf}: found {signals_found} historical signals")
+        return signals_found
+
+    except Exception as e:
+        print(f"[ERROR] Backtest failed for {ticker} {tf}: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
+
+
+def run_startup_backtest():
+    """Run backtest for all pairs/timeframes on startup."""
+    print("=" * 60)
+    print("[STARTUP] Running historical backtest to populate signal history...")
+    print("=" * 60)
+
+    total_signals = 0
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            count = backtest_history(ticker, tf, num_bars=800)
+            total_signals += count
+            # Small delay to avoid rate limits
+            import time
+            time.sleep(0.5)
+
+    print("=" * 60)
+    print(f"[STARTUP] Backtest complete! Total historical signals: {total_signals}")
+    print("=" * 60)
+
+
+# =====================================================================
 # 🗂️  STATE
 # =====================================================================
 def make_state():
@@ -319,6 +570,13 @@ def make_state():
     }
 
 state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
+
+# =====================================================================
+# 🔍  SCAN COUNTER — for debugging
+# =====================================================================
+scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
+
+
 
 def ensure_state(ticker: str):
     if ticker not in state:
@@ -550,6 +808,8 @@ def close_trade(st: dict, exit_price: float, result: str, ticker: str, tf: str):
 # =====================================================================
 
 def check_signals(ticker: str, timeframe: str, st: dict):
+    scan_stats["total_scans"] += 1
+    scan_stats["last_scan_time"] = datetime.now(timezone.utc).isoformat()
     try:
         htf_bias = get_htf_bias(ticker, timeframe)
         bars = exchange.fetch_ohlcv(ticker, timeframe, limit=900)
@@ -741,6 +1001,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
             return min(score, 100)
 
         signals = []
+        signal_fired = False
 
         if sig_a_long or sig_u_long:
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
@@ -751,8 +1012,10 @@ def check_signals(ticker: str, timeframe: str, st: dict):
             add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat())
             stats = get_signal_stats(ticker, timeframe, "long")
             if sig_a_long:
+                signal_fired = True
                 signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats))
             if sig_u_long:
+                signal_fired = True
                 signals.append(("U BUY  (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats))
 
         if sig_a_short or sig_u_short:
@@ -768,6 +1031,8 @@ def check_signals(ticker: str, timeframe: str, st: dict):
             if sig_u_short:
                 signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats))
 
+        if signal_fired:
+            scan_stats["signals_generated"] += len(signals)
         return signals, bar_time, regime, sugg_lev
 
     except Exception as e:
@@ -822,6 +1087,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl
 async def on_ready():
     ha_status = "HA ON" if UT_HEIKIN_ASHI else "HA OFF"
     print(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {HTF_BIAS.upper()} | UT: {ha_status} | Pairs: {' | '.join(TICKERS)}")
+
+    # Run backtest on startup to populate signal history
+    run_startup_backtest()
+
     market_scanner.start()
 
 
@@ -1137,6 +1406,153 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         lines.append(f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | Result: {rec['exit_type'].upper()}")
     await ctx.send("\n".join(lines))
 
+
+
+
+
+@bot.command(name="debug")
+async def debug_cmd(ctx):
+    """!debug - show internal scan statistics and signal history status"""
+    lines = []
+    lines.append("**Debug Information:**")
+    lines.append("• Total scans: **" + str(scan_stats["total_scans"]) + "**")
+    lines.append("• Signals generated: **" + str(scan_stats["signals_generated"]) + "**")
+    lines.append("• Last scan: " + str(scan_stats["last_scan_time"] or "never"))
+
+    history = load_signals_history()
+    total_signals = 0
+    total_closed = 0
+    for t in history:
+        for tf in history[t]:
+            for side in ("long", "short"):
+                records = history[t][tf].get(side, [])
+                total_signals += len(records)
+                total_closed += sum(1 for r in records if r["exit_type"] != "open")
+
+    lines.append("• Signal history records: **" + str(total_signals) + "** (" + str(total_closed) + " closed)")
+    lines.append("• File exists: **" + ("Yes" if os.path.exists(SIGNALS_HISTORY_FILE) else "No") + "**")
+
+    if os.path.exists(SIGNALS_HISTORY_FILE):
+        size = os.path.getsize(SIGNALS_HISTORY_FILE)
+        lines.append("• File size: **" + str(size) + " bytes**")
+
+    active_count = 0
+    for t in TICKERS:
+        for tf in TIMEFRAMES:
+            if state[t][tf].get("active_trade"):
+                active_count += 1
+    lines.append("• Active trades: **" + str(active_count) + "**")
+
+    await ctx.send(chr(10).join(lines))
+
+
+@bot.command(name="sim")
+async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
+    """!sim [long|short] [TICKER] [TF] - simulate a signal to test history recording"""
+    side = side.lower()
+    if side not in ("long", "short"):
+        await ctx.send("Side must be `long` or `short`")
+        return
+    ticker = ticker.upper()
+    tf = tf.lower()
+
+    await ctx.send("Simulating " + side.upper() + " signal for `" + ticker + "` `" + tf + "`...")
+
+    try:
+        bars = exchange.fetch_ohlcv(ticker, tf, limit=100)
+        df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+        last_close = float(df["close"].iloc[-2])
+
+        atr14 = calculate_atr(df, ATR_PERIOD)
+        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+        idx = len(df) - 2
+        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+        tp = calculate_adaptive_tp(ticker, tf, side, last_close, sl)
+
+        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+
+        # Simulate TP hit for testing
+        exit_price = tp
+        update_signal_record(ticker, tf, side, exit_price, "tp", 5)
+
+        stats = get_signal_stats(ticker, tf, side)
+
+        msg = "Simulated signal recorded!" + chr(10)
+        msg += "• Entry: $" + str(round(last_close, 4)) + chr(10)
+        msg += "• SL: $" + str(round(sl, 4)) + chr(10)
+        msg += "• TP: $" + str(round(tp, 4)) + chr(10)
+        msg += "• History now has **" + str(stats["count"]) + "** closed " + side + " signals" + chr(10)
+        msg += "• Run `!signals " + ticker + " " + tf + " " + side + "` to see details"
+
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send("Simulation failed: " + str(e))
+        import traceback
+        await ctx.send("```" + chr(10) + traceback.format_exc()[:1000] + chr(10) + "```")
+
+
+
+@bot.command(name="forcerun")
+async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
+    """!forcerun [long|short] [TICKER] [TF] - force a signal bypassing all filters (for testing)"""
+    side = side.lower()
+    if side not in ("long", "short"):
+        await ctx.send("Side must be `long` or `short`")
+        return
+    ticker = ticker.upper()
+    tf = tf.lower()
+
+    await ctx.send("Force-running " + side.upper() + " signal for `" + ticker + "` `" + tf + "` (bypassing filters)...")
+
+    try:
+        bars = exchange.fetch_ohlcv(ticker, tf, limit=100)
+        df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+        last_close = float(df["close"].iloc[-2])
+
+        atr14 = calculate_atr(df, ATR_PERIOD)
+        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+        idx = len(df) - 2
+        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+        tp = calculate_adaptive_tp(ticker, tf, side, last_close, sl)
+        risk = abs(last_close - sl)
+
+        st = state.get(ticker, {}).get(tf) or make_state()
+
+        # Force set active trade
+        st["active_trade"] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
+        st["bars_in_trade"] = 0
+
+        # Record in history
+        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+
+        stats = get_signal_stats(ticker, tf, side)
+
+        rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
+        tp_source = "Adaptive (" + str(stats["count"]) + " signals)" if stats["count"] >= 5 else "Fixed R:R = 2.0"
+        tp_pct = abs(tp - last_close) / last_close * 100
+
+        embed = discord.Embed(
+            title="FORCE SIGNAL " + ("📈 LONG" if side == "long" else "📉 SHORT"),
+            color=discord.Color.green() if side == "long" else discord.Color.red(),
+        )
+        embed.add_field(name="Pair", value="**" + ticker + "**", inline=True)
+        embed.add_field(name="TF", value=tf.upper(), inline=True)
+        embed.add_field(name="Entry", value="$" + str(round(last_close, 4)), inline=True)
+        embed.add_field(name="SL", value="$" + str(round(sl, 4)), inline=True)
+        embed.add_field(name="TP", value="$" + str(round(tp, 4)) + " (+" + str(round(tp_pct, 2)) + "%)", inline=True)
+        embed.add_field(name="R:R", value="1:" + str(rr), inline=True)
+        embed.add_field(name="TP Source", value=tp_source, inline=False)
+        if stats["count"] >= 5:
+            embed.add_field(name="Stats", value="Avg MFE: " + str(stats["avg_mfe"]) + "% | Median: " + str(stats["median_mfe"]) + "%", inline=False)
+        embed.add_field(name="WARNING", value="This signal BYPASSED all filters for testing!", inline=False)
+
+        await ctx.send(embed=embed)
+        await ctx.send("Signal recorded. Use `!debug` to verify, `!signals " + ticker + " " + tf + " " + side + "` to see history.")
+
+    except Exception as e:
+        await ctx.send("Force run failed: " + str(e))
+        import traceback
+        await ctx.send("```" + chr(10) + traceback.format_exc()[:1000] + chr(10) + "```")
 
 @tasks.loop(seconds=20)
 async def market_scanner():
