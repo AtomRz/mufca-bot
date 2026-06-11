@@ -289,7 +289,9 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
         "count": len(recent),
         "avg_mfe": round(float(np.mean(favorable_pcts)), 2),
         "median_mfe": round(float(np.median(favorable_pcts)), 2),
-        "tp_pct": round(float(np.percentile(favorable_pcts, TP_PERCENTILE * 100)), 2),
+        "tp_pct": round(float(np.mean(favorable_pcts) + 0.5 * np.std(favorable_pcts)), 2),
+        "mean_mfe": round(float(np.mean(favorable_pcts)), 2),
+        "std_mfe": round(float(np.std(favorable_pcts)), 2),
         "best": round(float(max(favorable_pcts)), 2),
         "worst": round(float(min(favorable_pcts)), 2),
     }
@@ -1074,7 +1076,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl
     embed.add_field(name="📊 Risk/Reward", value=f"1:{rr}", inline=True)
     embed.add_field(name="📚 TP Source", value=tp_source, inline=False)
     if stats['count'] >= 5:
-        embed.add_field(name="📈 Signal Stats", value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Median: {stats['median_mfe']:.2f}% | Best: {stats['best']:.2f}%", inline=False)
+        embed.add_field(name="📈 Signal Stats", value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Mean+0.5σ TP: {stats['tp_pct']:.2f}% | Best: {stats['best']:.2f}%", inline=False)
     embed.add_field(name="⚙️ Regime", value=regime, inline=True)
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
