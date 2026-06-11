@@ -1022,16 +1022,16 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
         if sig_a_short or sig_u_short:
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
-            tp = calculate_adaptive_tp(ticker, timeframe, "short", close_v, sl)
+            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14)
             risk = abs(sl - close_v)
             st["active_trade"] = {"side": "short", "entry": close_v, "sl": sl, "tp": tp, "lev": sugg_lev, "bar_opened": bar_idx}
             st["bars_in_trade"] = 0
             add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat())
             stats = get_signal_stats(ticker, timeframe, "short")
             if sig_a_short:
-                signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats))
+                signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
             if sig_u_short:
-                signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats))
+                signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
 
         if signal_fired:
             scan_stats["signals_generated"] += len(signals)
@@ -1050,7 +1050,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl, tp, risk, stats) -> discord.Embed:
+def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl, tp, risk, stats, tp_desc: str = "") -> discord.Embed:
     is_long = "BUY" in signal_type
     is_a_track = "Andean" in signal_type
     coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
@@ -1077,6 +1077,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl
     embed.add_field(name="📚 TP Source", value=tp_source, inline=False)
     if stats['count'] >= 5:
         embed.add_field(name="📈 Signal Stats", value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Mean+0.5σ TP: {stats['tp_pct']:.2f}% | Best: {stats['best']:.2f}%", inline=False)
+    if tp_desc:
+        embed.add_field(name="🧠 TP Logic", value=tp_desc, inline=False)
     embed.add_field(name="⚙️ Regime", value=regime, inline=True)
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
@@ -1125,7 +1127,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
     st = state.get(ticker, {}).get(tf) or make_state()
     signals, bar_time, regime, lev = check_signals(ticker, tf, st)
     if signals:
-        for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats in signals:
+        for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats)
             await ctx.send(embed=embed)
     else:
@@ -1659,7 +1661,7 @@ async def market_scanner():
 
             if bar_time and bar_time != st["last_bar_time"]:
                 st["last_bar_time"] = bar_time
-                for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats in signals:
+                for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
                     embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats)
                     await channel.send(embed=embed)
                     print(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f} | SL:{sl} TP:{tp} | conf={conf}%")
