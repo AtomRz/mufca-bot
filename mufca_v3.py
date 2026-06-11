@@ -298,7 +298,7 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
 # 🔙  BACKTEST — populate signal history from historical bars
 # =====================================================================
 
-def backtest_history(ticker: str, tf: str, num_bars: int = 500) -> int:
+def backtest_history(ticker: str, tf: str, num_bars: int = 2000) -> int:
     """
     Scan historical bars to find past signals and simulate their outcomes.
     Populates signals_history.json with synthetic data for adaptive TP.
@@ -327,7 +327,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 500) -> int:
         signals_found = 0
 
         # Scan from bar 50 to len-20 (need room for future bars to check TP/SL)
-        for idx in range(50, len(df) - 20):
+        for idx in range(50, len(df) - 60):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
@@ -395,7 +395,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 500) -> int:
                 exit_price = close_v
                 bars_held = 0
 
-                for future_idx in range(idx + 1, min(idx + 21, len(df))):
+                for future_idx in range(idx + 1, min(idx + 61, len(df))):
                     future_high = float(df["high"].iloc[future_idx])
                     future_low = float(df["low"].iloc[future_idx])
                     future_close = float(df["close"].iloc[future_idx])
@@ -464,7 +464,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 500) -> int:
                 exit_price = close_v
                 bars_held = 0
 
-                for future_idx in range(idx + 1, min(idx + 21, len(df))):
+                for future_idx in range(idx + 1, min(idx + 61, len(df))):
                     future_high = float(df["high"].iloc[future_idx])
                     future_low = float(df["low"].iloc[future_idx])
                     future_close = float(df["close"].iloc[future_idx])
@@ -534,7 +534,7 @@ def run_startup_backtest():
     total_signals = 0
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            count = backtest_history(ticker, tf, num_bars=800)
+            count = backtest_history(ticker, tf, num_bars=2000)
             total_signals += count
             # Small delay to avoid rate limits
             import time
