@@ -1,22 +1,23 @@
 # 🤖 MUFCA Bot [AtomDC] v3.0
 
-Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals based on the **MUFCA [AtomDC]** indicator logic.
+Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals based on the **MUFCA [AtomDC] v1.5** indicator logic.
 
 ---
 
-## 📊 Indicator Logic (identical to Pine Script)
+## 📊 Indicator Logic (identical to Pine Script v1.5)
 
 | Component | Description |
 |---|---|
 | **FRAMA Channel** | Fractal Adaptive Moving Average — trend detection |
-| **HTF Bias** | Higher timeframe filter (4H for 1H, 1D for 4H) |
+| **HTF Bias** | Higher timeframe filter — `htf_close > htf_frama` (default: Daily) |
 | **Andean + MFI (A-track)** | KMeans clustering of MFI + Andean Oscillator crossovers |
-| **UT Bot (U-track)** | ATR Trailing Stop — fast trend entries |
+| **UT Bot (U-track)** | ATR Trailing Stop — fast trend entries, fixed on bar close |
 | **Heikin Ashi (UT Bot)** | Optional HA candles for smoother UT Bot signals |
 | **CHOP Filter** | Blocks signals during sideways market |
 | **ATR Filter** | Volatility filter (min/max ATR%) |
 | **Fake Breakout Filter** | Blocks false breakout signals |
 | **Liquidity Sweep Filter** | Blocks signals after liquidity sweeps |
+| **FRAMA Slope Filter** | Entry only when FRAMA is trending in signal direction |
 | **Cooldown** | Minimum 2 bars between signals on the same track |
 | **Position Guard** | Prevents re-entry while already in a position |
 | **AI Confidence** | 0–100% score based on filter confluence |
@@ -29,31 +30,41 @@ Discord bot for scanning cryptocurrency pairs on Gate.io, generating signals bas
 | Command | Description | Example |
 |---|---|---|
 | `!pairs` | Show current list of scanned pairs | `!pairs` |
-| `!add TICKER` | Add a pair to the scanner | `!add SOL/USDT` |
+| `!add TICKER` | Add a pair to the scanner (validates on Gate.io) | `!add SOL/USDT` |
 | `!remove TICKER` | Remove a pair from the scanner | `!remove SOL/USDT` |
 
 ### 🔍 Scanning
 | Command | Description | Example |
 |---|---|---|
 | `!scan TICKER TF` | Manual signal request | `!scan ETH/USDT 1h` |
-| `!status` | Show all pairs, positions, HA status and last bar times | `!status` |
+| `!status` | Show all pairs, positions, HTF and HA status | `!status` |
 
 ### ⚙️ Exchange Settings
 | Command | Description | Example |
 |---|---|---|
-| `!mode` | Show current market mode (spot/futures) | `!mode` |
+| `!mode` | Show current market mode | `!mode` |
 | `!mode spot` | Switch to Gate.io spot market | `!mode spot` |
 | `!mode futures` | Switch to Gate.io perpetual futures | `!mode futures` |
+
+### 🧬 HTF Bias Settings
+| Command | Description | Example |
+|---|---|---|
+| `!htf` | Show current HTF Bias timeframe | `!htf` |
+| `!htf 1d` | Set HTF Bias to Daily (default, matches indicator) | `!htf 1d` |
+| `!htf 4h` | Set HTF Bias to 4 hours | `!htf 4h` |
+| `!htf 1w` | Set HTF Bias to Weekly | `!htf 1w` |
+
+> Valid HTF values: `1h`, `2h`, `4h`, `6h`, `12h`, `1d`, `3d`, `1w`
 
 ### 🕯️ UT Bot Settings
 | Command | Description | Example |
 |---|---|---|
-| `!utha` | Show current Heikin Ashi status for UT Bot | `!utha` |
+| `!utha` | Show current Heikin Ashi status | `!utha` |
 | `!utha on` | Enable Heikin Ashi candles for UT Bot | `!utha on` |
 | `!utha off` | Disable Heikin Ashi candles for UT Bot | `!utha off` |
 
-> ⚠️ Switching market mode resets all position states. Pair list and tickers remain unchanged.
-> 💡 Heikin Ashi smooths UT Bot signals — fewer but more reliable entries.
+> ⚠️ Switching market mode or HTF resets all position states.
+> 💡 Set `!htf 1d` to match the default indicator settings.
 
 ---
 
@@ -116,7 +127,8 @@ mufca-bot/
 ├── .gitignore         # Git ignore rules
 ├── pairs.json         # Saved pairs list (auto-created)
 ├── mode.json          # Saved market mode (auto-created)
-└── ut_ha.json         # Saved UT Bot HA setting (auto-created)
+├── ut_ha.json         # Saved UT Bot HA setting (auto-created)
+└── htf_bias.json      # Saved HTF Bias timeframe (auto-created)
 ```
 
 ---
@@ -154,8 +166,9 @@ python-dotenv==1.0.1
 | UT Sensitivity | 1.0 |
 | UT ATR Period | 10 |
 | UT Heikin Ashi | off (default) |
+| HTF Bias TF | 1d (default, matches indicator) |
 | Max Leverage | 10x |
 
 ---
 
-*MUFCA [AtomDC] v3.0 — identical logic to the Pine Script indicator*
+*MUFCA [AtomDC] v3.0 — identical logic to Pine Script v1.5 indicator*
