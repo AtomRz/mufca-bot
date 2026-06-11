@@ -1554,6 +1554,56 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         import traceback
         await ctx.send("```" + chr(10) + traceback.format_exc()[:1000] + chr(10) + "```")
 
+
+
+
+
+@bot.command(name="tp")
+async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
+    """!tp [long|short] [TICKER] [TF] - preview adaptive TP for current price without trading"""
+    side = side.lower()
+    if side not in ("long", "short"):
+        await ctx.send("Side must be `long` or `short`")
+        return
+    ticker = ticker.upper()
+    tf = tf.lower()
+
+    try:
+        bars = exchange.fetch_ohlcv(ticker, tf, limit=100)
+        df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+        last_close = float(df["close"].iloc[-2])
+
+        atr14 = calculate_atr(df, ATR_PERIOD)
+        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+        idx = len(df) - 2
+        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+        tp = calculate_adaptive_tp(ticker, tf, side, last_close, sl)
+
+        stats = get_signal_stats(ticker, tf, side)
+        risk = abs(last_close - sl)
+        rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
+        tp_pct = abs(tp - last_close) / last_close * 100
+
+        lines = []
+        lines.append("**📊 Adaptive TP Preview for `" + ticker + "` `" + tf + "` " + side.upper() + ":**")
+        lines.append("• Current price: **$" + str(round(last_close, 4)) + "**")
+        lines.append("• Stop Loss: **$" + str(round(sl, 4)) + "** (risk: $" + str(round(risk, 4)) + ")")
+        lines.append("• Take Profit: **$" + str(round(tp, 4)) + "** (+" + str(round(tp_pct, 2)) + "%)")
+        lines.append("• Risk/Reward: **1:" + str(rr) + "**")
+
+        if stats['count'] >= 5:
+            lines.append("• Based on **" + str(stats['count']) + "** historical signals")
+            lines.append("• Avg MFE: **" + str(stats['avg_mfe']) + "%** | Median: **" + str(stats['median_mfe']) + "%**")
+            lines.append("• Best: **" + str(stats['best']) + "%** | Worst: **" + str(stats['worst']) + "%**")
+            lines.append("• Used percentile: **" + str(int(TP_PERCENTILE*100)) + "th** → TP%: **" + str(stats['tp_pct']) + "%**")
+        else:
+            lines.append("• ⚠️ Only **" + str(stats['count']) + "** signals in history — using fallback R:R = 2.0")
+
+        await ctx.send(chr(10).join(lines))
+
+    except Exception as e:
+        await ctx.send("Error: " + str(e))
+
 @tasks.loop(seconds=20)
 async def market_scanner():
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
