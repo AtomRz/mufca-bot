@@ -23,7 +23,7 @@ TIMEFRAMES      = ["1h", "4h"]
 PAIRS_FILE      = "pairs.json"
 
 # =====================================================================
-# 💾 DYNAMIC PAIRS LIST — persisted to file
+# 💾 DYNAMIC PAIRS LIST
 # =====================================================================
 def load_tickers() -> list[str]:
     try:
@@ -43,7 +43,7 @@ def save_tickers(tickers: list[str]):
 TICKERS: list[str] = load_tickers()
 
 # =====================================================================
-# ⚙️  INDICATOR PARAMETERS (matching Pine Script defaults)
+# ⚙️  INDICATOR PARAMETERS
 # =====================================================================
 ATR_PERIOD      = 14
 ATR_MIN         = 0.3
@@ -64,15 +64,16 @@ MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
 
 # =====================================================================
-# 🎓  ADAPTIVE TP: how many past signals to analyze
+# 🎓  ADAPTIVE TP SETTINGS
 # =====================================================================
-SIGNAL_HISTORY_LIMIT = 25       # last N signals to analyze
-TP_PERCENTILE        = 0.75     # 75th percentile = TP hit in 75% of cases
-MIN_TP_PCT           = 0.3      # minimum TP %
-MAX_TP_PCT           = 8.0      # maximum TP %
+SIGNAL_HISTORY_LIMIT = 25
+TP_PERCENTILE        = 0.75
+MIN_TP_PCT           = 0.3
+MAX_TP_PCT           = 8.0
+MAX_HOLD_BARS        = 20  # force close after N bars
 
 # =====================================================================
-# 🕯️  HEIKIN ASHI SETTING FOR UT BOT
+# 🕯️  HEIKIN ASHI
 # =====================================================================
 UT_HA_FILE = "ut_ha.json"
 
@@ -93,7 +94,7 @@ def save_ut_ha(enabled: bool):
 UT_HEIKIN_ASHI: bool = load_ut_ha()
 
 # =====================================================================
-# 🧬  HTF BIAS SETTING — persisted to file
+# 🧬  HTF BIAS
 # =====================================================================
 HTF_FILE = "htf_bias.json"
 
@@ -114,7 +115,7 @@ def save_htf(htf: str):
 HTF_BIAS: str = load_htf()
 
 # =====================================================================
-# 📡  MARKET MODE — spot or futures
+# 📡  MARKET MODE
 # =====================================================================
 MODE_FILE = "mode.json"
 
@@ -160,12 +161,14 @@ def save_signals_history(history: dict):
         print(f"[WARN] Failed to save signals history: {e}")
 
 def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp: str):
+    """Add a new signal record when position opens."""
     history = load_signals_history()
     if ticker not in history:
         history[ticker] = {}
     if tf not in history[ticker]:
         history[ticker][tf] = {"long": [], "short": []}
-    history[ticker][tf][side].append({
+
+    record = {
         "entry": round(entry, 4),
         "exit": None,
         "exit_type": "open",
@@ -174,14 +177,19 @@ def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp: 
         "timestamp": timestamp,
         "max_favorable_pct": 0.0,
         "max_adverse_pct": 0.0,
-    })
+    }
+    history[ticker][tf][side].append(record)
     history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
     save_signals_history(history)
+    print(f"[SIGNAL_RECORD] ADDED {side} signal for {ticker} {tf} @ {entry}")
 
 def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int):
+    """Update the last open signal record with exit data."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
+        print(f"[WARN] Cannot update signal: no history for {ticker} {tf}")
         return
+
     records = history[ticker][tf][side]
     for rec in reversed(records):
         if rec["exit_type"] == "open":
@@ -194,12 +202,16 @@ def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exi
             else:
                 rec["moved_pct"] = round((entry - exit_price) / entry * 100, 4)
             save_signals_history(history)
+            print(f"[SIGNAL_RECORD] CLOSED {side} signal for {ticker} {tf} | Entry:{entry} Exit:{exit_price} Result:{exit_type} PnL:{rec['moved_pct']:.2f}%")
             return
+    print(f"[WARN] No open signal found to close for {ticker} {tf} {side}")
 
 def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float):
+    """Update max favorable/adverse excursion for the last open signal."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         return
+
     records = history[ticker][tf][side]
     for rec in reversed(records):
         if rec["exit_type"] == "open":
@@ -210,73 +222,100 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float)
             else:
                 favorable = (entry - current_price) / entry * 100
                 adverse = (current_price - entry) / entry * 100
-            rec["max_favorable_pct"] = round(max(rec.get("max_favorable_pct", 0), favorable), 4)
-            rec["max_adverse_pct"] = round(max(rec.get("max_adverse_pct", 0), adverse), 4)
+
+            # FIXED: proper round() syntax
+            rec["max_favorable_pct"] = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
+            rec["max_adverse_pct"] = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
             save_signals_history(history)
             return
 
 def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current_sl: float) -> float:
+    """Calculate adaptive TP based on historical signal performance."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         risk = abs(entry - current_sl)
-        return entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
+        tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
+        print(f"[ADAPTIVE_TP] {ticker} {tf} {side} | NO HISTORY | fallback TP={tp:.4f}")
+        return round(tp, 4)
+
     records = history[ticker][tf][side]
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and r.get("max_favorable_pct", 0) > 0]
-    if len(closed) < 5:
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
+
+    if len(closed) < 3:
         risk = abs(entry - current_sl)
-        return entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
+        tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
+        print(f"[ADAPTIVE_TP] {ticker} {tf} {side} | Only {len(closed)} closed signals | fallback TP={tp:.4f}")
+        return round(tp, 4)
+
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
-    favorable_pcts = [r["max_favorable_pct"] for r in recent]
+    favorable_pcts = []
+    for r in recent:
+        mfe = r.get("max_favorable_pct", 0)
+        if mfe == 0 and r.get("moved_pct", 0) != 0:
+            mfe = abs(r["moved_pct"])
+        favorable_pcts.append(max(mfe, 0.1))
+
     tp_pct = np.percentile(favorable_pcts, TP_PERCENTILE * 100)
     tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, tp_pct))
+
     if side == "long":
         tp = entry * (1 + tp_pct / 100)
     else:
         tp = entry * (1 - tp_pct / 100)
+
     print(f"[ADAPTIVE_TP] {ticker} {tf} {side} | entry={entry:.4f} | history={len(recent)} signals | tp_pct={tp_pct:.2f}% | TP={tp:.4f}")
     return round(tp, 4)
 
 def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
+    """Get statistics for adaptive TP display."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         return {"count": 0, "avg_mfe": 0, "median_mfe": 0, "tp_pct": 0}
+
     records = history[ticker][tf][side]
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and r.get("max_favorable_pct", 0) > 0]
-    if len(closed) < 3:
-        return {"count": len(closed), "avg_mfe": 0, "median_mfe": 0, "tp_pct": 0}
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
+    if len(closed) < 1:
+        return {"count": 0, "avg_mfe": 0, "median_mfe": 0, "tp_pct": 0}
+
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
-    favorable_pcts = [r["max_favorable_pct"] for r in recent]
+    favorable_pcts = []
+    for r in recent:
+        mfe = r.get("max_favorable_pct", 0)
+        if mfe == 0 and r.get("moved_pct", 0) != 0:
+            mfe = abs(r["moved_pct"])
+        favorable_pcts.append(max(mfe, 0.1))
+
     return {
         "count": len(recent),
-        "avg_mfe": round(np.mean(favorable_pcts), 2),
-        "median_mfe": round(np.median(favorable_pcts), 2),
-        "tp_pct": round(np.percentile(favorable_pcts, TP_PERCENTILE * 100), 2),
-        "best": round(max(favorable_pcts), 2),
-        "worst": round(min(favorable_pcts), 2),
+        "avg_mfe": round(float(np.mean(favorable_pcts)), 2),
+        "median_mfe": round(float(np.median(favorable_pcts)), 2),
+        "tp_pct": round(float(np.percentile(favorable_pcts, TP_PERCENTILE * 100)), 2),
+        "best": round(float(max(favorable_pcts)), 2),
+        "worst": round(float(min(favorable_pcts)), 2),
     }
 
 # =====================================================================
-# 🗂️  STATE — positions and cooldown per pair/timeframe
+# 🗂️  STATE
 # =====================================================================
 def make_state():
     return {
-        "a_in_long":               False,
-        "a_in_short":              False,
-        "a_long_bar":              None,
-        "a_short_bar":             None,
-        "u_in_long":               False,
-        "u_in_short":              False,
-        "u_long_bar":              None,
-        "u_short_bar":             None,
-        "last_a_long_bar":         None,
-        "last_a_short_bar":        None,
-        "last_u_long_bar":         None,
-        "last_u_short_bar":        None,
-        "last_bar_time":           None,
+        "a_in_long": False,
+        "a_in_short": False,
+        "a_long_bar": None,
+        "a_short_bar": None,
+        "u_in_long": False,
+        "u_in_short": False,
+        "u_long_bar": None,
+        "u_short_bar": None,
+        "last_a_long_bar": None,
+        "last_a_short_bar": None,
+        "last_u_long_bar": None,
+        "last_u_short_bar": None,
+        "last_bar_time": None,
         "last_processed_bar_time": None,
-        "active_trade":            None,
-        "trade_history":           [],
-        "bars_in_trade":           0,
+        "active_trade": None,
+        "trade_history": [],
+        "bars_in_trade": 0,
     }
 
 state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
@@ -286,7 +325,7 @@ def ensure_state(ticker: str):
         state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
 # =====================================================================
-# 📊  INDICATORS — identical to Pine Script
+# 📊  INDICATORS
 # =====================================================================
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -302,21 +341,21 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     lc = (df["low"]  - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     atr_sum = tr.rolling(window=length).sum()
-    hh      = df["high"].rolling(window=length).max()
-    ll      = df["low"].rolling(window=length).min()
+    hh = df["high"].rolling(window=length).max()
+    ll = df["low"].rolling(window=length).min()
     return 100 * np.log10(atr_sum / (hh - ll + 1e-8)) / np.log10(length)
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1):
-    n   = int(length / 2)
+    n = int(length / 2)
     hh1 = df["high"].rolling(window=n).max()
     ll1 = df["low"].rolling(window=n).min()
-    n1  = (hh1 - ll1) / n
+    n1 = (hh1 - ll1) / n
     hh2 = df["high"].shift(n).rolling(window=n).max()
     ll2 = df["low"].shift(n).rolling(window=n).min()
-    n2  = (hh2 - ll2) / n
+    n2 = (hh2 - ll2) / n
     hh3 = df["high"].rolling(window=length).max()
     ll3 = df["low"].rolling(window=length).min()
-    n3  = (hh3 - ll3) / length
+    n3 = (hh3 - ll3) / length
 
     with np.errstate(divide="ignore", invalid="ignore"):
         dimen = np.where(
@@ -326,20 +365,20 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1):
         )
     alpha = np.clip(np.exp(-4.6 * (dimen - 1.0)), 0.01, 1.0)
 
-    close    = df["close"].values
+    close = df["close"].values
     frama_ma = np.zeros(len(df))
     frama_ma[0] = close[0]
     for i in range(1, len(df)):
         frama_ma[i] = alpha[i] * close[i] + (1.0 - alpha[i]) * frama_ma[i - 1]
 
-    fs   = pd.Series(frama_ma, index=df.index)
-    hl   = df["high"] - df["low"]
-    hc   = (df["high"] - df["close"].shift()).abs()
-    lc   = (df["low"]  - df["close"].shift()).abs()
-    tr   = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    fs = pd.Series(frama_ma, index=df.index)
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"]  - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     fatr = tr.rolling(window=length).mean()
-    fu   = fs + fatr * mult
-    fl   = fs - fatr * mult
+    fu = fs + fatr * mult
+    fl = fs - fatr * mult
 
     fdir = np.zeros(len(df))
     for i in range(1, len(df)):
@@ -353,10 +392,10 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1):
     return fs, fu, fl, pd.Series(fdir, index=df.index)
 
 def calculate_mfi(df: pd.DataFrame, length: int = 8) -> pd.Series:
-    hlc3  = (df["high"] + df["low"] + df["close"]) / 3.0
-    mf    = hlc3 * df["volume"]
-    pos   = np.where(hlc3 > hlc3.shift(1), mf, 0.0)
-    neg   = np.where(hlc3 < hlc3.shift(1), mf, 0.0)
+    hlc3 = (df["high"] + df["low"] + df["close"]) / 3.0
+    mf = hlc3 * df["volume"]
+    pos = np.where(hlc3 > hlc3.shift(1), mf, 0.0)
+    neg = np.where(hlc3 < hlc3.shift(1), mf, 0.0)
     pos_s = pd.Series(pos, index=df.index).rolling(window=length).sum()
     neg_s = pd.Series(neg, index=df.index).rolling(window=length).sum()
     ratio = pos_s / (neg_s + 1e-8)
@@ -370,8 +409,8 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800):
     for _ in range(10):
         cl1 = vals[np.abs(vals - c1) < np.abs(vals - c2)]
         cl2 = vals[np.abs(vals - c2) <= np.abs(vals - c1)]
-        c1  = float(cl1.mean()) if len(cl1) > 0 else c1
-        c2  = float(cl2.mean()) if len(cl2) > 0 else c2
+        c1 = float(cl1.mean()) if len(cl1) > 0 else c1
+        c2 = float(cl2.mean()) if len(cl2) > 0 else c2
     return min(c1, c2), max(c1, c2)
 
 def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
@@ -394,24 +433,24 @@ def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
     return osc, osc.ewm(span=sig_len, adjust=False).mean()
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    ha       = df.copy()
+    ha = df.copy()
     ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
-    ha_open  = pd.Series(index=df.index, dtype=float)
+    ha_open = pd.Series(index=df.index, dtype=float)
     ha_open.iloc[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
     for i in range(1, len(df)):
         ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0
-    ha["open"]  = ha_open
-    ha["high"]  = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1)
-    ha["low"]   = pd.concat([df["low"],  ha_open, ha_close], axis=1).min(axis=1)
+    ha["open"] = ha_open
+    ha["high"] = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1)
+    ha["low"] = pd.concat([df["low"], ha_open, ha_close], axis=1).min(axis=1)
     ha["close"] = ha_close
     return ha
 
 def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 10, use_ha: bool = False):
-    df_ut  = heikin_ashi(df) if use_ha else df.copy()
-    src    = df_ut["close"].values
+    df_ut = heikin_ashi(df) if use_ha else df.copy()
+    src = df_ut["close"].values
     n_loss = (sensitivity * calculate_atr(df_ut, period)).values
-    ts     = np.zeros(len(df))
-    ts[0]  = src[0]
+    ts = np.zeros(len(df))
+    ts[0] = src[0]
     for i in range(1, len(df)):
         prev = ts[i-1]
         if src[i] > prev and src[i-1] > prev:
@@ -420,16 +459,16 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
             ts[i] = min(prev, src[i] + n_loss[i])
         else:
             ts[i] = src[i] - n_loss[i] if src[i] > prev else src[i] + n_loss[i]
-    ts_s    = pd.Series(ts, index=df.index)
-    src_s   = df_ut["close"]
-    ut_buy  = (src_s > ts_s) & (src_s.shift(1) <= ts_s.shift(1))
+    ts_s = pd.Series(ts, index=df.index)
+    src_s = df_ut["close"]
+    ut_buy = (src_s > ts_s) & (src_s.shift(1) <= ts_s.shift(1))
     ut_sell = (src_s < ts_s) & (src_s.shift(1) >= ts_s.shift(1))
     return ut_buy, ut_sell
 
 def get_htf_bias(ticker: str, timeframe: str) -> int:
     htf = HTF_BIAS
     try:
-        bars   = exchange.fetch_ohlcv(ticker, htf, limit=150)
+        bars = exchange.fetch_ohlcv(ticker, htf, limit=150)
         df_htf = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
         fs, fu, fl, fdir = calculate_frama(df_htf, FRAMA_LEN, FRAMA_MULT)
         htf_close = df_htf["close"].iloc[-2]
@@ -442,21 +481,21 @@ def get_htf_bias(ticker: str, timeframe: str) -> int:
         return 0
 
 # =====================================================================
-# 🎯  SL CALCULATION — based on FRAMA bands + ATR
+# 🎯  SL & TP CALCULATION
 # =====================================================================
 
 def calculate_sl(entry_price: float, side: str, fs: pd.Series, fu: pd.Series, fl: pd.Series, atr14: pd.Series, idx: int) -> float:
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     if side == "long":
         sl_frama = float(fl.iloc[idx])
-        sl_atr   = entry_price - 1.5 * atr_v
+        sl_atr = entry_price - 1.5 * atr_v
         return max(sl_frama, sl_atr)
     else:
         sl_frama = float(fu.iloc[idx])
-        sl_atr   = entry_price + 1.5 * atr_v
+        sl_atr = entry_price + 1.5 * atr_v
         return min(sl_frama, sl_atr)
 
-def check_tp_sl_hit(st: dict, high: float, low: float, close: float) -> str | None:
+def check_tp_sl_hit(st: dict, high: float, low: float) -> str | None:
     trade = st.get("active_trade")
     if not trade:
         return None
@@ -503,77 +542,86 @@ def close_trade(st: dict, exit_price: float, result: str, ticker: str, tf: str):
     update_signal_record(ticker, tf, side, exit_price, result, bars_held)
     st["active_trade"] = None
     st["bars_in_trade"] = 0
-    print(f"[TRADE] Closed {side.upper()} | Entry: {entry} | Exit: {exit_price} | Result: {result.upper()} | PnL: {pnl_pct:.2f}% | Bars: {bars_held}")
+    print(f"[TRADE] Closed {side.upper()} | Entry:{entry} | Exit:{exit_price} | Result:{result.upper()} | PnL:{pnl_pct:.2f}% | Bars:{bars_held}")
     return closed_trade
 
 # =====================================================================
-# 🧠  SIGNAL LOGIC — identical to Pine Script sections 7-9
+# 🧠  SIGNAL LOGIC
 # =====================================================================
 
 def check_signals(ticker: str, timeframe: str, st: dict):
     try:
         htf_bias = get_htf_bias(ticker, timeframe)
         bars = exchange.fetch_ohlcv(ticker, timeframe, limit=900)
-        df   = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+        df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
 
         current_bar_time = int(df["timestamp"].iloc[-2])
         is_new_bar = st["last_processed_bar_time"] is None or current_bar_time > st["last_processed_bar_time"]
         st["last_processed_bar_time"] = current_bar_time
 
+        # Data from LAST confirmed bar (idx = -2)
         last_high = float(df["high"].iloc[-2])
-        last_low  = float(df["low"].iloc[-2])
+        last_low = float(df["low"].iloc[-2])
         last_close = float(df["close"].iloc[-2])
+        last_open = float(df["open"].iloc[-2])
 
+        # Check TP/SL for active trade using LAST bar's high/low
         trade = st.get("active_trade")
         if trade:
             update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close)
             st["bars_in_trade"] = st.get("bars_in_trade", 0) + 1
 
-        hit = check_tp_sl_hit(st, last_high, last_low, last_close)
-        if hit:
-            close_trade(st, last_close if hit == "sl" else st["active_trade"]["tp"], hit, ticker, timeframe)
+            hit = check_tp_sl_hit(st, last_high, last_low)
+            if hit:
+                exit_price = trade["sl"] if hit == "sl" else trade["tp"]
+                close_trade(st, exit_price, hit, ticker, timeframe)
+            elif st.get("bars_in_trade", 0) >= MAX_HOLD_BARS:
+                # Force close after max hold bars
+                close_trade(st, last_close, "cancelled", ticker, timeframe)
+                print(f"[TRADE] Force-closed {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
 
-        atr14            = calculate_atr(df, ATR_PERIOD)
-        atr_pct          = (atr14 / df["close"]) * 100
-        chop             = calculate_chop(df, CHOP_LENGTH)
+        # Indicators
+        atr14 = calculate_atr(df, ATR_PERIOD)
+        atr_pct = (atr14 / df["close"]) * 100
+        chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        mfi              = calculate_mfi(df, MFI_LEN)
+        mfi = calculate_mfi(df, MFI_LEN)
         level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell  = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
+        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
 
-        idx      = len(df) - 2
-        bar_idx  = idx
+        idx = len(df) - 2
+        bar_idx = idx
         bar_time = int(df["timestamp"].iloc[idx])
 
-        close_v   = float(df["close"].iloc[idx])
-        open_v    = float(df["open"].iloc[idx])
-        atr_v     = max(float(atr14.iloc[idx]), 1e-8)
+        close_v = float(df["close"].iloc[idx])
+        open_v = float(df["open"].iloc[idx])
+        atr_v = max(float(atr14.iloc[idx]), 1e-8)
         atr_pct_v = float(atr_pct.iloc[idx])
-        chop_v    = float(chop.iloc[idx])
+        chop_v = float(chop.iloc[idx])
 
-        atr_ok  = ATR_MIN <= atr_pct_v <= ATR_MAX
+        atr_ok = ATR_MIN <= atr_pct_v <= ATR_MAX
         chop_ok = chop_v < CHOP_THRESHOLD
 
         frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
-        slope_long  = frama_slope > 0
+        slope_long = frama_slope > 0
         slope_short = frama_slope < 0
 
         frama_dir_v = int(fdir.iloc[idx])
-        frama_bull  = frama_dir_v == 1
-        frama_bear  = frama_dir_v == -1
+        frama_bull = frama_dir_v == 1
+        frama_bear = frama_dir_v == -1
 
         htf_bull = htf_bias == 1
         htf_bear = htf_bias == -1
 
-        hh10_prev    = float(df["high"].iloc[max(0, idx-10):idx].max())
-        ll10_prev    = float(df["low"].iloc[max(0, idx-10):idx].min())
-        fake_break_long  = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
-        fake_break_short = float(df["low"].iloc[idx])  < ll10_prev and close_v > ll10_prev
+        hh10_prev = float(df["high"].iloc[max(0, idx-10):idx].max())
+        ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())
+        fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
+        fake_break_short = float(df["low"].iloc[idx]) < ll10_prev and close_v > ll10_prev
 
         ll5_prev = float(df["low"].iloc[max(0, idx-5):idx].min())
         hh5_prev = float(df["high"].iloc[max(0, idx-5):idx].max())
-        liq_sweep_long  = float(df["low"].iloc[idx])  < ll5_prev and close_v > ll5_prev and close_v > open_v
+        liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
         liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
         filter_long = (
@@ -595,7 +643,6 @@ def check_signals(ticker: str, timeframe: str, st: dict):
               f"htf={'BULL' if htf_bull else 'BEAR'} | "
               f"slope_L={slope_long} slope_S={slope_short} | "
               f"chop_ok={chop_ok}({chop_v:.1f}) | atr_ok={atr_ok}({atr_pct_v:.2f}%) | "
-              f"fake_L={fake_break_long} liq_S={liq_sweep_short} | "
               f"filter_L={filter_long} filter_S={filter_short} | "
               f"new_bar={is_new_bar}")
 
@@ -639,36 +686,36 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx)
         bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx)
 
-        confirm_long_a  = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or \
-                          (and_bull_sig and bs_mfi_bull <= LOOKBACK)
+        confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or \
+                         (and_bull_sig and bs_mfi_bull <= LOOKBACK)
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or \
                           (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
         def cooldown_ok(last_bar):
             return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
 
-        a_long_cd_ok  = cooldown_ok(st["last_a_long_bar"])
+        a_long_cd_ok = cooldown_ok(st["last_a_long_bar"])
         a_short_cd_ok = cooldown_ok(st["last_a_short_bar"])
-        u_long_cd_ok  = cooldown_ok(st["last_u_long_bar"])
+        u_long_cd_ok = cooldown_ok(st["last_u_long_bar"])
         u_short_cd_ok = cooldown_ok(st["last_u_short_bar"])
 
         a_in_pos = st["a_in_long"] or st["a_in_short"]
         u_in_pos = st["u_in_long"] or st["u_in_short"]
 
-        sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok
+        sig_a_long = confirm_long_a and filter_long and not a_in_pos and a_long_cd_ok
         sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok
 
-        sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
+        sig_u_long = bool(ut_buy.iloc[idx]) and filter_long and not u_in_pos and u_long_cd_ok and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
         if sig_a_long:
-            st["a_in_long"] = True;  st["a_in_short"] = False
+            st["a_in_long"] = True; st["a_in_short"] = False
             st["a_long_bar"] = bar_idx; st["last_a_long_bar"] = bar_idx
         if sig_a_short:
             st["a_in_short"] = True; st["a_in_long"] = False
             st["a_short_bar"] = bar_idx; st["last_a_short_bar"] = bar_idx
         if sig_u_long:
-            st["u_in_long"] = True;  st["u_in_short"] = False
+            st["u_in_long"] = True; st["u_in_short"] = False
             st["u_long_bar"] = bar_idx; st["last_u_long_bar"] = bar_idx
         if sig_u_short:
             st["u_in_short"] = True; st["u_in_long"] = False
@@ -676,19 +723,19 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
-        frama_sl_long  = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
+        frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
-        sugg_sl  = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
+        sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
         sugg_lev = max(1, min(MAX_ALLOWED_LEV, math.floor(TARGET_RISK_DEP / max(sugg_sl, 0.1))))
         if regime == "CHAOS": sugg_lev = max(1, math.floor(sugg_lev * 0.5))
         if regime == "TREND": sugg_lev = min(MAX_ALLOWED_LEV, math.floor(sugg_lev * 1.2))
 
         def calc_confidence(is_long: bool) -> int:
-            score  = 20 if chop_ok else 0
-            score += 20 if atr_ok  else 0
+            score = 20 if chop_ok else 0
+            score += 20 if atr_ok else 0
             score += 15 if (frama_bull if is_long else frama_bear) else 0
-            a_sig  = sig_a_long if is_long else sig_a_short
-            u_sig  = sig_u_long if is_long else sig_u_short
+            a_sig = sig_a_long if is_long else sig_a_short
+            u_sig = sig_u_long if is_long else sig_u_short
             score += 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
             score += 20 if (htf_bull if is_long else htf_bear) else 0
             return min(score, 100)
@@ -737,13 +784,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl, tp, risk, stats) -> discord.Embed:
-    is_long     = "BUY" in signal_type
-    is_a_track  = "Andean" in signal_type
-    coin_emoji  = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
+    is_long = "BUY" in signal_type
+    is_a_track = "Andean" in signal_type
+    coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
     track_emoji = "🔵" if is_a_track else "🟢"
-    conf_color  = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
-    mode_label  = "Spot" if MARKET_MODE == "spot" else "Futures"
-    ha_label    = "HA" if UT_HEIKIN_ASHI else "Normal"
+    conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
+    mode_label = "Spot" if MARKET_MODE == "spot" else "Futures"
+    ha_label = "HA" if UT_HEIKIN_ASHI else "Normal"
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
     tp_source = f"📚 Adaptive (last {stats['count']} signals, {TP_PERCENTILE*100:.0f}th %ile)" if stats['count'] >= 5 else "📐 Fixed R:R = 2.0 (not enough history)"
     tp_pct = abs(tp - price) / price * 100
@@ -752,21 +799,21 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence, sl
         title=f"🚨 MUFCA v3.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
         color=discord.Color.green() if is_long else discord.Color.red(),
     )
-    embed.add_field(name="📈 Pair",               value=f"**{ticker}**",               inline=True)
-    embed.add_field(name="⏱ TF",                 value=tf.upper(),                     inline=True)
-    embed.add_field(name=f"{track_emoji} Track",  value=signal_type.strip(),            inline=True)
-    embed.add_field(name="🧬 HTF Bias",           value=f"✅ {HTF_BIAS.upper()} FRAMA confirmed", inline=True)
-    embed.add_field(name="💵 Entry Price",         value=f"${price:,.4f}",              inline=True)
-    embed.add_field(name="🛑 Stop Loss",           value=f"${sl:,.4f}",                 inline=True)
-    embed.add_field(name="🎯 Take Profit",         value=f"${tp:,.4f} (+{tp_pct:.2f}%)", inline=True)
-    embed.add_field(name="📊 Risk/Reward",         value=f"1:{rr}",                     inline=True)
-    embed.add_field(name="📚 TP Source",           value=tp_source,                      inline=False)
+    embed.add_field(name="📈 Pair", value=f"**{ticker}**", inline=True)
+    embed.add_field(name="⏱ TF", value=tf.upper(), inline=True)
+    embed.add_field(name=f"{track_emoji} Track", value=signal_type.strip(), inline=True)
+    embed.add_field(name="🧬 HTF Bias", value=f"✅ {HTF_BIAS.upper()} FRAMA confirmed", inline=True)
+    embed.add_field(name="💵 Entry Price", value=f"${price:,.4f}", inline=True)
+    embed.add_field(name="🛑 Stop Loss", value=f"${sl:,.4f}", inline=True)
+    embed.add_field(name="🎯 Take Profit", value=f"${tp:,.4f} (+{tp_pct:.2f}%)", inline=True)
+    embed.add_field(name="📊 Risk/Reward", value=f"1:{rr}", inline=True)
+    embed.add_field(name="📚 TP Source", value=tp_source, inline=False)
     if stats['count'] >= 5:
-        embed.add_field(name="📈 Signal Stats",      value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Median: {stats['median_mfe']:.2f}% | Best: {stats['best']:.2f}%", inline=False)
-    embed.add_field(name="⚙️ Regime",             value=regime,                         inline=True)
-    embed.add_field(name="⚠️ Leverage",           value=f"x{leverage}",                inline=True)
-    embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%",              inline=True)
-    embed.add_field(name="🕯️ UT Bot",             value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
+        embed.add_field(name="📈 Signal Stats", value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Median: {stats['median_mfe']:.2f}% | Best: {stats['best']:.2f}%", inline=False)
+    embed.add_field(name="⚙️ Regime", value=regime, inline=True)
+    embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
+    embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
+    embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
     embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • HTF:{HTF_BIAS.upper()} • UT:{ha_label}")
     return embed
 
@@ -787,9 +834,9 @@ async def status_cmd(ctx):
              f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{TP_PERCENTILE*100:.0f}th** percentile\n"]
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            st    = state[ticker][tf]
-            last  = st["last_bar_time"]
-            ts    = f"<t:{last // 1000}:R>" if last else "no data"
+            st = state[ticker][tf]
+            last = st["last_bar_time"]
+            ts = f"<t:{last // 1000}:R>" if last else "no data"
             a_pos = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else "—"
             u_pos = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else "—"
             trade = st.get("active_trade")
@@ -883,7 +930,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
         await ctx.send(f"⚠️ Already in **{MARKET_MODE}** mode.")
         return
     MARKET_MODE = new_mode
-    exchange    = make_exchange(MARKET_MODE)
+    exchange = make_exchange(MARKET_MODE)
     save_mode(MARKET_MODE)
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -951,6 +998,7 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
                        f"• History limit: **{SIGNAL_HISTORY_LIMIT}** signals\n"
                        f"• Percentile: **{TP_PERCENTILE*100:.0f}th** (TP hit in {TP_PERCENTILE*100:.0f}% of cases)\n"
                        f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
+                       f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
                        f"\nTo change: `!tpconfig limit 30` or `!tpconfig percentile 70`")
         return
     param = param.lower()
@@ -1109,16 +1157,22 @@ async def market_scanner():
                     await channel.send(embed=embed)
                     print(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f} | SL:{sl} TP:{tp} | conf={conf}%")
 
-            # Check if trade was closed by TP/SL
+            # Check for trade closure notifications
             trade = st.get("active_trade")
-            if trade:
-                last_trade_closed = False
-                # Check if we just closed a trade this bar (trade is None now but was active)
-                if not st.get("active_trade") and st.get("trade_history"):
-                    last = st["trade_history"][-1]
-                    if last.get("exit_time"):
-                        # Check if this closure was just reported
-                        pass  # Will be handled by the closure logic
+            if not trade and st.get("trade_history"):
+                last = st["trade_history"][-1]
+                # Only notify if closed in last 30 seconds (avoid spam on restart)
+                if last.get("exit_time"):
+                    from datetime import datetime, timezone
+                    exit_dt = datetime.fromisoformat(last["exit_time"])
+                    age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
+                    if age < 35:  # Just closed
+                        emoji = "🟢" if last['pnl_pct'] > 0 else "🔴"
+                        await channel.send(
+                            f"{emoji} **Trade Closed** | `{ticker}` `{tf}` | "
+                            f"{last['side'].upper()} | Entry: ${last['entry']} → Exit: ${last['exit']} | "
+                            f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                        )
 
             await asyncio.sleep(0.5)
 
