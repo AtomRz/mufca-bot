@@ -1070,11 +1070,14 @@ async def _startup_sequence():
 @bot.command(name="status")
 async def status_cmd(ctx):
     ha_status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
+    # FIX: show correct percentile based on active mode
+    active_pct = SAFE_TP_PERCENTILE if SAFE_TP_PERCENTILE != TP_PERCENTILE else TP_PERCENTILE
+    mode_label = "SAFE" if SAFE_TP_PERCENTILE != TP_PERCENTILE else "AGGRESSIVE"
     lines = [
         f"**MUFCA v3.1 — Scanner Status**\n",
         f"🧬 HTF Bias: **{HTF_BIAS.upper()}**\n",
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
-        f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{TP_PERCENTILE*100:.0f}th** percentile\n",
+        f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{active_pct*100:.0f}th** percentile ({mode_label})\n",
     ]
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
