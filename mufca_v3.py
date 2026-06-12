@@ -68,6 +68,7 @@ TARGET_RISK_DEP = 5.0
 # =====================================================================
 SIGNAL_HISTORY_LIMIT = 25
 TP_PERCENTILE        = 0.75
+SAFE_TP_PERCENTILE   = 0.50  # Conservative mode — uses median (50th %ile) instead of 75th
 MIN_TP_PCT           = 0.3
 MAX_TP_PCT           = 8.0
 MAX_HOLD_BARS        = 20
@@ -237,8 +238,13 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float)
             # Update cache but don't write to disk every tick — write only on close
             return
 
-def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current_sl: float) -> float:
-    """Calculate adaptive TP based on historical signal MFE percentile."""
+def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current_sl: float, use_safe: bool = False) -> float:
+    """Calculate adaptive TP based on historical signal MFE percentile.
+
+    Args:
+        use_safe: If True, uses SAFE_TP_PERCENTILE (50th / median) for conservative TP.
+                 If False, uses TP_PERCENTILE (75th) for aggressive TP.
+    """
     history = load_signals_history()
     risk = abs(entry - current_sl)
     fallback_tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
@@ -262,26 +268,29 @@ def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current
             mfe = abs(r["moved_pct"])
         favorable_pcts.append(max(mfe, 0.1))
 
-    tp_pct = float(np.percentile(favorable_pcts, TP_PERCENTILE * 100))
+    pct = SAFE_TP_PERCENTILE if use_safe else TP_PERCENTILE
+    tp_pct = float(np.percentile(favorable_pcts, pct * 100))
     tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, tp_pct))
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
-    print(f"[ADAPTIVE_TP] {ticker} {tf} {side} | entry={entry:.4f} | history={len(recent)} | tp_pct={tp_pct:.2f}% | TP={tp:.4f}")
+    mode = "SAFE" if use_safe else "AGGR"
+    print(f"[ADAPTIVE_TP] {ticker} {tf} {side} | mode={mode} | entry={entry:.4f} | history={len(recent)} | tp_pct={tp_pct:.2f}% | TP={tp:.4f}")
     return round(tp, 4)
 
 def calculate_combined_tp(ticker: str, tf: str, side: str, entry: float, sl: float,
-                          df: pd.DataFrame, idx: int, atr14: pd.Series) -> tuple[float, str]:
+                          df: pd.DataFrame, idx: int, atr14: pd.Series, use_safe: bool = False) -> tuple[float, str]:
     """
     Combined TP: adaptive history-based (primary) with R:R fallback.
     Returns (tp_price, description_string).
     """
     stats = get_signal_stats(ticker, tf, side)
-    tp = calculate_adaptive_tp(ticker, tf, side, entry, sl)
+    tp = calculate_adaptive_tp(ticker, tf, side, entry, sl, use_safe=use_safe)
     risk = abs(entry - sl)
     rr   = round(abs(tp - entry) / max(risk, 1e-8), 2)
 
+    pct = SAFE_TP_PERCENTILE if use_safe else TP_PERCENTILE
     if stats["count"] >= 5:
-        desc = f"📚 Adaptive {TP_PERCENTILE*100:.0f}th %ile | {stats['count']} signals | Avg MFE {stats['avg_mfe']:.2f}%"
+        desc = f"📚 Adaptive {pct*100:.0f}th %ile | {stats['count']} signals | Avg MFE {stats['avg_mfe']:.2f}% | Win Rate: {stats['win_rate']:.1f}%"
     else:
         desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals in history)"
 
@@ -289,7 +298,8 @@ def calculate_combined_tp(ticker: str, tf: str, side: str, entry: float, sl: flo
 
 def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
     history = load_signals_history()
-    empty   = {"count": 0, "avg_mfe": 0, "median_mfe": 0, "tp_pct": 0, "best": 0, "worst": 0, "mean_mfe": 0, "std_mfe": 0}
+    empty   = {"count": 0, "avg_mfe": 0, "median_mfe": 0, "tp_pct": 0, "best": 0, "worst": 0, "mean_mfe": 0, "std_mfe": 0,
+                 "tp_hits": 0, "sl_hits": 0, "cancelled": 0, "win_rate": 0, "avg_pnl": 0}
     if ticker not in history or tf not in history[ticker]:
         return empty
     records = history[ticker][tf][side]
@@ -298,13 +308,23 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
         return empty
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
     favorable_pcts = []
+    pnls = []
+    tp_hits = sl_hits = cancelled = wins = 0
     for r in recent:
         mfe = r.get("max_favorable_pct", 0)
         if mfe == 0 and r.get("moved_pct", 0) != 0:
             mfe = abs(r["moved_pct"])
         favorable_pcts.append(max(mfe, 0.1))
+        pnls.append(r.get("moved_pct", 0))
+        et = r.get("exit_type", "")
+        if et == "tp": tp_hits += 1
+        elif et == "sl": sl_hits += 1
+        elif et == "cancelled": cancelled += 1
+        if r.get("moved_pct", 0) > 0:
+            wins += 1
+    count = len(recent)
     return {
-        "count":      len(recent),
+        "count":      count,
         "avg_mfe":    round(float(np.mean(favorable_pcts)), 2),
         "median_mfe": round(float(np.median(favorable_pcts)), 2),
         "tp_pct":     round(float(np.mean(favorable_pcts) + 0.5 * np.std(favorable_pcts)), 2),
@@ -312,6 +332,11 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> dict:
         "std_mfe":    round(float(np.std(favorable_pcts)), 2),
         "best":       round(float(max(favorable_pcts)), 2),
         "worst":      round(float(min(favorable_pcts)), 2),
+        "tp_hits":    tp_hits,
+        "sl_hits":    sl_hits,
+        "cancelled":  cancelled,
+        "win_rate":   round(wins / count * 100, 1) if count > 0 else 0,
+        "avg_pnl":    round(float(np.mean(pnls)), 2) if pnls else 0,
     }
 
 # =====================================================================
@@ -1009,7 +1034,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="📚 TP Source",     value=tp_source,                               inline=False)
     if stats["count"] >= 5:
         embed.add_field(name="📈 Signal Stats",
-                        value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Best: {stats['best']:.2f}% | Signals: {stats['count']}",
+                        value=f"Avg MFE: {stats['avg_mfe']:.2f}% | Best: {stats['best']:.2f}% | Signals: {stats['count']} | Win Rate: {stats['win_rate']:.1f}%",
+                        inline=False)
+        embed.add_field(name="📊 Exit Breakdown",
+                        value=f"🎯 TP: {stats['tp_hits']} | 🛑 SL: {stats['sl_hits']} | ⏱️ Cancelled: {stats['cancelled']} | Avg PnL: {stats['avg_pnl']:.2f}%",
                         inline=False)
     if tp_desc:
         embed.add_field(name="🧠 TP Logic", value=tp_desc, inline=False)
@@ -1214,15 +1242,16 @@ async def htf_cmd(ctx, new_htf: str = ""):
 
 @bot.command(name="tpconfig")
 async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
-    global SIGNAL_HISTORY_LIMIT, TP_PERCENTILE
+    global SIGNAL_HISTORY_LIMIT, TP_PERCENTILE, SAFE_TP_PERCENTILE
     if not param:
         await ctx.send(
             f"**📚 Adaptive TP Configuration:**\n"
             f"• History limit: **{SIGNAL_HISTORY_LIMIT}** signals\n"
-            f"• Percentile: **{TP_PERCENTILE*100:.0f}th** (TP hit in {TP_PERCENTILE*100:.0f}% of cases)\n"
+            f"• Aggressive percentile: **{TP_PERCENTILE*100:.0f}th** (TP hit in ~{100-TP_PERCENTILE*100:.0f}% of cases)\n"
+            f"• Safe percentile: **{SAFE_TP_PERCENTILE*100:.0f}th** (TP hit in ~{100-SAFE_TP_PERCENTILE*100:.0f}% of cases)\n"
             f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
             f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
-            f"\nTo change: `!tpconfig limit 30` or `!tpconfig percentile 70`"
+            f"\nTo change: `!tpconfig limit 30` | `!tpconfig percentile 70` | `!tpconfig safe 50` | `!tpconfig mode safe`"
         )
         return
     param = param.lower()
@@ -1245,12 +1274,39 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
                 return
             old = TP_PERCENTILE
             TP_PERCENTILE = new_pct / 100
-            await ctx.send(f"✅ Percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
+            await ctx.send(f"✅ Aggressive percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
         except ValueError:
             await ctx.send("❌ Invalid number")
+    elif param == "safe":
+        try:
+            new_pct = float(value)
+            if not (10 <= new_pct <= 99):
+                await ctx.send("❌ Safe percentile must be between 10 and 99")
+                return
+            old = SAFE_TP_PERCENTILE
+            SAFE_TP_PERCENTILE = new_pct / 100
+            await ctx.send(f"✅ Safe percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
+        except ValueError:
+            await ctx.send("❌ Invalid number")
+    elif param == "mode":
+        if value.lower() == "safe":
+            await ctx.send(
+                f"🛡️ **Safe Mode Enabled**\n"
+                f"TP will use **{SAFE_TP_PERCENTILE*100:.0f}th percentile** (median-based, more conservative).\n"
+                f"This increases win rate but reduces average profit per trade.\n"
+                f"Use `!tpconfig mode aggressive` to switch back."
+            )
+        elif value.lower() == "aggressive":
+            await ctx.send(
+                f"⚡ **Aggressive Mode Enabled**\n"
+                f"TP will use **{TP_PERCENTILE*100:.0f}th percentile** (top-quartile, higher profit).\n"
+                f"This reduces win rate but increases average profit per trade.\n"
+                f"Use `!tpconfig mode safe` to switch to conservative."
+            )
+        else:
+            await ctx.send("❌ Mode must be `safe` or `aggressive`")
     else:
-        await ctx.send("❌ Unknown parameter. Use `limit` or `percentile`")
-
+        await ctx.send("❌ Unknown parameter. Use `limit`, `percentile`, `safe`, or `mode`")
 
 @bot.command(name="history")
 async def history_cmd(ctx, ticker: str = "", tf: str = ""):
@@ -1305,19 +1361,23 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
 async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
     history = load_signals_history()
     if not ticker:
-        lines = ["**📚 Signal History Summary:**\n"]
+        lines = ["**📚 Signal History Summary:**
+"]
         for t in history:
             for timeframe in history[t]:
                 for s in ("long", "short"):
                     records = [r for r in history[t][timeframe].get(s, []) if r["exit_type"] != "open"]
                     if records:
-                        wins    = sum(1 for r in records if r["moved_pct"] > 0)
-                        avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                        lines.append(f"• `{t}` `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
+                        stats = get_signal_stats(t, timeframe, s)
+                        lines.append(f"• `{t}` `{timeframe}` {s.upper()}: {stats['count']} signals | "
+                                    f"Win Rate: {stats['win_rate']:.1f}% | "
+                                    f"🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | "
+                                    f"Avg MFE: {stats['avg_mfe']:.2f}% | Avg PnL: {stats['avg_pnl']:.2f}%")
         if len(lines) == 1:
             await ctx.send("📭 No signal history yet.")
             return
-        await ctx.send("\n".join(lines))
+        await ctx.send("
+".join(lines))
         return
 
     ticker = ticker.upper()
@@ -1325,15 +1385,19 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"📭 No history for `{ticker}`")
         return
     if not tf:
-        lines = [f"**📚 `{ticker}` Signal History:**\n"]
+        lines = [f"**📚 `{ticker}` Signal History:**
+"]
         for timeframe in history[ticker]:
             for s in ("long", "short"):
                 records = [r for r in history[ticker][timeframe].get(s, []) if r["exit_type"] != "open"]
                 if records:
-                    wins    = sum(1 for r in records if r["moved_pct"] > 0)
-                    avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                    lines.append(f"• `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-        await ctx.send("\n".join(lines))
+                    stats = get_signal_stats(ticker, timeframe, s)
+                    lines.append(f"• `{timeframe}` {s.upper()}: {stats['count']} signals | "
+                                f"Win Rate: {stats['win_rate']:.1f}% | "
+                                f"🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | "
+                                f"Avg MFE: {stats['avg_mfe']:.2f}% | Avg PnL: {stats['avg_pnl']:.2f}%")
+        await ctx.send("
+".join(lines))
         return
 
     tf = tf.lower()
@@ -1341,14 +1405,18 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"📭 No history for `{ticker}` `{tf}`")
         return
     if not side:
-        lines = [f"**📚 `{ticker}` `{tf}` Signal History:**\n"]
+        lines = [f"**📚 `{ticker}` `{tf}` Signal History:**
+"]
         for s in ("long", "short"):
             records = [r for r in history[ticker][tf].get(s, []) if r["exit_type"] != "open"]
             if records:
-                wins    = sum(1 for r in records if r["moved_pct"] > 0)
-                avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                lines.append(f"• {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-        await ctx.send("\n".join(lines))
+                stats = get_signal_stats(ticker, tf, s)
+                lines.append(f"• {s.upper()}: {stats['count']} signals | "
+                            f"Win Rate: {stats['win_rate']:.1f}% | "
+                            f"🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | "
+                            f"Avg MFE: {stats['avg_mfe']:.2f}% | Avg PnL: {stats['avg_pnl']:.2f}%")
+        await ctx.send("
+".join(lines))
         return
 
     side = side.lower()
@@ -1359,16 +1427,21 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
     if not records:
         await ctx.send(f"📭 No {side} history for `{ticker}` `{tf}`")
         return
-    lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**\n"]
+    stats = get_signal_stats(ticker, tf, side)
+    lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**
+"]
+    lines.append(f"📊 Win Rate: {stats['win_rate']:.1f}% | 🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | Avg PnL: {stats['avg_pnl']:.2f}%
+")
     for i, rec in enumerate(records[-15:], 1):
         emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
+        exit_emoji = "🎯" if rec["exit_type"] == "tp" else "🛑" if rec["exit_type"] == "sl" else "⏱️"
         lines.append(
             f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | "
             f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
-            f"Result: {rec['exit_type'].upper()}"
+            f"{exit_emoji} {rec['exit_type'].upper()} | PnL: {rec['moved_pct']:.2f}%"
         )
-    await ctx.send("\n".join(lines))
-
+    await ctx.send("
+".join(lines))
 
 @bot.command(name="tp")
 async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
