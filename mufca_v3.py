@@ -703,15 +703,19 @@ def get_htf_bias(ticker: str, timeframe: str) -> int:
 # =====================================================================
 def calculate_sl(entry_price: float, side: str, fs: pd.Series, fu: pd.Series,
                  fl: pd.Series, atr14: pd.Series, idx: int) -> float:
+    """FIX: Match PineScript indicator logic — frama_sl as coefficient, not absolute price."""
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
+    frama_lower = float(fl.iloc[idx])
+    frama_upper = float(fu.iloc[idx])
+
+    # As in indicator: frama_sl_long = max(1.0, min(3.5, abs(close - frama_lower) / atr))
+    frama_sl_long  = max(1.0, min(3.5, abs(entry_price - frama_lower) / atr_v))
+    frama_sl_short = max(1.0, min(3.5, abs(frama_upper - entry_price) / atr_v))
+
     if side == "long":
-        sl_frama = float(fl.iloc[idx])
-        sl_atr   = entry_price - 1.5 * atr_v
-        return max(sl_frama, sl_atr)   # tighter SL wins (closer to price)
+        return entry_price - atr_v * frama_sl_long
     else:
-        sl_frama = float(fu.iloc[idx])
-        sl_atr   = entry_price + 1.5 * atr_v
-        return min(sl_frama, sl_atr)
+        return entry_price + atr_v * frama_sl_short
 
 def check_tp_sl_hit(st: dict, high: float, low: float) -> str | None:
     trade = st.get("active_trade")
