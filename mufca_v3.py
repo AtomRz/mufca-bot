@@ -114,6 +114,10 @@ def save_htf(htf: str):
 
 HTF_BIAS: str = load_htf()
 
+# HTF cache: {ticker: (bias, timestamp)}
+_htf_cache: dict[str, tuple[int, datetime]] = {}
+HTF_CACHE_TTL_SECONDS = 300  # 5 minutes
+
 # =====================================================================
 # 📡  MARKET MODE
 # =====================================================================
@@ -386,6 +390,9 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
 
                 sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
 
+                # FIX #5: Use the same adaptive TP logic as live trading (no lookahead bias)
+                tp = calculate_adaptive_tp(ticker, tf, side, close_v, sl)
+
                 tp_hit = sl_hit = False
                 max_favorable = max_adverse = 0.0
                 exit_price = close_v
@@ -402,10 +409,8 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
                         max_adverse   = max(max_adverse,   adverse)
                         if fl_ <= sl:
                             sl_hit = True; exit_price = sl; bars_held = future_idx - idx; break
-                        optimal_tp_pct = min(max_favorable, MAX_TP_PCT)
-                        tp_price = close_v * (1 + optimal_tp_pct / 100)
-                        if fh >= tp_price:
-                            tp_hit = True; exit_price = tp_price; bars_held = future_idx - idx; break
+                        if fh >= tp:
+                            tp_hit = True; exit_price = tp; bars_held = future_idx - idx; break
                     else:
                         favorable = (close_v - fl_) / close_v * 100
                         adverse   = (fh - close_v) / close_v * 100
@@ -413,10 +418,8 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
                         max_adverse   = max(max_adverse,   adverse)
                         if fh >= sl:
                             sl_hit = True; exit_price = sl; bars_held = future_idx - idx; break
-                        optimal_tp_pct = min(max_favorable, MAX_TP_PCT)
-                        tp_price = close_v * (1 - optimal_tp_pct / 100)
-                        if fl_ <= tp_price:
-                            tp_hit = True; exit_price = tp_price; bars_held = future_idx - idx; break
+                        if fl_ <= tp:
+                            tp_hit = True; exit_price = tp; bars_held = future_idx - idx; break
                     bars_held = future_idx - idx
 
                 _ensure_history_slot(history, ticker, tf)
@@ -482,6 +485,7 @@ def make_state():
         "active_trade":            None,
         "trade_history":           [],
         "bars_in_trade":           0,
+        "last_closure_notified":   False,  # FIX #3: prevent duplicate closure notifications
     }
 
 state: dict = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
@@ -510,7 +514,8 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     atr_sum = tr.rolling(window=length).sum()
     hh = df["high"].rolling(window=length).max()
     ll = df["low"].rolling(window=length).min()
-    return 100 * np.log10(atr_sum / (hh - ll + 1e-8)) / np.log10(length)
+    # FIX #8: stronger protection against division by zero
+    return 100 * np.log10(atr_sum / (hh - ll + 1e-12)) / np.log10(length)
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1):
     n   = int(length / 2)
@@ -574,10 +579,21 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800):
         return 20.0, 80.0
     c1, c2 = float(vals.min()), float(vals.max())
     for _ in range(10):
-        cl1 = vals[np.abs(vals - c1) < np.abs(vals - c2)]
-        cl2 = vals[np.abs(vals - c2) <= np.abs(vals - c1)]
-        c1  = float(cl1.mean()) if len(cl1) > 0 else c1
-        c2  = float(cl2.mean()) if len(cl2) > 0 else c2
+        d1 = np.abs(vals - c1)
+        d2 = np.abs(vals - c2)
+        # FIX #9: handle empty clusters — assign to nearest if tied
+        cl1 = vals[d1 < d2]
+        cl2 = vals[d2 <= d1]
+        if len(cl1) == 0 and len(cl2) == 0:
+            break
+        if len(cl1) == 0:
+            c1 = float(vals.mean())
+        else:
+            c1 = float(cl1.mean())
+        if len(cl2) == 0:
+            c2 = float(vals.mean())
+        else:
+            c2 = float(cl2.mean())
     return min(c1, c2), max(c1, c2)
 
 def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6):
@@ -616,9 +632,10 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
     df_ut  = heikin_ashi(df) if use_ha else df.copy()
     src    = df_ut["close"].values
     n_loss = (sensitivity * calculate_atr(df_ut, period)).values
-    ts     = np.zeros(len(df))
+    # FIX #1: use len(df_ut) instead of len(df)
+    ts     = np.zeros(len(df_ut))
     ts[0]  = src[0]
-    for i in range(1, len(df)):
+    for i in range(1, len(df_ut)):
         prev = ts[i-1]
         if src[i] > prev and src[i-1] > prev:
             ts[i] = max(prev, src[i] - n_loss[i])
@@ -633,6 +650,14 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
     return ut_buy, ut_sell
 
 def get_htf_bias(ticker: str, timeframe: str) -> int:
+    """FIX #12: Cache HTF bias for HTF_CACHE_TTL_SECONDS to reduce API calls."""
+    global _htf_cache
+    now = datetime.now(timezone.utc)
+    if ticker in _htf_cache:
+        bias, cached_at = _htf_cache[ticker]
+        if (now - cached_at).total_seconds() < HTF_CACHE_TTL_SECONDS:
+            return bias
+
     htf = HTF_BIAS
     try:
         bars   = exchange.fetch_ohlcv(ticker, htf, limit=150)
@@ -641,7 +666,8 @@ def get_htf_bias(ticker: str, timeframe: str) -> int:
         htf_close = df_htf["close"].iloc[-2]
         htf_frama = fs.iloc[-2]
         bias = 1 if htf_close > htf_frama else -1
-        print(f"[HTF] {ticker} → {htf} | close={htf_close:.2f} frama={htf_frama:.2f} bias={'BULL' if bias==1 else 'BEAR'}")
+        _htf_cache[ticker] = (bias, now)
+        print(f"[HTF] {ticker} -> {htf} | close={htf_close:.2f} frama={htf_frama:.2f} bias={'BULL' if bias==1 else 'BEAR'}")
         return bias
     except Exception as e:
         print(f"[WARN] HTF Bias ({ticker} {htf}): {e}")
@@ -702,6 +728,7 @@ def close_trade(st: dict, exit_price: float, result: str, ticker: str, tf: str):
     update_signal_record(ticker, tf, side, exit_price, result, bars_held)
     st["active_trade"]  = None
     st["bars_in_trade"] = 0
+    st["last_closure_notified"] = False  # FIX #3: reset notification flag
     print(f"[TRADE] Closed {side.upper()} | Entry:{entry} | Exit:{exit_price} | Result:{result.upper()} | PnL:{pnl_pct:.2f}% | Bars:{bars_held}")
     return closed_trade
 
@@ -728,7 +755,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         trade = st.get("active_trade")
         if trade:
             update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close)
-            st["bars_in_trade"] = st.get("bars_in_trade", 0) + 1
+            # FIX #13: only increment bars_in_trade if trade remains open after this bar
             hit = check_tp_sl_hit(st, last_high, last_low)
             if hit:
                 exit_price = trade["sl"] if hit == "sl" else trade["tp"]
@@ -736,6 +763,8 @@ def check_signals(ticker: str, timeframe: str, st: dict):
             elif st.get("bars_in_trade", 0) >= MAX_HOLD_BARS:
                 close_trade(st, last_close, "cancelled", ticker, timeframe)
                 print(f"[TRADE] Force-closed {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
+            else:
+                st["bars_in_trade"] = st.get("bars_in_trade", 0) + 1
 
         # Indicators
         atr14            = calculate_atr(df, ATR_PERIOD)
@@ -962,7 +991,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                    if stats["count"] >= 5 else "📐 Fixed R:R = 2.0 (not enough history)")
 
     embed = discord.Embed(
-        title=f"🚨 MUFCA v3.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
+        title=f"🚨 MUFCA v3.1 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
         color=discord.Color.green() if is_long else discord.Color.red(),
     )
     embed.add_field(name="📈 Pair",         value=f"**{ticker}**",                          inline=True)
@@ -984,29 +1013,37 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                         inline=False)
     if tp_desc:
         embed.add_field(name="🧠 TP Logic", value=tp_desc, inline=False)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.0 • Gate.io {mode_label} • HTF:{HTF_BIAS.upper()} • UT:{ha_label}")
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.1 • Gate.io {mode_label} • HTF:{HTF_BIAS.upper()} • UT:{ha_label}")
     return embed
 
+
+# FIX #6: track whether backtest is running
+_backtest_running = False
 
 @bot.event
 async def on_ready():
     ha_status = "HA ON" if UT_HEIKIN_ASHI else "HA OFF"
     print(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {HTF_BIAS.upper()} | UT: {ha_status} | Pairs: {' | '.join(TICKERS)}")
-    # FIX: run backtest in executor so it doesn't block the event loop
-    asyncio.create_task(_startup_backtest_task())
-    market_scanner.start()
+    # FIX #6: run backtest first, then start scanner
+    asyncio.create_task(_startup_sequence())
 
-async def _startup_backtest_task():
+async def _startup_sequence():
+    """FIX #6: Ensure backtest completes before starting market scanner."""
+    global _backtest_running
+    _backtest_running = True
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, run_startup_backtest)
-    print("[STARTUP] Backtest complete — adaptive TP ready.")
+    _backtest_running = False
+    print("[STARTUP] Backtest complete — adaptive TP ready. Starting scanner...")
+    if not market_scanner.is_running():
+        market_scanner.start()
 
 
 @bot.command(name="status")
 async def status_cmd(ctx):
     ha_status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
     lines = [
-        f"**MUFCA v3.0 — Scanner Status**\n",
+        f"**MUFCA v3.1 — Scanner Status**\n",
         f"🧬 HTF Bias: **{HTF_BIAS.upper()}**\n",
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
         f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{TP_PERCENTILE*100:.0f}th** percentile\n",
@@ -1023,7 +1060,12 @@ async def status_cmd(ctx):
             if trade:
                 trade_info = f" | 🎯 {trade['side'].upper()} @ ${trade['entry']} SL:${trade['sl']} TP:${trade['tp']}"
             lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}")
-    await ctx.send("\n".join(lines))
+    # FIX #10: paginate if message too long
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        await ctx.send(msg[:1900] + "\n... (truncated)")
+    else:
+        await ctx.send(msg)
 
 
 @bot.command(name="scan")
@@ -1160,6 +1202,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
         return
     old_htf  = HTF_BIAS
     HTF_BIAS = new_htf
+    _htf_cache = {}  # clear cache on HTF change
     save_htf(HTF_BIAS)
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -1516,9 +1559,9 @@ async def market_scanner():
                     await channel.send(embed=embed)
                     print(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f} | SL:{sl:.4f} TP:{tp:.4f} | conf={conf}%")
 
-            # Notify on fresh trade closure
+            # FIX #3: Notify on fresh trade closure (with deduplication flag)
             trade = st.get("active_trade")
-            if not trade and st.get("trade_history"):
+            if not trade and st.get("trade_history") and not st.get("last_closure_notified", False):
                 last = st["trade_history"][-1]
                 if last.get("exit_time"):
                     exit_dt = datetime.fromisoformat(last["exit_time"])
@@ -1530,6 +1573,7 @@ async def market_scanner():
                             f"{last['side'].upper()} | Entry: ${last['entry']} → Exit: ${last['exit']} | "
                             f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
                         )
+                        st["last_closure_notified"] = True
 
             await asyncio.sleep(0.5)
 
