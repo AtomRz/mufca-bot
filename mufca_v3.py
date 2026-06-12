@@ -1361,8 +1361,7 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
 async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
     history = load_signals_history()
     if not ticker:
-        lines = ["**📚 Signal History Summary:**
-"]
+        lines = ["**📚 Signal History Summary:**\n"]
         for t in history:
             for timeframe in history[t]:
                 for s in ("long", "short"):
@@ -1376,8 +1375,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         if len(lines) == 1:
             await ctx.send("📭 No signal history yet.")
             return
-        await ctx.send("
-".join(lines))
+        await ctx.send("\n".join(lines))
         return
 
     ticker = ticker.upper()
@@ -1385,8 +1383,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"📭 No history for `{ticker}`")
         return
     if not tf:
-        lines = [f"**📚 `{ticker}` Signal History:**
-"]
+        lines = [f"**📚 `{ticker}` Signal History:**"]
         for timeframe in history[ticker]:
             for s in ("long", "short"):
                 records = [r for r in history[ticker][timeframe].get(s, []) if r["exit_type"] != "open"]
@@ -1396,8 +1393,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
                                 f"Win Rate: {stats['win_rate']:.1f}% | "
                                 f"🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | "
                                 f"Avg MFE: {stats['avg_mfe']:.2f}% | Avg PnL: {stats['avg_pnl']:.2f}%")
-        await ctx.send("
-".join(lines))
+        await ctx.send("\n".join(lines))
         return
 
     tf = tf.lower()
@@ -1405,8 +1401,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"📭 No history for `{ticker}` `{tf}`")
         return
     if not side:
-        lines = [f"**📚 `{ticker}` `{tf}` Signal History:**
-"]
+        lines = [f"**📚 `{ticker}` `{tf}` Signal History:**"]
         for s in ("long", "short"):
             records = [r for r in history[ticker][tf].get(s, []) if r["exit_type"] != "open"]
             if records:
@@ -1415,8 +1410,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
                             f"Win Rate: {stats['win_rate']:.1f}% | "
                             f"🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | "
                             f"Avg MFE: {stats['avg_mfe']:.2f}% | Avg PnL: {stats['avg_pnl']:.2f}%")
-        await ctx.send("
-".join(lines))
+        await ctx.send("\n".join(lines))
         return
 
     side = side.lower()
@@ -1428,10 +1422,8 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"📭 No {side} history for `{ticker}` `{tf}`")
         return
     stats = get_signal_stats(ticker, tf, side)
-    lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**
-"]
-    lines.append(f"📊 Win Rate: {stats['win_rate']:.1f}% | 🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | Avg PnL: {stats['avg_pnl']:.2f}%
-")
+    lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**"]
+    lines.append(f"📊 Win Rate: {stats['win_rate']:.1f}% | 🎯TP:{stats['tp_hits']} 🛑SL:{stats['sl_hits']} ⏱️TO:{stats['cancelled']} | Avg PnL: {stats['avg_pnl']:.2f}%")
     for i, rec in enumerate(records[-15:], 1):
         emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
         exit_emoji = "🎯" if rec["exit_type"] == "tp" else "🛑" if rec["exit_type"] == "sl" else "⏱️"
@@ -1440,8 +1432,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
             f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
             f"{exit_emoji} {rec['exit_type'].upper()} | PnL: {rec['moved_pct']:.2f}%"
         )
-    await ctx.send("
-".join(lines))
+    await ctx.send("\n".join(lines))
 
 @bot.command(name="tp")
 async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
