@@ -49,7 +49,10 @@ ATR_PERIOD      = 14
 ATR_MIN         = 0.3
 ATR_MAX         = 4.5
 CHOP_LENGTH     = 14
-CHOP_THRESHOLD  = 61.8
+CHOP_THRESHOLD = {
+    "1h": 55.0,
+    "4h": 61.8,
+}
 FRAMA_LEN       = 22
 FRAMA_MULT      = 2.1
 MFI_LEN         = 8
@@ -360,7 +363,7 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
             chop_v    = float(chop.iloc[idx])
 
             atr_ok  = ATR_MIN <= atr_pct_v <= ATR_MAX
-            chop_ok = chop_v < CHOP_THRESHOLD
+            chop_ok = chop_v < CHOP_THRESHOLD.get(tf, 61.8)
 
             frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
             slope_long  = frama_slope > 0
@@ -792,7 +795,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
         chop_v    = float(chop.iloc[idx])
 
         atr_ok  = ATR_MIN <= atr_pct_v <= ATR_MAX
-        chop_ok = chop_v < CHOP_THRESHOLD
+        chop_ok = chop_v < CHOP_THRESHOLD.get(timeframe, 61.8)
 
         frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
         slope_long  = frama_slope > 0
@@ -1283,6 +1286,39 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             await ctx.send("❌ Invalid number")
     else:
         await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `percentile`, or `safe`")
+
+
+@bot.command(name="chop")
+async def chop_cmd(ctx, tf: str = "", value: str = ""):
+    """!chop — show or change CHOP threshold per timeframe.
+    Examples: !chop | !chop 1h 55 | !chop 4h 61.8"""
+    global CHOP_THRESHOLD
+    if not tf:
+        lines = ["**📊 CHOP Threshold Settings:**"]
+        for t, v in CHOP_THRESHOLD.items():
+            lines.append(f"• `{t}`: **{v}** (below = trend, above = sideways)")
+        lines.append("\nTo change: `!chop 1h 55` or `!chop 4h 61.8`")
+        await ctx.send("\n".join(lines))
+        return
+    tf = tf.lower()
+    if tf not in TIMEFRAMES:
+        await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(f'`{t}`' for t in TIMEFRAMES)}")
+        return
+    if not value:
+        current = CHOP_THRESHOLD.get(tf, 61.8)
+        await ctx.send(f"📊 CHOP threshold for `{tf}`: **{current}**\nTo change: `!chop {tf} 55`")
+        return
+    try:
+        new_val = float(value)
+        if not (20.0 <= new_val <= 90.0):
+            await ctx.send("❌ Value must be between 20 and 90")
+            return
+        old = CHOP_THRESHOLD.get(tf, 61.8)
+        CHOP_THRESHOLD[tf] = new_val
+        await ctx.send(f"✅ CHOP threshold for `{tf}` changed: **{old}** → **{new_val}**")
+        print(f"[CHOP] {tf} threshold changed: {old} → {new_val}")
+    except ValueError:
+        await ctx.send("❌ Invalid number")
 
 
 @bot.command(name="history")
