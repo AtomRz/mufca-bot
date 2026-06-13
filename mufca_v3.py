@@ -512,7 +512,8 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"]  - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+    # Pine Script ta.atr() uses RMA (Wilder's MA), not SMA
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
 def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     hl = df["high"] - df["low"]
