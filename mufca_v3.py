@@ -1174,9 +1174,18 @@ async def mode_cmd(ctx, new_mode: str = ""):
     MARKET_MODE = new_mode
     exchange    = make_exchange(MARKET_MODE)
     save_mode(MARKET_MODE)
+    # FIX: fetch current bar time for each pair/tf to prevent replaying old signals
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            state[ticker][tf] = make_state()
+            st = make_state()
+            try:
+                bars = exchange.fetch_ohlcv(ticker, tf, limit=3)
+                if bars and len(bars) >= 2:
+                    st["last_bar_time"]           = int(bars[-2][0])
+                    st["last_processed_bar_time"] = int(bars[-2][0])
+            except Exception:
+                pass
+            state[ticker][tf] = st
     label = "🔵 Spot (Gate.io Spot)" if MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
     await ctx.send(f"✅ Switched to **{label}**\n⚠️ Position states have been reset.")
     print(f"[MODE] Switched to {MARKET_MODE}")
@@ -1228,7 +1237,15 @@ async def htf_cmd(ctx, new_htf: str = ""):
     save_htf(HTF_BIAS)
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            state[ticker][tf] = make_state()
+            st = make_state()
+            try:
+                bars = exchange.fetch_ohlcv(ticker, tf, limit=3)
+                if bars and len(bars) >= 2:
+                    st["last_bar_time"]           = int(bars[-2][0])
+                    st["last_processed_bar_time"] = int(bars[-2][0])
+            except Exception:
+                pass
+            state[ticker][tf] = st
     await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{HTF_BIAS.upper()}**\n"
                    f"⚠️ Position states have been reset.")
     print(f"[HTF] Changed from {old_htf} to {HTF_BIAS}")
