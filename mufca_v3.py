@@ -643,7 +643,9 @@ def calculate_ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, period: int = 1
     n_loss = (sensitivity * calculate_atr(df_ut, period)).values
     # FIX #1: use len(df_ut) instead of len(df)
     ts     = np.zeros(len(df_ut))
-    ts[0]  = src[0]
+    # Pine Script: var xATRTrailingStop = 0.0, prev = nz(ts[1]) = 0 on bar 0
+    # src[0] > 0 always for price, so: ts[0] = src[0] - n_loss[0]
+    ts[0]  = src[0] - n_loss[0]
     for i in range(1, len(df_ut)):
         prev = ts[i-1]
         if src[i] > prev and src[i-1] > prev:
