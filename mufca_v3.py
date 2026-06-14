@@ -937,6 +937,7 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
         signals      = []
         signal_fired = False
+        MIN_RR = 1.0  # minimum acceptable risk/reward ratio
 
         # --- LONG signals ---
         if sig_a_long or sig_u_long:
@@ -947,17 +948,28 @@ def check_signals(ticker: str, timeframe: str, st: dict):
                 close_trade(st, close_v, "cancelled", ticker, timeframe)
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14)
-            risk = abs(close_v - sl)
-            st["active_trade"] = {"side": "long", "entry": close_v, "sl": sl, "tp": tp, "lev": sugg_lev, "bar_opened": bar_idx}
-            st["bars_in_trade"] = 0
-            add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat())
-            stats = get_signal_stats(ticker, timeframe, "long")
-            if sig_a_long:
-                signal_fired = True
-                signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True),  sl, tp, risk, stats, tp_desc))
-            if sig_u_long:
-                signal_fired = True
-                signals.append(("U BUY  (UT Bot)",     close_v, regime, sugg_lev, bar_time, calc_confidence(True),  sl, tp, risk, stats, tp_desc))
+            risk   = abs(close_v - sl)
+            reward = abs(tp - close_v)
+            rr     = reward / max(risk, 1e-8)
+            # FIX: skip signal if R:R too low or SL already hit by current bar's low
+            bar_low = float(df["low"].iloc[idx])
+            if rr < MIN_RR:
+                print(f"[FILTER] {ticker} {timeframe} LONG skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_a_long = sig_u_long = False
+            elif bar_low <= sl:
+                print(f"[FILTER] {ticker} {timeframe} LONG skipped — bar low={bar_low:.4f} already below SL={sl:.4f}")
+                sig_a_long = sig_u_long = False
+            else:
+                st["active_trade"] = {"side": "long", "entry": close_v, "sl": sl, "tp": tp, "lev": sugg_lev, "bar_opened": bar_idx}
+                st["bars_in_trade"] = 0
+                add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat())
+                stats = get_signal_stats(ticker, timeframe, "long")
+                if sig_a_long:
+                    signal_fired = True
+                    signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True),  sl, tp, risk, stats, tp_desc))
+                if sig_u_long:
+                    signal_fired = True
+                    signals.append(("U BUY  (UT Bot)",     close_v, regime, sugg_lev, bar_time, calc_confidence(True),  sl, tp, risk, stats, tp_desc))
 
         # --- SHORT signals ---
         if sig_a_short or sig_u_short:
@@ -968,17 +980,28 @@ def check_signals(ticker: str, timeframe: str, st: dict):
                 close_trade(st, close_v, "cancelled", ticker, timeframe)
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14)
-            risk = abs(sl - close_v)
-            st["active_trade"] = {"side": "short", "entry": close_v, "sl": sl, "tp": tp, "lev": sugg_lev, "bar_opened": bar_idx}
-            st["bars_in_trade"] = 0
-            add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat())
-            stats = get_signal_stats(ticker, timeframe, "short")
-            if sig_a_short:
-                signal_fired = True
-                signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
-            if sig_u_short:
-                signal_fired = True
-                signals.append(("U SELL (UT Bot)",     close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
+            risk   = abs(sl - close_v)
+            reward = abs(close_v - tp)
+            rr     = reward / max(risk, 1e-8)
+            # FIX: skip signal if R:R too low or SL already hit by current bar's high
+            bar_high = float(df["high"].iloc[idx])
+            if rr < MIN_RR:
+                print(f"[FILTER] {ticker} {timeframe} SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_a_short = sig_u_short = False
+            elif bar_high >= sl:
+                print(f"[FILTER] {ticker} {timeframe} SHORT skipped — bar high={bar_high:.4f} already above SL={sl:.4f}")
+                sig_a_short = sig_u_short = False
+            else:
+                st["active_trade"] = {"side": "short", "entry": close_v, "sl": sl, "tp": tp, "lev": sugg_lev, "bar_opened": bar_idx}
+                st["bars_in_trade"] = 0
+                add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat())
+                stats = get_signal_stats(ticker, timeframe, "short")
+                if sig_a_short:
+                    signal_fired = True
+                    signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
+                if sig_u_short:
+                    signal_fired = True
+                    signals.append(("U SELL (UT Bot)",     close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
 
         if signal_fired:
             scan_stats["signals_generated"] += len(signals)
