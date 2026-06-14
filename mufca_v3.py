@@ -940,6 +940,11 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
         # --- LONG signals ---
         if sig_a_long or sig_u_long:
+            # FIX: don't overwrite existing active_trade — close it first
+            if st.get("active_trade"):
+                existing = st["active_trade"]
+                print(f"[WARN] New long signal while {existing['side'].upper()} trade active — closing old trade at market")
+                close_trade(st, close_v, "cancelled", ticker, timeframe)
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14)
             risk = abs(close_v - sl)
@@ -956,6 +961,11 @@ def check_signals(ticker: str, timeframe: str, st: dict):
 
         # --- SHORT signals ---
         if sig_a_short or sig_u_short:
+            # FIX: don't overwrite existing active_trade — close it first
+            if st.get("active_trade"):
+                existing = st["active_trade"]
+                print(f"[WARN] New short signal while {existing['side'].upper()} trade active — closing old trade at market")
+                close_trade(st, close_v, "cancelled", ticker, timeframe)
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14)
             risk = abs(sl - close_v)
