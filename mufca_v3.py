@@ -398,8 +398,10 @@ def backtest_history(ticker: str, tf: str, num_bars: int = 3000) -> int:
 
                 sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
 
-                # FIX #5: Use the same adaptive TP logic as live trading (no lookahead bias)
-                tp = calculate_adaptive_tp(ticker, tf, side, close_v, sl)
+                # Use fixed R:R 2.0 in backtest to accumulate clean MFE history.
+                # Adaptive TP is only used in live trading based on this history.
+                risk = abs(close_v - sl)
+                tp = close_v + 2.0 * risk if side == "long" else close_v - 2.0 * risk
 
                 tp_hit = sl_hit = False
                 max_favorable = max_adverse = 0.0
