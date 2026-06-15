@@ -1116,7 +1116,8 @@ async def status_cmd(ctx):
 async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
     ticker = ticker.upper(); tf = tf.lower()
     await ctx.send(f"🔍 Scanning `{ticker}` `{tf}`…")
-    st = state.get(ticker, {}).get(tf) or make_state()
+    ensure_state(ticker)
+    st = state[ticker][tf]
     signals, bar_time, regime, lev = check_signals(ticker, tf, st)
     if signals:
         for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
