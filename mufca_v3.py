@@ -1054,9 +1054,9 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⏱ TF",            value=tf.upper(),                               inline=True)
     embed.add_field(name=f"{track_emoji} Track", value=signal_type.strip(),                 inline=True)
     embed.add_field(name="🧬 HTF Bias",     value=f"✅ {HTF_BIAS.upper()} FRAMA confirmed", inline=True)
-    embed.add_field(name="💵 Entry",         value=f"${price:,.4f}",                        inline=True)
-    embed.add_field(name="🛑 Stop Loss",     value=f"${sl:,.4f}",                           inline=True)
-    embed.add_field(name="🎯 Take Profit",   value=f"${tp:,.4f} (+{tp_pct:.2f}%)",          inline=True)
+    embed.add_field(name="💵 Entry",         value=f"${price:,.2f}",                        inline=True)
+    embed.add_field(name="🛑 Stop Loss",     value=f"${sl:,.2f}",                           inline=True)
+    embed.add_field(name="🎯 Take Profit",   value=f"${tp:,.2f} (+{tp_pct:.2f}%)",          inline=True)
     embed.add_field(name="📊 Risk/Reward",   value=f"1:{rr}",                               inline=True)
     embed.add_field(name="⚙️ Regime",        value=regime,                                  inline=True)
     embed.add_field(name="⚠️ Leverage",      value=f"x{leverage}",                          inline=True)
@@ -1114,7 +1114,7 @@ async def status_cmd(ctx):
             trade = st.get("active_trade")
             trade_info = ""
             if trade:
-                trade_info = f" | 🎯 {trade['side'].upper()} @ ${trade['entry']} SL:${trade['sl']} TP:${trade['tp']}"
+                trade_info = f" | 🎯 {trade['side'].upper()} @ ${trade['entry']:.2f} SL:${trade['sl']:.2f} TP:${trade['tp']:.2f}"
             lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}")
     # FIX #10: paginate if message too long
     msg = "\n".join(lines)
@@ -1399,7 +1399,7 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
                     lines.append(f"\n**`{t}` `{timeframe}` — {len(trades)} trades:**")
                     for i, trade in enumerate(trades[-5:], 1):
                         emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                        lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']} → Exit: ${trade['exit']} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+                        lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']:.2f} → Exit: ${trade['exit']:.2f} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
         if len(lines) == 1:
             await ctx.send("📭 No trade history yet.")
             return
@@ -1420,7 +1420,7 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
         lines = [f"**📊 `{ticker}` `{tf}` Trade History ({len(trades)} trades):**\n"]
         for i, trade in enumerate(trades[-10:], 1):
             emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-            lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']} → Exit: ${trade['exit']} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+            lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']:.2f} → Exit: ${trade['exit']:.2f} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
         await ctx.send("\n".join(lines))
     else:
         lines = [f"**📊 `{ticker}` Trade History:**\n"]
@@ -1432,7 +1432,7 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
                     lines.append(f"\n**`{timeframe}` — {len(trades)} trades:**")
                     for i, trade in enumerate(trades[-5:], 1):
                         emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                        lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']} → Exit: ${trade['exit']} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+                        lines.append(f"{emoji} #{i} {trade['side'].upper()} | Entry: ${trade['entry']:.2f} → Exit: ${trade['exit']:.2f} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
         await ctx.send("\n".join(lines))
 
 
@@ -1498,7 +1498,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
     for i, rec in enumerate(records[-15:], 1):
         emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
         lines.append(
-            f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | "
+            f"{emoji} #{i} Entry: ${rec['entry']:.2f} → Exit: ${rec['exit']:.2f} | "
             f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
             f"Result: {rec['exit_type'].upper()}"
         )
@@ -1529,7 +1529,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         lines = [f"**📊 Adaptive TP Preview — `{ticker}` `{tf}` {side.upper()}:**"]
         lines.append(f"• Current price: **${last_close:,.4f}**")
         lines.append(f"• Stop Loss: **${sl:,.4f}** (risk: ${risk:,.4f})")
-        lines.append(f"• Take Profit: **${tp:,.4f}** (+{tp_pct:.2f}%)")
+        lines.append(f"• Take Profit: **${tp:,.2f}** (+{tp_pct:.2f}%)")
         lines.append(f"• Risk/Reward: **1:{rr}**")
         if stats["count"] >= 5:
             lines.append(f"• Based on **{stats['count']}** historical signals")
@@ -1663,9 +1663,9 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         )
         embed.add_field(name="Pair",   value=f"**{ticker}**",          inline=True)
         embed.add_field(name="TF",     value=tf.upper(),                inline=True)
-        embed.add_field(name="Entry",  value=f"${last_close:,.4f}",     inline=True)
-        embed.add_field(name="SL",     value=f"${sl:,.4f}",             inline=True)
-        embed.add_field(name="TP",     value=f"${tp:,.4f} (+{tp_pct:.2f}%)", inline=True)
+        embed.add_field(name="Entry",  value=f"${last_close:,.2f}",     inline=True)
+        embed.add_field(name="SL",     value=f"${sl:,.2f}",             inline=True)
+        embed.add_field(name="TP",     value=f"${tp:,.2f} (+{tp_pct:.2f}%)", inline=True)
         embed.add_field(name="R:R",    value=f"1:{rr}",                 inline=True)
         embed.add_field(name="⚠️ WARNING", value="Bypassed all filters — for testing only!", inline=False)
         await ctx.send(embed=embed)
@@ -1705,7 +1705,7 @@ async def market_scanner():
                         emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
                         await channel.send(
                             f"{emoji} **Trade Closed** | `{ticker}` `{tf}` | "
-                            f"{last['side'].upper()} | Entry: ${last['entry']} → Exit: ${last['exit']} | "
+                            f"{last['side'].upper()} | Entry: ${last['entry']:.2f} → Exit: ${last['exit']:.2f} | "
                             f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
                         )
                         st["last_closure_notified"] = True
