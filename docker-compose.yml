@@ -7,8 +7,6 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
-    volumes:
-      - ./data:/app/data
     logging:
       driver: "json-file"
       options:
