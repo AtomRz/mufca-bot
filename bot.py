@@ -370,7 +370,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
         for tf in TIMEFRAMES:
             st = make_state()
             try:
-                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
+                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
                 if bars and len(bars) >= 2:
                     st["last_bar_time"] = int(bars[-2][0])
                     st["last_processed_bar_time"] = int(bars[-2][0])
@@ -436,7 +436,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
             for tf in TIMEFRAMES:
                 st = make_state()
                 try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
                     if bars and len(bars) >= 2:
                         st["last_bar_time"] = int(bars[-2][0])
                         st["last_processed_bar_time"] = int(bars[-2][0])
@@ -693,7 +693,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         if not validate_dataframe(df, 50):
             await ctx.send("❌ Not enough data")
@@ -704,7 +704,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         idx = len(df) - 2
         sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14, regime=None)
         stats = get_signal_stats(ticker, tf, side)
         risk = abs(last_close - sl)
         rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
@@ -805,16 +805,16 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         idx = len(df) - 2
         sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14, regime=None)
 
-        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(), regime=None)
         update_signal_record(ticker, tf, side, tp, "tp", 5)
         stats = get_signal_stats(ticker, tf, side)
 
@@ -850,21 +850,21 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         idx = len(df) - 2
         sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14, regime=None)
         risk = abs(last_close - sl)
 
         st = state.get(ticker, {}).get(tf) or make_state()
         st["active_trade"] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
         st["bars_in_trade"] = 0
         state[ticker][tf] = st
-        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(), regime=None)
         stats = get_signal_stats(ticker, tf, side)
 
         rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)

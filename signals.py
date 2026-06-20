@@ -416,7 +416,7 @@ async def check_signals(
         # --- LONG ---
         if (sig_a_long or sig_u_long) and not state.get("active_trade"):
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14)
+            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
             risk = abs(close_v - sl)
             reward = abs(tp - close_v)
             rr = reward / max(risk, 1e-8)
@@ -438,7 +438,7 @@ async def check_signals(
                     "bar_opened": bar_idx
                 }
                 state["bars_in_trade"] = 0
-                add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat())
+                add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "long")
 
                 if sig_a_long:
@@ -449,7 +449,7 @@ async def check_signals(
         # --- SHORT ---
         if (sig_a_short or sig_u_short) and not state.get("active_trade"):
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14)
+            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
             risk = abs(sl - close_v)
             reward = abs(close_v - tp)
             rr = reward / max(risk, 1e-8)
@@ -471,7 +471,7 @@ async def check_signals(
                     "bar_opened": bar_idx
                 }
                 state["bars_in_trade"] = 0
-                add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat())
+                add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "short")
 
                 if sig_a_short:
@@ -677,6 +677,9 @@ def backtest_history(
                 exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
                 moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
 
+                # Определяем режим для бэктеста
+                bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
+
                 history[ticker][tf][side].append({
                     "entry": round(close_v, 4),
                     "exit": round(exit_price, 4),
@@ -686,6 +689,7 @@ def backtest_history(
                     "timestamp": str(int(df["timestamp"].iloc[idx])),
                     "max_favorable_pct": round(max_favorable, 4),
                     "max_adverse_pct": round(max_adverse, 4),
+                    "regime": bt_regime,
                 })
                 history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1

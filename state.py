@@ -62,7 +62,7 @@ def _normalize_timestamp(timestamp) -> str:
         return timestamp
     return datetime.now(timezone.utc).isoformat()
 
-def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp):
+def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp, regime: str = "unknown"):
     """Добавляет запись о новом сигнале."""
     history = load_signals_history()
     _ensure_history_slot(history, ticker, tf)
@@ -76,12 +76,13 @@ def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp):
         "timestamp": _normalize_timestamp(timestamp),
         "max_favorable_pct": 0.0,
         "max_adverse_pct": 0.0,
+        "regime": regime,  # 🆕 Режим рынка при входе
     }
 
     history[ticker][tf][side].append(record)
     history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
     save_signals_history(history)
-    logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry}")
+    logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Regime: {regime}")
 
 def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int):
     """Закрывает открытый сигнал."""
@@ -102,7 +103,7 @@ def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exi
             else:
                 rec["moved_pct"] = round((entry - exit_price) / entry * 100, 4)
             save_signals_history(history)
-            logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | PnL: {rec['moved_pct']:.2f}%")
+            logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | PnL: {rec['moved_pct']:.2f}% | Regime: {rec.get('regime', 'unknown')}")
             return
 
     logger.warning(f"No open signal found to close for {ticker} {tf} {side}")
@@ -143,7 +144,7 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 # 📊  СТАТИСТИКА ПО СИГНАЛАМ
 # =====================================================================
 
-def get_signal_stats(ticker: str, tf: str, side: str) -> Dict:
+def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None) -> Dict:
     """Возвращает статистику по сигналам."""
     history = load_signals_history()
     empty = {
@@ -165,6 +166,15 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> Dict:
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
     if not closed:
         return empty
+
+    # 🆕 Фильтрация по режиму, если указан
+    if regime:
+        regime_closed = [r for r in closed if r.get("regime", "unknown") == regime]
+        if len(regime_closed) >= 5:  # Минимум 5 сигналов для режима
+            closed = regime_closed
+        else:
+            # Недостаточно данных по режиму — используем все, но помечаем
+            pass
 
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
     favorable_pcts = []
@@ -189,11 +199,60 @@ def get_signal_stats(ticker: str, tf: str, side: str) -> Dict:
     }
 
 # =====================================================================
-# 🎯  АДАПТИВНЫЙ ТП
+# 🎯  АДАПТИВНЫЙ ТП (ГИБРИДНЫЙ: РЕЖИМ + ВЗВЕШИВАНИЕ)
 # =====================================================================
 
-def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current_sl: float) -> float:
-    """Адаптивный TP на основе исторических MFE."""
+def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
+    """
+    Извлекает MFE с весами по типу выхода.
+    Возвращает список (mfe, weight).
+    """
+    favorable_pcts = []
+
+    for r in records:
+        mfe = r.get("max_favorable_pct", 0)
+        if mfe == 0 and r.get("moved_pct", 0) != 0:
+            mfe = abs(r["moved_pct"])
+        mfe = max(mfe, 0.1)
+
+        exit_type = r.get("exit_type", "unknown")
+        if exit_type == "tp":
+            weight = 1.0
+        elif exit_type == "sl":
+            weight = 0.6
+        elif exit_type == "cancelled":
+            weight = 0.4
+        else:
+            weight = 0.5
+
+        favorable_pcts.append((mfe, weight))
+
+    return favorable_pcts
+
+def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[float]:
+    """Строит взвешенную выборку для персентиля."""
+    expanded = []
+    for mfe, weight in weighted_mfes:
+        copies = max(1, int(weight * 10))
+        expanded.extend([mfe] * copies)
+    return expanded
+
+def calculate_adaptive_tp(
+    ticker: str,
+    tf: str,
+    side: str,
+    entry: float,
+    current_sl: float,
+    atr14: Optional[float] = None,
+    regime: Optional[str] = None
+) -> float:
+    """
+    Адаптивный TP на основе исторических MFE.
+    Гибридная логика:
+    1. Если по режиму ≥ 10 сигналов — используем только их
+    2. Если 5-9 сигналов — используем режим + общие с дисконтом
+    3. Если < 5 — используем все с взвешиванием по exit_type
+    """
     history = load_signals_history()
     risk = abs(entry - current_sl)
     fallback_tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
@@ -202,28 +261,62 @@ def calculate_adaptive_tp(ticker: str, tf: str, side: str, entry: float, current
         return round(fallback_tp, 4)
 
     records = history[ticker][tf][side]
-    # ✅ ИСПРАВЛЕНО: включаем cancelled
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
 
     if len(closed) < 3:
         return round(fallback_tp, 4)
 
-    recent = closed[-SIGNAL_HISTORY_LIMIT:]
-    favorable_pcts = []
-    for r in recent:
-        mfe = r.get("max_favorable_pct", 0)
-        if mfe == 0 and r.get("moved_pct", 0) != 0:
-            mfe = abs(r["moved_pct"])
-        favorable_pcts.append(max(mfe, 0.1))
+    # 🆕 ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ
+    use_records = []
+    regime_discount = 1.0
+    regime_info = ""
 
-    if not favorable_pcts:
+    if regime:
+        regime_records = [r for r in closed if r.get("regime", "unknown") == regime]
+
+        if len(regime_records) >= 10:
+            # ✅ Достаточно данных по режиму — используем только их
+            use_records = regime_records
+            regime_info = f"regime={regime} ({len(regime_records)} signals)"
+        elif len(regime_records) >= 5:
+            # ⚠️ Мало данных — смешиваем режим + общие с дисконтом
+            use_records = regime_records + closed
+            regime_discount = 0.85
+            regime_info = f"regime={regime} (mixed, {len(regime_records)} + {len(closed)} signals)"
+        else:
+            # ❌ Недостаточно данных — используем все
+            use_records = closed
+            regime_discount = 0.75
+            regime_info = f"regime={regime} (fallback, {len(regime_records)} regime signals)"
+    else:
+        use_records = closed
+        regime_info = "no regime filter"
+
+    recent = use_records[-SIGNAL_HISTORY_LIMIT:]
+    weighted_mfes = _extract_weighted_mfes(recent)
+
+    if not weighted_mfes:
         return round(fallback_tp, 4)
 
+    expanded = _build_weighted_sample(weighted_mfes)
+
     active_pct = SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE
-    tp_pct = float(np.percentile(favorable_pcts, active_pct * 100))
+    tp_pct = float(np.percentile(expanded, active_pct * 100))
+
+    # Применяем дисконт режима
+    tp_pct *= regime_discount
+
+    # 🛡️ ATR-кап
+    if atr14 and atr14 > 0:
+        atr_tp_pct = (atr14 * 3 / entry) * 100
+        tp_pct = min(tp_pct, atr_tp_pct)
+        logger.debug(f"[TP] ATR cap: {tp_pct:.2f}% raw → min({tp_pct:.2f}%, {atr_tp_pct:.2f}%)")
+
     tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, tp_pct))
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
+
+    logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | {regime_info} | expanded: {len(expanded)}")
     return round(tp, 4)
 
 def calculate_combined_tp(
@@ -234,18 +327,21 @@ def calculate_combined_tp(
     sl: float,
     df,
     idx: int,
-    atr14
+    atr14,
+    regime: Optional[str] = None
 ) -> Tuple[float, str]:
-    """Комбинированный TP: адаптивный + R:R 2.0 как fallback."""
-    stats = get_signal_stats(ticker, tf, side)
-    tp = calculate_adaptive_tp(ticker, tf, side, entry, sl)
+    """Комбинированный TP: адаптивный (гибридный) + R:R 2.0 как fallback."""
+    stats = get_signal_stats(ticker, tf, side, regime)
+    tp = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr14, regime)
     risk = abs(entry - sl)
     rr = round(abs(tp - entry) / max(risk, 1e-8), 2)
 
     mode_label = "SAFE" if USE_SAFE_TP else "AGGR"
+    regime_label = f" | Regime: {regime}" if regime else ""
+
     if stats["count"] >= 5:
-        desc = f"📚 Adaptive {SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE:.0%} %ile [{mode_label}] | {stats['count']} signals"
+        desc = f"📚 Adaptive {SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE:.0%} %ile [{mode_label}] | {stats['count']} signals{regime_label}"
     else:
-        desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals)"
+        desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
 
     return tp, desc
