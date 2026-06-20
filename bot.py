@@ -96,8 +96,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
     tp_pct = abs(tp - price) / price * 100
 
+    active_pct = SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE
+    active_mode = "SAFE" if USE_SAFE_TP else "AGGR"
     tp_source = (
-        f"📚 Adaptive (last {stats['count']} signals, {TP_PERCENTILE*100:.0f}th %ile)"
+        f"📚 Adaptive (last {stats['count']} signals, {active_pct*100:.0f}th %ile [{active_mode}])"
         if stats["count"] >= 5 else "📐 Fixed R:R = 2.0"
     )
 
