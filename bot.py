@@ -247,10 +247,15 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
-    temp_state = make_state()
+    # FIX: use real state to respect open positions and cooldowns
+    if ticker not in state:
+        state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
+    if tf not in state[ticker]:
+        state[ticker][tf] = make_state()
+    st = state[ticker][tf]
+
     try:
-        signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state)
+        signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, st)
     except Exception as e:
         logger.error(f"Manual scan error: {e}", exc_info=True)
         await ctx.send(f"❌ Scan error: {e}")
@@ -429,6 +434,9 @@ async def htf_cmd(ctx, new_htf: str = ""):
     HTF_BIAS = new_htf
     from config import save_htf
     save_htf(HTF_BIAS)
+    # FIX: clear HTF cache so new bias takes effect immediately
+    from signals import clear_htf_cache
+    clear_htf_cache()
 
     exchange = getattr(market_scanner, "exchange", None)
     if exchange:

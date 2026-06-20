@@ -64,6 +64,10 @@ logger = logging.getLogger(__name__)
 
 _htf_cache = Timer(HTF_CACHE_TTL_SECONDS)
 
+def clear_htf_cache():
+    """Сбрасывает кэш HTF bias — вызывать при изменении !htf."""
+    _htf_cache.clear()
+
 async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> int:
     """Возвращает HTF bias с кэшированием."""
     cache_key = f"{ticker}_{timeframe}"
