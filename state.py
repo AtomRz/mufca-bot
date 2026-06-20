@@ -307,10 +307,17 @@ def calculate_adaptive_tp(
     tp_pct *= regime_discount
 
     # 🛡️ ATR-кап
-    if atr14 and atr14 > 0:
-        atr_tp_pct = (atr14 * 3 / entry) * 100
-        tp_pct = min(tp_pct, atr_tp_pct)
-        logger.debug(f"[TP] ATR cap: {tp_pct:.2f}% raw → min({tp_pct:.2f}%, {atr_tp_pct:.2f}%)")
+    if atr14 is not None:
+        # atr14 может быть Series или float — извлекаем скаляр
+        try:
+            atr_val = float(atr14.iloc[-1]) if hasattr(atr14, 'iloc') else float(atr14)
+        except (TypeError, ValueError, AttributeError):
+            atr_val = 0.0
+
+        if atr_val > 0:
+            atr_tp_pct = (atr_val * 3 / entry) * 100
+            tp_pct = min(tp_pct, atr_tp_pct)
+            logger.debug(f"[TP] ATR cap: {tp_pct:.2f}% raw → min({tp_pct:.2f}%, {atr_tp_pct:.2f}%)")
 
     tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, tp_pct))
 
