@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
