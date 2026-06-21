@@ -751,7 +751,7 @@ def backtest_history(
         history = load_signals_history()
 
         # 🆕 FIX: Use module-level helpers (no duplication)
-        for idx in range(max(50, htf_len), len(df) - 100):
+        for idx in range(50, len(df) - 100):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
