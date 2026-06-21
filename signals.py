@@ -45,6 +45,11 @@ from indicators import (
     run_kmeans_mfi,
     heikin_ashi,
 )
+from volume_indicators import (
+    volume_filter,
+    volume_flow_signal,
+    volume_leverage_adjustment,
+)
 from state import (
     load_signals_history,
     save_signals_history,
@@ -278,17 +283,26 @@ async def check_signals(
         liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
         liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+        # Режим
+        regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
+
+        # 🆕 Volume filter (regime-aware)
+        vol_passed_long, vol_reason_long = volume_filter(df, "long", regime)
+        vol_passed_short, vol_reason_short = volume_filter(df, "short", regime)
+
         filter_long = (
             frama_bull and chop_ok and atr_ok and slope_long
             and htf_bull
             and not fake_break_long
             and not liq_sweep_short
+            and vol_passed_long
         )
         filter_short = (
             frama_bear and chop_ok and atr_ok and slope_short
             and htf_bear
             and not fake_break_short
             and not liq_sweep_long
+            and vol_passed_short
         )
 
         # Сигналы
@@ -387,18 +401,26 @@ async def check_signals(
             state["u_short_bar"] = bar_idx
             state["last_u_short_bar"] = bar_idx
 
-        # Режим
-        regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
-
         # Леверидж
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
         sugg_lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sugg_sl, 0.1))))
+
         if regime == "CHAOS":
             sugg_lev = max(1, int(sugg_lev * 0.5))
         if regime == "TREND":
             sugg_lev = min(MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
+
+        # 🆕 Volume-based leverage adjustment
+        if (sig_a_long or sig_u_long):
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
+                df, regime, sugg_lev, "long"
+            )
+        elif (sig_a_short or sig_u_short):
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
+                df, regime, sugg_lev, "short"
+            )
 
         def calc_confidence(is_long: bool) -> int:
             score = 20 if chop_ok else 0
@@ -569,15 +591,24 @@ def backtest_history(
             liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+            # Режим для бэктеста
+            bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
+
+            # 🆕 Volume filter для бэктеста (regime-aware)
+            vol_passed_long, _ = volume_filter(df.iloc[:idx+1], "long", bt_regime)
+            vol_passed_short, _ = volume_filter(df.iloc[:idx+1], "short", bt_regime)
+
             filter_long = (
                 frama_bull and chop_ok and atr_ok and slope_long
                 and not fake_break_long
                 and not liq_sweep_short
+                and vol_passed_long
             )
             filter_short = (
                 frama_bear and chop_ok and atr_ok and slope_short
                 and not fake_break_short
                 and not liq_sweep_long
+                and vol_passed_short
             )
 
             # Сигналы (упрощенные для бэктеста — без HTF bias)
@@ -676,9 +707,6 @@ def backtest_history(
                 _ensure_history_slot(history, ticker, tf)
                 exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
                 moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
-
-                # Определяем режим для бэктеста
-                bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
                 history[ticker][tf][side].append({
                     "entry": round(close_v, 4),

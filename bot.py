@@ -37,6 +37,7 @@ from config import (
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
+from volume_indicators import volume_flow_signal
 from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record
 
@@ -85,7 +86,7 @@ async def startup_sequence(exchange: ccxt.Exchange):
 # =====================================================================
 
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
-                sl, tp, risk, stats, tp_desc: str = "") -> discord.Embed:
+                sl, tp, risk, stats, tp_desc: str = "", df=None) -> discord.Embed:
     is_long = "BUY" in signal_type
     is_a_track = "Andean" in signal_type
     coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
@@ -96,10 +97,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
     tp_pct = abs(tp - price) / price * 100
 
-    active_pct = SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE
-    active_mode = "SAFE" if USE_SAFE_TP else "AGGR"
     tp_source = (
-        f"📚 Adaptive (last {stats['count']} signals, {active_pct*100:.0f}th %ile [{active_mode}])"
+        f"📚 Adaptive (last {stats['count']} signals, {TP_PERCENTILE*100:.0f}th %ile)"
         if stats["count"] >= 5 else "📐 Fixed R:R = 2.0"
     )
 
@@ -119,6 +118,15 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
     embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
+    # 🆕 Volume Flow info
+    if df is not None:
+        try:
+            vol_flow = volume_flow_signal(df)
+            vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+            embed.add_field(name=f"{vol_emoji} Volume Flow", value=f"OBV: {vol_flow.upper()}", inline=True)
+        except Exception:
+            pass
+
     embed.add_field(name="📚 TP Source", value=tp_source, inline=False)
     if stats["count"] >= 5:
         embed.add_field(name="📈 Signal Stats",
@@ -156,8 +164,11 @@ async def market_scanner():
 
                 if bar_time and bar_time != st["last_bar_time"]:
                     st["last_bar_time"] = bar_time
+                    # 🆕 Fetch df for volume info
+                    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
+                    df = parse_ohlcv(bars) if bars else None
                     for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
-                        embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc)
+                        embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
                         try:
                             await channel.send(embed=embed)
                             scan_stats["signals_generated"] += 1  # ✅ ИСПРАВЛЕНО
@@ -258,9 +269,13 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         await ctx.send(f"❌ Scan error: {e}")
         return
 
+    # 🆕 Fetch df for volume info
+    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
+    df = parse_ohlcv(bars) if bars else None
+
     if signals:
         for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
-            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc)
+            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
             await ctx.send(embed=embed)
     else:
         await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**")
@@ -372,7 +387,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
         for tf in TIMEFRAMES:
             st = make_state()
             try:
-                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
+                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
                 if bars and len(bars) >= 2:
                     st["last_bar_time"] = int(bars[-2][0])
                     st["last_processed_bar_time"] = int(bars[-2][0])
@@ -438,7 +453,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
             for tf in TIMEFRAMES:
                 st = make_state()
                 try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
                     if bars and len(bars) >= 2:
                         st["last_bar_time"] = int(bars[-2][0])
                         st["last_processed_bar_time"] = int(bars[-2][0])
@@ -695,7 +710,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         if not validate_dataframe(df, 50):
             await ctx.send("❌ Not enough data")
@@ -807,7 +822,7 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
@@ -852,7 +867,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
