@@ -64,6 +64,7 @@ from state import (
     calculate_combined_tp,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer
+from config import ONCHAIN_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -205,11 +206,13 @@ async def check_signals(
     timeframe: str,
     state: Dict[str, Any],
     dry_run: bool = False,
+    onchain_bias: Optional[Dict] = None,
 ) -> Tuple[List[Tuple], Optional[int], str, int]:
     """
     Проверяет сигналы для пары/таймфрейма.
     Возвращает: (signals, bar_time, regime, leverage)
-    dry_run=True — не записывает сигналы в историю (используется в !scan).
+    dry_run=True       — не записывает сигналы в историю (используется в !scan).
+    onchain_bias=dict  — данные из onchain.get_onchain_bias(), влияют на TP/SL/lev/confidence.
     """
     try:
         # HTF bias
@@ -441,6 +444,30 @@ async def check_signals(
                 vol_info, "short", sugg_lev
             )
 
+        # ─── On-Chain bias ─────────────────────────────────────────
+        # Читаем множители TP/SL и дельту leverage из onchain_bias.
+        # По умолчанию (если onchain отключён или нет данных) — нейтрально.
+        oc_bias_long  = 0
+        oc_bias_short = 0
+        oc_tp_mult_long   = 1.0
+        oc_tp_mult_short  = 1.0
+        oc_sl_mult_long   = 1.0
+        oc_sl_mult_short  = 1.0
+        oc_lev_delta      = 0
+
+        if onchain_bias and ONCHAIN_ENABLED:
+            oc_bias_long      = onchain_bias.get("bias_long",      0)
+            oc_bias_short     = onchain_bias.get("bias_short",     0)
+            oc_tp_mult_long   = onchain_bias.get("tp_mult_long",   1.0)
+            oc_tp_mult_short  = onchain_bias.get("tp_mult_short",  1.0)
+            oc_sl_mult_long   = onchain_bias.get("sl_mult_long",   1.0)
+            oc_sl_mult_short  = onchain_bias.get("sl_mult_short",  1.0)
+            oc_lev_delta      = onchain_bias.get("lev_delta",      0)
+
+        # Применяем onchain leverage delta
+        if (sig_a_long or sig_u_long) or (sig_a_short or sig_u_short):
+            sugg_lev = max(1, min(MAX_ALLOWED_LEV, sugg_lev + oc_lev_delta))
+
         def calc_confidence(is_long: bool) -> int:
             score = 20 if chop_ok else 0
             score += 20 if atr_ok else 0
@@ -449,7 +476,9 @@ async def check_signals(
             u_sig = sig_u_long if is_long else sig_u_short
             score += 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
             score += 20 if (htf_bull if is_long else htf_bear) else 0
-            return min(score, 100)
+            # 🆕 On-chain confidence bias
+            score += oc_bias_long if is_long else oc_bias_short
+            return max(0, min(100, score))
 
         signals = []
         MIN_RR = 1.0
@@ -459,6 +488,16 @@ async def check_signals(
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
             risk = abs(close_v - sl)
+            reward = abs(tp - close_v)
+
+            # 🆕 Применяем on-chain TP/SL множители
+            if oc_tp_mult_long != 1.0:
+                tp = close_v + reward * oc_tp_mult_long
+                tp_desc += f" | OC×{oc_tp_mult_long}"
+            if oc_sl_mult_long != 1.0:
+                sl = close_v - risk * oc_sl_mult_long
+                risk = abs(close_v - sl)
+
             reward = abs(tp - close_v)
             rr = reward / max(risk, 1e-8)
 
@@ -493,6 +532,16 @@ async def check_signals(
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
             risk = abs(sl - close_v)
+            reward = abs(close_v - tp)
+
+            # 🆕 Применяем on-chain TP/SL множители
+            if oc_tp_mult_short != 1.0:
+                tp = close_v - reward * oc_tp_mult_short
+                tp_desc += f" | OC×{oc_tp_mult_short}"
+            if oc_sl_mult_short != 1.0:
+                sl = close_v + risk * oc_sl_mult_short
+                risk = abs(sl - close_v)
+
             reward = abs(close_v - tp)
             rr = reward / max(risk, 1e-8)
 

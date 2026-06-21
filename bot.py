@@ -1,13 +1,14 @@
 import asyncio
 import math
 import os
+import time
 import numpy as np
 import pandas as pd
 import discord
 from discord.ext import tasks, commands
 from datetime import datetime, timezone
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 import ccxt
 
@@ -39,6 +40,8 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl, clear_htf_cache
+from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache
+from config import ONCHAIN_ENABLED
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache
 
 logger = logging.getLogger(__name__)
@@ -147,6 +150,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
 # 📡  SCANNER LOOP
 # =====================================================================
 
+# On-chain bias кэш (обновляется раз в час в market_scanner)
+_onchain_bias_cache: Optional[Dict] = None
+_onchain_last_fetch: float = 0.0
+
 @tasks.loop(seconds=20)
 async def market_scanner():
     """Основной цикл сканирования."""
@@ -159,11 +166,25 @@ async def market_scanner():
     if exchange is None:
         return
 
+    # 🆕 Обновляем on-chain bias раз в час (кэш TTL управляется внутри onchain.py)
+    global _onchain_bias_cache, _onchain_last_fetch
+    now_ts = time.time()
+    if ONCHAIN_ENABLED and (now_ts - _onchain_last_fetch) >= 3600:
+        try:
+            _onchain_bias_cache = await get_onchain_bias()
+            _onchain_last_fetch = now_ts
+            logger.info(f"[ONCHAIN] Bias refreshed: long={_onchain_bias_cache.get('bias_long',0):+d} short={_onchain_bias_cache.get('bias_short',0):+d}")
+        except Exception as e:
+            logger.warning(f"[ONCHAIN] Refresh failed: {e}")
+
     for ticker in list(TICKERS):  # копия списка — защита от мутации через !add/!remove
         for tf in TIMEFRAMES:
             try:
                 st = state[ticker][tf]
-                signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, st)
+                signals, bar_time, regime, lev = await check_signals(
+                    exchange, ticker, tf, st,
+                    onchain_bias=_onchain_bias_cache,
+                )
 
                 scan_stats["total_scans"] += 1
                 scan_stats["last_scan_time"] = datetime.now(timezone.utc).isoformat()
@@ -958,11 +979,38 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         import traceback
         await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
 
+@bot.command(name="onchain")
+async def onchain_cmd(ctx):
+    """Показывает текущий on-chain анализ (F&G, ETH flows, влияние на сигналы)."""
+    if not ONCHAIN_ENABLED:
+        await ctx.send(
+            "⚠️ On-Chain анализ отключён.\n"
+            "Добавьте в `.env`:\n"
+            "```\nETHERSCAN_API_KEY=ваш_ключ\nCOINGECKO_API_KEY=ваш_ключ\n```"
+        )
+        return
+
+    msg = await ctx.send("⏳ Получаю on-chain данные...")
+    try:
+        bias = await get_onchain_bias()
+        global _onchain_bias_cache, _onchain_last_fetch
+        _onchain_bias_cache = bias
+        _onchain_last_fetch = time.time()
+        report = format_onchain_report(bias)
+        await msg.edit(content=report)
+    except Exception as e:
+        await msg.edit(content=f"❌ Ошибка on-chain: `{e}`")
+
+
 @bot.command(name="reset_cache")
 async def reset_cache_cmd(ctx):
-    """Сбрасывает HTF кэш вручную — полезно после изменения !htf без перезапуска."""
+    """Сбрасывает HTF bias cache и on-chain cache вручную."""
     clear_htf_cache()
-    await ctx.send("✅ HTF bias cache cleared. Next scan will re-fetch HTF data.")
+    clear_onchain_cache()
+    global _onchain_bias_cache, _onchain_last_fetch
+    _onchain_bias_cache = None
+    _onchain_last_fetch = 0.0
+    await ctx.send("✅ HTF bias cache и On-Chain cache сброшены. Следующий скан обновит данные.")
 
 # =====================================================================
 # 🚀  ЗАПУСК

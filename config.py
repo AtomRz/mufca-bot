@@ -18,6 +18,20 @@ DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =====================================================================
+# 🔑  ВНЕШНИЕ API КЛЮЧИ
+# =====================================================================
+ETHERSCAN_API_KEY  = os.getenv("ETHERSCAN_API_KEY", "")
+COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")   # Demo key (бесплатный)
+
+# =====================================================================
+# 📡  ON-CHAIN НАСТРОЙКИ
+# =====================================================================
+ONCHAIN_CACHE_TTL             = 3600    # секунд (1 час) — обновление балансов
+ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — порог "normal" сигнала
+ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — порог "large" сигнала
+ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
+
+# =====================================================================
 # 🔒  THREAD-SAFE FILE OPERATIONS
 # =====================================================================
 
