@@ -46,14 +46,8 @@ from indicators import (
     heikin_ashi,
 )
 from volume_indicators import (
-    volume_filter,
-    volume_filter_v3,
-    volume_flow_signal,
     volume_flow_signal_v3,
-    volume_leverage_adjustment,
     volume_leverage_adjustment_v3,
-    volume_confidence_adjustment,
-    volume_score_for_side,
 )
 from state import (
     load_signals_history,
@@ -291,23 +285,21 @@ async def check_signals(
         # Режим
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
-        # 🆕 Volume filter (regime-aware)
-        vol_passed_long, vol_reason_long = volume_filter(df, "long", regime)
-        vol_passed_short, vol_reason_short = volume_filter(df, "short", regime)
+        # Volume info for leverage adjustment (NOT a signal filter)
+        vol_info_long = volume_flow_signal_v3(df)
+        vol_info_short = volume_flow_signal_v3(df)
 
         filter_long = (
             frama_bull and chop_ok and atr_ok and slope_long
             and htf_bull
             and not fake_break_long
             and not liq_sweep_short
-            and vol_passed_long
         )
         filter_short = (
             frama_bear and chop_ok and atr_ok and slope_short
             and htf_bear
             and not fake_break_short
             and not liq_sweep_long
-            and vol_passed_short
         )
 
         # Сигналы
@@ -417,14 +409,14 @@ async def check_signals(
         if regime == "TREND":
             sugg_lev = min(MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
 
-        # 🆕 Volume-based leverage adjustment
+        # 🆕 Volume-based leverage adjustment only
         if (sig_a_long or sig_u_long):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
-                df, regime, sugg_lev, "long"
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
+                vol_info_long, "long", sugg_lev
             )
         elif (sig_a_short or sig_u_short):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
-                df, regime, sugg_lev, "short"
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
+                vol_info_short, "short", sugg_lev
             )
 
         def calc_confidence(is_long: bool) -> int:
@@ -435,11 +427,7 @@ async def check_signals(
             u_sig = sig_u_long if is_long else sig_u_short
             score += 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
             score += 20 if (htf_bull if is_long else htf_bear) else 0
-            # 🆕 Volume confidence adjustment
-            vol_info = vol_info_long if is_long else vol_info_short
-            vol_adj = volume_confidence_adjustment(vol_info, "long" if is_long else "short")
-            score += vol_adj
-            return max(0, min(score, 100))
+            return min(score, 100)
 
         signals = []
         MIN_RR = 1.0
@@ -604,20 +592,16 @@ def backtest_history(
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
             # 🆕 Volume filter для бэктеста (regime-aware)
-            vol_passed_long, _ = volume_filter(df.iloc[:idx+1], "long", bt_regime)
-            vol_passed_short, _ = volume_filter(df.iloc[:idx+1], "short", bt_regime)
 
             filter_long = (
                 frama_bull and chop_ok and atr_ok and slope_long
                 and not fake_break_long
                 and not liq_sweep_short
-                and vol_passed_long
             )
             filter_short = (
                 frama_bear and chop_ok and atr_ok and slope_short
                 and not fake_break_short
                 and not liq_sweep_long
-                and vol_passed_short
             )
 
             # Сигналы (упрощенные для бэктеста — без HTF bias)
