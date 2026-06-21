@@ -8,10 +8,10 @@ import logging
 
 import ccxt
 
+import config as _cfg
 from config import (
     TICKERS,
     TIMEFRAMES,
-    UT_HEIKIN_ASHI,
     ATR_PERIOD,
     ATR_MIN,
     ATR_MAX,
@@ -30,11 +30,12 @@ from config import (
     MAX_ALLOWED_LEV,
     TARGET_RISK_DEP,
     MAX_HOLD_BARS,
-    HTF_BIAS,
     HTF_CACHE_TTL_SECONDS,
     MARKET_MODE,
     SIGNAL_HISTORY_LIMIT,
 )
+# UT_HEIKIN_ASHI и HTF_BIAS читаются через _cfg.UT_HEIKIN_ASHI / _cfg.HTF_BIAS
+# чтобы видеть актуальное значение после !utha / !htf без перезапуска бота
 from indicators import (
     calculate_atr,
     calculate_chop,
@@ -79,7 +80,7 @@ async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> 
     if cached is not None:
         return cached
 
-    htf = HTF_BIAS
+    htf = _cfg.HTF_BIAS
     try:
         bars = await safe_fetch_ohlcv(exchange, ticker, htf, limit=150)
         if not bars:
@@ -181,6 +182,11 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     state["active_trade"] = None
     state["bars_in_trade"] = 0
     state["last_closure_notified"] = False
+    # Сбрасываем track-флаги, чтобы следующие сигналы не блокировались
+    state["a_in_long"] = False
+    state["a_in_short"] = False
+    state["u_in_long"] = False
+    state["u_in_short"] = False
 
     logger.info(f"[TRADE] Closed {side.upper()} | PnL: {pnl_pct:.2f}% | Result: {result.upper()}")
     return closed_trade
@@ -193,11 +199,13 @@ async def check_signals(
     exchange: ccxt.Exchange,
     ticker: str,
     timeframe: str,
-    state: Dict[str, Any]
+    state: Dict[str, Any],
+    dry_run: bool = False,
 ) -> Tuple[List[Tuple], Optional[int], str, int]:
     """
     Проверяет сигналы для пары/таймфрейма.
     Возвращает: (signals, bar_time, regime, leverage)
+    dry_run=True — не записывает сигналы в историю (используется в !scan).
     """
     try:
         # HTF bias
@@ -245,7 +253,7 @@ async def check_signals(
         mfi = calculate_mfi(df, MFI_LEN)
         level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
+        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
         idx = len(df) - 2
         bar_idx = idx
@@ -286,8 +294,9 @@ async def check_signals(
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
         # Volume info for leverage adjustment (NOT a signal filter)
-        vol_info_long = volume_flow_signal_v3(df)
-        vol_info_short = volume_flow_signal_v3(df)
+        # Один вызов — результат одинаков для long/short, направление учитывается внутри
+        vol_info = volume_flow_signal_v3(df)
+        vol_lev_reason = "no signal"
 
         filter_long = (
             frama_bull and chop_ok and atr_ok and slope_long
@@ -412,11 +421,11 @@ async def check_signals(
         # 🆕 Volume-based leverage adjustment only
         if (sig_a_long or sig_u_long):
             sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
-                vol_info_long, "long", sugg_lev
+                vol_info, "long", sugg_lev
             )
         elif (sig_a_short or sig_u_short):
             sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
-                vol_info_short, "short", sugg_lev
+                vol_info, "short", sugg_lev
             )
 
         def calc_confidence(is_long: bool) -> int:
@@ -457,7 +466,8 @@ async def check_signals(
                     "bar_opened": bar_idx
                 }
                 state["bars_in_trade"] = 0
-                add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
+                if not dry_run:
+                    add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "long")
 
                 if sig_a_long:
@@ -490,7 +500,8 @@ async def check_signals(
                     "bar_opened": bar_idx
                 }
                 state["bars_in_trade"] = 0
-                add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
+                if not dry_run:
+                    add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "short")
 
                 if sig_a_short:
@@ -534,7 +545,7 @@ def backtest_history(
         mfi = calculate_mfi(df, MFI_LEN)
         level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=UT_HEIKIN_ASHI)
+        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
         signals_found = 0
         history = load_signals_history()

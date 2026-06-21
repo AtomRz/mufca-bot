@@ -38,8 +38,8 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
-from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl
-from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record
+from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl, clear_htf_cache
+from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ async def market_scanner():
     if exchange is None:
         return
 
-    for ticker in TICKERS:
+    for ticker in list(TICKERS):  # копия списка — защита от мутации через !add/!remove
         for tf in TIMEFRAMES:
             try:
                 st = state[ticker][tf]
@@ -286,7 +286,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
     # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
     temp_state = make_state()
     try:
-        signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state)
+        signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state, dry_run=True)
     except Exception as e:
         logger.error(f"Manual scan error: {e}", exc_info=True)
         await ctx.send(f"❌ Scan error: {e}")
@@ -792,21 +792,24 @@ async def debug_cmd(ctx):
     active_count = sum(1 for t in TICKERS for tf in TIMEFRAMES if state[t][tf].get("active_trade"))
     lines.append(f"• Active trades: **{active_count}**")
 
-    # 🆕 Volume overview
+    # Volume overview
+    exchange = getattr(market_scanner, "exchange", None)  # ✅ ИСПРАВЛЕНО: была NameError
     lines.append("\n**📊 Volume Overview:**")
-    for ticker in TICKERS:
-        for tf in TIMEFRAMES:
-            try:
-                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
-                if bars and len(bars) >= 25:
-                    from utils import parse_ohlcv
-                    df_d = parse_ohlcv(bars)
-                    vol_data = volume_flow_signal_v3(df_d)
-                    vol_flow = vol_data["flow"]
-                    vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-                    lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x")
-            except Exception:
-                pass
+    if exchange is None:
+        lines.append("• Exchange not initialized")
+    else:
+        for ticker in list(TICKERS):
+            for tf in TIMEFRAMES:
+                try:
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
+                    if bars and len(bars) >= 25:
+                        df_d = parse_ohlcv(bars)
+                        vol_data = volume_flow_signal_v3(df_d)
+                        vol_flow = vol_data["flow"]
+                        vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+                        lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x")
+                except Exception:
+                    pass
 
     await ctx.send("\n".join(lines))
 
@@ -821,6 +824,7 @@ async def reset_cmd(ctx, confirm: str = ""):
 
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)
+    clear_history_cache()  # ✅ ИСПРАВЛЕНО: сбрасываем in-memory кэш после удаления файла
 
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -953,6 +957,12 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         await ctx.send(f"❌ Force run failed: {e}")
         import traceback
         await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
+
+@bot.command(name="reset_cache")
+async def reset_cache_cmd(ctx):
+    """Сбрасывает HTF кэш вручную — полезно после изменения !htf без перезапуска."""
+    clear_htf_cache()
+    await ctx.send("✅ HTF bias cache cleared. Next scan will re-fetch HTF data.")
 
 # =====================================================================
 # 🚀  ЗАПУСК

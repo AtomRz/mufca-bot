@@ -28,6 +28,12 @@ _history_cache: Optional[Dict] = None
 # 💾  УПРАВЛЕНИЕ ИСТОРИЕЙ СИГНАЛОВ
 # =====================================================================
 
+def clear_history_cache():
+    """Сбрасывает кэш истории сигналов — вызывать при удалении файла истории."""
+    global _history_cache
+    _history_cache = None
+
+
 def load_signals_history() -> Dict:
     """Загружает историю сигналов из файла."""
     global _history_cache
