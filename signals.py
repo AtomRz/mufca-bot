@@ -69,6 +69,54 @@ from config import ONCHAIN_ENABLED
 logger = logging.getLogger(__name__)
 
 # =====================================================================
+# 🔄  CROSSOVER HELPERS (module level for reuse)
+# =====================================================================
+
+def crossover(s, lvl, i):
+    if i < 1:
+        return False
+    return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
+
+def crossunder(s, lvl, i):
+    if i < 1:
+        return False
+    return float(s.iloc[i]) < lvl and float(s.iloc[i-1]) >= lvl
+
+def crossover2(s1, s2, i):
+    if i < 1:
+        return False
+    return float(s1.iloc[i]) > float(s2.iloc[i]) and float(s1.iloc[i-1]) <= float(s2.iloc[i-1])
+
+def crossunder2(s1, s2, i):
+    if i < 1:
+        return False
+    return float(s1.iloc[i]) < float(s2.iloc[i]) and float(s1.iloc[i-1]) >= float(s2.iloc[i-1])
+
+def bars_since_crossover2(s1, s2, cur, lookback):
+    for k in range(cur, max(cur - lookback - 1, 1), -1):
+        if float(s1.iloc[k]) > float(s2.iloc[k]) and float(s1.iloc[k-1]) <= float(s2.iloc[k-1]):
+            return cur - k
+    return 999
+
+def bars_since_crossunder2(s1, s2, cur, lookback):
+    for k in range(cur, max(cur - lookback - 1, 1), -1):
+        if float(s1.iloc[k]) < float(s2.iloc[k]) and float(s1.iloc[k-1]) >= float(s2.iloc[k-1]):
+            return cur - k
+    return 999
+
+def bars_since_crossover(s, lvl, cur, lookback):
+    for k in range(cur, max(cur - lookback - 1, 1), -1):
+        if float(s.iloc[k]) > lvl and float(s.iloc[k-1]) <= lvl:
+            return cur - k
+    return 999
+
+def bars_since_crossunder(s, lvl, cur, lookback):
+    for k in range(cur, max(cur - lookback - 1, 1), -1):
+        if float(s.iloc[k]) < lvl and float(s.iloc[k-1]) >= lvl:
+            return cur - k
+    return 999
+
+# =====================================================================
 # 🧬  HTF BIAS (С КЭШИРОВАНИЕМ)
 # =====================================================================
 
@@ -120,24 +168,28 @@ def calculate_sl(
     atr14: pd.Series,
     idx: int
 ) -> float:
-    """Рассчитывает Stop Loss."""
+    """Рассчитывает Stop Loss с валидацией (SL не пересекает цену входа)."""
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     if side == "long":
         sl_frama = float(fl.iloc[idx])
         sl_atr = entry_price - 1.5 * atr_v
-        return max(sl_frama, sl_atr)
+        sl = max(sl_frama, sl_atr)
+        # 🆕 FIX: SL не может быть >= entry для long
+        return min(sl, entry_price * 0.995)
     else:
         sl_frama = float(fu.iloc[idx])
         sl_atr = entry_price + 1.5 * atr_v
-        return min(sl_frama, sl_atr)
+        sl = min(sl_frama, sl_atr)
+        # 🆕 FIX: SL не может быть <= entry для short
+        return max(sl, entry_price * 1.005)
 
 # =====================================================================
 # 📊  TP/SL CHECK
 # =====================================================================
 
-def check_tp_sl_hit(state: Dict, high: float, low: float) -> Optional[str]:
-    """Проверяет, был ли пробит TP или SL."""
-    trade = state.get("active_trade")
+def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a") -> Optional[str]:
+    """Проверяет, был ли пробит TP или SL для указанного трека."""
+    trade = state.get(f"{track}_active_trade")
     if not trade:
         return None
 
@@ -157,15 +209,17 @@ def check_tp_sl_hit(state: Dict, high: float, low: float) -> Optional[str]:
             return "tp"
     return None
 
-def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str) -> Optional[Dict]:
-    """Закрывает активную позицию."""
-    trade = state.get("active_trade")
+def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str, track: str = "a") -> Optional[Dict]:
+    """Закрывает активную позицию указанного трека (a или u)."""
+    trade_key = f"{track}_active_trade"
+    trade = state.get(trade_key)
     if not trade:
         return None
 
     entry = trade["entry"]
     side = trade["side"]
-    bars_held = state.get("bars_in_trade", 0)
+    bars_key = f"{track}_bars_in_trade"
+    bars_held = state.get(bars_key, 0)
     pnl_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
 
     closed_trade = {
@@ -179,21 +233,40 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         "pnl_pct": round(pnl_pct, 4),
         "bars_held": bars_held,
         "lev": trade.get("lev", 1),
+        "track": track,
     }
 
+    # Save to track-specific history
+    history_key = f"{track}_trade_history"
+    state[history_key].append(closed_trade)
+    state[history_key] = state[history_key][-50:]
+
+    # Also update legacy combined history for backward compat
     state["trade_history"].append(closed_trade)
     state["trade_history"] = state["trade_history"][-50:]
-    update_signal_record(ticker, tf, side, exit_price, result, bars_held)
-    state["active_trade"] = None
-    state["bars_in_trade"] = 0
-    state["last_closure_notified"] = False
-    # Сбрасываем track-флаги, чтобы следующие сигналы не блокировались
-    state["a_in_long"] = False
-    state["a_in_short"] = False
-    state["u_in_long"] = False
-    state["u_in_short"] = False
 
-    logger.info(f"[TRADE] Closed {side.upper()} | PnL: {pnl_pct:.2f}% | Result: {result.upper()}")
+    update_signal_record(ticker, tf, side, exit_price, result, bars_held)
+
+    # Clear track-specific state
+    state[trade_key] = None
+    state[bars_key] = 0
+    notified_key = f"{track}_last_closure_notified"
+    state[notified_key] = False
+
+    # Reset track-specific position flags
+    if track == "a":
+        state["a_in_long"] = False
+        state["a_in_short"] = False
+    else:
+        state["u_in_long"] = False
+        state["u_in_short"] = False
+
+    # Update legacy fields
+    state["active_trade"] = state.get("a_active_trade") or state.get("u_active_trade")
+    state["bars_in_trade"] = max(state.get("a_bars_in_trade", 0), state.get("u_bars_in_trade", 0))
+    state["last_closure_notified"] = state.get("a_last_closure_notified", False) and state.get("u_last_closure_notified", False)
+
+    logger.info(f"[TRADE] Closed {track.upper()}-track {side.upper()} | PnL: {pnl_pct:.2f}% | Result: {result.upper()}")
     return closed_trade
 
 # =====================================================================
@@ -238,19 +311,21 @@ async def check_signals(
         last_low = float(df["low"].iloc[-2])
         last_close = float(df["close"].iloc[-2])
 
-        # Проверка активной позиции
-        trade = state.get("active_trade")
-        if trade:
-            update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close)
-            hit = check_tp_sl_hit(state, last_high, last_low)
-            if hit:
-                exit_price = trade["sl"] if hit == "sl" else trade["tp"]
-                close_trade(state, exit_price, hit, ticker, timeframe)
-            elif is_new_bar:
-                state["bars_in_trade"] = state.get("bars_in_trade", 0) + 1
-                if state["bars_in_trade"] >= MAX_HOLD_BARS:
-                    close_trade(state, last_close, "cancelled", ticker, timeframe)
-                    logger.info(f"[TRADE] Force-closed {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
+        # 🆕 FIX: Check BOTH independent tracks for TP/SL
+        for track in ("a", "u"):
+            trade = state.get(f"{track}_active_trade")
+            if trade:
+                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close)
+                hit = check_tp_sl_hit(state, last_high, last_low, track)
+                if hit:
+                    exit_price = trade["sl"] if hit == "sl" else trade["tp"]
+                    close_trade(state, exit_price, hit, ticker, timeframe, track)
+                elif is_new_bar:
+                    bars_key = f"{track}_bars_in_trade"
+                    state[bars_key] = state.get(bars_key, 0) + 1
+                    if state[bars_key] >= MAX_HOLD_BARS:
+                        close_trade(state, last_close, "cancelled", ticker, timeframe, track)
+                        logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
 
         # Индикаторы
         atr14 = calculate_atr(df, ATR_PERIOD)
@@ -328,65 +403,22 @@ async def check_signals(
         )
 
         # Сигналы
-        def crossover(s, lvl, i):
-            if i < 1:
-                return False
-            return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
-
-        def crossunder(s, lvl, i):
-            if i < 1:
-                return False
-            return float(s.iloc[i]) < lvl and float(s.iloc[i-1]) >= lvl
-
-        def crossover2(s1, s2, i):
-            if i < 1:
-                return False
-            return float(s1.iloc[i]) > float(s2.iloc[i]) and float(s1.iloc[i-1]) <= float(s2.iloc[i-1])
-
-        def crossunder2(s1, s2, i):
-            if i < 1:
-                return False
-            return float(s1.iloc[i]) < float(s2.iloc[i]) and float(s1.iloc[i-1]) >= float(s2.iloc[i-1])
-
+        # 🆕 FIX: Use module-level helpers (extracted to avoid duplication)
         mfi_bull_sig = crossover(mfi, level_os, idx)
         mfi_bear_sig = crossunder(mfi, level_ob, idx)
         and_bull_sig = crossover2(and_osc, and_sig, idx)
         and_bear_sig = crossunder2(and_osc, and_sig, idx)
 
-        def bars_since_crossover(s, lvl, cur):
-            for k in range(cur, max(cur - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО: min k=1
-                if float(s.iloc[k]) > lvl and float(s.iloc[k-1]) <= lvl:
-                    return cur - k
-            return 999
-
-        def bars_since_crossunder(s, lvl, cur):
-            for k in range(cur, max(cur - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО: min k=1
-                if float(s.iloc[k]) < lvl and float(s.iloc[k-1]) >= lvl:
-                    return cur - k
-            return 999
-
-        def bars_since_crossover2(s1, s2, cur):
-            for k in range(cur, max(cur - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО: min k=1
-                if float(s1.iloc[k]) > float(s2.iloc[k]) and float(s1.iloc[k-1]) <= float(s2.iloc[k-1]):
-                    return cur - k
-            return 999
-
-        def bars_since_crossunder2(s1, s2, cur):
-            for k in range(cur, max(cur - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО: min k=1
-                if float(s1.iloc[k]) < float(s2.iloc[k]) and float(s1.iloc[k-1]) >= float(s2.iloc[k-1]):
-                    return cur - k
-            return 999
-
-        bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx)
-        bs_mfi_bull = bars_since_crossover(mfi, level_os, idx)
-        bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx)
-        bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx)
+        bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, LOOKBACK)
+        bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, LOOKBACK)
+        bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, LOOKBACK)
+        bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, LOOKBACK)
 
         confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
         def cooldown_ok(last_bar):
-            return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
+            return last_bar is None or (bar_idx - last_bar) >= COOLDOWN_BARS
 
         a_long_cd_ok = cooldown_ok(state["last_a_long_bar"])
         a_short_cd_ok = cooldown_ok(state["last_a_short_bar"])
@@ -483,8 +515,8 @@ async def check_signals(
         signals = []
         MIN_RR = 1.0
 
-        # --- LONG ---
-        if (sig_a_long or sig_u_long) and not state.get("active_trade"):
+        # --- A-track LONG ---
+        if sig_a_long and not state.get("a_active_trade"):
             sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
             risk = abs(close_v - sl)
@@ -503,13 +535,13 @@ async def check_signals(
 
             bar_low = float(df["low"].iloc[idx])
             if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} LONG skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_a_long = sig_u_long = False
+                logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_a_long = False
             elif bar_low <= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} LONG skipped — bar low below SL")
-                sig_a_long = sig_u_long = False
+                logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — bar low below SL")
+                sig_a_long = False
             else:
-                state["active_trade"] = {
+                state["a_active_trade"] = {
                     "side": "long",
                     "entry": close_v,
                     "sl": sl,
@@ -517,18 +549,54 @@ async def check_signals(
                     "lev": sugg_lev,
                     "bar_opened": bar_idx
                 }
-                state["bars_in_trade"] = 0
+                state["a_bars_in_trade"] = 0
                 if not dry_run:
                     add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "long")
+                signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
 
-                if sig_a_long:
-                    signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
-                if sig_u_long:
-                    signals.append(("U BUY  (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
+        # --- U-track LONG ---
+        if sig_u_long and not state.get("u_active_trade"):
+            sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
+            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
+            risk = abs(close_v - sl)
+            reward = abs(tp - close_v)
 
-        # --- SHORT ---
-        if (sig_a_short or sig_u_short) and not state.get("active_trade"):
+            # 🆕 Применяем on-chain TP/SL множители
+            if oc_tp_mult_long != 1.0:
+                tp = close_v + reward * oc_tp_mult_long
+                tp_desc += f" | OC×{oc_tp_mult_long}"
+            if oc_sl_mult_long != 1.0:
+                sl = close_v - risk * oc_sl_mult_long
+                risk = abs(close_v - sl)
+
+            reward = abs(tp - close_v)
+            rr = reward / max(risk, 1e-8)
+
+            bar_low = float(df["low"].iloc[idx])
+            if rr < MIN_RR:
+                logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_u_long = False
+            elif bar_low <= sl:
+                logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — bar low below SL")
+                sig_u_long = False
+            else:
+                state["u_active_trade"] = {
+                    "side": "long",
+                    "entry": close_v,
+                    "sl": sl,
+                    "tp": tp,
+                    "lev": sugg_lev,
+                    "bar_opened": bar_idx
+                }
+                state["u_bars_in_trade"] = 0
+                if not dry_run:
+                    add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
+                stats = get_signal_stats(ticker, timeframe, "long")
+                signals.append(("U BUY  (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
+
+        # --- A-track SHORT ---
+        if sig_a_short and not state.get("a_active_trade"):
             sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
             risk = abs(sl - close_v)
@@ -547,13 +615,13 @@ async def check_signals(
 
             bar_high = float(df["high"].iloc[idx])
             if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_a_short = sig_u_short = False
+                logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_a_short = False
             elif bar_high >= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} SHORT skipped — bar high above SL")
-                sig_a_short = sig_u_short = False
+                logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — bar high above SL")
+                sig_a_short = False
             else:
-                state["active_trade"] = {
+                state["a_active_trade"] = {
                     "side": "short",
                     "entry": close_v,
                     "sl": sl,
@@ -561,15 +629,51 @@ async def check_signals(
                     "lev": sugg_lev,
                     "bar_opened": bar_idx
                 }
-                state["bars_in_trade"] = 0
+                state["a_bars_in_trade"] = 0
                 if not dry_run:
                     add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
                 stats = get_signal_stats(ticker, timeframe, "short")
+                signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
 
-                if sig_a_short:
-                    signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
-                if sig_u_short:
-                    signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
+        # --- U-track SHORT ---
+        if sig_u_short and not state.get("u_active_trade"):
+            sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
+            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
+            risk = abs(sl - close_v)
+            reward = abs(close_v - tp)
+
+            # 🆕 Применяем on-chain TP/SL множители
+            if oc_tp_mult_short != 1.0:
+                tp = close_v - reward * oc_tp_mult_short
+                tp_desc += f" | OC×{oc_tp_mult_short}"
+            if oc_sl_mult_short != 1.0:
+                sl = close_v + risk * oc_sl_mult_short
+                risk = abs(sl - close_v)
+
+            reward = abs(close_v - tp)
+            rr = reward / max(risk, 1e-8)
+
+            bar_high = float(df["high"].iloc[idx])
+            if rr < MIN_RR:
+                logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
+                sig_u_short = False
+            elif bar_high >= sl:
+                logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — bar high above SL")
+                sig_u_short = False
+            else:
+                state["u_active_trade"] = {
+                    "side": "short",
+                    "entry": close_v,
+                    "sl": sl,
+                    "tp": tp,
+                    "lev": sugg_lev,
+                    "bar_opened": bar_idx
+                }
+                state["u_bars_in_trade"] = 0
+                if not dry_run:
+                    add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
+                stats = get_signal_stats(ticker, timeframe, "short")
+                signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
 
         return signals, bar_time, regime, sugg_lev
 
@@ -605,34 +709,27 @@ def backtest_history(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         mfi = calculate_mfi(df, MFI_LEN)
-        level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
+        # 🆕 FIX: Use fixed MFI levels for backtest to avoid lookahead bias
+        # K-Means on full dataset = lookahead bias. Use 20/80 or rolling window.
+        level_os, level_ob = 20.0, 80.0
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+
+        # 🆕 FIX: Calculate rolling HTF bias (no lookahead)
+        # For simplicity, use same-timeframe FRAMA direction as HTF proxy
+        # In production, fetch actual HTF data with proper alignment
+        htf_bias_arr = np.zeros(len(df))
+        htf_len = max(50, FRAMA_LEN * 2)
+        for i in range(htf_len, len(df)):
+            htf_close = float(df["close"].iloc[i])
+            htf_frama = float(fs.iloc[i])
+            htf_bias_arr[i] = 1 if htf_close > htf_frama else -1
 
         signals_found = 0
         history = load_signals_history()
 
-        def crossover(s, lvl, i):
-            if i < 1:
-                return False
-            return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
-
-        def crossunder(s, lvl, i):
-            if i < 1:
-                return False
-            return float(s.iloc[i]) < lvl and float(s.iloc[i-1]) >= lvl
-
-        def crossover2(s1, s2, i):
-            if i < 1:
-                return False
-            return float(s1.iloc[i]) > float(s2.iloc[i]) and float(s1.iloc[i-1]) <= float(s2.iloc[i-1])
-
-        def crossunder2(s1, s2, i):
-            if i < 1:
-                return False
-            return float(s1.iloc[i]) < float(s2.iloc[i]) and float(s1.iloc[i-1]) >= float(s2.iloc[i-1])
-
-        for idx in range(50, len(df) - 100):
+        # 🆕 FIX: Use module-level helpers (no duplication)
+        for idx in range(max(50, htf_len), len(df) - 100):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
@@ -686,39 +783,26 @@ def backtest_history(
                 and not liq_sweep_long
             )
 
-            # Сигналы (упрощённые для бэктеста — без HTF bias, warmed_up guard добавлен)
+            # 🆕 FIX: Use module-level helpers + rolling HTF bias
             mfi_bull_sig = crossover(mfi, level_os, idx)
             mfi_bear_sig = crossunder(mfi, level_ob, idx)
             and_bull_sig = crossover2(and_osc, and_sig, idx)
             and_bear_sig = crossunder2(and_osc, and_sig, idx)
 
-            bs_and_bull = 0
-            bs_mfi_bull = 0
-            bs_and_bear = 0
-            bs_mfi_bear = 0
-
-            for k in range(idx, max(idx - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО
-                if crossover2(and_osc, and_sig, k):
-                    bs_and_bull = idx - k
-                    break
-            for k in range(idx, max(idx - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО
-                if crossover(mfi, level_os, k):
-                    bs_mfi_bull = idx - k
-                    break
-            for k in range(idx, max(idx - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО
-                if crossunder2(and_osc, and_sig, k):
-                    bs_and_bear = idx - k
-                    break
-            for k in range(idx, max(idx - LOOKBACK - 1, 1), -1):  # ✅ ИСПРАВЛЕНО
-                if crossunder(mfi, level_ob, k):
-                    bs_mfi_bear = idx - k
-                    break
+            bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, LOOKBACK)
+            bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, LOOKBACK)
+            bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, LOOKBACK)
+            bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, LOOKBACK)
 
             confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
             confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
-            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt
-            sig_a_short = confirm_short_a and filter_short and warmed_up_bt
+            # 🆕 FIX: Apply rolling HTF bias filter (no lookahead)
+            htf_bull_bt = htf_bias_arr[idx] == 1
+            htf_bear_bt = htf_bias_arr[idx] == -1
+
+            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt and (not ENABLE_MTF_BIAS or htf_bull_bt)
+            sig_a_short = confirm_short_a and filter_short and warmed_up_bt and (not ENABLE_MTF_BIAS or htf_bear_bt)
             sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
 
@@ -810,22 +894,38 @@ def backtest_history(
 # =====================================================================
 
 def make_state() -> Dict:
-    """Создает начальное состояние."""
+    """Создает начальное состояние с независимыми A и U треками."""
     return {
+        # A-track state
         "a_in_long": False,
         "a_in_short": False,
         "a_long_bar": None,
         "a_short_bar": None,
+        "last_a_long_bar": None,
+        "last_a_short_bar": None,
+        # U-track state
         "u_in_long": False,
         "u_in_short": False,
         "u_long_bar": None,
         "u_short_bar": None,
-        "last_a_long_bar": None,
-        "last_a_short_bar": None,
         "last_u_long_bar": None,
         "last_u_short_bar": None,
+        # Bar tracking
         "last_bar_time": None,
         "last_processed_bar_time": None,
+        # Independent active trades per track
+        "a_active_trade": None,
+        "u_active_trade": None,
+        # Independent trade histories per track
+        "a_trade_history": [],
+        "u_trade_history": [],
+        # Bars in trade per track
+        "a_bars_in_trade": 0,
+        "u_bars_in_trade": 0,
+        # Closure notification per track
+        "a_last_closure_notified": False,
+        "u_last_closure_notified": False,
+        # Legacy fields (for backward compat with existing code)
         "active_trade": None,
         "trade_history": [],
         "bars_in_trade": 0,

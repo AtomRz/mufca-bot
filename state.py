@@ -141,10 +141,10 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
             updated = True
             break
 
-    if updated and getattr(update_signal_mae_mfe, "_counter", 0) % save_every == 0:
-        save_signals_history(history)
-
     update_signal_mae_mfe._counter = getattr(update_signal_mae_mfe, "_counter", 0) + 1
+
+    if updated and update_signal_mae_mfe._counter % save_every == 0:
+        save_signals_history(history)
 
 # =====================================================================
 # 📊  СТАТИСТИКА ПО СИГНАЛАМ
@@ -173,14 +173,16 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
     if not closed:
         return empty
 
-    # 🆕 Фильтрация по режиму, если указан
+    # 🆕 FIX: Фильтрация по режиму, если указан
+    regime_used = False
     if regime:
         regime_closed = [r for r in closed if r.get("regime", "unknown") == regime]
         if len(regime_closed) >= 5:  # Минимум 5 сигналов для режима
             closed = regime_closed
+            regime_used = True
         else:
-            # Недостаточно данных по режиму — используем все, но помечаем
-            pass
+            # Недостаточно данных по режиму — используем все (логируем)
+            logger.debug(f"[STATS] Only {len(regime_closed)} {regime} signals for {ticker} {tf} {side}, falling back to all {len(closed)} signals")
 
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
     favorable_pcts = []
@@ -202,6 +204,8 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         "std_mfe": round(float(np.std(favorable_pcts)), 2),
         "best": round(float(max(favorable_pcts)), 2),
         "worst": round(float(min(favorable_pcts)), 2),
+        "regime_applied": regime_used if regime else None,
+        "regime": regime,
     }
 
 # =====================================================================
@@ -272,7 +276,7 @@ def calculate_adaptive_tp(
     if len(closed) < 3:
         return round(fallback_tp, 4)
 
-    # 🆕 ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ
+    # 🆕 FIX: ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ (без дублирования записей)
     use_records = []
     regime_discount = 1.0
     regime_info = ""
@@ -285,12 +289,13 @@ def calculate_adaptive_tp(
             use_records = regime_records
             regime_info = f"regime={regime} ({len(regime_records)} signals)"
         elif len(regime_records) >= 5:
-            # ⚠️ Мало данных — смешиваем режим + общие с дисконтом
-            use_records = regime_records + closed
+            # ⚠️ Мало данных — смешиваем режим + НЕ-режим с дисконтом
+            non_regime = [r for r in closed if r.get("regime", "unknown") != regime]
+            use_records = regime_records + non_regime
             regime_discount = 0.85
-            regime_info = f"regime={regime} (mixed, {len(regime_records)} + {len(closed)} signals)"
+            regime_info = f"regime={regime} (mixed, {len(regime_records)} regime + {len(non_regime)} other)"
         else:
-            # ❌ Недостаточно данных — используем все
+            # ❌ Недостаточно данных — используем все с дисконтом
             use_records = closed
             regime_discount = 0.75
             regime_info = f"regime={regime} (fallback, {len(regime_records)} regime signals)"

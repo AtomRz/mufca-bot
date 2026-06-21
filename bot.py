@@ -1,5 +1,6 @@
 import asyncio
 import math
+import json
 import os
 import time
 import numpy as np
@@ -58,11 +59,52 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
 scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
 
+# 🆕 FIX: Per-ticker/tf asyncio locks to prevent race conditions
+_state_locks: Dict[str, Dict[str, asyncio.Lock]] = {}
+
+def _ensure_locks():
+    """Ensure locks exist for all tickers/timeframes."""
+    for ticker in TICKERS:
+        if ticker not in _state_locks:
+            _state_locks[ticker] = {}
+        for tf in TIMEFRAMES:
+            if tf not in _state_locks[ticker]:
+                _state_locks[ticker][tf] = asyncio.Lock()
+
+_ensure_locks()
+
+# 🆕 FIX: Module-level exchange reference (more robust than task attribute)
+_exchange_ref: Optional[ccxt.Exchange] = None
+
+# 🆕 FIX: Persisted closure notifications
+_closure_notified_file = os.path.join(DATA_DIR, "closure_notified.json")
+
+def _load_closure_notified() -> set:
+    """Load set of already-notified trade IDs."""
+    try:
+        with open(_closure_notified_file, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def _save_closure_notified(notified: set):
+    """Save notified trade IDs."""
+    try:
+        temp = _closure_notified_file + ".tmp"
+        with open(temp, "w") as f:
+            json.dump(list(notified), f)
+        os.replace(temp, _closure_notified_file)
+    except Exception as e:
+        logger.warning(f"Failed to save closure notifications: {e}")
+
+
 # =====================================================================
 # 🚀  ЗАПУСК
 # =====================================================================
 
 async def startup_sequence(exchange: ccxt.Exchange):
+    global _exchange_ref
+    _exchange_ref = exchange
     """Запуск: сначала бэктест, потом сканер."""
     logger.info("=" * 60)
     logger.info("[STARTUP] Running historical backtest to populate signal history...")
@@ -90,10 +132,11 @@ async def startup_sequence(exchange: ccxt.Exchange):
 
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                 sl, tp, risk, stats, tp_desc: str = "", df=None) -> discord.Embed:
-    is_long = "BUY" in signal_type
-    is_a_track = "Andean" in signal_type
+    is_long = "BUY" in signal_type or "LONG" in signal_type
+    is_a_track = "Andean" in signal_type or "A " in signal_type
+    is_u_track = "UT Bot" in signal_type or "U " in signal_type
     coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
-    track_emoji = "🔵" if is_a_track else "🟢"
+    track_emoji = "🔵" if is_a_track else "🟢" if is_u_track else "⚪"
     conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label = "Spot" if MARKET_MODE == "spot" else "Futures"
     ha_label = "HA" if UT_HEIKIN_ASHI else "Normal"
@@ -133,8 +176,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
             lev_adj = "+" if dir_score > 0.3 else "-" if dir_score < -0.3 else "="
             vol_text = f"{vol_flow.upper()} RV:{rel_vol:.1f}x [{lev_adj}lev]"
             embed.add_field(name=f"{vol_emoji} Volume", value=vol_text, inline=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Volume info error in build_embed: {e}")
 
     embed.add_field(name="📚 TP Source", value=tp_source, inline=False)
     if stats["count"] >= 5:
@@ -162,7 +205,7 @@ async def market_scanner():
         logger.warning(f"[WARN] Channel '{CHANNEL_NAME}' not found!")
         return
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         return
 
@@ -177,55 +220,88 @@ async def market_scanner():
         except Exception as e:
             logger.warning(f"[ONCHAIN] Refresh failed: {e}")
 
+    # 🆕 FIX: Load persisted closure notifications
+    notified_ids = _load_closure_notified()
+
     for ticker in list(TICKERS):  # копия списка — защита от мутации через !add/!remove
         for tf in TIMEFRAMES:
             try:
-                st = state[ticker][tf]
-                signals, bar_time, regime, lev = await check_signals(
-                    exchange, ticker, tf, st,
-                    onchain_bias=_onchain_bias_cache,
-                )
+                # 🆕 FIX: Use lock to prevent race with commands
+                lock = _state_locks.get(ticker, {}).get(tf)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    if ticker not in _state_locks:
+                        _state_locks[ticker] = {}
+                    _state_locks[ticker][tf] = lock
 
-                scan_stats["total_scans"] += 1
-                scan_stats["last_scan_time"] = datetime.now(timezone.utc).isoformat()
+                async with lock:
+                    st = state[ticker][tf]
+                    signals, bar_time, regime, lev = await check_signals(
+                        exchange, ticker, tf, st,
+                        onchain_bias=_onchain_bias_cache,
+                    )
 
-                if bar_time and bar_time != st["last_bar_time"]:
-                    st["last_bar_time"] = bar_time
-                    # 🆕 Fetch df for volume info
-                    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
-                    df = parse_ohlcv(bars) if bars else None
-                    for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
-                        embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
-                        try:
-                            await channel.send(embed=embed)
-                            scan_stats["signals_generated"] += 1  # ✅ ИСПРАВЛЕНО
-                        except discord.HTTPException as e:
-                            logger.error(f"Failed to send signal: {e}")
-                        logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
+                    scan_stats["total_scans"] += 1
+                    scan_stats["last_scan_time"] = datetime.now(timezone.utc).isoformat()
 
-                # Уведомление о закрытии
-                trade = st.get("active_trade")
-                if not trade and st.get("trade_history") and not st.get("last_closure_notified", False):
-                    last = st["trade_history"][-1]
-                    if last.get("exit_time"):
-                        try:
-                            exit_dt = datetime.fromisoformat(last["exit_time"])
-                            age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
-                            if age < 35:
-                                emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
-                                await channel.send(
-                                    f"{emoji} **Trade Closed** | `{ticker}` `{tf}` | "
-                                    f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
-                                    f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
-                                )
-                                st["last_closure_notified"] = True
-                        except ValueError:
-                            logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
+                    if bar_time and bar_time != st["last_bar_time"]:
+                        st["last_bar_time"] = bar_time
+                        # 🆕 Fetch df for volume info
+                        bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
+                        df = parse_ohlcv(bars) if bars else None
+                        for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
+                            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
+                            try:
+                                await channel.send(embed=embed)
+                                scan_stats["signals_generated"] += 1
+                            except discord.HTTPException as e:
+                                logger.error(f"Failed to send signal: {e}")
+                            logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
+
+                    # 🆕 FIX: Check BOTH tracks for closures independently
+                    for track in ("a", "u"):
+                        trade_key = f"{track}_active_trade"
+                        history_key = f"{track}_trade_history"
+                        notified_key = f"{track}_last_closure_notified"
+
+                        trade = st.get(trade_key)
+                        if not trade and st.get(history_key) and not st.get(notified_key, False):
+                            last = st[history_key][-1]
+                            if last.get("exit_time"):
+                                # Generate unique trade ID with track
+                                trade_id = f"{ticker}_{tf}_{track}_{last['exit_time']}"
+                                if trade_id not in notified_ids:
+                                    try:
+                                        exit_dt = datetime.fromisoformat(last["exit_time"])
+                                        age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
+                                        if age < 35:
+                                            emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
+                                            track_label = "A" if track == "a" else "U"
+                                            await channel.send(
+                                                f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                                f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                                f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                                            )
+                                            notified_ids.add(trade_id)
+                                            _save_closure_notified(notified_ids)
+                                        st[notified_key] = True
+                                    except ValueError:
+                                        logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
 
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Scanner error for {ticker} {tf}: {e}", exc_info=True)
                 await asyncio.sleep(0.5)
+
+# 🆕 FIX: CRITICAL - Task error handler to prevent silent death
+@market_scanner.error
+async def on_scanner_error(error):
+    """Handle scanner loop errors and restart if needed."""
+    logger.exception(f"[CRITICAL] Scanner loop crashed: {error}")
+    await asyncio.sleep(10)
+    if not market_scanner.is_running():
+        logger.info("[RECOVERY] Restarting scanner loop...")
+        market_scanner.restart()
 
 # =====================================================================
 # 🤖  DISCORD COMMANDS
@@ -240,8 +316,24 @@ async def on_ready():
     else:
         exchange = ccxt.gate({"enableRateLimit": True})
 
-    setattr(market_scanner, "exchange", exchange)
+    global _exchange_ref
+    _exchange_ref = exchange
     asyncio.create_task(startup_sequence(exchange))
+
+# 🆕 FIX: Global command error handler
+@bot.event
+async def on_command_error(ctx, error):
+    """Global handler for command errors."""
+    if isinstance(error, commands.CommandNotFound):
+        return  # Ignore unknown commands
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: {error.param.name}")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Bad argument: {error}")
+        return
+    logger.exception(f"Command error in {ctx.command}: {error}")
+    await ctx.send(f"❌ Command failed: {type(error).__name__}: {str(error)[:200]}")
 
 @bot.command(name="status")
 async def status_cmd(ctx):
@@ -252,18 +344,28 @@ async def status_cmd(ctx):
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
         f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{(SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
     ]
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             st = state[ticker][tf]
             last = st["last_bar_time"]
-            ts = f"<t:{int(last) // 1000}:R>" if last else "no data"
+            # 🆕 FIX: Handle both int and string timestamps
+            ts = "no data"
+            if last is not None:
+                try:
+                    ts_val = int(last)
+                    ts = f"<t:{ts_val // 1000}:R>"
+                except (ValueError, TypeError):
+                    ts = str(last)
             a_pos = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else "—"
             u_pos = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else "—"
-            trade = st.get("active_trade")
+            a_trade = st.get("a_active_trade")
+            u_trade = st.get("u_active_trade")
             trade_info = ""
-            if trade:
-                trade_info = f" | 🎯 {trade['side'].upper()} @ ${round(trade['entry'], 2)} SL:${round(trade['sl'], 2)} TP:${round(trade['tp'], 2)}"
+            if a_trade:
+                trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${round(a_trade['entry'], 2)}"
+            if u_trade:
+                trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${round(u_trade['entry'], 2)}"
 
             # 🆕 Volume info
             vol_info = ""
@@ -299,19 +401,26 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
 
     await ctx.send(f"🔍 Scanning `{ticker}` `{tf}`…")
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
-    temp_state = make_state()
-    try:
-        signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state, dry_run=True)
-    except Exception as e:
-        logger.error(f"Manual scan error: {e}", exc_info=True)
-        await ctx.send(f"❌ Scan error: {e}")
-        return
+    # 🆕 FIX: Use lock during scan command
+    if ticker not in _state_locks:
+        _state_locks[ticker] = {}
+    if tf not in _state_locks.get(ticker, {}):
+        _state_locks[ticker][tf] = asyncio.Lock()
+
+    async with _state_locks[ticker][tf]:
+        # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
+        temp_state = make_state()
+        try:
+            signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state, dry_run=True)
+        except Exception as e:
+            logger.error(f"Manual scan error: {e}", exc_info=True)
+            await ctx.send(f"❌ Scan error: {e}")
+            return
 
     # 🆕 Fetch df for volume info
     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
@@ -329,8 +438,8 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             vol_flow = vol_data["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             vol_info = f" | {vol_emoji} Vol:{vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Volume info error in build_embed: {e}")
         await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**{vol_info}")
 
 @bot.command(name="pairs")
@@ -353,7 +462,7 @@ async def add_cmd(ctx, ticker: str = ""):
         await ctx.send(f"⚠️ `{ticker}` is already in the list.")
         return
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
@@ -370,6 +479,13 @@ async def add_cmd(ctx, ticker: str = ""):
 
     TICKERS.append(ticker)
     state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
+
+    # 🆕 FIX: Ensure locks for new ticker
+    if ticker not in _state_locks:
+        _state_locks[ticker] = {}
+    for tf in TIMEFRAMES:
+        if tf not in _state_locks[ticker]:
+            _state_locks[ticker][tf] = asyncio.Lock()
 
     # ✅ ИСПРАВЛЕНО: сохраняем через функцию config
     save_tickers(TICKERS)
@@ -403,6 +519,8 @@ async def remove_cmd(ctx, ticker: str = ""):
     TICKERS.remove(ticker)
     if ticker in state:
         del state[ticker]
+    if ticker in _state_locks:
+        del _state_locks[ticker]
 
     save_tickers(TICKERS)
 
@@ -434,7 +552,8 @@ async def mode_cmd(ctx, new_mode: str = ""):
         exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     else:
         exchange = ccxt.gate({"enableRateLimit": True})
-    setattr(market_scanner, "exchange", exchange)
+    global _exchange_ref
+    _exchange_ref = exchange
 
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -500,7 +619,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
     from config import save_htf
     save_htf(HTF_BIAS)
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange:
         for ticker in TICKERS:
             for tf in TIMEFRAMES:
@@ -757,43 +876,50 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(TIMEFRAMES)}")
         return
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
 
-    try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
-        df = parse_ohlcv(bars)
-        if not validate_dataframe(df, 50):
-            await ctx.send("❌ Not enough data")
-            return
+    # 🆕 FIX: Use lock during sim
+    if ticker not in _state_locks:
+        _state_locks[ticker] = {}
+    if tf not in _state_locks.get(ticker, {}):
+        _state_locks[ticker][tf] = asyncio.Lock()
 
-        last_close = float(df["close"].iloc[-2])
-        atr14 = calculate_atr(df, ATR_PERIOD)
-        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        idx = len(df) - 2
-        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
-        stats = get_signal_stats(ticker, tf, side)
-        risk = abs(last_close - sl)
-        rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
-        tp_pct = abs(tp - last_close) / last_close * 100
+    async with _state_locks[ticker][tf]:
+        try:
+            bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+            df = parse_ohlcv(bars)
+            if not validate_dataframe(df, 50):
+                await ctx.send("❌ Not enough data")
+                return
 
-        lines = [f"**📊 Adaptive TP Preview — `{ticker}` `{tf}` {side.upper()}:**"]
-        lines.append(f"• Current price: **${round(last_close, 2):,.2f}**")
-        lines.append(f"• Stop Loss: **${round(sl, 2):,.2f}** (risk: ${round(risk, 2):,.2f})")
-        lines.append(f"• Take Profit: **${round(tp, 2):,.2f}** (+{tp_pct:.2f}%)")
-        lines.append(f"• Risk/Reward: **1:{rr}**")
-        if stats["count"] >= 5:
-            lines.append(f"• Based on **{stats['count']}** historical signals")
-            lines.append(f"• Avg MFE: **{stats['avg_mfe']:.2f}%** | Best: **{stats['best']:.2f}%**")
-        else:
-            lines.append(f"• ⚠️ Only **{stats['count']}** signals in history — using fallback R:R 2.0")
-        await ctx.send("\n".join(lines))
-    except Exception as e:
-        logger.error(f"TP command error: {e}", exc_info=True)
-        await ctx.send(f"❌ Error: {e}")
+            last_close = float(df["close"].iloc[-2])
+            atr14 = calculate_atr(df, ATR_PERIOD)
+            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+            idx = len(df) - 2
+            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            stats = get_signal_stats(ticker, tf, side)
+            risk = abs(last_close - sl)
+            rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
+            tp_pct = abs(tp - last_close) / last_close * 100
+
+            lines = [f"**📊 Adaptive TP Preview — `{ticker}` `{tf}` {side.upper()}:**"]
+            lines.append(f"• Current price: **${round(last_close, 2):,.2f}**")
+            lines.append(f"• Stop Loss: **${round(sl, 2):,.2f}** (risk: ${round(risk, 2):,.2f})")
+            lines.append(f"• Take Profit: **${round(tp, 2):,.2f}** (+{tp_pct:.2f}%)")
+            lines.append(f"• Risk/Reward: **1:{rr}**")
+            if stats["count"] >= 5:
+                lines.append(f"• Based on **{stats['count']}** historical signals")
+                lines.append(f"• Avg MFE: **{stats['avg_mfe']:.2f}%** | Best: **{stats['best']:.2f}%**")
+            else:
+                lines.append(f"• ⚠️ Only **{stats['count']}** signals in history — using fallback R:R 2.0")
+            await ctx.send("\n".join(lines))
+        except Exception as e:
+            logger.error(f"TP command error: {e}", exc_info=True)
+            await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="debug")
 async def debug_cmd(ctx):
@@ -814,7 +940,7 @@ async def debug_cmd(ctx):
     lines.append(f"• Active trades: **{active_count}**")
 
     # Volume overview
-    exchange = getattr(market_scanner, "exchange", None)  # ✅ ИСПРАВЛЕНО: была NameError
+    exchange = _exchange_ref
     lines.append("\n**📊 Volume Overview:**")
     if exchange is None:
         lines.append("• Exchange not initialized")
@@ -855,7 +981,7 @@ async def reset_cmd(ctx, confirm: str = ""):
 
     await ctx.send("🗑️ History cleared. Running fresh backtest…")
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
@@ -890,34 +1016,59 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
     await ctx.send(f"Simulating {side.upper()} signal for `{ticker}` `{tf}`…")
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
 
-    try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
-        df = parse_ohlcv(bars)
-        last_close = float(df["close"].iloc[-2])
-        atr14 = calculate_atr(df, ATR_PERIOD)
-        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        idx = len(df) - 2
-        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+    # 🆕 FIX: Use lock during sim
+    if ticker not in _state_locks:
+        _state_locks[ticker] = {}
+    if tf not in _state_locks.get(ticker, {}):
+        _state_locks[ticker][tf] = asyncio.Lock()
 
-        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
-        update_signal_record(ticker, tf, side, tp, "tp", 5)
-        stats = get_signal_stats(ticker, tf, side)
+    async with _state_locks[ticker][tf]:
+        try:
+            bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+            df = parse_ohlcv(bars)
 
-        lines = [f"✅ Simulated {side.upper()} signal recorded!"]
-        lines.append(f"• Entry: **${round(last_close, 2):,.2f}**")
-        lines.append(f"• SL: **${round(sl, 2):,.2f}**")
-        lines.append(f"• TP: **${round(tp, 2):,.2f}**")
-        lines.append(f"• History now has **{stats['count']}** closed {side} signals")
-        await ctx.send("\n".join(lines))
-    except Exception as e:
-        logger.error(f"Sim command error: {e}", exc_info=True)
-        await ctx.send(f"❌ Simulation failed: {e}")
+            last_close = float(df["close"].iloc[-2])
+
+            atr14 = calculate_atr(df, ATR_PERIOD)
+
+            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+
+            idx = len(df) - 2
+
+            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+
+            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+
+
+            add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+
+            update_signal_record(ticker, tf, side, tp, "tp", 5)
+
+            stats = get_signal_stats(ticker, tf, side)
+
+
+            lines = [f"✅ Simulated {side.upper()} signal recorded!"]
+
+            lines.append(f"• Entry: **${round(last_close, 2):,.2f}**")
+
+            lines.append(f"• SL: **${round(sl, 2):,.2f}**")
+
+            lines.append(f"• TP: **${round(tp, 2):,.2f}**")
+
+            lines.append(f"• History now has **{stats['count']}** closed {side} signals")
+
+            await ctx.send("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"Sim command error: {e}", exc_info=True)
+
+            await ctx.send(f"❌ Simulation failed: {e}")
+
 
 @bot.command(name="forcerun")
 async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
@@ -935,49 +1086,86 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
 
     await ctx.send(f"Force-running {side.upper()} signal for `{ticker}` `{tf}` (bypassing filters)…")
 
-    exchange = getattr(market_scanner, "exchange", None)
+    exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
         return
 
-    try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
-        df = parse_ohlcv(bars)
-        last_close = float(df["close"].iloc[-2])
-        atr14 = calculate_atr(df, ATR_PERIOD)
-        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        idx = len(df) - 2
-        sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-        tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
-        risk = abs(last_close - sl)
+    # 🆕 FIX: Use lock during sim
+    if ticker not in _state_locks:
+        _state_locks[ticker] = {}
+    if tf not in _state_locks.get(ticker, {}):
+        _state_locks[ticker][tf] = asyncio.Lock()
 
-        st = state.get(ticker, {}).get(tf) or make_state()
-        st["active_trade"] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
-        st["bars_in_trade"] = 0
-        state[ticker][tf] = st
-        add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
-        stats = get_signal_stats(ticker, tf, side)
+    async with _state_locks[ticker][tf]:
+        try:
+            bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
+            df = parse_ohlcv(bars)
 
-        rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
-        tp_pct = abs(tp - last_close) / last_close * 100
+            last_close = float(df["close"].iloc[-2])
 
-        embed = discord.Embed(
+            atr14 = calculate_atr(df, ATR_PERIOD)
+
+            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+
+            idx = len(df) - 2
+
+            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+
+            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+
+            risk = abs(last_close - sl)
+
+
+            st = state.get(ticker, {}).get(tf) or make_state()
+
+            st["active_trade"] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
+
+            st["bars_in_trade"] = 0
+
+            state[ticker][tf] = st
+
+            add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+
+            stats = get_signal_stats(ticker, tf, side)
+
+
+            rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
+
+            tp_pct = abs(tp - last_close) / last_close * 100
+
+
+            embed = discord.Embed(
+
             title=f"⚡ FORCE SIGNAL {'📈 LONG' if side == 'long' else '📉 SHORT'}",
             color=discord.Color.green() if side == "long" else discord.Color.red(),
-        )
-        embed.add_field(name="Pair", value=f"**{ticker}**", inline=True)
-        embed.add_field(name="TF", value=tf.upper(), inline=True)
-        embed.add_field(name="Entry", value=f"${round(last_close, 2):,.2f}", inline=True)
-        embed.add_field(name="SL", value=f"${round(sl, 2):,.2f}", inline=True)
-        embed.add_field(name="TP", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
-        embed.add_field(name="R:R", value=f"1:{rr}", inline=True)
-        embed.add_field(name="⚠️ WARNING", value="Bypassed all filters — for testing only!", inline=False)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Forcerun error: {e}", exc_info=True)
-        await ctx.send(f"❌ Force run failed: {e}")
-        import traceback
-        await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
+            )
+
+            embed.add_field(name="Pair", value=f"**{ticker}**", inline=True)
+
+            embed.add_field(name="TF", value=tf.upper(), inline=True)
+
+            embed.add_field(name="Entry", value=f"${round(last_close, 2):,.2f}", inline=True)
+
+            embed.add_field(name="SL", value=f"${round(sl, 2):,.2f}", inline=True)
+
+            embed.add_field(name="TP", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
+
+            embed.add_field(name="R:R", value=f"1:{rr}", inline=True)
+
+            embed.add_field(name="⚠️ WARNING", value="Bypassed all filters — for testing only!", inline=False)
+
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Forcerun error: {e}", exc_info=True)
+
+            await ctx.send(f"❌ Force run failed: {e}")
+
+            import traceback
+
+            await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
+
 
 @bot.command(name="onchain")
 async def onchain_cmd(ctx):

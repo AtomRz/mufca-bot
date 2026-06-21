@@ -180,7 +180,8 @@ def volume_leverage_adjustment_v3(info: Dict, side: str, base_lev: int) -> Tuple
     else:
         delta = 0
 
-    new_lev = max(1, min(10, base_lev + delta))
+    from config import MAX_ALLOWED_LEV
+    new_lev = max(1, min(MAX_ALLOWED_LEV, base_lev + delta))
 
     if delta > 0:
         return new_lev, f"VOL_CONFIRM({directional:+.2f},RV={rel_vol:.1f}): lev +{delta}->{new_lev}x"
