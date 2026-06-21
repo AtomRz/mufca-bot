@@ -10,7 +10,7 @@ import asyncio
 import aiohttp
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Any, Tuple
 
 from config import (
     ETHERSCAN_API_KEY,
@@ -35,15 +35,15 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
 # =====================================================================
 # 💾  КЭШ
 # =====================================================================
-_cache: Dict[str, Tuple[float, any]] = {}   # key -> (timestamp, data)
+_cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
 
-def _cache_get(key: str) -> Optional[any]:
+def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
     if entry and (time.time() - entry[0]) < ONCHAIN_CACHE_TTL:
         return entry[1]
     return None
 
-def _cache_set(key: str, value: any):
+def _cache_set(key: str, value: Any):
     _cache[key] = (time.time(), value)
 
 def clear_onchain_cache():
@@ -84,14 +84,13 @@ async def get_exchange_balances() -> Dict[str, Optional[float]]:
         return cached
 
     async with aiohttp.ClientSession() as session:
-        tasks = {
-            name: _fetch_eth_balance(session, addr)
-            for name, addr in EXCHANGE_ETH_ADDRESSES.items()
-        }
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        results = await asyncio.gather(
+            *[_fetch_eth_balance(session, addr) for addr in EXCHANGE_ETH_ADDRESSES.values()],
+            return_exceptions=True,
+        )
 
     balances = {}
-    for name, result in zip(tasks.keys(), results):
+    for name, result in zip(EXCHANGE_ETH_ADDRESSES.keys(), results):
         balances[name] = result if not isinstance(result, Exception) else None
 
     _cache_set("eth_balances", balances)
@@ -204,7 +203,6 @@ async def get_coingecko_data() -> Dict:
             ) as resp:
                 coins = await resp.json()
                 for coin in coins:
-                    vol_change = coin.get("total_volume", 0)
                     # CoinGecko не даёт volume_change напрямую, используем price_change как прокси
                     price_change = coin.get("price_change_percentage_24h", 0.0) or 0.0
                     if coin["id"] == "ethereum":

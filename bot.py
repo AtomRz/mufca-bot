@@ -13,6 +13,7 @@ from typing import Optional, Dict
 
 import ccxt
 
+import config as _cfg
 from config import (
     DISCORD_TOKEN,
     CHANNEL_NAME,
@@ -26,8 +27,6 @@ from config import (
     MIN_TP_PCT,
     MAX_TP_PCT,
     MAX_HOLD_BARS,
-    UT_HEIKIN_ASHI,
-    HTF_BIAS,
     MARKET_MODE,
     CHOP_THRESHOLD,
     PAIRS_FILE,
@@ -103,9 +102,9 @@ def _save_closure_notified(notified: set):
 # =====================================================================
 
 async def startup_sequence(exchange: ccxt.Exchange):
+    """Запуск: сначала бэктест, потом сканер."""
     global _exchange_ref
     _exchange_ref = exchange
-    """Запуск: сначала бэктест, потом сканер."""
     logger.info("=" * 60)
     logger.info("[STARTUP] Running historical backtest to populate signal history...")
     logger.info("=" * 60)
@@ -139,7 +138,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     track_emoji = "🔵" if is_a_track else "🟢" if is_u_track else "⚪"
     conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label = "Spot" if MARKET_MODE == "spot" else "Futures"
-    ha_label = "HA" if UT_HEIKIN_ASHI else "Normal"
+    ha_label = "HA" if _cfg.UT_HEIKIN_ASHI else "Normal"
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
     tp_pct = abs(tp - price) / price * 100
 
@@ -155,7 +154,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="📈 Pair", value=f"**{ticker}**", inline=True)
     embed.add_field(name="⏱ TF", value=tf.upper(), inline=True)
     embed.add_field(name=f"{track_emoji} Track", value=signal_type.strip(), inline=True)
-    embed.add_field(name="🧬 HTF Bias", value=f"✅ {HTF_BIAS.upper()} FRAMA confirmed", inline=True)
+    embed.add_field(name="🧬 HTF Bias", value=f"✅ {_cfg.HTF_BIAS.upper()} FRAMA confirmed", inline=True)
     embed.add_field(name="💵 Entry", value=f"${round(price, 2):,.2f}", inline=True)
     embed.add_field(name="🛑 Stop Loss", value=f"${round(sl, 2):,.2f}", inline=True)
     embed.add_field(name="🎯 Take Profit", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
@@ -163,7 +162,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⚙️ Regime", value=regime, inline=True)
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
-    embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
+    embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if _cfg.UT_HEIKIN_ASHI else '❌'}", inline=True)
     # 🆕 Volume info (display only, not a filter)
     if df is not None:
         try:
@@ -186,7 +185,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                         inline=False)
     if tp_desc:
         embed.add_field(name="🧠 TP Logic", value=tp_desc, inline=False)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.1 • Gate.io {mode_label} • HTF:{HTF_BIAS.upper()} • UT:{ha_label}")
+    embed.set_footer(text=f"MUFCA [AtomDC] v3.1 • Gate.io {mode_label} • HTF:{_cfg.HTF_BIAS.upper()} • UT:{ha_label}")
     return embed
 
 # =====================================================================
@@ -337,10 +336,10 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="status")
 async def status_cmd(ctx):
-    ha_status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
+    ha_status = "✅ ON" if _cfg.UT_HEIKIN_ASHI else "❌ OFF"
     lines = [
         f"**MUFCA v3.1 — Scanner Status**\n",
-        f"🧬 HTF Bias: **{HTF_BIAS.upper()}**\n",
+        f"🧬 HTF Bias: **{_cfg.HTF_BIAS.upper()}**\n",
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
         f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{(SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
     ]
@@ -975,9 +974,15 @@ async def reset_cmd(ctx, confirm: str = ""):
 
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            state[ticker][tf]["trade_history"] = []
-            state[ticker][tf]["active_trade"] = None
-            state[ticker][tf]["bars_in_trade"] = 0
+            state[ticker][tf]["trade_history"]       = []
+            state[ticker][tf]["a_trade_history"]     = []
+            state[ticker][tf]["u_trade_history"]     = []
+            state[ticker][tf]["active_trade"]        = None
+            state[ticker][tf]["a_active_trade"]      = None
+            state[ticker][tf]["u_active_trade"]      = None
+            state[ticker][tf]["bars_in_trade"]       = 0
+            state[ticker][tf]["a_bars_in_trade"]     = 0
+            state[ticker][tf]["u_bars_in_trade"]     = 0
 
     await ctx.send("🗑️ History cleared. Running fresh backtest…")
 

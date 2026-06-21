@@ -418,7 +418,7 @@ async def check_signals(
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
         def cooldown_ok(last_bar):
-            return last_bar is None or (bar_idx - last_bar) >= COOLDOWN_BARS
+            return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
 
         a_long_cd_ok = cooldown_ok(state["last_a_long_bar"])
         a_short_cd_ok = cooldown_ok(state["last_a_short_bar"])
@@ -734,6 +734,11 @@ def backtest_history(
 
                     htf_idx = 0
                     for i in range(len(df)):
+                        # Если LTF бар раньше первого HTF бара — bias неизвестен
+                        if htf_times[0] > ltf_times[i]:
+                            htf_bias_arr[i] = 0
+                            continue
+
                         # Advance htf_idx while next HTF bar is still <= current LTF time
                         while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] <= ltf_times[i]:
                             htf_idx += 1
