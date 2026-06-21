@@ -308,7 +308,7 @@ async def on_scanner_error(error):
 
 @bot.event
 async def on_ready():
-    logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
+    logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {_cfg.HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
 
     if MARKET_MODE == "futures":
         exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
@@ -596,9 +596,8 @@ async def utha_cmd(ctx, arg: str = ""):
 
 @bot.command(name="htf")
 async def htf_cmd(ctx, new_htf: str = ""):
-    global HTF_BIAS
     if not new_htf:
-        await ctx.send(f"🧬 Current HTF Bias: **{HTF_BIAS.upper()}**\n"
+        await ctx.send(f"🧬 Current HTF Bias: **{_cfg.HTF_BIAS.upper()}**\n"
                        f"Available: `1d`, `4h`, `1h`, `1w`\n"
                        f"To change: `!htf 4h`")
         return
@@ -609,14 +608,14 @@ async def htf_cmd(ctx, new_htf: str = ""):
         await ctx.send(f"❌ Valid HTF values: {', '.join(valid_htfs)}")
         return
 
-    if new_htf == HTF_BIAS:
-        await ctx.send(f"⚠️ HTF Bias is already **{HTF_BIAS.upper()}**.")
+    if new_htf == _cfg.HTF_BIAS:
+        await ctx.send(f"⚠️ HTF Bias is already **{_cfg.HTF_BIAS.upper()}**.")
         return
 
-    old_htf = HTF_BIAS
-    HTF_BIAS = new_htf
+    old_htf = _cfg.HTF_BIAS
+    _cfg.HTF_BIAS = new_htf
     from config import save_htf
-    save_htf(HTF_BIAS)
+    save_htf(_cfg.HTF_BIAS)
 
     exchange = _exchange_ref
     if exchange:
@@ -632,7 +631,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
                     pass
                 state[ticker][tf] = st
 
-    await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{HTF_BIAS.upper()}**\n"
+    await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{_cfg.HTF_BIAS.upper()}**\n"
                    f"⚠️ Position states have been reset.")
 
 @bot.command(name="tpconfig")
