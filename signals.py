@@ -47,8 +47,11 @@ from indicators import (
 )
 from volume_indicators import (
     volume_filter,
+    volume_filter_v2,
     volume_flow_signal,
+    volume_flow_signal_v2,
     volume_leverage_adjustment,
+    volume_leverage_adjustment_v2,
 )
 from state import (
     load_signals_history,
@@ -286,9 +289,9 @@ async def check_signals(
         # Режим
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
-        # 🆕 Volume filter (regime-aware)
-        vol_passed_long, vol_reason_long = volume_filter(df, "long", regime)
-        vol_passed_short, vol_reason_short = volume_filter(df, "short", regime)
+        # 🆕 Volume filter v2 (regime-aware with relative volume)
+        vol_passed_long, vol_reason_long, vol_info_long = volume_filter_v2(df, "long", regime)
+        vol_passed_short, vol_reason_short, vol_info_short = volume_filter_v2(df, "short", regime)
 
         filter_long = (
             frama_bull and chop_ok and atr_ok and slope_long
@@ -304,12 +307,6 @@ async def check_signals(
             and not liq_sweep_long
             and vol_passed_short
         )
-
-        # 🆕 Log volume filter rejections for debugging
-        if not vol_passed_long and (mfi_bull_sig or and_bull_sig or bool(ut_buy.iloc[idx])):
-            logger.info(f"[VOLUME] {ticker} {timeframe} LONG rejected: {vol_reason_long}")
-        if not vol_passed_short and (mfi_bear_sig or and_bear_sig or bool(ut_sell.iloc[idx])):
-            logger.info(f"[VOLUME] {ticker} {timeframe} SHORT rejected: {vol_reason_short}")
 
         # Сигналы
         def crossover(s, lvl, i):
@@ -418,13 +415,13 @@ async def check_signals(
         if regime == "TREND":
             sugg_lev = min(MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
 
-        # 🆕 Volume-based leverage adjustment
+        # 🆕 Volume-based leverage adjustment v2
         if (sig_a_long or sig_u_long):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v2(
                 df, regime, sugg_lev, "long"
             )
         elif (sig_a_short or sig_u_short):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment(
+            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v2(
                 df, regime, sugg_lev, "short"
             )
 
@@ -600,9 +597,9 @@ def backtest_history(
             # Режим для бэктеста
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
-            # 🆕 Volume filter для бэктеста (regime-aware)
-            vol_passed_long, _ = volume_filter(df.iloc[:idx+1], "long", bt_regime)
-            vol_passed_short, _ = volume_filter(df.iloc[:idx+1], "short", bt_regime)
+            # 🆕 Volume filter v2 для бэктеста (regime-aware)
+            vol_passed_long, _, _ = volume_filter_v2(df.iloc[:idx+1], "long", bt_regime)
+            vol_passed_short, _, _ = volume_filter_v2(df.iloc[:idx+1], "short", bt_regime)
 
             filter_long = (
                 frama_bull and chop_ok and atr_ok and slope_long
