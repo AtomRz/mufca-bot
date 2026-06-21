@@ -1,102 +1,83 @@
 import pandas as pd
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Dict
 
 # =====================================================================
-# 📊  VOLUME FLOW INDICATORS v2 — Relative Volume + OBV Momentum
+# 📊  VOLUME FLOW INDICATORS v3 — Score-Based (Confidence & Leverage)
 # =====================================================================
 
 def calculate_obv(df: pd.DataFrame) -> pd.Series:
-    """
-    On-Balance Volume (OBV).
-    """
+    """On-Balance Volume."""
     price_change = df["close"].diff()
     sign = np.sign(price_change)
     signed_volume = sign * df["volume"]
-    obv = signed_volume.fillna(0).cumsum()
-    return obv
+    return signed_volume.fillna(0).cumsum()
 
 
 def calculate_obv_ema(obv: pd.Series, period: int = 20) -> pd.Series:
-    """EMA of OBV for smoothing."""
     return obv.ewm(span=period, adjust=False).mean()
 
 
 def calculate_relative_volume(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """
-    Relative Volume = current volume / SMA(volume, period).
-    > 1.5 = high volume, < 0.7 = low volume.
-    """
+    """Relative Volume = current / SMA(volume, period)."""
     vol_sma = df["volume"].rolling(window=period).mean()
     return df["volume"] / (vol_sma + 1e-12)
 
 
 def calculate_volume_delta(df: pd.DataFrame) -> pd.Series:
     """
-    Volume Delta — оценка buying/selling pressure через позицию close внутри бара.
-
-    close near high = buying pressure (+)
-    close near low = selling pressure (-)
+    Volume Delta — buying/selling pressure via close location in bar.
+    close near high = +pressure, close near low = -pressure.
     """
     range_ = df["high"] - df["low"]
-    # Where in the range did close finish? 0 = at low, 1 = at high
     close_loc = (df["close"] - df["low"]) / (range_ + 1e-12)
-    # Map to [-1, 1]: -1 = sold at lows, +1 = bought at highs
     pressure = (close_loc - 0.5) * 2.0
     return pressure * df["volume"]
 
 
-def calculate_volume_delta_ema(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """EMA of Volume Delta."""
-    delta = calculate_volume_delta(df)
-    return delta.ewm(span=period, adjust=False).mean()
-
-
-def volume_flow_signal_v2(df: pd.DataFrame, obv_period: int = 20) -> dict:
+def volume_flow_signal_v3(df: pd.DataFrame, obv_period: int = 20) -> Dict:
     """
-    Комплексный анализ объёма v2.
+    Комплексный анализ объёма v3.
 
     Returns dict:
         - flow: "inflow" | "outflow" | "neutral"
-        - strength: 0.0-1.0 (сила сигнала)
-        - rel_vol: относительный объём
-        - obv_mom: моментум OBV (изменение за 5 баров)
-        - delta_trend: направление volume delta
+        - score: -1.0 to +1.0 (composite volume score)
+        - rel_vol: relative volume
+        - obv_mom: OBV momentum % (5 bars)
+        - delta_trend: volume delta trend
+        - strength: 0.0-1.0
     """
     if len(df) < obv_period + 10:
         return {
             "flow": "neutral",
-            "strength": 0.0,
+            "score": 0.0,
             "rel_vol": 1.0,
             "obv_mom": 0.0,
             "delta_trend": "neutral",
+            "strength": 0.0,
             "reason": "insufficient data"
         }
 
-    # 1. OBV Flow (classic)
+    # 1. OBV Flow
     obv = calculate_obv(df)
     obv_ema = calculate_obv_ema(obv, obv_period)
     current_obv = obv.iloc[-1]
     current_ema = obv_ema.iloc[-1]
 
-    if pd.isna(current_obv) or pd.isna(current_ema) or current_ema == 0:
-        obv_flow = "neutral"
-        obv_strength = 0.0
-    elif current_obv > current_ema * 1.02:
-        obv_flow = "inflow"
-        obv_strength = min(1.0, (current_obv / current_ema - 1.02) / 0.1)
-    elif current_obv < current_ema * 0.98:
-        obv_flow = "outflow"
-        obv_strength = min(1.0, (0.98 - current_obv / current_ema) / 0.1)
-    else:
-        obv_flow = "neutral"
-        obv_strength = 0.0
+    obv_score = 0.0
+    if not (pd.isna(current_obv) or pd.isna(current_ema) or current_ema == 0):
+        obv_ratio = current_obv / current_ema
+        if obv_ratio > 1.02:
+            obv_score = min(1.0, (obv_ratio - 1.02) / 0.08)
+        elif obv_ratio < 0.98:
+            obv_score = max(-1.0, (obv_ratio - 0.98) / 0.08)
 
-    # 2. OBV Momentum (изменение за 5 баров — более актуально чем уровень)
+    # 2. OBV Momentum (5 bars)
     obv_mom = (obv.iloc[-1] - obv.iloc[-6]) / (abs(obv.iloc[-6]) + 1e-12) * 100
+    mom_score = np.clip(obv_mom / 10, -0.5, 0.5)
 
     # 3. Relative Volume
-    rel_vol = calculate_relative_volume(df, obv_period).iloc[-1]
+    rel_vol = float(calculate_relative_volume(df, obv_period).iloc[-1])
 
     # 4. Volume Delta Trend
     delta = calculate_volume_delta(df)
@@ -104,174 +85,164 @@ def volume_flow_signal_v2(df: pd.DataFrame, obv_period: int = 20) -> dict:
     current_delta = delta.iloc[-1]
     current_delta_ema = delta_ema.iloc[-1]
 
-    if pd.isna(current_delta) or pd.isna(current_delta_ema):
-        delta_trend = "neutral"
-    elif current_delta > current_delta_ema * 1.05:
-        delta_trend = "inflow"
-    elif current_delta < current_delta_ema * 0.95:
-        delta_trend = "outflow"
+    delta_score = 0.0
+    if not (pd.isna(current_delta) or pd.isna(current_delta_ema)):
+        if current_delta > current_delta_ema * 1.05:
+            delta_score = 0.3
+        elif current_delta < current_delta_ema * 0.95:
+            delta_score = -0.3
+
+    # Combined score: OBV 40%, momentum 30%, delta 30%
+    score = 0.4 * obv_score + 0.3 * mom_score + 0.3 * delta_score
+
+    # Rel_vol multiplier: high volume amplifies signal, low volume dampens
+    if rel_vol >= 1.5:
+        vol_mult = 1.2
+    elif rel_vol >= 1.0:
+        vol_mult = 1.0
+    elif rel_vol >= 0.7:
+        vol_mult = 0.8
     else:
-        delta_trend = "neutral"
+        vol_mult = 0.5  # Low volume = weak signal
 
-    # 5. Combined flow (взвешенное)
-    # OBV flow: 40%, OBV mom: 30%, Delta trend: 30%
-    if obv_flow == "inflow":
-        score = 0.4 * obv_strength
-    elif obv_flow == "outflow":
-        score = -0.4 * obv_strength
+    score *= vol_mult
+    score = float(np.clip(score, -1.0, 1.0))
+
+    if score > 0.2:
+        flow = "inflow"
+    elif score < -0.2:
+        flow = "outflow"
     else:
-        score = 0.0
-
-    # OBV momentum contribution
-    if obv_mom > 2:
-        score += 0.3 * min(1.0, obv_mom / 10)
-    elif obv_mom < -2:
-        score -= 0.3 * min(1.0, abs(obv_mom) / 10)
-
-    # Delta trend contribution
-    if delta_trend == "inflow":
-        score += 0.3
-    elif delta_trend == "outflow":
-        score -= 0.3
-
-    # Final classification
-    if score > 0.25:
-        final_flow = "inflow"
-    elif score < -0.25:
-        final_flow = "outflow"
-    else:
-        final_flow = "neutral"
-
-    strength = min(1.0, abs(score))
+        flow = "neutral"
 
     return {
-        "flow": final_flow,
-        "strength": round(strength, 2),
-        "rel_vol": round(float(rel_vol), 2),
+        "flow": flow,
+        "score": round(score, 3),
+        "rel_vol": round(rel_vol, 2),
         "obv_mom": round(float(obv_mom), 2),
-        "delta_trend": delta_trend,
-        "reason": f"OBV:{obv_flow}({obv_strength:.2f})|mom:{obv_mom:.1f}|delta:{delta_trend}|relvol:{rel_vol:.2f}"
+        "delta_trend": "inflow" if delta_score > 0 else "outflow" if delta_score < 0 else "neutral",
+        "strength": round(abs(score), 2),
+        "reason": f"score={score:.2f}|RV={rel_vol:.1f}|OBV={obv_score:.2f}|mom={mom_score:.2f}|delta={delta_score:.2f}"
     }
 
 
-def volume_confirm_v2(df: pd.DataFrame, side: str, obv_period: int = 20) -> Tuple[bool, dict]:
+def volume_score_for_side(info: Dict, side: str) -> float:
     """
-    Проверяет, подтверждает ли объём направление сигнала v2.
+    Преобразует volume score в directional score для стороны сигнала.
 
-    Returns: (confirmed: bool, info: dict)
+    LONG:  положительный score = хорошо (покупатели)
+    SHORT: отрицательный score = хорошо (продавцы)
+
+    Returns: -1.0 to +1.0 where +1 = perfect alignment
     """
-    info = volume_flow_signal_v2(df, obv_period)
-    flow = info["flow"]
-
+    score = info["score"]
     if side == "long":
-        confirmed = flow == "inflow"
+        return score  # Positive = inflow = good for long
     else:
-        confirmed = flow == "outflow"
-
-    return confirmed, info
+        return -score  # Negative = outflow = good for short
 
 
-def volume_filter_v2(df: pd.DataFrame, side: str, regime: str,
-                     obv_period: int = 20) -> Tuple[bool, str, dict]:
+def volume_confidence_adjustment(info: Dict, side: str) -> int:
     """
-    Volume Filter v2 — regime-aware с градациями.
+    Корректировка confidence на основе объёма.
 
-    Returns: (passed: bool, reason: str, info: dict)
+    Returns: delta to add to confidence score (-15 to +15)
     """
-    info = volume_flow_signal_v2(df, obv_period)
-    flow = info["flow"]
-    strength = info["strength"]
+    directional = volume_score_for_side(info, side)
+
+    # Map -1..+1 to -15..+15 confidence points
+    return int(round(directional * 15))
+
+
+def volume_leverage_adjustment_v3(info: Dict, side: str, base_lev: int) -> Tuple[int, str]:
+    """
+    Корректировка leverage на основе объёма.
+
+    Returns: (adjusted_lev, reason)
+    """
+    directional = volume_score_for_side(info, side)
     rel_vol = info["rel_vol"]
 
-    # Режим CHAOS — игнорируем объём
-    if regime == "CHAOS":
-        return True, "CHAOS: volume ignored", info
-
-    # Низкий объём — всегда подозрительно
+    # Critical low volume — always reduce significantly
     if rel_vol < 0.5:
-        return False, f"LOW_VOLUME: rel_vol={rel_vol:.2f} (too thin)", info
+        new_lev = max(1, int(base_lev * 0.5))
+        return new_lev, f"LOW_VOL(RV={rel_vol:.1f}): lev {base_lev}->{new_lev}x"
 
-    confirmed, _ = volume_confirm_v2(df, side, obv_period)
+    # Volume score adjustment
+    if directional > 0.5 and rel_vol > 1.2:
+        delta = +2
+    elif directional > 0.2 and rel_vol > 0.8:
+        delta = +1
+    elif directional < -0.5:
+        delta = -2
+    elif directional < -0.2:
+        delta = -1
+    else:
+        delta = 0
 
-    if regime == "TREND":
-        # В тренде — мягче. Даже divergence на сильном объёме может быть OK
-        if confirmed:
-            return True, f"TREND: volume confirmed ({flow}, strength={strength})", info
-        elif strength < 0.3 and rel_vol > 1.0:
-            # Слабая divergence на высоком объёме — допустимо
-            return True, f"TREND: weak divergence accepted (strength={strength}, rel_vol={rel_vol})", info
-        else:
-            return False, f"TREND: strong divergence rejected ({flow} vs {side}, strength={strength})", info
+    new_lev = max(1, min(10, base_lev + delta))
 
-    else:  # NORMAL
-        if flow == "neutral":
-            return True, f"NORMAL: neutral volume (rel_vol={rel_vol})", info
-        elif confirmed:
-            return True, f"NORMAL: confirmed ({flow}, strength={strength})", info
-        elif strength < 0.4 and rel_vol > 0.8:
-            # Умеренная divergence на нормальном объёме
-            return True, f"NORMAL: moderate divergence accepted", info
-        else:
-            return False, f"NORMAL: divergence rejected ({flow} vs {side}, strength={strength})", info
+    if delta > 0:
+        return new_lev, f"VOL_CONFIRM({directional:+.2f},RV={rel_vol:.1f}): lev +{delta}->{new_lev}x"
+    elif delta < 0:
+        return new_lev, f"VOL_WARN({directional:+.2f},RV={rel_vol:.1f}): lev {delta}->{new_lev}x"
+    else:
+        return new_lev, f"VOL_NEUTRAL: lev unchanged {new_lev}x"
 
 
-def volume_leverage_adjustment_v2(df: pd.DataFrame, regime: str,
-                                  base_lev: int, side: str,
-                                  obv_period: int = 20) -> Tuple[int, str]:
+def volume_filter_v3(df: pd.DataFrame, side: str, regime: str,
+                     obv_period: int = 20) -> Tuple[bool, str, Dict]:
     """
-    Корректирует leverage на основе объёма v2.
+    Volume Filter v3 — score-based, almost never rejects.
+
+    Returns: (passed, reason, info)
+    passed is almost always True except critical conditions.
     """
-    info = volume_flow_signal_v2(df, obv_period)
-    flow = info["flow"]
-    strength = info["strength"]
+    info = volume_flow_signal_v3(df, obv_period)
     rel_vol = info["rel_vol"]
-    confirmed, _ = volume_confirm_v2(df, side, obv_period)
+    score = info["score"]
+
+    # Only hard reject: critically low volume (manipulation risk)
+    if rel_vol < 0.3:
+        return False, f"CRITICAL_LOW_VOL(RV={rel_vol:.2f}): reject", info
+
+    # Regime context
+    directional = volume_score_for_side(info, side)
 
     if regime == "CHAOS":
-        return max(1, int(base_lev * 0.6)), f"CHAOS: lev reduced to {max(1, int(base_lev * 0.6))}x"
+        return True, f"CHAOS: vol ignored (score={directional:+.2f})", info
 
-    if confirmed and rel_vol > 1.2 and strength > 0.5:
-        # Сильное подтверждение на высоком объёме
-        new_lev = min(base_lev + 2, 10)
-        return new_lev, f"STRONG_CONFIRM: lev +2 -> {new_lev}x"
-    elif confirmed and rel_vol > 0.8:
-        new_lev = min(base_lev + 1, 10)
-        return new_lev, f"CONFIRM: lev +1 -> {new_lev}x"
-    elif not confirmed and strength > 0.5:
-        # Сильная divergence
-        new_lev = max(1, int(base_lev * 0.6))
-        return new_lev, f"STRONG_DIV: lev -40% -> {new_lev}x"
-    elif not confirmed:
-        new_lev = max(1, int(base_lev * 0.8))
-        return new_lev, f"DIV: lev -20% -> {new_lev}x"
+    # All other cases: PASS with scoring info
+    if directional > 0.3:
+        return True, f"VOL_ALIGN({directional:+.2f},RV={rel_vol:.1f}): pass", info
+    elif directional < -0.3:
+        return True, f"VOL_MISALIGN({directional:+.2f},RV={rel_vol:.1f}): pass", info
     else:
-        return base_lev, f"NEUTRAL: lev unchanged"
+        return True, f"VOL_NEUTRAL({directional:+.2f},RV={rel_vol:.1f}): pass", info
 
 
 # =====================================================================
-# 🔄  BACKWARD COMPATIBILITY (v1 API)
+# 🔄  BACKWARD COMPATIBILITY
 # =====================================================================
 
 def volume_flow_signal(df: pd.DataFrame, obv_period: int = 20) -> str:
-    """Backward compatible — returns just the flow string."""
-    return volume_flow_signal_v2(df, obv_period)["flow"]
+    return volume_flow_signal_v3(df, obv_period)["flow"]
 
 
 def volume_confirm(df: pd.DataFrame, side: str, obv_period: int = 20) -> bool:
-    """Backward compatible."""
-    confirmed, _ = volume_confirm_v2(df, side, obv_period)
-    return confirmed
+    info = volume_flow_signal_v3(df, obv_period)
+    directional = volume_score_for_side(info, side)
+    return directional > 0.1  # Soft threshold for backward compat
 
 
 def volume_filter(df: pd.DataFrame, side: str, regime: str,
                   obv_period: int = 20) -> Tuple[bool, str]:
-    """Backward compatible — returns (passed, reason)."""
-    passed, reason, _ = volume_filter_v2(df, side, regime, obv_period)
+    passed, reason, _ = volume_filter_v3(df, side, regime, obv_period)
     return passed, reason
 
 
 def volume_leverage_adjustment(df: pd.DataFrame, regime: str,
                                base_lev: int, side: str,
                                obv_period: int = 20) -> Tuple[int, str]:
-    """Backward compatible."""
-    return volume_leverage_adjustment_v2(df, regime, base_lev, side, obv_period)
+    info = volume_flow_signal_v3(df, obv_period)
+    return volume_leverage_adjustment_v3(info, side, base_lev)

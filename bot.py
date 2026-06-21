@@ -37,7 +37,7 @@ from config import (
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
-from volume_indicators import volume_flow_signal, volume_flow_signal_v2
+from volume_indicators import volume_flow_signal, volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record
 
@@ -118,17 +118,18 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
     embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if UT_HEIKIN_ASHI else '❌'}", inline=True)
-    # 🆕 Volume Flow info v2
+    # 🆕 Volume Flow info v3
     if df is not None:
         try:
-            vol_info = volume_flow_signal_v2(df)
+            vol_info = volume_flow_signal_v3(df)
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             rel_vol = vol_info["rel_vol"]
-            strength = vol_info["strength"]
-            obv_mom = vol_info["obv_mom"]
-            vol_text = f"{vol_flow.upper()} | RV:{rel_vol:.1f}x | S:{strength:.0%} | M:{obv_mom:+.1f}%"
-            embed.add_field(name=f"{vol_emoji} Volume Flow", value=vol_text, inline=True)
+            score = vol_info["score"]
+            is_long = "BUY" in signal_type or "LONG" in signal_type
+            dir_score = volume_score_for_side(vol_info, "long" if is_long else "short")
+            vol_text = f"{vol_flow.upper()} | RV:{rel_vol:.1f}x | Score:{dir_score:+.2f}"
+            embed.add_field(name=f"{vol_emoji} Volume", value=vol_text, inline=True)
         except Exception:
             pass
 
@@ -243,7 +244,7 @@ async def status_cmd(ctx):
             if trade:
                 trade_info = f" | 🎯 {trade['side'].upper()} @ ${round(trade['entry'], 2)} SL:${round(trade['sl'], 2)} TP:${round(trade['tp'], 2)}"
 
-            # 🆕 Volume Flow status v2
+            # 🆕 Volume Flow status v3
             vol_info = ""
             if exchange:
                 try:
@@ -251,7 +252,7 @@ async def status_cmd(ctx):
                     if bars and len(bars) >= 25:
                         from utils import parse_ohlcv
                         df_v = parse_ohlcv(bars)
-                        vol_data = volume_flow_signal_v2(df_v)
+                        vol_data = volume_flow_signal_v3(df_v)
                         vol_flow = vol_data["flow"]
                         vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
                         vol_info = f" | {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x"
@@ -303,10 +304,10 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         # 🆕 Show volume flow even when no signal
         vol_info = ""
         try:
-            vol_info_data = volume_flow_signal_v2(df)
-            vol_flow = vol_info_data["flow"]
+            vol_data = volume_flow_signal_v3(df)
+            vol_flow = vol_data["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-            vol_info = f" | {vol_emoji} Vol:{vol_flow.upper()} RV:{vol_info_data['rel_vol']:.1f}x"
+            vol_info = f" | {vol_emoji} Vol:{vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x"
         except Exception:
             pass
         await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**{vol_info}")
@@ -769,12 +770,14 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         else:
             lines.append(f"• ⚠️ Only **{stats['count']}** signals in history — using fallback R:R 2.0")
 
-        # 🆕 Volume Flow info v2
+        # 🆕 Volume Flow info v3
         try:
-            vol_info = volume_flow_signal_v2(df)
+            vol_info = volume_flow_signal_v3(df)
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-            lines.append(f"• {vol_emoji} Volume: **{vol_flow.upper()}** | RV:{vol_info['rel_vol']:.1f}x | Strength:{vol_info['strength']:.0%}")
+            dir_score = volume_score_for_side(vol_info, side)
+            conf_adj = int(round(dir_score * 15))
+            lines.append(f"• {vol_emoji} Volume: **{vol_flow.upper()}** | RV:{vol_info['rel_vol']:.1f}x | Score:{dir_score:+.2f} | Conf:{conf_adj:+d}")
         except Exception:
             pass
 
@@ -801,7 +804,7 @@ async def debug_cmd(ctx):
     active_count = sum(1 for t in TICKERS for tf in TIMEFRAMES if state[t][tf].get("active_trade"))
     lines.append(f"• Active trades: **{active_count}**")
 
-    # 🆕 Volume Flow overview v2
+    # 🆕 Volume Flow overview v3
     lines.append("\n**📊 Volume Flow Overview:**")
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
@@ -810,10 +813,10 @@ async def debug_cmd(ctx):
                 if bars and len(bars) >= 25:
                     from utils import parse_ohlcv
                     df_d = parse_ohlcv(bars)
-                    vol_data = volume_flow_signal_v2(df_d)
+                    vol_data = volume_flow_signal_v3(df_d)
                     vol_flow = vol_data["flow"]
                     vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-                    lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x S:{vol_data['strength']:.0%}")
+                    lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x Score:{vol_data['score']:+.2f}")
             except Exception:
                 pass
 
