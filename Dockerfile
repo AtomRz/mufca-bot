@@ -14,8 +14,9 @@ COPY signals.py .
 COPY state.py .
 COPY indicators.py .
 COPY utils.py .
+COPY volume_indicators.py .
 
-# Директория для данных (pairs.json, mode.json, signals_history.json и т.д.)
+# Директория для данных
 RUN mkdir -p /app/data
 
 # Запуск
