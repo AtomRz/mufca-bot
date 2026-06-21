@@ -33,6 +33,10 @@ from config import (
     HTF_CACHE_TTL_SECONDS,
     MARKET_MODE,
     SIGNAL_HISTORY_LIMIT,
+    ENABLE_FRAMA_FILTER,
+    ENABLE_CHOP_FILTER,
+    ENABLE_ATR_FILTER,
+    ENABLE_MTF_BIAS,
 )
 # UT_HEIKIN_ASHI и HTF_BIAS читаются через _cfg.UT_HEIKIN_ASHI / _cfg.HTF_BIAS
 # чтобы видеть актуальное значение после !utha / !htf без перезапуска бота
@@ -298,15 +302,24 @@ async def check_signals(
         vol_info = volume_flow_signal_v3(df)
         vol_lev_reason = "no signal"
 
+        # warmed_up: зеркало Pine Script `bar_index >= mfi_training`
+        warmed_up = len(df) >= MFI_TRAINING
+
         filter_long = (
-            frama_bull and chop_ok and atr_ok and slope_long
-            and htf_bull
+            (not ENABLE_FRAMA_FILTER or frama_bull)
+            and (not ENABLE_CHOP_FILTER  or chop_ok)
+            and (not ENABLE_ATR_FILTER   or atr_ok)
+            and slope_long
+            and (not ENABLE_MTF_BIAS     or htf_bull)
             and not fake_break_long
             and not liq_sweep_short
         )
         filter_short = (
-            frama_bear and chop_ok and atr_ok and slope_short
-            and htf_bear
+            (not ENABLE_FRAMA_FILTER or frama_bear)
+            and (not ENABLE_CHOP_FILTER  or chop_ok)
+            and (not ENABLE_ATR_FILTER   or atr_ok)
+            and slope_short
+            and (not ENABLE_MTF_BIAS     or htf_bear)
             and not fake_break_short
             and not liq_sweep_long
         )
@@ -380,9 +393,9 @@ async def check_signals(
         a_in_pos = state["a_in_long"] or state["a_in_short"]
         u_in_pos = state["u_in_long"] or state["u_in_short"]
 
-        sig_a_long = confirm_long_a and filter_long and not a_in_pos and a_long_cd_ok
-        sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok
-        sig_u_long = bool(ut_buy.iloc[idx]) and filter_long and not u_in_pos and u_long_cd_ok and is_new_bar
+        sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok  and warmed_up
+        sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok and warmed_up
+        sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
         # Обновляем состояния
@@ -604,18 +617,27 @@ def backtest_history(
 
             # 🆕 Volume filter для бэктеста (regime-aware)
 
+            # warmed_up: зеркало Pine Script `bar_index >= mfi_training`
+            warmed_up_bt = idx >= MFI_TRAINING
+
             filter_long = (
-                frama_bull and chop_ok and atr_ok and slope_long
+                (not ENABLE_FRAMA_FILTER or frama_bull)
+                and (not ENABLE_CHOP_FILTER  or chop_ok)
+                and (not ENABLE_ATR_FILTER   or atr_ok)
+                and slope_long
                 and not fake_break_long
                 and not liq_sweep_short
             )
             filter_short = (
-                frama_bear and chop_ok and atr_ok and slope_short
+                (not ENABLE_FRAMA_FILTER or frama_bear)
+                and (not ENABLE_CHOP_FILTER  or chop_ok)
+                and (not ENABLE_ATR_FILTER   or atr_ok)
+                and slope_short
                 and not fake_break_short
                 and not liq_sweep_long
             )
 
-            # Сигналы (упрощенные для бэктеста — без HTF bias)
+            # Сигналы (упрощённые для бэктеста — без HTF bias, warmed_up guard добавлен)
             mfi_bull_sig = crossover(mfi, level_os, idx)
             mfi_bear_sig = crossunder(mfi, level_ob, idx)
             and_bull_sig = crossover2(and_osc, and_sig, idx)
@@ -646,9 +668,9 @@ def backtest_history(
             confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
             confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
-            sig_a_long = confirm_long_a and filter_long
-            sig_a_short = confirm_short_a and filter_short
-            sig_u_long = bool(ut_buy.iloc[idx]) and filter_long
+            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt
+            sig_a_short = confirm_short_a and filter_short and warmed_up_bt
+            sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
 
             for side, sig_ok in [("long", sig_a_long or sig_u_long), ("short", sig_a_short or sig_u_short)]:

@@ -73,6 +73,14 @@ TICKERS: List[str] = load_tickers()
 TIMEFRAMES = ["1h", "4h"]
 
 # =====================================================================
+# 🔧  FILTER TOGGLES (зеркало Pine Script input.bool)
+# =====================================================================
+ENABLE_FRAMA_FILTER = True   # use_frama_filter
+ENABLE_CHOP_FILTER  = True   # use_chop
+ENABLE_ATR_FILTER   = True   # use_atr_f
+ENABLE_MTF_BIAS     = True   # enable_mtf_bias
+
+# =====================================================================
 # 📈  ПАРАМЕТРЫ ИНДИКАТОРОВ
 # =====================================================================
 ATR_PERIOD = 14
