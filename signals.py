@@ -715,15 +715,37 @@ def backtest_history(
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
-        # 🆕 FIX: Calculate rolling HTF bias (no lookahead)
-        # For simplicity, use same-timeframe FRAMA direction as HTF proxy
-        # In production, fetch actual HTF data with proper alignment
+        # 🆕 FIX: Real HTF bias — fetch HTF data and align to LTF bars
+        htf = _cfg.HTF_BIAS
         htf_bias_arr = np.zeros(len(df))
-        htf_len = max(50, FRAMA_LEN * 2)
-        for i in range(htf_len, len(df)):
-            htf_close = float(df["close"].iloc[i])
-            htf_frama = float(fs.iloc[i])
-            htf_bias_arr[i] = 1 if htf_close > htf_frama else -1
+
+        try:
+            # Fetch HTF data (same limit as LTF for simplicity)
+            htf_bars = exchange.fetch_ohlcv(ticker, htf, limit=num_bars)
+            if htf_bars and len(htf_bars) >= 100:
+                df_htf = parse_ohlcv(htf_bars)
+                if validate_dataframe(df_htf, 50):
+                    fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, FRAMA_LEN, FRAMA_MULT)
+
+                    # Align HTF bars to LTF bars
+                    # For each LTF bar, find the latest HTF bar that started before or at the same time
+                    ltf_times = df["timestamp"].values
+                    htf_times = df_htf["timestamp"].values
+
+                    htf_idx = 0
+                    for i in range(len(df)):
+                        # Advance htf_idx while next HTF bar is still <= current LTF time
+                        while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] <= ltf_times[i]:
+                            htf_idx += 1
+
+                        # Use HTF FRAMA direction at this point in time
+                        if htf_idx >= FRAMA_LEN * 2:  # Enough data for FRAMA
+                            htf_close = float(df_htf["close"].iloc[htf_idx])
+                            htf_frama_val = float(fs_htf.iloc[htf_idx])
+                            htf_bias_arr[i] = 1 if htf_close > htf_frama_val else -1
+        except Exception as e:
+            logger.warning(f"[BACKTEST] HTF bias fetch failed for {ticker} {tf}: {e}")
+            # Fallback: no HTF bias (all zeros = neutral)
 
         signals_found = 0
         history = load_signals_history()
@@ -806,7 +828,11 @@ def backtest_history(
             sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
 
-            for side, sig_ok in [("long", sig_a_long or sig_u_long), ("short", sig_a_short or sig_u_short)]:
+            # 🆕 FIX: Independent A-track and U-track signals in backtest
+            for track, side, sig_ok in [
+                ("a", "long", sig_a_long), ("a", "short", sig_a_short),
+                ("u", "long", sig_u_long), ("u", "short", sig_u_short)
+            ]:
                 if not sig_ok:
                     continue
 
@@ -877,6 +903,7 @@ def backtest_history(
                     "max_favorable_pct": round(max_favorable, 4),
                     "max_adverse_pct": round(max_adverse, 4),
                     "regime": bt_regime,
+                    "track": track,
                 })
                 history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1
