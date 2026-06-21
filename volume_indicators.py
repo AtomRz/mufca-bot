@@ -45,11 +45,18 @@ def volume_flow_signal(df: pd.DataFrame, obv_period: int = 20) -> str:
         "outflow" - OBV below EMA (selling pressure)
         "neutral" - OBV near EMA (no clear direction)
     """
+    if len(df) < obv_period + 5:
+        return "neutral"  # Not enough data
+
     obv = calculate_obv(df)
     obv_ema = calculate_obv_ema(obv, obv_period)
 
     current_obv = obv.iloc[-1]
     current_ema = obv_ema.iloc[-1]
+
+    # Guard against NaN
+    if pd.isna(current_obv) or pd.isna(current_ema) or current_ema == 0:
+        return "neutral"
 
     # 2% buffer to avoid noise
     if current_obv > current_ema * 1.02:

@@ -305,6 +305,12 @@ async def check_signals(
             and vol_passed_short
         )
 
+        # 🆕 Log volume filter rejections for debugging
+        if not vol_passed_long and (mfi_bull_sig or and_bull_sig or bool(ut_buy.iloc[idx])):
+            logger.info(f"[VOLUME] {ticker} {timeframe} LONG rejected: {vol_reason_long}")
+        if not vol_passed_short and (mfi_bear_sig or and_bear_sig or bool(ut_sell.iloc[idx])):
+            logger.info(f"[VOLUME] {ticker} {timeframe} SHORT rejected: {vol_reason_short}")
+
         # Сигналы
         def crossover(s, lvl, i):
             if i < 1:

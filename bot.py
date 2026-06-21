@@ -225,6 +225,7 @@ async def status_cmd(ctx):
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
         f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{(SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
     ]
+    exchange = getattr(market_scanner, "exchange", None)
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             st = state[ticker][tf]
@@ -236,7 +237,22 @@ async def status_cmd(ctx):
             trade_info = ""
             if trade:
                 trade_info = f" | 🎯 {trade['side'].upper()} @ ${round(trade['entry'], 2)} SL:${round(trade['sl'], 2)} TP:${round(trade['tp'], 2)}"
-            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}")
+
+            # 🆕 Volume Flow status
+            vol_info = ""
+            if exchange:
+                try:
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
+                    if bars and len(bars) >= 25:
+                        from utils import parse_ohlcv
+                        df_v = parse_ohlcv(bars)
+                        vol_flow = volume_flow_signal(df_v)
+                        vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+                        vol_info = f" | {vol_emoji} {vol_flow.upper()}"
+                except Exception:
+                    pass
+
+            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}{vol_info}")
 
     msg = "\n".join(lines)
     if len(msg) > 1900:
@@ -278,7 +294,15 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
             await ctx.send(embed=embed)
     else:
-        await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**")
+        # 🆕 Show volume flow even when no signal
+        vol_info = ""
+        try:
+            vol_flow = volume_flow_signal(df)
+            vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+            vol_info = f" | {vol_emoji} Volume: {vol_flow.upper()}"
+        except Exception:
+            pass
+        await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**{vol_info}")
 
 @bot.command(name="pairs")
 async def pairs_cmd(ctx):
@@ -737,6 +761,15 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
             lines.append(f"• Avg MFE: **{stats['avg_mfe']:.2f}%** | Best: **{stats['best']:.2f}%**")
         else:
             lines.append(f"• ⚠️ Only **{stats['count']}** signals in history — using fallback R:R 2.0")
+
+        # 🆕 Volume Flow info
+        try:
+            vol_flow = volume_flow_signal(df)
+            vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+            lines.append(f"• {vol_emoji} Volume Flow: **{vol_flow.upper()}**")
+        except Exception:
+            pass
+
         await ctx.send("\n".join(lines))
     except Exception as e:
         logger.error(f"TP command error: {e}", exc_info=True)
@@ -759,6 +792,22 @@ async def debug_cmd(ctx):
 
     active_count = sum(1 for t in TICKERS for tf in TIMEFRAMES if state[t][tf].get("active_trade"))
     lines.append(f"• Active trades: **{active_count}**")
+
+    # 🆕 Volume Flow overview
+    lines.append("\n**📊 Volume Flow Overview:**")
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            try:
+                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
+                if bars and len(bars) >= 25:
+                    from utils import parse_ohlcv
+                    df_d = parse_ohlcv(bars)
+                    vol_flow = volume_flow_signal(df_d)
+                    vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+                    lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()}")
+            except Exception:
+                pass
+
     await ctx.send("\n".join(lines))
 
 @bot.command(name="reset")
