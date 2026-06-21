@@ -387,7 +387,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
         for tf in TIMEFRAMES:
             st = make_state()
             try:
-                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
+                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
                 if bars and len(bars) >= 2:
                     st["last_bar_time"] = int(bars[-2][0])
                     st["last_processed_bar_time"] = int(bars[-2][0])
@@ -453,7 +453,7 @@ async def htf_cmd(ctx, new_htf: str = ""):
             for tf in TIMEFRAMES:
                 st = make_state()
                 try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 3)
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
                     if bars and len(bars) >= 2:
                         st["last_bar_time"] = int(bars[-2][0])
                         st["last_processed_bar_time"] = int(bars[-2][0])
@@ -710,7 +710,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
         df = parse_ohlcv(bars)
         if not validate_dataframe(df, 50):
             await ctx.send("❌ Not enough data")
@@ -822,7 +822,7 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
@@ -867,7 +867,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         return
 
     try:
-        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, 100)
+        bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
         df = parse_ohlcv(bars)
         last_close = float(df["close"].iloc[-2])
         atr14 = calculate_atr(df, ATR_PERIOD)
