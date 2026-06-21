@@ -1204,6 +1204,87 @@ async def reset_cache_cmd(ctx):
     _onchain_last_fetch = 0.0
     await ctx.send("✅ HTF bias cache и On-Chain cache сброшены. Следующий скан обновит данные.")
 
+
+@bot.command(name="help")
+async def help_cmd(ctx):
+    """Shows all available commands with descriptions."""
+    embed = discord.Embed(
+        title="📖 MUFCA v3.1 — Command Reference",
+        description="All bot commands and their usage:",
+        color=discord.Color.blue(),
+    )
+
+    embed.add_field(
+        name="🔍 Scanning & Signals",
+        value=(
+            "`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals\n"
+            "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal\n"
+            "`!sim [side] [ticker] [tf]` — Simulate and record a signal\n"
+            "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📊 Status & Info",
+        value=(
+            "`!status` — Show scanner status, positions, and volume overview\n"
+            "`!pairs` — List all scanned trading pairs\n"
+            "`!debug` — Show debug stats, scan counts, and volume data"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📚 History & Stats",
+        value=(
+            "`!history [ticker] [tf]` — Show trade history\n"
+            "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Configuration",
+        value=(
+            "`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)\n"
+            "`!remove <ticker>` — Remove a trading pair\n"
+            "`!mode [spot|futures]` — Switch market mode\n"
+            "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot\n"
+            "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)\n"
+            "`!tpconfig [param] [value]` — Configure adaptive TP settings\n"
+            "`!chop [tf] [value]` — Set CHOP threshold per timeframe"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔗 On-Chain & Analysis",
+        value=(
+            "`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)\n"
+            "`!reset_cache` — Reset HTF bias and on-chain cache"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛠️ Maintenance",
+        value=(
+            "`!reset yes` — Clear all signal history and trade data (requires confirmation)\n"
+            "`!help` / `!?` — Show this help message"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="MUFCA v3.1 by AtomDC | Prefix: ! | Example: !scan BTC/USDT 1h")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="?")
+async def question_cmd(ctx):
+    """Alias for !help."""
+    await help_cmd(ctx)
+
 # =====================================================================
 # 🚀  ЗАПУСК
 # =====================================================================
