@@ -55,6 +55,10 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Удаляем встроенный help для кастомного
+bot.remove_command('help')
+
+
 # Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
 scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
@@ -1221,6 +1225,102 @@ async def reset_cache_cmd(ctx):
 # 🚀  ЗАПУСК
 # =====================================================================
 
+
+
+@bot.command(name="help")
+async def help_cmd(ctx, category: str = ""):
+    """📖 Показывает справку по командам MUFCA."""
+    if category:
+        # Категорийная справка (можно расширить)
+        cats = {
+            "scanning": "🔍 Scanning & Signals",
+            "status": "📊 Status & Info",
+            "history": "📚 History & Stats",
+            "config": "⚙️ Configuration",
+            "onchain": "🔗 On-Chain & Analysis",
+            "maintenance": "🛠️ Maintenance",
+        }
+        if category.lower() in cats:
+            embed = discord.Embed(
+                title=f"📖 {cats[category.lower()]}",
+                color=discord.Color.blue()
+            )
+            # Здесь можно добавить детальную справку по категории
+            await ctx.send(embed=embed)
+            return
+
+    embed = discord.Embed(
+        title="📖 MUFCA v3.1 — Command Reference",
+        description="All bot commands and their usage:",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(
+        name="🔍 Scanning & Signals",
+        value="`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals
+"
+              "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal
+"
+              "`!sim [side] [ticker] [tf]` — Simulate and record a signal
+"
+              "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Status & Info",
+        value="`!status` — Show scanner status, positions, and volume overview
+"
+              "`!pairs` — List all scanned trading pairs
+"
+              "`!debug` — Show debug stats, scan counts, and volume data",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📚 History & Stats",
+        value="`!history [ticker] [tf]` — Show trade history
+"
+              "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data",
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ Configuration",
+        value="`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)
+"
+              "`!remove <ticker>` — Remove a trading pair
+"
+              "`!mode [spot|futures]` — Switch market mode
+"
+              "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot
+"
+              "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)
+"
+              "`!tpconfig [param] [value]` — Configure adaptive TP settings
+"
+              "`!chop [tf] [value]` — Set CHOP threshold per timeframe",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔗 On-Chain & Analysis",
+        value="`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)
+"
+              "`!reset_cache` — Reset HTF bias and on-chain cache",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛠️ Maintenance",
+        value="`!reset yes` — Clear all signal history and trade data (requires confirmation)
+"
+              "`!help / !?` — Show this help message",
+        inline=False
+    )
+
+    embed.set_footer(text="MUFCA v3.1 by AtomDC | Prefix: ! | Example: !scan BTC/USDT 1h")
+    await ctx.send(embed=embed)
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set in .env file!")
