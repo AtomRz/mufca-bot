@@ -126,12 +126,21 @@ MIN_TP_PCT = 0.3
 MAX_TP_PCT = 8.0
 MAX_HOLD_BARS = 20
 
+# 🆕 TP FEEDBACK LOOP — автоподстройка на основе реального hit rate
+TP_HIT_RATE_TARGET = 0.35      # Целевой процент достижения TP (35%)
+TP_AUTO_ADJUST = True          # Включить автоподстройку перцентиля
+TP_CAPTURE_RATE = 0.70         # Realistic MFE capture rate (0.5-0.8)
+TP_ADJUST_MIN_PCT = 0.30       # Минимальный перцентиль после корректировки
+TP_ADJUST_MAX_PCT = 0.85       # Максимальный перцентиль после корректировки
+
 # Персистенс TP конфига
 TP_CONFIG_FILE = os.path.join(DATA_DIR, "tp_config.json")
 
 def load_tp_config():
     """Загружает TP конфиг из файла."""
     global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
+    global TP_HIT_RATE_TARGET, TP_AUTO_ADJUST, TP_CAPTURE_RATE
+    global TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT
     data = safe_json_load(TP_CONFIG_FILE, {})
     if not data:
         return
@@ -139,6 +148,11 @@ def load_tp_config():
     SAFE_TP_PERCENTILE   = data.get("safe_tp_percentile",   SAFE_TP_PERCENTILE)
     USE_SAFE_TP          = data.get("use_safe_tp",          USE_SAFE_TP)
     SIGNAL_HISTORY_LIMIT = data.get("signal_history_limit", SIGNAL_HISTORY_LIMIT)
+    TP_HIT_RATE_TARGET   = data.get("tp_hit_rate_target",   TP_HIT_RATE_TARGET)
+    TP_AUTO_ADJUST       = data.get("tp_auto_adjust",       TP_AUTO_ADJUST)
+    TP_CAPTURE_RATE      = data.get("tp_capture_rate",      TP_CAPTURE_RATE)
+    TP_ADJUST_MIN_PCT    = data.get("tp_adjust_min_pct",    TP_ADJUST_MIN_PCT)
+    TP_ADJUST_MAX_PCT    = data.get("tp_adjust_max_pct",    TP_ADJUST_MAX_PCT)
 
 def save_tp_config():
     """Сохраняет текущий TP конфиг в файл."""
@@ -147,6 +161,11 @@ def save_tp_config():
         "safe_tp_percentile":   SAFE_TP_PERCENTILE,
         "use_safe_tp":          USE_SAFE_TP,
         "signal_history_limit": SIGNAL_HISTORY_LIMIT,
+        "tp_hit_rate_target":   TP_HIT_RATE_TARGET,
+        "tp_auto_adjust":       TP_AUTO_ADJUST,
+        "tp_capture_rate":      TP_CAPTURE_RATE,
+        "tp_adjust_min_pct":    TP_ADJUST_MIN_PCT,
+        "tp_adjust_max_pct":    TP_ADJUST_MAX_PCT,
     })
 
 # Загружаем при старте

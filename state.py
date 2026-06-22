@@ -20,9 +20,6 @@ logger = logging.getLogger(__name__)
 
 _history_cache: Optional[Dict] = None
 
-# =====================================================================
-# 💾  УПРАВЛЕНИЕ ИСТОРИЕЙ СИГНАЛОВ
-# =====================================================================
 
 def clear_history_cache():
     """Сбрасывает кэш истории сигналов — вызывать при удалении файла истории."""
@@ -39,11 +36,13 @@ def load_signals_history() -> Dict:
     _history_cache = safe_json_load(SIGNALS_HISTORY_FILE, {})
     return _history_cache
 
+
 def save_signals_history(history: Dict):
     """Сохраняет историю сигналов в файл."""
     global _history_cache
     _history_cache = history
     safe_json_save(SIGNALS_HISTORY_FILE, history)
+
 
 def _ensure_history_slot(history: Dict, ticker: str, tf: str):
     """Создает слот для пары/таймфрейма если его нет."""
@@ -51,6 +50,7 @@ def _ensure_history_slot(history: Dict, ticker: str, tf: str):
         history[ticker] = {}
     if tf not in history[ticker]:
         history[ticker][tf] = {"long": [], "short": []}
+
 
 def _normalize_timestamp(timestamp) -> str:
     """Унифицирует timestamp в ISO формат."""
@@ -63,6 +63,7 @@ def _normalize_timestamp(timestamp) -> str:
             return datetime.fromtimestamp(int(timestamp) / 1000, tz=timezone.utc).isoformat()
         return timestamp
     return datetime.now(timezone.utc).isoformat()
+
 
 def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp, regime: str = "unknown"):
     """Добавляет запись о новом сигнале."""
@@ -78,13 +79,14 @@ def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp, 
         "timestamp": _normalize_timestamp(timestamp),
         "max_favorable_pct": 0.0,
         "max_adverse_pct": 0.0,
-        "regime": regime,  # 🆕 Режим рынка при входе
+        "regime": regime,
     }
 
     history[ticker][tf][side].append(record)
     history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
     save_signals_history(history)
     logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Regime: {regime}")
+
 
 def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int):
     """Закрывает открытый сигнал."""
@@ -109,6 +111,7 @@ def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exi
             return
 
     logger.warning(f"No open signal found to close for {ticker} {tf} {side}")
+
 
 def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, save_every: int = 5):
     """
@@ -142,6 +145,7 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
     if updated and update_signal_mae_mfe._counter % save_every == 0:
         save_signals_history(history)
 
+
 # =====================================================================
 # 📊  СТАТИСТИКА ПО СИГНАЛАМ
 # =====================================================================
@@ -158,13 +162,15 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         "worst": 0,
         "mean_mfe": 0,
         "std_mfe": 0,
+        "tp_hit_rate": 0.0,
+        "sl_hit_rate": 0.0,
+        "avg_bars_held": 0,
     }
 
     if ticker not in history or tf not in history[ticker]:
         return empty
 
     records = history[ticker][tf][side]
-    # ✅ ИСПРАВЛЕНО: включаем cancelled в статистику для более полной картины
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
     if not closed:
         return empty
@@ -173,20 +179,34 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
     regime_used = False
     if regime:
         regime_closed = [r for r in closed if r.get("regime", "unknown") == regime]
-        if len(regime_closed) >= 5:  # Минимум 5 сигналов для режима
+        if len(regime_closed) >= 5:
             closed = regime_closed
             regime_used = True
         else:
-            # Недостаточно данных по режиму — используем все (логируем)
             logger.debug(f"[STATS] Only {len(regime_closed)} {regime} signals for {ticker} {tf} {side}, falling back to all {len(closed)} signals")
 
     recent = closed[-SIGNAL_HISTORY_LIMIT:]
     favorable_pcts = []
+    tp_hits = 0
+    sl_hits = 0
+    bars_held_list = []
+
     for r in recent:
         mfe = r.get("max_favorable_pct", 0)
         if mfe == 0 and r.get("moved_pct", 0) != 0:
             mfe = abs(r["moved_pct"])
         favorable_pcts.append(max(mfe, 0.1))
+
+        if r["exit_type"] == "tp":
+            tp_hits += 1
+        elif r["exit_type"] == "sl":
+            sl_hits += 1
+
+        bars = r.get("bars_held", 0)
+        if bars > 0:
+            bars_held_list.append(bars)
+
+    total_exits = tp_hits + sl_hits
 
     if not favorable_pcts:
         return empty
@@ -200,12 +220,16 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         "std_mfe": round(float(np.std(favorable_pcts)), 2),
         "best": round(float(max(favorable_pcts)), 2),
         "worst": round(float(min(favorable_pcts)), 2),
+        "tp_hit_rate": round(tp_hits / total_exits, 3) if total_exits > 0 else 0.0,
+        "sl_hit_rate": round(sl_hits / total_exits, 3) if total_exits > 0 else 0.0,
+        "avg_bars_held": round(float(np.mean(bars_held_list)), 1) if bars_held_list else 0,
         "regime_applied": regime_used if regime else None,
         "regime": regime,
     }
 
+
 # =====================================================================
-# 🎯  АДАПТИВНЫЙ ТП (ГИБРИДНЫЙ: РЕЖИМ + ВЗВЕШИВАНИЕ)
+# 🎯  АДАПТИВНЫЙ ТП (ГИБРИДНЫЙ: РЕЖИМ + ВЗВЕШИВАНИЕ + HIT RATE FEEDBACK)
 # =====================================================================
 
 def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
@@ -235,17 +259,78 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
 
     return favorable_pcts
 
+
 def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[float]:
     """
     Строит взвешенную выборку для персентиля.
-    Максимум 2 копии на сигнал (tp=2, sl=1, cancelled=1) — не раздувает выборку.
+    Максимум 2 копии на сигнал (tp=2, всё остальное=1) — не раздувает выборку.
     """
     expanded = []
     for mfe, weight in weighted_mfes:
-        # tp → 2 копии, всё остальное → 1 копия
         copies = 2 if weight >= 1.0 else 1
         expanded.extend([mfe] * copies)
     return expanded
+
+
+def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
+    """
+    Возвращает (tp_hit_rate, tp_count, total_exits) по записям.
+    """
+    tp_hits = sum(1 for r in records if r["exit_type"] == "tp")
+    sl_hits = sum(1 for r in records if r["exit_type"] == "sl")
+    total = tp_hits + sl_hits
+    if total == 0:
+        return 0.0, 0, 0
+    return tp_hits / total, tp_hits, total
+
+
+def _adjust_percentile_by_hit_rate(
+    base_percentile: float,
+    tp_hit_rate: float,
+    target_hit_rate: float = 0.35,
+    min_pct: float = 0.30,
+    max_pct: float = 0.85,
+) -> Tuple[float, str]:
+    """
+    Автоподстройка перцентиля на основе реального hit rate.
+
+    Если hit rate ниже целевого — снижаем перцентиль (TP ближе, достижимее).
+    Если hit rate выше — можно поднять (TP дальше, больше прибыли).
+
+    Returns: (adjusted_percentile, reason)
+    """
+    if tp_hit_rate < target_hit_rate * 0.7:
+        # Слишком мало TP hits — TP слишком агрессивный
+        adjustment = -0.12
+        reason = f"hit_rate={tp_hit_rate:.1%} < target, lowering pct {base_percentile:.0%} → {max(min_pct, base_percentile + adjustment):.0%}"
+    elif tp_hit_rate < target_hit_rate * 0.9:
+        # Немного ниже цели — небольшая корректировка
+        adjustment = -0.06
+        reason = f"hit_rate={tp_hit_rate:.1%} slightly low, adjusting pct {base_percentile:.0%} → {max(min_pct, base_percentile + adjustment):.0%}"
+    elif tp_hit_rate > target_hit_rate * 1.5:
+        # TP достигается слишком часто — можно быть агрессивнее
+        adjustment = +0.08
+        reason = f"hit_rate={tp_hit_rate:.1%} high, raising pct {base_percentile:.0%} → {min(max_pct, base_percentile + adjustment):.0%}"
+    elif tp_hit_rate > target_hit_rate * 1.2:
+        # Немного выше цели — небольшой буст
+        adjustment = +0.04
+        reason = f"hit_rate={tp_hit_rate:.1%} good, slight boost {base_percentile:.0%} → {min(max_pct, base_percentile + adjustment):.0%}"
+    else:
+        # В целевом диапазоне — не трогаем
+        adjustment = 0.0
+        reason = f"hit_rate={tp_hit_rate:.1%} in target zone, pct unchanged {base_percentile:.0%}"
+
+    adjusted = max(min_pct, min(max_pct, base_percentile + adjustment))
+    return adjusted, reason
+
+
+def _apply_realistic_capture(mfe_pct: float, capture_rate: float = 0.70) -> float:
+    """
+    Применяет "realistic capture rate" к MFE.
+    Идеальный MFE невозможно поймать — корректируем вниз.
+    """
+    return mfe_pct * capture_rate
+
 
 def calculate_adaptive_tp(
     ticker: str,
@@ -257,11 +342,14 @@ def calculate_adaptive_tp(
     regime: Optional[str] = None
 ) -> float:
     """
-    Адаптивный TP на основе исторических MFE.
+    Адаптивный TP на основе исторических MFE с feedback loop по hit rate.
+
     Гибридная логика:
     1. Если по режиму ≥ 10 сигналов — используем только их
     2. Если 5-9 сигналов — используем режим + общие с дисконтом
     3. Если < 5 — используем все с взвешиванием по exit_type
+    4. 🆕 Автоподстройка перцентиля на основе реального hit rate
+    5. 🆕 Realistic capture rate (70% от идеального MFE)
     """
     history = load_signals_history()
     risk = abs(entry - current_sl)
@@ -276,7 +364,7 @@ def calculate_adaptive_tp(
     if len(closed) < 3:
         return round(fallback_tp, 4)
 
-    # 🆕 FIX: ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ (без дублирования записей)
+    # 🆕 FIX: ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ
     use_records = []
     regime_discount = 1.0
     regime_info = ""
@@ -285,17 +373,14 @@ def calculate_adaptive_tp(
         regime_records = [r for r in closed if r.get("regime", "unknown") == regime]
 
         if len(regime_records) >= 10:
-            # ✅ Достаточно данных по режиму — используем только их
             use_records = regime_records
             regime_info = f"regime={regime} ({len(regime_records)} signals)"
         elif len(regime_records) >= 5:
-            # ⚠️ Мало данных — смешиваем режим + НЕ-режим с дисконтом
             non_regime = [r for r in closed if r.get("regime", "unknown") != regime]
             use_records = regime_records + non_regime
             regime_discount = 0.85
             regime_info = f"regime={regime} (mixed, {len(regime_records)} regime + {len(non_regime)} other)"
         else:
-            # ❌ Недостаточно данных — используем все с дисконтом
             use_records = closed
             regime_discount = 0.75
             regime_info = f"regime={regime} (fallback, {len(regime_records)} regime signals)"
@@ -304,6 +389,22 @@ def calculate_adaptive_tp(
         regime_info = "no regime filter"
 
     recent = use_records[-SIGNAL_HISTORY_LIMIT:]
+
+    # 🆕 FIX: АВТОПОДСТРОЙКА ПЕРЦЕНТИЛЯ ПО HIT RATE
+    base_percentile = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
+    adjusted_percentile = base_percentile
+    hit_rate_info = ""
+
+    # Только если достаточно данных для статистически значимой оценки
+    if len(recent) >= 15:
+        tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent)
+        adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
+            base_percentile,
+            tp_hit_rate,
+            target_hit_rate=0.35,
+        )
+        logger.info(f"[TP-HIT-RATE] {ticker} {tf} {side}: {hit_rate_info}")
+
     weighted_mfes = _extract_weighted_mfes(recent)
 
     if not weighted_mfes:
@@ -311,11 +412,14 @@ def calculate_adaptive_tp(
 
     expanded = _build_weighted_sample(weighted_mfes)
 
-    active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
-    tp_pct = float(np.percentile(expanded, active_pct * 100))
+    tp_pct = float(np.percentile(expanded, adjusted_percentile * 100))
 
     # Применяем дисконт режима
     tp_pct *= regime_discount
+
+    # 🆕 FIX: REALISTIC CAPTURE RATE
+    # Идеальный MFE невозможно поймать — корректируем на реалистичность
+    tp_pct = _apply_realistic_capture(tp_pct, capture_rate=0.70)
 
     # 🛡️ ATR-кап
     if atr14 is not None:
@@ -326,15 +430,17 @@ def calculate_adaptive_tp(
 
         if atr_val > 0:
             atr_tp_pct = (atr_val * 2 / entry) * 100
-            tp_pct = min(tp_pct, atr_tp_pct)
-            logger.debug(f"[TP] ATR cap 2x: {tp_pct:.2f}% → capped at {atr_tp_pct:.2f}%")
+            if tp_pct > atr_tp_pct:
+                logger.debug(f"[TP] ATR cap 2x: {tp_pct:.2f}% → capped at {atr_tp_pct:.2f}%")
+                tp_pct = atr_tp_pct
 
     tp_pct = max(_cfg.MIN_TP_PCT, min(_cfg.MAX_TP_PCT, tp_pct))
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
 
-    logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | {regime_info} | expanded: {len(expanded)}")
+    logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | pct={adjusted_percentile:.0%} (base={base_percentile:.0%}) | {regime_info} | {hit_rate_info} | capture=70%")
     return round(tp, 4)
+
 
 def calculate_combined_tp(
     ticker: str,
@@ -353,12 +459,13 @@ def calculate_combined_tp(
     risk = abs(entry - sl)
     rr = round(abs(tp - entry) / max(risk, 1e-8), 2)
 
-    mode_label   = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
+    mode_label = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
 
     if stats["count"] >= 5:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
-        desc = f"📚 Adaptive {active_pct:.0%} %ile [{mode_label}] | {stats['count']} signals{regime_label}"
+        hit_info = f" | Hit rate: {stats.get('tp_hit_rate', 0):.1%}" if stats.get('tp_hit_rate', 0) > 0 else ""
+        desc = f"📚 Adaptive {active_pct:.0%} %ile [{mode_label}] | {stats['count']} signals{hit_info}{regime_label}"
     else:
         desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
 

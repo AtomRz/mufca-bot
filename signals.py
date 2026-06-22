@@ -38,8 +38,6 @@ from config import (
     ENABLE_ATR_FILTER,
     ENABLE_MTF_BIAS,
 )
-# UT_HEIKIN_ASHI и HTF_BIAS читаются через _cfg.UT_HEIKIN_ASHI / _cfg.HTF_BIAS
-# чтобы видеть актуальное значение после !utha / !htf без перезапуска бота
 from indicators import (
     calculate_atr,
     calculate_chop,
@@ -174,14 +172,99 @@ def calculate_sl(
         sl_frama = float(fl.iloc[idx])
         sl_atr = entry_price - 1.5 * atr_v
         sl = max(sl_frama, sl_atr)
-        # 🆕 FIX: SL не может быть >= entry для long
         return min(sl, entry_price * 0.995)
     else:
         sl_frama = float(fu.iloc[idx])
         sl_atr = entry_price + 1.5 * atr_v
         sl = min(sl_frama, sl_atr)
-        # 🆕 FIX: SL не может быть <= entry для short
         return max(sl, entry_price * 1.005)
+
+# =====================================================================
+# 🆕 ON-CHAIN TP/SL SAFETY WRAPPER
+# =====================================================================
+
+def apply_onchain_with_safety(
+    entry: float,
+    sl: float,
+    tp: float,
+    side: str,
+    onchain_bias: Optional[Dict],
+    min_rr: float = 1.0,
+    max_sl_widen_pct: float = 0.15,  # Максимальное расширение SL на 15%
+) -> Tuple[float, float, str, bool]:
+    """
+    Применяет on-chain множители к TP/SL с проверкой безопасности.
+
+    Returns: (new_tp, new_sl, desc_suffix, applied_ok)
+    applied_ok = False если on-chain ухудшил R:R ниже min_rr и был отклонён
+    """
+    if not onchain_bias or not ONCHAIN_ENABLED:
+        return tp, sl, "", True
+
+    if side == "long":
+        tp_mult = onchain_bias.get("tp_mult_long", 1.0)
+        sl_mult = onchain_bias.get("sl_mult_long", 1.0)
+    else:
+        tp_mult = onchain_bias.get("tp_mult_short", 1.0)
+        sl_mult = onchain_bias.get("sl_mult_short", 1.0)
+
+    if tp_mult == 1.0 and sl_mult == 1.0:
+        return tp, sl, "", True
+
+    risk_before = abs(entry - sl)
+    reward_before = abs(tp - entry)
+    rr_before = reward_before / max(risk_before, 1e-8)
+
+    # Применяем множители
+    if side == "long":
+        new_tp = entry + reward_before * tp_mult
+        # SL mult > 1 = SL дальше (шире), < 1 = SL ближе
+        new_sl = entry - risk_before * sl_mult
+    else:
+        new_tp = entry - reward_before * tp_mult
+        new_sl = entry + risk_before * sl_mult
+
+    risk_after = abs(entry - new_sl)
+    reward_after = abs(new_tp - entry)
+    rr_after = reward_after / max(risk_after, 1e-8)
+
+    # 🆕 SAFETY CHECKS
+    desc_suffix = ""
+
+    # 1. Если RR упал ниже минимума — откатываем TP к минимально допустимому
+    if rr_after < min_rr:
+        logger.warning(f"[ONCHAIN-SAFETY] RR degraded {rr_before:.2f} -> {rr_after:.2f} (below {min_rr}), using conservative")
+        # Восстанавливаем RR = min_rr, сохраняя направление on-chain если возможно
+        if side == "long":
+            # Минимальный TP = entry + risk_after * min_rr
+            safe_tp = entry + risk_after * min_rr
+            # Но не хуже оригинального TP
+            new_tp = max(safe_tp, tp)
+        else:
+            safe_tp = entry - risk_after * min_rr
+            new_tp = min(safe_tp, tp)
+
+        reward_after = abs(new_tp - entry)
+        rr_after = reward_after / max(risk_after, 1e-8)
+        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [SAFETY: RR capped @ {rr_after:.2f}]"
+        return new_tp, new_sl, desc_suffix, False
+
+    # 2. Если SL расширен слишком сильно — ограничиваем
+    sl_widen = (risk_after - risk_before) / risk_before
+    if sl_widen > max_sl_widen_pct:
+        logger.warning(f"[ONCHAIN-SAFETY] SL widened {sl_widen:.1%} > max {max_sl_widen_pct:.1%}, capping")
+        if side == "long":
+            new_sl = entry - risk_before * (1 + max_sl_widen_pct)
+        else:
+            new_sl = entry + risk_before * (1 + max_sl_widen_pct)
+        risk_after = abs(entry - new_sl)
+        reward_after = abs(new_tp - entry)
+        rr_after = reward_after / max(risk_after, 1e-8)
+        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [SL capped +{max_sl_widen_pct:.0%}]"
+        return new_tp, new_sl, desc_suffix, True
+
+    desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [RR {rr_before:.2f}→{rr_after:.2f}]"
+    return new_tp, new_sl, desc_suffix, True
 
 # =====================================================================
 # 📊  TP/SL CHECK
@@ -236,24 +319,20 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         "track": track,
     }
 
-    # Save to track-specific history
     history_key = f"{track}_trade_history"
     state[history_key].append(closed_trade)
     state[history_key] = state[history_key][-50:]
 
-    # Also update legacy combined history for backward compat
     state["trade_history"].append(closed_trade)
     state["trade_history"] = state["trade_history"][-50:]
 
     update_signal_record(ticker, tf, side, exit_price, result, bars_held)
 
-    # Clear track-specific state
     state[trade_key] = None
     state[bars_key] = 0
     notified_key = f"{track}_last_closure_notified"
     state[notified_key] = False
 
-    # Reset track-specific position flags
     if track == "a":
         state["a_in_long"] = False
         state["a_in_short"] = False
@@ -261,7 +340,6 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         state["u_in_long"] = False
         state["u_in_short"] = False
 
-    # Update legacy fields
     state["active_trade"] = state.get("a_active_trade") or state.get("u_active_trade")
     state["bars_in_trade"] = max(state.get("a_bars_in_trade", 0), state.get("u_bars_in_trade", 0))
     state["last_closure_notified"] = state.get("a_last_closure_notified", False) and state.get("u_last_closure_notified", False)
@@ -288,10 +366,8 @@ async def check_signals(
     onchain_bias=dict  — данные из onchain.get_onchain_bias(), влияют на TP/SL/lev/confidence.
     """
     try:
-        # HTF bias
         htf_bias = await get_htf_bias(exchange, ticker, timeframe)
 
-        # Fetch OHLCV
         bars = await safe_fetch_ohlcv(exchange, ticker, timeframe, limit=900)
         if not bars:
             return [], None, "NO_DATA", 1
@@ -311,7 +387,6 @@ async def check_signals(
         last_low = float(df["low"].iloc[-2])
         last_close = float(df["close"].iloc[-2])
 
-        # 🆕 FIX: Check BOTH independent tracks for TP/SL
         for track in ("a", "u"):
             trade = state.get(f"{track}_active_trade")
             if trade:
@@ -327,7 +402,6 @@ async def check_signals(
                         close_trade(state, last_close, "cancelled", ticker, timeframe, track)
                         logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
 
-        # Индикаторы
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
         chop = calculate_chop(df, CHOP_LENGTH)
@@ -361,9 +435,8 @@ async def check_signals(
         htf_bull = htf_bias == 1
         htf_bear = htf_bias == -1
 
-        # Фильтры
         hh10_prev = float(df["high"].iloc[max(0, idx-10):idx].max())
-        ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())  # ✅ ИСПРАВЛЕНО: .min()
+        ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())
         fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
         fake_break_short = float(df["low"].iloc[idx]) < ll10_prev and close_v > ll10_prev
 
@@ -372,15 +445,11 @@ async def check_signals(
         liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
         liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
-        # Режим
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
-        # Volume info for leverage adjustment (NOT a signal filter)
-        # Один вызов — результат одинаков для long/short, направление учитывается внутри
         vol_info = volume_flow_signal_v3(df)
         vol_lev_reason = "no signal"
 
-        # warmed_up: зеркало Pine Script `bar_index >= mfi_training`
         warmed_up = len(df) >= MFI_TRAINING
 
         filter_long = (
@@ -402,8 +471,6 @@ async def check_signals(
             and not liq_sweep_long
         )
 
-        # Сигналы
-        # 🆕 FIX: Use module-level helpers (extracted to avoid duplication)
         mfi_bull_sig = crossover(mfi, level_os, idx)
         mfi_bear_sig = crossunder(mfi, level_ob, idx)
         and_bull_sig = crossover2(and_osc, and_sig, idx)
@@ -433,7 +500,6 @@ async def check_signals(
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
-        # Обновляем состояния
         if sig_a_long:
             state["a_in_long"] = True
             state["a_in_short"] = False
@@ -455,7 +521,6 @@ async def check_signals(
             state["u_short_bar"] = bar_idx
             state["last_u_short_bar"] = bar_idx
 
-        # Леверидж
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
@@ -466,7 +531,6 @@ async def check_signals(
         if regime == "TREND":
             sugg_lev = min(MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
 
-        # 🆕 Volume-based leverage adjustment only
         if (sig_a_long or sig_u_long):
             sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
                 vol_info, "long", sugg_lev
@@ -476,27 +540,15 @@ async def check_signals(
                 vol_info, "short", sugg_lev
             )
 
-        # ─── On-Chain bias ─────────────────────────────────────────
-        # Читаем множители TP/SL и дельту leverage из onchain_bias.
-        # По умолчанию (если onchain отключён или нет данных) — нейтрально.
         oc_bias_long  = 0
         oc_bias_short = 0
-        oc_tp_mult_long   = 1.0
-        oc_tp_mult_short  = 1.0
-        oc_sl_mult_long   = 1.0
-        oc_sl_mult_short  = 1.0
-        oc_lev_delta      = 0
+        oc_lev_delta  = 0
 
         if onchain_bias and ONCHAIN_ENABLED:
             oc_bias_long      = onchain_bias.get("bias_long",      0)
             oc_bias_short     = onchain_bias.get("bias_short",     0)
-            oc_tp_mult_long   = onchain_bias.get("tp_mult_long",   1.0)
-            oc_tp_mult_short  = onchain_bias.get("tp_mult_short",  1.0)
-            oc_sl_mult_long   = onchain_bias.get("sl_mult_long",   1.0)
-            oc_sl_mult_short  = onchain_bias.get("sl_mult_short",  1.0)
             oc_lev_delta      = onchain_bias.get("lev_delta",      0)
 
-        # Применяем onchain leverage delta
         if (sig_a_long or sig_u_long) or (sig_a_short or sig_u_short):
             sugg_lev = max(1, min(MAX_ALLOWED_LEV, sugg_lev + oc_lev_delta))
 
@@ -508,7 +560,6 @@ async def check_signals(
             u_sig = sig_u_long if is_long else sig_u_short
             score += 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
             score += 20 if (htf_bull if is_long else htf_bear) else 0
-            # 🆕 On-chain confidence bias
             score += oc_bias_long if is_long else oc_bias_short
             return max(0, min(100, score))
 
@@ -521,15 +572,14 @@ async def check_signals(
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
             risk = abs(close_v - sl)
             reward = abs(tp - close_v)
+            rr = reward / max(risk, 1e-8)
 
-            # 🆕 Применяем on-chain TP/SL множители
-            if oc_tp_mult_long != 1.0:
-                tp = close_v + reward * oc_tp_mult_long
-                tp_desc += f" | OC×{oc_tp_mult_long}"
-            if oc_sl_mult_long != 1.0:
-                sl = close_v - risk * oc_sl_mult_long
-                risk = abs(close_v - sl)
-
+            # 🆕 FIX: Применяем on-chain с safety check
+            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
+                close_v, sl, tp, "long", onchain_bias, min_rr=MIN_RR
+            )
+            tp_desc += oc_desc
+            risk = abs(close_v - sl)
             reward = abs(tp - close_v)
             rr = reward / max(risk, 1e-8)
 
@@ -561,15 +611,13 @@ async def check_signals(
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
             risk = abs(close_v - sl)
             reward = abs(tp - close_v)
+            rr = reward / max(risk, 1e-8)
 
-            # 🆕 Применяем on-chain TP/SL множители
-            if oc_tp_mult_long != 1.0:
-                tp = close_v + reward * oc_tp_mult_long
-                tp_desc += f" | OC×{oc_tp_mult_long}"
-            if oc_sl_mult_long != 1.0:
-                sl = close_v - risk * oc_sl_mult_long
-                risk = abs(close_v - sl)
-
+            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
+                close_v, sl, tp, "long", onchain_bias, min_rr=MIN_RR
+            )
+            tp_desc += oc_desc
+            risk = abs(close_v - sl)
             reward = abs(tp - close_v)
             rr = reward / max(risk, 1e-8)
 
@@ -601,15 +649,13 @@ async def check_signals(
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
             risk = abs(sl - close_v)
             reward = abs(close_v - tp)
+            rr = reward / max(risk, 1e-8)
 
-            # 🆕 Применяем on-chain TP/SL множители
-            if oc_tp_mult_short != 1.0:
-                tp = close_v - reward * oc_tp_mult_short
-                tp_desc += f" | OC×{oc_tp_mult_short}"
-            if oc_sl_mult_short != 1.0:
-                sl = close_v + risk * oc_sl_mult_short
-                risk = abs(sl - close_v)
-
+            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
+                close_v, sl, tp, "short", onchain_bias, min_rr=MIN_RR
+            )
+            tp_desc += oc_desc
+            risk = abs(sl - close_v)
             reward = abs(close_v - tp)
             rr = reward / max(risk, 1e-8)
 
@@ -641,15 +687,13 @@ async def check_signals(
             tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
             risk = abs(sl - close_v)
             reward = abs(close_v - tp)
+            rr = reward / max(risk, 1e-8)
 
-            # 🆕 Применяем on-chain TP/SL множители
-            if oc_tp_mult_short != 1.0:
-                tp = close_v - reward * oc_tp_mult_short
-                tp_desc += f" | OC×{oc_tp_mult_short}"
-            if oc_sl_mult_short != 1.0:
-                sl = close_v + risk * oc_sl_mult_short
-                risk = abs(sl - close_v)
-
+            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
+                close_v, sl, tp, "short", onchain_bias, min_rr=MIN_RR
+            )
+            tp_desc += oc_desc
+            risk = abs(sl - close_v)
             reward = abs(close_v - tp)
             rr = reward / max(risk, 1e-8)
 
@@ -709,53 +753,38 @@ def backtest_history(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         mfi = calculate_mfi(df, MFI_LEN)
-        # 🆕 FIX: Use fixed MFI levels for backtest to avoid lookahead bias
-        # K-Means on full dataset = lookahead bias. Use 20/80 or rolling window.
         level_os, level_ob = 20.0, 80.0
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
-        # 🆕 FIX: Real HTF bias — fetch HTF data and align to LTF bars
         htf = _cfg.HTF_BIAS
         htf_bias_arr = np.zeros(len(df))
 
         try:
-            # Fetch HTF data (same limit as LTF for simplicity)
             htf_bars = exchange.fetch_ohlcv(ticker, htf, limit=num_bars)
             if htf_bars and len(htf_bars) >= 100:
                 df_htf = parse_ohlcv(htf_bars)
                 if validate_dataframe(df_htf, 50):
                     fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, FRAMA_LEN, FRAMA_MULT)
-
-                    # Align HTF bars to LTF bars
-                    # For each LTF bar, find the latest HTF bar that started before or at the same time
                     ltf_times = df["timestamp"].values
                     htf_times = df_htf["timestamp"].values
-
                     htf_idx = 0
                     for i in range(len(df)):
-                        # Если LTF бар раньше первого HTF бара — bias неизвестен
                         if htf_times[0] > ltf_times[i]:
                             htf_bias_arr[i] = 0
                             continue
-
-                        # Advance htf_idx while next HTF bar is still <= current LTF time
                         while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] <= ltf_times[i]:
                             htf_idx += 1
-
-                        # Use HTF FRAMA direction at this point in time
-                        if htf_idx >= FRAMA_LEN * 2:  # Enough data for FRAMA
+                        if htf_idx >= FRAMA_LEN * 2:
                             htf_close = float(df_htf["close"].iloc[htf_idx])
                             htf_frama_val = float(fs_htf.iloc[htf_idx])
                             htf_bias_arr[i] = 1 if htf_close > htf_frama_val else -1
         except Exception as e:
             logger.warning(f"[BACKTEST] HTF bias fetch failed for {ticker} {tf}: {e}")
-            # Fallback: no HTF bias (all zeros = neutral)
 
         signals_found = 0
         history = load_signals_history()
 
-        # 🆕 FIX: Use module-level helpers (no duplication)
         for idx in range(50, len(df) - 100):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
@@ -774,9 +803,8 @@ def backtest_history(
             frama_bull = frama_dir_v == 1
             frama_bear = frama_dir_v == -1
 
-            # Фильтры
             hh10_prev = float(df["high"].iloc[max(0, idx-10):idx].max())
-            ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())  # ✅ ИСПРАВЛЕНО
+            ll10_prev = float(df["low"].iloc[max(0, idx-10):idx].min())
             fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
             fake_break_short = float(df["low"].iloc[idx]) < ll10_prev and close_v > ll10_prev
 
@@ -785,12 +813,7 @@ def backtest_history(
             liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
-            # Режим для бэктеста
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
-
-            # 🆕 Volume filter для бэктеста (regime-aware)
-
-            # warmed_up: зеркало Pine Script `bar_index >= mfi_training`
             warmed_up_bt = idx >= MFI_TRAINING
 
             filter_long = (
@@ -810,7 +833,6 @@ def backtest_history(
                 and not liq_sweep_long
             )
 
-            # 🆕 FIX: Use module-level helpers + rolling HTF bias
             mfi_bull_sig = crossover(mfi, level_os, idx)
             mfi_bear_sig = crossunder(mfi, level_ob, idx)
             and_bull_sig = crossover2(and_osc, and_sig, idx)
@@ -824,7 +846,6 @@ def backtest_history(
             confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
             confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
 
-            # 🆕 FIX: Apply rolling HTF bias filter (no lookahead)
             htf_bull_bt = htf_bias_arr[idx] == 1
             htf_bear_bt = htf_bias_arr[idx] == -1
 
@@ -833,7 +854,6 @@ def backtest_history(
             sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
 
-            # 🆕 FIX: Independent A-track and U-track signals in backtest
             for track, side, sig_ok in [
                 ("a", "long", sig_a_long), ("a", "short", sig_a_short),
                 ("u", "long", sig_u_long), ("u", "short", sig_u_short)
@@ -842,8 +862,6 @@ def backtest_history(
                     continue
 
                 sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
-
-                # FIXED R:R 2.0 для бэктеста
                 risk_fixed = abs(close_v - sl)
                 tp = close_v + (2.0 * risk_fixed) if side == "long" else close_v - (2.0 * risk_fixed)
 
@@ -889,11 +907,9 @@ def backtest_history(
                             break
                     bars_held = future_idx - idx
 
-                # Если не сработал TP/SL — используем последнюю цену
                 if not tp_hit and not sl_hit and bars_held > 0:
                     exit_price = float(df["close"].iloc[min(idx + bars_held, len(df) - 1)])
 
-                # Сохраняем сигнал
                 _ensure_history_slot(history, ticker, tf)
                 exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
                 moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
@@ -928,36 +944,28 @@ def backtest_history(
 def make_state() -> Dict:
     """Создает начальное состояние с независимыми A и U треками."""
     return {
-        # A-track state
         "a_in_long": False,
         "a_in_short": False,
         "a_long_bar": None,
         "a_short_bar": None,
         "last_a_long_bar": None,
         "last_a_short_bar": None,
-        # U-track state
         "u_in_long": False,
         "u_in_short": False,
         "u_long_bar": None,
         "u_short_bar": None,
         "last_u_long_bar": None,
         "last_u_short_bar": None,
-        # Bar tracking
         "last_bar_time": None,
         "last_processed_bar_time": None,
-        # Independent active trades per track
         "a_active_trade": None,
         "u_active_trade": None,
-        # Independent trade histories per track
         "a_trade_history": [],
         "u_trade_history": [],
-        # Bars in trade per track
         "a_bars_in_trade": 0,
         "u_bars_in_trade": 0,
-        # Closure notification per track
         "a_last_closure_notified": False,
         "u_last_closure_notified": False,
-        # Legacy fields (for backward compat with existing code)
         "active_trade": None,
         "trade_history": [],
         "bars_in_trade": 0,
