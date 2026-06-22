@@ -4,14 +4,10 @@ from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone
 import logging
 
+import config as _cfg
 from config import (
     SIGNALS_HISTORY_FILE,
     SIGNAL_HISTORY_LIMIT,
-    TP_PERCENTILE,
-    SAFE_TP_PERCENTILE,
-    USE_SAFE_TP,
-    MIN_TP_PCT,
-    MAX_TP_PCT,
     safe_json_load,
     safe_json_save,
 )
@@ -240,10 +236,14 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
     return favorable_pcts
 
 def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[float]:
-    """Строит взвешенную выборку для персентиля."""
+    """
+    Строит взвешенную выборку для персентиля.
+    Максимум 2 копии на сигнал (tp=2, sl=1, cancelled=1) — не раздувает выборку.
+    """
     expanded = []
     for mfe, weight in weighted_mfes:
-        copies = max(1, int(weight * 10))
+        # tp → 2 копии, всё остальное → 1 копия
+        copies = 2 if weight >= 1.0 else 1
         expanded.extend([mfe] * copies)
     return expanded
 
@@ -311,7 +311,7 @@ def calculate_adaptive_tp(
 
     expanded = _build_weighted_sample(weighted_mfes)
 
-    active_pct = SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE
+    active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
     tp_pct = float(np.percentile(expanded, active_pct * 100))
 
     # Применяем дисконт режима
@@ -319,18 +319,17 @@ def calculate_adaptive_tp(
 
     # 🛡️ ATR-кап
     if atr14 is not None:
-        # atr14 может быть Series или float — извлекаем скаляр
         try:
             atr_val = float(atr14.iloc[-1]) if hasattr(atr14, 'iloc') else float(atr14)
         except (TypeError, ValueError, AttributeError):
             atr_val = 0.0
 
         if atr_val > 0:
-            atr_tp_pct = (atr_val * 3 / entry) * 100
+            atr_tp_pct = (atr_val * 2 / entry) * 100
             tp_pct = min(tp_pct, atr_tp_pct)
-            logger.debug(f"[TP] ATR cap: {tp_pct:.2f}% raw → min({tp_pct:.2f}%, {atr_tp_pct:.2f}%)")
+            logger.debug(f"[TP] ATR cap 2x: {tp_pct:.2f}% → capped at {atr_tp_pct:.2f}%")
 
-    tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, tp_pct))
+    tp_pct = max(_cfg.MIN_TP_PCT, min(_cfg.MAX_TP_PCT, tp_pct))
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
 
@@ -354,11 +353,12 @@ def calculate_combined_tp(
     risk = abs(entry - sl)
     rr = round(abs(tp - entry) / max(risk, 1e-8), 2)
 
-    mode_label = "SAFE" if USE_SAFE_TP else "AGGR"
+    mode_label   = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
 
     if stats["count"] >= 5:
-        desc = f"📚 Adaptive {SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE:.0%} %ile [{mode_label}] | {stats['count']} signals{regime_label}"
+        active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
+        desc = f"📚 Adaptive {active_pct:.0%} %ile [{mode_label}] | {stats['count']} signals{regime_label}"
     else:
         desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
 

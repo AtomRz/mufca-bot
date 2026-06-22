@@ -126,6 +126,32 @@ MIN_TP_PCT = 0.3
 MAX_TP_PCT = 8.0
 MAX_HOLD_BARS = 20
 
+# Персистенс TP конфига
+TP_CONFIG_FILE = os.path.join(DATA_DIR, "tp_config.json")
+
+def load_tp_config():
+    """Загружает TP конфиг из файла."""
+    global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
+    data = safe_json_load(TP_CONFIG_FILE, {})
+    if not data:
+        return
+    TP_PERCENTILE        = data.get("tp_percentile",        TP_PERCENTILE)
+    SAFE_TP_PERCENTILE   = data.get("safe_tp_percentile",   SAFE_TP_PERCENTILE)
+    USE_SAFE_TP          = data.get("use_safe_tp",          USE_SAFE_TP)
+    SIGNAL_HISTORY_LIMIT = data.get("signal_history_limit", SIGNAL_HISTORY_LIMIT)
+
+def save_tp_config():
+    """Сохраняет текущий TP конфиг в файл."""
+    safe_json_save(TP_CONFIG_FILE, {
+        "tp_percentile":        TP_PERCENTILE,
+        "safe_tp_percentile":   SAFE_TP_PERCENTILE,
+        "use_safe_tp":          USE_SAFE_TP,
+        "signal_history_limit": SIGNAL_HISTORY_LIMIT,
+    })
+
+# Загружаем при старте
+load_tp_config()
+
 # =====================================================================
 # 🕯️  HEIKIN ASHI ДЛЯ UT BOT
 # =====================================================================

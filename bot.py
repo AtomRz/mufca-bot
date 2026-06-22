@@ -20,10 +20,6 @@ from config import (
     TICKERS,
     TIMEFRAMES,
     DATA_DIR,
-    SIGNAL_HISTORY_LIMIT,
-    TP_PERCENTILE,
-    SAFE_TP_PERCENTILE,
-    USE_SAFE_TP,
     MIN_TP_PCT,
     MAX_TP_PCT,
     MAX_HOLD_BARS,
@@ -35,13 +31,14 @@ from config import (
     FRAMA_LEN,
     FRAMA_MULT,
     save_tickers,
+    save_tp_config,
+    ONCHAIN_ENABLED,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache
-from config import ONCHAIN_ENABLED
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache
 
 logger = logging.getLogger(__name__)
@@ -52,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
@@ -102,9 +99,9 @@ def _save_closure_notified(notified: set):
 # =====================================================================
 
 async def startup_sequence(exchange: ccxt.Exchange):
-    """Запуск: сначала бэктест, потом сканер."""
     global _exchange_ref
     _exchange_ref = exchange
+    """Запуск: сначала бэктест, потом сканер."""
     logger.info("=" * 60)
     logger.info("[STARTUP] Running historical backtest to populate signal history...")
     logger.info("=" * 60)
@@ -143,7 +140,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     tp_pct = abs(tp - price) / price * 100
 
     tp_source = (
-        f"📚 Adaptive (last {stats['count']} signals, {TP_PERCENTILE*100:.0f}th %ile)"
+        f"📚 Adaptive (last {stats['count']} signals, {_cfg.TP_PERCENTILE*100:.0f}th %ile)"
         if stats["count"] >= 5 else "📐 Fixed R:R = 2.0"
     )
 
@@ -341,7 +338,7 @@ async def status_cmd(ctx):
         f"**MUFCA v3.1 — Scanner Status**\n",
         f"🧬 HTF Bias: **{_cfg.HTF_BIAS.upper()}**\n",
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
-        f"📚 Adaptive TP: last **{SIGNAL_HISTORY_LIMIT}** signals | **{(SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
+        f"📚 Adaptive TP: last **{_cfg.SIGNAL_HISTORY_LIMIT}** signals | **{(_cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if _cfg.USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
     ]
     exchange = _exchange_ref
     for ticker in TICKERS:
@@ -571,9 +568,8 @@ async def mode_cmd(ctx, new_mode: str = ""):
 
 @bot.command(name="utha")
 async def utha_cmd(ctx, arg: str = ""):
-    global UT_HEIKIN_ASHI
     if not arg:
-        status = "✅ ON" if UT_HEIKIN_ASHI else "❌ OFF"
+        status = "✅ ON" if _cfg.UT_HEIKIN_ASHI else "❌ OFF"
         await ctx.send(f"🕯️ Heikin Ashi for UT Bot: **{status}**\nTo change: `!utha on` or `!utha off`")
         return
 
@@ -583,15 +579,14 @@ async def utha_cmd(ctx, arg: str = ""):
         return
 
     new_value = arg == "on"
-    if new_value == UT_HEIKIN_ASHI:
-        status = "✅ already ON" if UT_HEIKIN_ASHI else "❌ already OFF"
+    if new_value == _cfg.UT_HEIKIN_ASHI:
+        status = "✅ already ON" if _cfg.UT_HEIKIN_ASHI else "❌ already OFF"
         await ctx.send(f"⚠️ Heikin Ashi for UT Bot is {status}.")
         return
 
-    UT_HEIKIN_ASHI = new_value
-    from config import save_ut_ha
-    save_ut_ha(UT_HEIKIN_ASHI)
-    status = "✅ ENABLED" if UT_HEIKIN_ASHI else "❌ DISABLED"
+    _cfg.UT_HEIKIN_ASHI = new_value
+    _cfg.save_ut_ha(_cfg.UT_HEIKIN_ASHI)
+    status = "✅ ENABLED" if _cfg.UT_HEIKIN_ASHI else "❌ DISABLED"
     await ctx.send(f"🕯️ Heikin Ashi for UT Bot **{status}**.")
 
 @bot.command(name="htf")
@@ -614,8 +609,8 @@ async def htf_cmd(ctx, new_htf: str = ""):
 
     old_htf = _cfg.HTF_BIAS
     _cfg.HTF_BIAS = new_htf
-    from config import save_htf
-    save_htf(_cfg.HTF_BIAS)
+    _cfg.save_htf(_cfg.HTF_BIAS)
+    clear_htf_cache()
 
     exchange = _exchange_ref
     if exchange:
@@ -636,17 +631,16 @@ async def htf_cmd(ctx, new_htf: str = ""):
 
 @bot.command(name="tpconfig")
 async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
-    global SIGNAL_HISTORY_LIMIT, TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP
-    active_pct = SAFE_TP_PERCENTILE if USE_SAFE_TP else TP_PERCENTILE
-    active_mode = "SAFE 🛡️" if USE_SAFE_TP else "AGGRESSIVE ⚡"
+    active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
+    active_mode = "SAFE 🛡️" if _cfg.USE_SAFE_TP else "AGGRESSIVE ⚡"
 
     if not param:
         await ctx.send(
             f"**📚 Adaptive TP Configuration:**\n"
             f"• Active mode: **{active_mode}** | Percentile: **{active_pct*100:.0f}th**\n"
-            f"• Aggressive percentile: **{TP_PERCENTILE*100:.0f}th**\n"
-            f"• Safe percentile: **{SAFE_TP_PERCENTILE*100:.0f}th**\n"
-            f"• History limit: **{SIGNAL_HISTORY_LIMIT}** signals\n"
+            f"• Aggressive percentile: **{_cfg.TP_PERCENTILE*100:.0f}th**\n"
+            f"• Safe percentile: **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th**\n"
+            f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals\n"
             f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
             f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
             f"\nTo change: `!tpconfig mode safe` | `!tpconfig mode aggressive` | "
@@ -657,11 +651,13 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
     param = param.lower()
     if param == "mode":
         if value.lower() == "safe":
-            USE_SAFE_TP = True
-            await ctx.send(f"🛡️ **Safe mode enabled** — TP now uses **{SAFE_TP_PERCENTILE*100:.0f}th percentile**.")
+            _cfg.USE_SAFE_TP = True
+            save_tp_config()
+            await ctx.send(f"🛡️ **Safe mode enabled** — TP now uses **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th percentile**.")
         elif value.lower() in ("aggressive", "aggr"):
-            USE_SAFE_TP = False
-            await ctx.send(f"⚡ **Aggressive mode enabled** — TP now uses **{TP_PERCENTILE*100:.0f}th percentile**.")
+            _cfg.USE_SAFE_TP = False
+            save_tp_config()
+            await ctx.send(f"⚡ **Aggressive mode enabled** — TP now uses **{_cfg.TP_PERCENTILE*100:.0f}th percentile**.")
         else:
             await ctx.send("❌ Mode must be `safe` or `aggressive`")
     elif param == "limit":
@@ -670,8 +666,9 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             if not (5 <= new_limit <= 200):
                 await ctx.send("❌ Limit must be between 5 and 200")
                 return
-            old = SIGNAL_HISTORY_LIMIT
-            SIGNAL_HISTORY_LIMIT = new_limit
+            old = _cfg.SIGNAL_HISTORY_LIMIT
+            _cfg.SIGNAL_HISTORY_LIMIT = new_limit
+            save_tp_config()
             await ctx.send(f"✅ History limit changed: **{old}** → **{new_limit}** signals")
         except ValueError:
             await ctx.send("❌ Invalid number")
@@ -681,8 +678,9 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             if not (10 <= new_pct <= 99):
                 await ctx.send("❌ Percentile must be between 10 and 99")
                 return
-            old = TP_PERCENTILE
-            TP_PERCENTILE = new_pct / 100
+            old = _cfg.TP_PERCENTILE
+            _cfg.TP_PERCENTILE = new_pct / 100
+            save_tp_config()
             await ctx.send(f"✅ Aggressive percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
         except ValueError:
             await ctx.send("❌ Invalid number")
@@ -692,8 +690,9 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             if not (10 <= new_pct <= 99):
                 await ctx.send("❌ Safe percentile must be between 10 and 99")
                 return
-            old = SAFE_TP_PERCENTILE
-            SAFE_TP_PERCENTILE = new_pct / 100
+            old = _cfg.SAFE_TP_PERCENTILE
+            _cfg.SAFE_TP_PERCENTILE = new_pct / 100
+            save_tp_config()
             await ctx.send(f"✅ Safe percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
         except ValueError:
             await ctx.send("❌ Invalid number")
@@ -973,15 +972,9 @@ async def reset_cmd(ctx, confirm: str = ""):
 
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            state[ticker][tf]["trade_history"]       = []
-            state[ticker][tf]["a_trade_history"]     = []
-            state[ticker][tf]["u_trade_history"]     = []
-            state[ticker][tf]["active_trade"]        = None
-            state[ticker][tf]["a_active_trade"]      = None
-            state[ticker][tf]["u_active_trade"]      = None
-            state[ticker][tf]["bars_in_trade"]       = 0
-            state[ticker][tf]["a_bars_in_trade"]     = 0
-            state[ticker][tf]["u_bars_in_trade"]     = 0
+            state[ticker][tf]["trade_history"] = []
+            state[ticker][tf]["active_trade"] = None
+            state[ticker][tf]["bars_in_trade"] = 0
 
     await ctx.send("🗑️ History cleared. Running fresh backtest…")
 
@@ -1203,87 +1196,6 @@ async def reset_cache_cmd(ctx):
     _onchain_bias_cache = None
     _onchain_last_fetch = 0.0
     await ctx.send("✅ HTF bias cache и On-Chain cache сброшены. Следующий скан обновит данные.")
-
-
-@bot.command(name="help")
-async def help_cmd(ctx):
-    """Shows all available commands with descriptions."""
-    embed = discord.Embed(
-        title="📖 MUFCA v3.1 — Command Reference",
-        description="All bot commands and their usage:",
-        color=discord.Color.blue(),
-    )
-
-    embed.add_field(
-        name="🔍 Scanning & Signals",
-        value=(
-            "`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals\n"
-            "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal\n"
-            "`!sim [side] [ticker] [tf]` — Simulate and record a signal\n"
-            "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📊 Status & Info",
-        value=(
-            "`!status` — Show scanner status, positions, and volume overview\n"
-            "`!pairs` — List all scanned trading pairs\n"
-            "`!debug` — Show debug stats, scan counts, and volume data"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📚 History & Stats",
-        value=(
-            "`!history [ticker] [tf]` — Show trade history\n"
-            "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⚙️ Configuration",
-        value=(
-            "`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)\n"
-            "`!remove <ticker>` — Remove a trading pair\n"
-            "`!mode [spot|futures]` — Switch market mode\n"
-            "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot\n"
-            "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)\n"
-            "`!tpconfig [param] [value]` — Configure adaptive TP settings\n"
-            "`!chop [tf] [value]` — Set CHOP threshold per timeframe"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔗 On-Chain & Analysis",
-        value=(
-            "`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)\n"
-            "`!reset_cache` — Reset HTF bias and on-chain cache"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🛠️ Maintenance",
-        value=(
-            "`!reset yes` — Clear all signal history and trade data (requires confirmation)\n"
-            "`!help` / `!?` — Show this help message"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(text="MUFCA v3.1 by AtomDC | Prefix: ! | Example: !scan BTC/USDT 1h")
-    await ctx.send(embed=embed)
-
-
-@bot.command(name="?")
-async def question_cmd(ctx):
-    """Alias for !help."""
-    await help_cmd(ctx)
 
 # =====================================================================
 # 🚀  ЗАПУСК
