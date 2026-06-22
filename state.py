@@ -396,12 +396,14 @@ def calculate_adaptive_tp(
     hit_rate_info = ""
 
     # Только если достаточно данных для статистически значимой оценки
-    if len(recent) >= 15:
+    if len(recent) >= 15 and _cfg.TP_AUTO_ADJUST:
         tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent)
         adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
             base_percentile,
             tp_hit_rate,
-            target_hit_rate=0.35,
+            target_hit_rate=_cfg.TP_HIT_RATE_TARGET,
+            min_pct=_cfg.TP_ADJUST_MIN_PCT,
+            max_pct=_cfg.TP_ADJUST_MAX_PCT,
         )
         logger.info(f"[TP-HIT-RATE] {ticker} {tf} {side}: {hit_rate_info}")
 
@@ -417,9 +419,16 @@ def calculate_adaptive_tp(
     # Применяем дисконт режима
     tp_pct *= regime_discount
 
-    # 🆕 FIX: REALISTIC CAPTURE RATE
-    # Идеальный MFE невозможно поймать — корректируем на реалистичность
-    tp_pct = _apply_realistic_capture(tp_pct, capture_rate=0.70)
+    # 🛡️ Realistic capture rate
+    # Применяем capture rate ТОЛЬКО если regime_discount не срабатывал (нет дисконта)
+    # иначе тройной дисконт (weighted + regime + capture) делает TP слишком близким
+    if regime_discount >= 1.0:
+        tp_pct = _apply_realistic_capture(tp_pct, capture_rate=_cfg.TP_CAPTURE_RATE)
+    else:
+        # При наличии regime_discount capture_rate смягчаем до среднего между 1.0 и capture_rate
+        soft_capture = (_cfg.TP_CAPTURE_RATE + 1.0) / 2
+        tp_pct = _apply_realistic_capture(tp_pct, capture_rate=soft_capture)
+        logger.debug(f"[TP] Soft capture {soft_capture:.2f} (regime_discount={regime_discount})")
 
     # 🛡️ ATR-кап
     if atr14 is not None:
@@ -438,7 +447,7 @@ def calculate_adaptive_tp(
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
 
-    logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | pct={adjusted_percentile:.0%} (base={base_percentile:.0%}) | {regime_info} | {hit_rate_info} | capture=70%")
+    logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | pct={adjusted_percentile:.0%} (base={base_percentile:.0%}) | {regime_info} | {hit_rate_info} | capture={'full' if regime_discount >= 1.0 else 'soft'}")
     return round(tp, 4)
 
 
