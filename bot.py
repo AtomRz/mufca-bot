@@ -1227,11 +1227,10 @@ async def reset_cache_cmd(ctx):
 
 
 
-@bot.command(name="help")
-async def help_cmd(ctx, category: str = ""):
-    """📖 Показывает справку по командам MUFCA."""
+@bot.command(name='help')
+async def help_cmd(ctx, category: str = ''):
+    """Shows this help message."""
     if category:
-        # Категорийная справка (можно расширить)
         cats = {
             "scanning": "🔍 Scanning & Signals",
             "status": "📊 Status & Info",
@@ -1245,7 +1244,6 @@ async def help_cmd(ctx, category: str = ""):
                 title=f"📖 {cats[category.lower()]}",
                 color=discord.Color.blue()
             )
-            # Здесь можно добавить детальную справку по категории
             await ctx.send(embed=embed)
             return
 
@@ -1257,65 +1255,63 @@ async def help_cmd(ctx, category: str = ""):
 
     embed.add_field(
         name="🔍 Scanning & Signals",
-        value="`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals
-"
-              "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal
-"
-              "`!sim [side] [ticker] [tf]` — Simulate and record a signal
-"
-              "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)",
+        value=(
+            "`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals\n"
+            "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal\n"
+            "`!sim [side] [ticker] [tf]` — Simulate and record a signal\n"
+            "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)"
+        ),
         inline=False
     )
 
     embed.add_field(
         name="📊 Status & Info",
-        value="`!status` — Show scanner status, positions, and volume overview
-"
-              "`!pairs` — List all scanned trading pairs
-"
-              "`!debug` — Show debug stats, scan counts, and volume data",
+        value=(
+            "`!status` — Show scanner status, positions, and volume overview\n"
+            "`!pairs` — List all scanned trading pairs\n"
+            "`!debug` — Show debug stats, scan counts, and volume data"
+        ),
         inline=False
     )
 
     embed.add_field(
         name="📚 History & Stats",
-        value="`!history [ticker] [tf]` — Show trade history
-"
-              "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data",
+        value=(
+            "`!history [ticker] [tf]` — Show trade history\n"
+            "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data"
+        ),
         inline=False
     )
 
     embed.add_field(
         name="⚙️ Configuration",
-        value="`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)
-"
-              "`!remove <ticker>` — Remove a trading pair
-"
-              "`!mode [spot|futures]` — Switch market mode
-"
-              "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot
-"
-              "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)
-"
-              "`!tpconfig [param] [value]` — Configure adaptive TP settings
-"
-              "`!chop [tf] [value]` — Set CHOP threshold per timeframe",
+        value=(
+            "`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)\n"
+            "`!remove <ticker>` — Remove a trading pair\n"
+            "`!mode [spot|futures]` — Switch market mode\n"
+            "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot\n"
+            "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)\n"
+            "`!tpconfig [param] [value]` — Configure adaptive TP settings\n"
+            "`!chop [tf] [value]` — Set CHOP threshold per timeframe"
+        ),
         inline=False
     )
 
     embed.add_field(
         name="🔗 On-Chain & Analysis",
-        value="`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)
-"
-              "`!reset_cache` — Reset HTF bias and on-chain cache",
+        value=(
+            "`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)\n"
+            "`!reset_cache` — Reset HTF bias and on-chain cache"
+        ),
         inline=False
     )
 
     embed.add_field(
         name="🛠️ Maintenance",
-        value="`!reset yes` — Clear all signal history and trade data (requires confirmation)
-"
-              "`!help / !?` — Show this help message",
+        value=(
+            "`!reset yes` — Clear all signal history and trade data (requires confirmation)\n"
+            "`!help / !?` — Show this help message"
+        ),
         inline=False
     )
 
