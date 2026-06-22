@@ -36,6 +36,7 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
 # 💾  КЭШ
 # =====================================================================
 _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
+_prev_balances: Dict[str, Optional[float]] = {}  # постоянное хранилище предыдущих балансов (без TTL)
 
 def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -49,6 +50,7 @@ def _cache_set(key: str, value: Any):
 def clear_onchain_cache():
     """Сбрасывает весь on-chain кэш."""
     _cache.clear()
+    _prev_balances.clear()
     logger.info("[ONCHAIN] Cache cleared")
 
 # =====================================================================
@@ -102,17 +104,17 @@ async def get_eth_flow_delta() -> Dict:
     """
     Сравнивает текущие балансы с предыдущими.
     Возвращает:
-      delta_eth:   суммарная дельта по всем биржам (+ = приток, - = отток)
+      delta_eth:   суммарная дельта по всем биржам (+ = приток на биржу, - = отток с биржи)
       flow:        "inflow" | "outflow" | "neutral"
       strength:    "large" | "normal" | "weak"
       per_exchange: детали по каждой бирже
     """
-    prev_balances = _cache_get("eth_balances_prev")
     curr_balances = await get_exchange_balances()
 
-    # При первом запуске сохраняем как "предыдущие" и возвращаем neutral
-    if prev_balances is None:
-        _cache_set("eth_balances_prev", curr_balances)
+    # При первом запуске — сохраняем как базу и сразу делаем второй запрос через паузу
+    if not _prev_balances:
+        _prev_balances.update(curr_balances)
+        logger.info("[ONCHAIN] First run: saved baseline balances, delta will be available on next cycle.")
         return {
             "delta_eth": 0.0,
             "flow": "neutral",
@@ -127,14 +129,14 @@ async def get_eth_flow_delta() -> Dict:
 
     for name in EXCHANGE_ETH_ADDRESSES:
         curr = curr_balances.get(name)
-        prev = prev_balances.get(name)
+        prev = _prev_balances.get(name)
         if curr is not None and prev is not None:
             delta = curr - prev    # + = приток на биржу, - = отток с биржи
             delta_total += delta
             per_exchange[name] = round(delta, 2)
 
-    # Обновляем "предыдущие"
-    _cache_set("eth_balances_prev", curr_balances)
+    # Обновляем предыдущие балансы для следующего цикла
+    _prev_balances.update(curr_balances)
 
     # Классифицируем
     abs_delta = abs(delta_total)
@@ -151,8 +153,8 @@ async def get_eth_flow_delta() -> Dict:
 
     return {
         "delta_eth": round(delta_total, 2),
-        "flow": flow,          # inflow  = давление продаж (медвежий)
-        "strength": strength,  # outflow = накопление    (бычий)
+        "flow": flow,
+        "strength": strength,
         "per_exchange": per_exchange,
         "note": "ok",
     }
@@ -427,7 +429,7 @@ def format_onchain_report(bias: Dict) -> str:
         f"**Fear & Greed:** {fg_emoji} `{fg}` — {fglbl}",
         f"**BTC Dominance:** `{dom:.1f}%`",
         "",
-        f"**ETH Exchange Flow:** {flow_emoji} `{flow.upper()}` ({stren})",
+        f"**ETH Exchange Flow:** {flow_emoji} `{'EXCHANGE INFLOW' if flow == 'inflow' else 'EXCHANGE OUTFLOW' if flow == 'outflow' else 'NEUTRAL'}` ({stren})",
     ]
 
     if note == "first_run":

@@ -43,6 +43,10 @@ from state import load_signals_history, calculate_combined_tp, add_signal_record
 
 logger = logging.getLogger(__name__)
 
+def _flow_label(flow: str) -> str:
+    """Переводит internal flow в читаемый лейбл для Discord."""
+    return {"inflow": "BUY PRESSURE", "outflow": "SELL PRESSURE"}.get(flow, "NEUTRAL")
+
 # =====================================================================
 # 🤖  DISCORD BOT
 # =====================================================================
@@ -170,7 +174,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
             is_long = "BUY" in signal_type or "LONG" in signal_type
             dir_score = volume_score_for_side(vol_info, "long" if is_long else "short")
             lev_adj = "+" if dir_score > 0.3 else "-" if dir_score < -0.3 else "="
-            vol_text = f"{vol_flow.upper()} RV:{rel_vol:.1f}x [{lev_adj}lev]"
+            vol_text = f"{_flow_label(vol_flow)} RV:{rel_vol:.1f}x [{lev_adj}lev]"
             embed.add_field(name=f"{vol_emoji} Volume", value=vol_text, inline=True)
         except Exception as e:
             logger.debug(f"Volume info error in build_embed: {e}")
@@ -212,7 +216,14 @@ async def market_scanner():
         try:
             _onchain_bias_cache = await get_onchain_bias()
             _onchain_last_fetch = now_ts
-            logger.info(f"[ONCHAIN] Bias refreshed: long={_onchain_bias_cache.get('bias_long',0):+d} short={_onchain_bias_cache.get('bias_short',0):+d}")
+            # Если первый запуск — сбрасываем onchain_bias кеш чтобы следующий
+            # hourly цикл пересчитал реальную дельту (baseline уже сохранён в _prev_balances)
+            if _onchain_bias_cache.get("flow_data", {}).get("note") == "first_run":
+                from onchain import _cache
+                _cache.pop("onchain_bias", None)
+                logger.info("[ONCHAIN] First run detected — bias cache cleared for next cycle")
+            else:
+                logger.info(f"[ONCHAIN] Bias refreshed: long={_onchain_bias_cache.get('bias_long',0):+d} short={_onchain_bias_cache.get('bias_short',0):+d}")
         except Exception as e:
             logger.warning(f"[ONCHAIN] Refresh failed: {e}")
 
@@ -374,7 +385,7 @@ async def status_cmd(ctx):
                         vol_data = volume_flow_signal_v3(df_v)
                         vol_flow = vol_data["flow"]
                         vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-                        vol_info = f" | {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x"
+                        vol_info = f" | {vol_emoji} {_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
                 except Exception:
                     pass
 
@@ -433,7 +444,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             vol_data = volume_flow_signal_v3(df)
             vol_flow = vol_data["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-            vol_info = f" | {vol_emoji} Vol:{vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x"
+            vol_info = f" | {vol_emoji} Vol:{_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
         except Exception as e:
             logger.debug(f"Volume info error in build_embed: {e}")
         await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**{vol_info}")
@@ -951,7 +962,7 @@ async def debug_cmd(ctx):
                         vol_data = volume_flow_signal_v3(df_d)
                         vol_flow = vol_data["flow"]
                         vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-                        lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {vol_flow.upper()} RV:{vol_data['rel_vol']:.1f}x")
+                        lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x")
                 except Exception:
                     pass
 
@@ -1170,14 +1181,23 @@ async def onchain_cmd(ctx):
     if not ONCHAIN_ENABLED:
         await ctx.send(
             "⚠️ On-Chain анализ отключён.\n"
-            "Добавьте в `.env`:\n"
+            "Добавьте в переменные окружения:\n"
             "```\nETHERSCAN_API_KEY=ваш_ключ\nCOINGECKO_API_KEY=ваш_ключ\n```"
         )
         return
 
     msg = await ctx.send("⏳ Получаю on-chain данные...")
     try:
+        # Первый вызов — может быть first_run (сохраняет baseline)
         bias = await get_onchain_bias()
+
+        # Если first_run — делаем паузу и второй запрос чтобы получить реальную дельту
+        if bias.get("flow_data", {}).get("note") == "first_run":
+            await msg.edit(content="⏳ Первый запуск — жду 5 секунд для сбора дельты...")
+            await asyncio.sleep(5)
+            clear_onchain_cache()
+            bias = await get_onchain_bias()
+
         global _onchain_bias_cache, _onchain_last_fetch
         _onchain_bias_cache = bias
         _onchain_last_fetch = time.time()
