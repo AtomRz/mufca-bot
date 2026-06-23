@@ -53,7 +53,7 @@ def _flow_label(flow: str) -> str:
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
@@ -358,6 +358,54 @@ async def on_command_error(ctx, error):
         return
     logger.exception(f"Command error in {ctx.command}: {error}")
     await ctx.send(f"❌ Command failed: {type(error).__name__}: {str(error)[:200]}")
+
+@bot.command(name="help", aliases=["?"])
+async def help_cmd(ctx):
+    """Список всех команд MUFCA Bot."""
+    lines = [
+        "**📖 MUFCA v3.1 — Команды**\n",
+
+        "**📊 Мониторинг**",
+        "`!status`       — состояние сканера: пары, треки A/U, volume",
+        "`!scan <pair> <tf>` — ручной скан (напр. `!scan BTC/USDT 1h`)",
+        "`!history <pair> <tf>` — история сделок (напр. `!history BTC/USDT 4h`)",
+        "`!signals <pair> <tf>` — статистика сигналов по паре",
+        "`!tp <pair> <tf>` — текущий адаптивный TP",
+        "`!debug`        — расширенная отладочная информация",
+        "`!onchain`      — on-chain анализ (F&G, ETH flows)",
+        "",
+
+        "**⚙️ Настройки**",
+        "`!mode spot|futures` — переключить режим торговли",
+        "`!htf <tf>`     — HTF Bias таймфрейм (напр. `!htf 4h`)",
+        "`!utha on|off`  — Heikin Ashi для UT Bot",
+        "`!chop <tf> <val>` — порог CHOP (напр. `!chop 1h 55`)",
+        "",
+
+        "**📚 Адаптивный TP**",
+        "`!tpconfig`           — показать текущий конфиг TP",
+        "`!tpconfig mode safe` — безопасный режим (50-й %ile)",
+        "`!tpconfig mode aggressive` — агрессивный (75-й %ile)",
+        "`!tpconfig percentile 70` — изменить агрессивный %ile",
+        "`!tpconfig safe 45`   — изменить безопасный %ile",
+        "`!tpconfig limit 30`  — кол-во сигналов для обучения",
+        "",
+
+        "**📋 Пары**",
+        "`!pairs`        — список активных пар",
+        "`!add <pair>`   — добавить пару (напр. `!add SOL/USDT`)",
+        "`!remove <pair>` — удалить пару",
+        "",
+
+        "**🛠️ Утилиты**",
+        "`!sim <pair> <tf> <side>` — симуляция сделки",
+        "`!forcerun`     — принудительный запуск сканера",
+        "`!reset`        — сбросить всё состояние и историю",
+        "`!reset_cache`  — сбросить HTF и on-chain кеш",
+        "`!help` / `!?` — эта справка",
+    ]
+    await ctx.send("\n".join(lines))
+
 
 @bot.command(name="status")
 async def status_cmd(ctx):
