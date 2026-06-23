@@ -55,12 +55,25 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Удаляем встроенный help для кастомного
-bot.remove_command('help')
-
-
 # Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
+
+def _heal_state():
+    """Исправляет рассинхрон флагов треков при старте."""
+    for ticker in TICKERS:
+        for tf in TIMEFRAMES:
+            st = state[ticker][tf]
+            # Если флаг стоит но active_trade нет — сбрасываем флаг
+            if (st.get("a_in_long") or st.get("a_in_short")) and not st.get("a_active_trade"):
+                st["a_in_long"] = False
+                st["a_in_short"] = False
+                logger.warning(f"[HEAL] A-track desync fixed at startup: {ticker} {tf}")
+            if (st.get("u_in_long") or st.get("u_in_short")) and not st.get("u_active_trade"):
+                st["u_in_long"] = False
+                st["u_in_short"] = False
+                logger.warning(f"[HEAL] U-track desync fixed at startup: {ticker} {tf}")
+
+_heal_state()
 scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
 
 # 🆕 FIX: Per-ticker/tf asyncio locks to prevent race conditions
@@ -368,10 +381,30 @@ async def status_cmd(ctx):
                     ts = f"<t:{ts_val // 1000}:R>"
                 except (ValueError, TypeError):
                     ts = str(last)
-            a_pos = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else "—"
-            u_pos = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else "—"
             a_trade = st.get("a_active_trade")
             u_trade = st.get("u_active_trade")
+
+            # Показываем позицию только если флаг И active_trade оба установлены
+            # Если только флаг без trade — рассинхрон, показываем предупреждение
+            a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
+            u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
+
+            if a_flag and not a_trade:
+                a_pos = f"⚠️{a_flag}"   # флаг есть, trade нет — рассинхрон
+                state[ticker][tf]["a_in_long"] = False   # auto-heal
+                state[ticker][tf]["a_in_short"] = False
+                a_pos = "—"
+                logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
+            else:
+                a_pos = a_flag or "—"
+
+            if u_flag and not u_trade:
+                state[ticker][tf]["u_in_long"] = False   # auto-heal
+                state[ticker][tf]["u_in_short"] = False
+                u_pos = "—"
+                logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
+            else:
+                u_pos = u_flag or "—"
             trade_info = ""
             if a_trade:
                 trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${round(a_trade['entry'], 2)}"
@@ -1225,98 +1258,6 @@ async def reset_cache_cmd(ctx):
 # 🚀  ЗАПУСК
 # =====================================================================
 
-
-
-@bot.command(name='help')
-async def help_cmd(ctx, category: str = ''):
-    """Shows this help message."""
-    if category:
-        cats = {
-            "scanning": "🔍 Scanning & Signals",
-            "status": "📊 Status & Info",
-            "history": "📚 History & Stats",
-            "config": "⚙️ Configuration",
-            "onchain": "🔗 On-Chain & Analysis",
-            "maintenance": "🛠️ Maintenance",
-        }
-        if category.lower() in cats:
-            embed = discord.Embed(
-                title=f"📖 {cats[category.lower()]}",
-                color=discord.Color.blue()
-            )
-            await ctx.send(embed=embed)
-            return
-
-    embed = discord.Embed(
-        title="📖 MUFCA v3.1 — Command Reference",
-        description="All bot commands and their usage:",
-        color=discord.Color.blue()
-    )
-
-    embed.add_field(
-        name="🔍 Scanning & Signals",
-        value=(
-            "`!scan [ticker] [tf]` — Manually scan a pair/timeframe for signals\n"
-            "`!tp [side] [ticker] [tf]` — Preview adaptive TP for a signal\n"
-            "`!sim [side] [ticker] [tf]` — Simulate and record a signal\n"
-            "`!forcerun [side] [ticker] [tf]` — Force a signal (bypasses all filters)"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Status & Info",
-        value=(
-            "`!status` — Show scanner status, positions, and volume overview\n"
-            "`!pairs` — List all scanned trading pairs\n"
-            "`!debug` — Show debug stats, scan counts, and volume data"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📚 History & Stats",
-        value=(
-            "`!history [ticker] [tf]` — Show trade history\n"
-            "`!signals [ticker] [tf] [side]` — Show signal statistics and MFE data"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚙️ Configuration",
-        value=(
-            "`!add <ticker>` — Add a new trading pair (e.g., `!add SOL/USDT`)\n"
-            "`!remove <ticker>` — Remove a trading pair\n"
-            "`!mode [spot|futures]` — Switch market mode\n"
-            "`!utha [on|off]` — Toggle Heikin Ashi for UT Bot\n"
-            "`!htf [timeframe]` — Set HTF bias (1d, 4h, 1h, 1w, etc.)\n"
-            "`!tpconfig [param] [value]` — Configure adaptive TP settings\n"
-            "`!chop [tf] [value]` — Set CHOP threshold per timeframe"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🔗 On-Chain & Analysis",
-        value=(
-            "`!onchain` — Show on-chain analysis (F&G, ETH flows, bias)\n"
-            "`!reset_cache` — Reset HTF bias and on-chain cache"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🛠️ Maintenance",
-        value=(
-            "`!reset yes` — Clear all signal history and trade data (requires confirmation)\n"
-            "`!help / !?` — Show this help message"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text="MUFCA v3.1 by AtomDC | Prefix: ! | Example: !scan BTC/USDT 1h")
-    await ctx.send(embed=embed)
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set in .env file!")

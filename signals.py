@@ -500,26 +500,29 @@ async def check_signals(
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
-        if sig_a_long:
-            state["a_in_long"] = True
-            state["a_in_short"] = False
-            state["a_long_bar"] = bar_idx
-            state["last_a_long_bar"] = bar_idx
-        if sig_a_short:
-            state["a_in_short"] = True
-            state["a_in_long"] = False
-            state["a_short_bar"] = bar_idx
-            state["last_a_short_bar"] = bar_idx
-        if sig_u_long:
-            state["u_in_long"] = True
-            state["u_in_short"] = False
-            state["u_long_bar"] = bar_idx
-            state["last_u_long_bar"] = bar_idx
-        if sig_u_short:
-            state["u_in_short"] = True
-            state["u_in_long"] = False
-            state["u_short_bar"] = bar_idx
-            state["last_u_short_bar"] = bar_idx
+        # Флаги треков ставятся ТОЛЬКО при реальном открытии (не dry_run)
+        # и ТОЛЬКО вместе с active_trade, чтобы не было рассинхрона
+        if not dry_run:
+            if sig_a_long:
+                state["a_in_long"] = True
+                state["a_in_short"] = False
+                state["a_long_bar"] = bar_idx
+                state["last_a_long_bar"] = bar_idx
+            if sig_a_short:
+                state["a_in_short"] = True
+                state["a_in_long"] = False
+                state["a_short_bar"] = bar_idx
+                state["last_a_short_bar"] = bar_idx
+            if sig_u_long:
+                state["u_in_long"] = True
+                state["u_in_short"] = False
+                state["u_long_bar"] = bar_idx
+                state["last_u_long_bar"] = bar_idx
+            if sig_u_short:
+                state["u_in_short"] = True
+                state["u_in_long"] = False
+                state["u_short_bar"] = bar_idx
+                state["last_u_short_bar"] = bar_idx
 
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
