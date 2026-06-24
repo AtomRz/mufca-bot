@@ -28,9 +28,18 @@ def calculate_volume_delta(df: pd.DataFrame) -> pd.Series:
     """
     Volume Delta — buying/selling pressure via close location in bar.
     close near high = +pressure, close near low = -pressure.
+
+    BUGFIX BUG-ME004: При high == low (doji-свеча) range_ = 0, close_loc ≈ 0,
+    pressure = -1.0 — doji интерпретировалась как максимальное давление продаж.
+    Теперь при doji close_loc = 0.5 (нейтрально).
     """
     range_ = df["high"] - df["low"]
-    close_loc = (df["close"] - df["low"]) / (range_ + 1e-12)
+    # 🆕 FIX: doji защита — при нулевом или почти нулевом range ставим нейтральное значение
+    close_loc = np.where(
+        range_ < 1e-12,
+        0.5,  # Doji = нейтрально
+        (df["close"] - df["low"]) / (range_ + 1e-12)
+    )
     pressure = (close_loc - 0.5) * 2.0
     return pressure * df["volume"]
 
