@@ -37,9 +37,9 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
-from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl, clear_htf_cache
+from signals import check_signals, backtest_history, make_state, calculate_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
-from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache
+from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache, get_signal_stats
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
 
 # 🆕 FIX: Per-ticker/tf asyncio locks to prevent race conditions
 _state_locks: Dict[str, Dict[str, asyncio.Lock]] = {}
+_tickers_lock = asyncio.Lock()
 
 def _ensure_locks():
     """Ensure locks exist for all tickers/timeframes."""
@@ -353,6 +354,7 @@ async def on_ready():
     global _exchange_ref
     _exchange_ref = exchange
     asyncio.create_task(startup_sequence(exchange))
+    await asyncio.sleep(0)  # satisfy async convention
 
 # 🆕 FIX: Global command error handler
 @bot.event
@@ -450,22 +452,23 @@ async def status_cmd(ctx):
             # 🆕 FIX BUG-HI001: Убрано двойное присваивание a_pos
             # Ранее: a_pos = f"⚠️{a_flag}" → затем a_pos = "—" (перезаписывало!)
             # Теперь: одно присваивание с информативным сообщением
-            if a_flag and not a_trade:
-                logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
-                state[ticker][tf]["a_in_long"] = False   # auto-heal
-                state[ticker][tf]["a_in_short"] = False
-                a_pos = f"⚠️{a_flag} (fixed)"  # ← Одно присваивание, пользователь видит предупреждение
-            else:
-                a_pos = a_flag or "—"
+            async with _state_locks[ticker][tf]:
+                if a_flag and not a_trade:
+                    logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
+                    state[ticker][tf]["a_in_long"] = False   # auto-heal
+                    state[ticker][tf]["a_in_short"] = False
+                    a_pos = f"⚠️{a_flag} (fixed)"  # ← Одно присваивание, пользователь видит предупреждение
+                else:
+                    a_pos = a_flag or "—"
 
-            # 🆕 FIX BUG-HI001: Аналогично для U-трека
-            if u_flag and not u_trade:
-                logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
-                state[ticker][tf]["u_in_long"] = False   # auto-heal
-                state[ticker][tf]["u_in_short"] = False
-                u_pos = f"⚠️{u_flag} (fixed)"  # ← Аналогично для U-трека
-            else:
-                u_pos = u_flag or "—"
+                # 🆕 FIX BUG-HI001: Аналогично для U-трека
+                if u_flag and not u_trade:
+                    logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
+                    state[ticker][tf]["u_in_long"] = False   # auto-heal
+                    state[ticker][tf]["u_in_short"] = False
+                    u_pos = f"⚠️{u_flag} (fixed)"  # ← Аналогично для U-трека
+                else:
+                    u_pos = u_flag or "—"
             trade_info = ""
             if a_trade:
                 trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${round(a_trade['entry'], 2)}"
@@ -478,7 +481,6 @@ async def status_cmd(ctx):
                 try:
                     bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
                     if bars and len(bars) >= 25:
-                        from utils import parse_ohlcv
                         df_v = parse_ohlcv(bars)
                         vol_data = volume_flow_signal_v3(df_v)
                         vol_flow = vol_data["flow"]
@@ -582,8 +584,9 @@ async def add_cmd(ctx, ticker: str = ""):
         await ctx.send(f"❌ Check failed: {e}")
         return
 
-    TICKERS.append(ticker)
-    state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
+    async with _tickers_lock:
+        TICKERS.append(ticker)
+        state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
     # 🆕 FIX: Ensure locks for new ticker
     if ticker not in _state_locks:
@@ -621,11 +624,12 @@ async def remove_cmd(ctx, ticker: str = ""):
         await ctx.send("❌ Cannot remove the last pair.")
         return
 
-    TICKERS.remove(ticker)
-    if ticker in state:
-        del state[ticker]
-    if ticker in _state_locks:
-        del _state_locks[ticker]
+    async with _tickers_lock:
+        TICKERS.remove(ticker)
+        if ticker in state:
+            del state[ticker]
+        if ticker in _state_locks:
+            del _state_locks[ticker]
 
     save_tickers(TICKERS)
 
@@ -652,7 +656,6 @@ async def mode_cmd(ctx, new_mode: str = ""):
 
     _cfg.MARKET_MODE = new_mode  # ← Меняем через модуль, не через global
 
-    from config import MODE_FILE, save_mode
     save_mode(_cfg.MARKET_MODE)
 
     if _cfg.MARKET_MODE == "futures":
@@ -672,7 +675,8 @@ async def mode_cmd(ctx, new_mode: str = ""):
                     st["last_processed_bar_time"] = int(bars[-2][0])
             except Exception:
                 pass
-            state[ticker][tf] = st
+            async with _state_locks[ticker][tf]:
+                state[ticker][tf] = st
 
     label = "🔵 Spot (Gate.io Spot)" if _cfg.MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
     await ctx.send(f"✅ Switched to **{label}**\n⚠️ Position states have been reset.")
@@ -735,14 +739,16 @@ async def htf_cmd(ctx, new_htf: str = ""):
                         st["last_processed_bar_time"] = int(bars[-2][0])
                 except Exception:
                     pass
-                state[ticker][tf] = st
+                async with _state_locks[ticker][tf]:
+                    state[ticker][tf] = st
 
     await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{_cfg.HTF_BIAS.upper()}**\n"
                    f"⚠️ Position states have been reset.")
 
 @bot.command(name="tpconfig")
 async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
-    active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
+    try:
+        active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
     active_mode = "SAFE 🛡️" if _cfg.USE_SAFE_TP else "AGGRESSIVE ⚡"
 
     if not param:
@@ -809,10 +815,14 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             await ctx.send("❌ Invalid number")
     else:
         await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `percentile`, or `safe`")
+    except Exception as e:
+        logger.error(f"TPConfig command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="chop")
 async def chop_cmd(ctx, tf: str = "", value: str = ""):
-    if not tf:
+    try:
+        if not tf:
         lines = ["**📊 CHOP Threshold Settings:**"]
         for t, v in CHOP_THRESHOLD.items():
             lines.append(f"• `{t}`: **{v}** (below = trend, above = sideways)")
@@ -840,10 +850,14 @@ async def chop_cmd(ctx, tf: str = "", value: str = ""):
         await ctx.send(f"✅ CHOP threshold for `{tf}` changed: **{old}** → **{new_val}**")
     except ValueError:
         await ctx.send("❌ Invalid number")
+    except Exception as e:
+        logger.error(f"Chop command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="history")
 async def history_cmd(ctx, ticker: str = "", tf: str = ""):
-    lines = []
+    try:
+        lines = []
 
     if not ticker:
         lines = ["**📊 Trade History:**\n"]
@@ -896,10 +910,14 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
             chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
         await ctx.send(chunk)
         msg = msg[len(chunk):].lstrip("\n")
+    except Exception as e:
+        logger.error(f"History command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="signals")
 async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
-    history = load_signals_history()
+    try:
+        history = load_signals_history()
 
     if not ticker:
         lines = ["**📚 Signal History Summary:**\n"]
@@ -969,6 +987,9 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
             f"Result: {rec['exit_type'].upper()}"
         )
     await ctx.send("\n".join(lines))
+    except Exception as e:
+        logger.error(f"Signals command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="tp")
 async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
@@ -1095,6 +1116,11 @@ async def reset_cmd(ctx, confirm: str = ""):
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             state[ticker][tf] = make_state()
+
+    # 🆕 FIX: Clear on-chain cache on reset
+    global _onchain_bias_cache, _onchain_last_fetch
+    _onchain_bias_cache = None
+    _onchain_last_fetch = 0.0
 
     await ctx.send("🗑️ History cleared. Running fresh backtest…")
 

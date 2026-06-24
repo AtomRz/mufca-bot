@@ -1,5 +1,6 @@
 import asyncio
 import time
+import threading
 import logging
 from typing import Optional, List, Dict, Any
 import ccxt
@@ -39,7 +40,8 @@ async def safe_fetch_ohlcv(
             if attempt < retries - 1:
                 await asyncio.sleep(1)
             else:
-                raise
+                logger.error(f"Fetch failed after {retries} retries for {ticker} {timeframe}, returning empty")
+                return []
     return []
 
 # =====================================================================
@@ -68,18 +70,22 @@ class Timer:
     def __init__(self, ttl_seconds: int):
         self.ttl = ttl_seconds
         self._data = {}
-    
+        self._lock = threading.Lock()
+
     def get(self, key: str) -> Optional[Any]:
-        if key not in self._data:
-            return None
-        data, timestamp = self._data[key]
-        if (time.time() - timestamp) > self.ttl:
-            del self._data[key]
-            return None
-        return data
-    
+        with self._lock:
+            if key not in self._data:
+                return None
+            data, timestamp = self._data[key]
+            if (time.time() - timestamp) > self.ttl:
+                del self._data[key]
+                return None
+            return data
+
     def set(self, key: str, value: Any):
-        self._data[key] = (value, time.time())
-    
+        with self._lock:
+            self._data[key] = (value, time.time())
+
     def clear(self):
-        self._data.clear()
+        with self._lock:
+            self._data.clear()

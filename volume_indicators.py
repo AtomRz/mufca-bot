@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Tuple, Dict
+from config import MAX_ALLOWED_LEV
 
 # =====================================================================
 # 📊  VOLUME FLOW INDICATORS v3 — Score-Based (Confidence & Leverage)
@@ -189,7 +190,6 @@ def volume_leverage_adjustment_v3(info: Dict, side: str, base_lev: int) -> Tuple
     else:
         delta = 0
 
-    from config import MAX_ALLOWED_LEV
     new_lev = max(1, min(MAX_ALLOWED_LEV, base_lev + delta))
 
     if delta > 0:

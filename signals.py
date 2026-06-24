@@ -223,7 +223,7 @@ def apply_onchain_with_safety(
         tp_mult = onchain_bias.get("tp_mult_short", 1.0)
         sl_mult = onchain_bias.get("sl_mult_short", 1.0)
 
-    if tp_mult == 1.0 and sl_mult == 1.0:
+    if abs(tp_mult - 1.0) < 1e-9 and abs(sl_mult - 1.0) < 1e-9:
         return tp, sl, "", True
 
     risk_before = abs(entry - sl)
@@ -361,6 +361,110 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
     logger.info(f"[TRADE] Closed {track.upper()}-track {side.upper()} | PnL: {pnl_pct:.2f}% | Result: {result.upper()}")
     return closed_trade
+
+
+# =====================================================================
+# 🆕 UNIFIED POSITION OPENING (replaces 4 duplicated blocks)
+# =====================================================================
+
+async def open_position(
+    state: Dict[str, Any],
+    track: str,
+    side: str,
+    close_v: float,
+    fs: pd.Series,
+    fu: pd.Series,
+    fl: pd.Series,
+    atr14: pd.Series,
+    df: pd.DataFrame,
+    idx: int,
+    ticker: str,
+    timeframe: str,
+    regime: str,
+    sugg_lev: int,
+    onchain_bias: Optional[Dict],
+    dry_run: bool,
+    calc_confidence,
+    MIN_RR: float,
+) -> Optional[Tuple]:
+    """
+    Unified position opening logic for any track (a/u) and side (long/short).
+    Returns signal tuple if position opened, None if filtered out.
+    """
+    trade_key = f"{track}_active_trade"
+    if state.get(trade_key):
+        return None
+
+    sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
+    tp, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
+
+    if side == "long":
+        risk = abs(close_v - sl)
+        reward = abs(tp - close_v)
+    else:
+        risk = abs(sl - close_v)
+        reward = abs(close_v - tp)
+    rr = reward / max(risk, 1e-8)
+
+    tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
+        close_v, sl, tp, side, onchain_bias, min_rr=MIN_RR
+    )
+    tp_desc += oc_desc
+
+    if side == "long":
+        risk = abs(close_v - sl)
+        reward = abs(tp - close_v)
+        bar_extreme = float(df["low"].iloc[idx])
+        extreme_violation = bar_extreme <= sl
+    else:
+        risk = abs(sl - close_v)
+        reward = abs(close_v - tp)
+        bar_extreme = float(df["high"].iloc[idx])
+        extreme_violation = bar_extreme >= sl
+
+    rr = reward / max(risk, 1e-8)
+
+    track_label = "A" if track == "a" else "U"
+    signal_label = f"{track_label} BUY  (Andean+MFI)" if side == "long" and track == "a" else                    f"{track_label} BUY  (UT Bot)" if side == "long" and track == "u" else                    f"{track_label} SELL (Andean+MFI)" if side == "short" and track == "a" else                    f"{track_label} SELL (UT Bot)"
+
+    in_long_key = f"{track}_in_long"
+    in_short_key = f"{track}_in_short"
+    last_bar_key = f"last_{track}_{side}_bar"
+    bars_key = f"{track}_bars_in_trade"
+
+    if rr < MIN_RR:
+        logger.info(f"[FILTER] {ticker} {timeframe} {track_label}-{side.upper()} skipped — R:R={rr:.2f} < {MIN_RR}")
+        if not dry_run:
+            state[in_long_key] = False
+            state[in_short_key] = False
+            state[last_bar_key] = None
+        return None
+
+    if extreme_violation:
+        logger.info(f"[FILTER] {ticker} {timeframe} {track_label}-{side.upper()} skipped — bar extreme violates SL")
+        if not dry_run:
+            state[in_long_key] = False
+            state[in_short_key] = False
+            state[last_bar_key] = None
+        return None
+
+    state[trade_key] = {
+        "side": side,
+        "entry": close_v,
+        "sl": sl,
+        "tp": tp,
+        "lev": sugg_lev,
+        "bar_opened": idx
+    }
+    state[bars_key] = 0
+
+    if not dry_run:
+        add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime)
+
+    stats = get_signal_stats(ticker, timeframe, side)
+    conf = calc_confidence(side == "long")
+
+    return (signal_label, close_v, regime, sugg_lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, risk, stats, tp_desc)
 
 # =====================================================================
 # 🧠  CHECK SIGNALS (ОСНОВНАЯ ЛОГИКА)
@@ -582,200 +686,47 @@ async def check_signals(
             return max(0, min(100, score))
 
         signals = []
-        MIN_RR = 1.0
+        MIN_RR = 1.5
 
         # --- A-track LONG ---
-        if sig_a_long and not state.get("a_active_trade"):
-            sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
-            risk = abs(close_v - sl)
-            reward = abs(tp - close_v)
-            rr = reward / max(risk, 1e-8)
-
-            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
-                close_v, sl, tp, "long", onchain_bias, min_rr=MIN_RR
-            )
-            tp_desc += oc_desc
-            risk = abs(close_v - sl)
-            reward = abs(tp - close_v)
-            rr = reward / max(risk, 1e-8)
-
-            bar_low = float(df["low"].iloc[idx])
-            if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_a_long = False
-                # BUGFIX BUG-CR001: откатываем флаги трека — active_trade не создан,
-                # иначе трек "замерзает" и блокирует все следующие сигналы
-                if not dry_run:
-                    state["a_in_long"] = False
-                    state["a_in_short"] = False
-                    state["last_a_long_bar"] = None
-            elif bar_low <= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — bar low below SL")
-                sig_a_long = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["a_in_long"] = False
-                    state["a_in_short"] = False
-                    state["last_a_long_bar"] = None
+        if sig_a_long:
+            sig = await open_position(state, "a", "long", close_v, fs, fu, fl, atr14, df, idx,
+                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      calc_confidence, MIN_RR)
+            if sig:
+                signals.append(sig)
             else:
-                state["a_active_trade"] = {
-                    "side": "long",
-                    "entry": close_v,
-                    "sl": sl,
-                    "tp": tp,
-                    "lev": sugg_lev,
-                    "bar_opened": bar_idx
-                }
-                state["a_bars_in_trade"] = 0
-                if not dry_run:
-                    add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
-                stats = get_signal_stats(ticker, timeframe, "long")
-                signals.append(("A BUY  (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
+                sig_a_long = False
 
         # --- U-track LONG ---
-        if sig_u_long and not state.get("u_active_trade"):
-            sl = calculate_sl(close_v, "long", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "long", close_v, sl, df, idx, atr14, regime)
-            risk = abs(close_v - sl)
-            reward = abs(tp - close_v)
-            rr = reward / max(risk, 1e-8)
-
-            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
-                close_v, sl, tp, "long", onchain_bias, min_rr=MIN_RR
-            )
-            tp_desc += oc_desc
-            risk = abs(close_v - sl)
-            reward = abs(tp - close_v)
-            rr = reward / max(risk, 1e-8)
-
-            bar_low = float(df["low"].iloc[idx])
-            if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_u_long = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["u_in_long"] = False
-                    state["u_in_short"] = False
-                    state["last_u_long_bar"] = None
-            elif bar_low <= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — bar low below SL")
-                sig_u_long = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["u_in_long"] = False
-                    state["u_in_short"] = False
-                    state["last_u_long_bar"] = None
+        if sig_u_long:
+            sig = await open_position(state, "u", "long", close_v, fs, fu, fl, atr14, df, idx,
+                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      calc_confidence, MIN_RR)
+            if sig:
+                signals.append(sig)
             else:
-                state["u_active_trade"] = {
-                    "side": "long",
-                    "entry": close_v,
-                    "sl": sl,
-                    "tp": tp,
-                    "lev": sugg_lev,
-                    "bar_opened": bar_idx
-                }
-                state["u_bars_in_trade"] = 0
-                if not dry_run:
-                    add_signal_record(ticker, timeframe, "long", close_v, datetime.now(timezone.utc).isoformat(), regime)
-                stats = get_signal_stats(ticker, timeframe, "long")
-                signals.append(("U BUY  (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(True), sl, tp, risk, stats, tp_desc))
+                sig_u_long = False
 
         # --- A-track SHORT ---
-        if sig_a_short and not state.get("a_active_trade"):
-            sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
-            risk = abs(sl - close_v)
-            reward = abs(close_v - tp)
-            rr = reward / max(risk, 1e-8)
-
-            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
-                close_v, sl, tp, "short", onchain_bias, min_rr=MIN_RR
-            )
-            tp_desc += oc_desc
-            risk = abs(sl - close_v)
-            reward = abs(close_v - tp)
-            rr = reward / max(risk, 1e-8)
-
-            bar_high = float(df["high"].iloc[idx])
-            if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_a_short = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["a_in_short"] = False
-                    state["a_in_long"] = False
-                    state["last_a_short_bar"] = None
-            elif bar_high >= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — bar high above SL")
-                sig_a_short = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["a_in_short"] = False
-                    state["a_in_long"] = False
-                    state["last_a_short_bar"] = None
+        if sig_a_short:
+            sig = await open_position(state, "a", "short", close_v, fs, fu, fl, atr14, df, idx,
+                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      calc_confidence, MIN_RR)
+            if sig:
+                signals.append(sig)
             else:
-                state["a_active_trade"] = {
-                    "side": "short",
-                    "entry": close_v,
-                    "sl": sl,
-                    "tp": tp,
-                    "lev": sugg_lev,
-                    "bar_opened": bar_idx
-                }
-                state["a_bars_in_trade"] = 0
-                if not dry_run:
-                    add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
-                stats = get_signal_stats(ticker, timeframe, "short")
-                signals.append(("A SELL (Andean+MFI)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
+                sig_a_short = False
 
         # --- U-track SHORT ---
-        if sig_u_short and not state.get("u_active_trade"):
-            sl = calculate_sl(close_v, "short", fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, timeframe, "short", close_v, sl, df, idx, atr14, regime)
-            risk = abs(sl - close_v)
-            reward = abs(close_v - tp)
-            rr = reward / max(risk, 1e-8)
-
-            tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
-                close_v, sl, tp, "short", onchain_bias, min_rr=MIN_RR
-            )
-            tp_desc += oc_desc
-            risk = abs(sl - close_v)
-            reward = abs(close_v - tp)
-            rr = reward / max(risk, 1e-8)
-
-            bar_high = float(df["high"].iloc[idx])
-            if rr < MIN_RR:
-                logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
-                sig_u_short = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["u_in_short"] = False
-                    state["u_in_long"] = False
-                    state["last_u_short_bar"] = None
-            elif bar_high >= sl:
-                logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — bar high above SL")
-                sig_u_short = False
-                # BUGFIX BUG-CR001: откатываем флаги трека
-                if not dry_run:
-                    state["u_in_short"] = False
-                    state["u_in_long"] = False
-                    state["last_u_short_bar"] = None
+        if sig_u_short:
+            sig = await open_position(state, "u", "short", close_v, fs, fu, fl, atr14, df, idx,
+                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      calc_confidence, MIN_RR)
+            if sig:
+                signals.append(sig)
             else:
-                state["u_active_trade"] = {
-                    "side": "short",
-                    "entry": close_v,
-                    "sl": sl,
-                    "tp": tp,
-                    "lev": sugg_lev,
-                    "bar_opened": bar_idx
-                }
-                state["u_bars_in_trade"] = 0
-                if not dry_run:
-                    add_signal_record(ticker, timeframe, "short", close_v, datetime.now(timezone.utc).isoformat(), regime)
-                stats = get_signal_stats(ticker, timeframe, "short")
-                signals.append(("U SELL (UT Bot)", close_v, regime, sugg_lev, bar_time, calc_confidence(False), sl, tp, risk, stats, tp_desc))
+                sig_u_short = False
 
         return signals, bar_time, regime, sugg_lev
 
