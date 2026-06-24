@@ -76,9 +76,12 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
     4 параллельных запроса через asyncio.gather могут вызвать 429 Too Many Requests.
     Добавлен retry с exponential backoff.
     """
+    # 🆕 FIX: Etherscan deprecated V1 endpoint (2025+).
+    # Мигрируем на V2 API: добавляем /v2/ и обязательный chainid=1 (Ethereum mainnet).
     url = (
-        f"https://api.etherscan.io/api"
-        f"?module=account&action=balance"
+        f"https://api.etherscan.io/v2/api"
+        f"?chainid=1"
+        f"&module=account&action=balance"
         f"&address={address}"
         f"&tag=latest"
         f"&apikey={ETHERSCAN_API_KEY}"
