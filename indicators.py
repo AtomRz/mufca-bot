@@ -23,7 +23,11 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     atr_sum = tr.rolling(window=length).sum()
     hh = df["high"].rolling(window=length).max()
     ll = df["low"].rolling(window=length).min()
-    return 100 * np.log10(atr_sum / (hh - ll + 1e-12)) / np.log10(length)
+    # 🆕 FIX BUG-LO004: Защита от отрицательных значений CHOP
+    # При atr_sum → 0 (флэт-рынок) CHOP → -∞, что некорректно.
+    # Добавляем 1e-12 внутрь log и clip на [0, 100].
+    chop = 100 * np.log10(atr_sum / (hh - ll + 1e-12) + 1e-12) / np.log10(length)
+    return np.clip(chop, 0, 100)
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """Fractal Adaptive Moving Average."""
