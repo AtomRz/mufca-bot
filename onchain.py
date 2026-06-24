@@ -48,10 +48,22 @@ def _cache_set(key: str, value: Any):
     _cache[key] = (time.time(), value)
 
 def clear_onchain_cache():
-    """Сбрасывает весь on-chain кэш."""
+    """Сбрасывает TTL-кэш on-chain данных.
+
+    BUGFIX BUG-HI004: ранее очищала и _prev_balances, из-за чего следующий вызов
+    get_eth_flow_delta() снова попадал в ветку first_run (нет baseline → возвращает
+    note='first_run' → bot.py вызывал clear_onchain_cache() → цикл бесконечно).
+    Теперь _prev_balances НЕ сбрасывается — baseline сохраняется между сбросами кэша.
+    Для полного сброса включая baseline используйте clear_onchain_cache_full().
+    """
+    _cache.clear()
+    logger.info("[ONCHAIN] TTL cache cleared (baseline balances preserved)")
+
+def clear_onchain_cache_full():
+    """Полный сброс кэша включая baseline балансов (использовать только при !reset_cache)."""
     _cache.clear()
     _prev_balances.clear()
-    logger.info("[ONCHAIN] Cache cleared")
+    logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
 # 🔗  ETHERSCAN — балансы бирж

@@ -38,7 +38,7 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, get_signal_stats, calculate_sl, clear_htf_cache
-from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache
+from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache
 
 logger = logging.getLogger(__name__)
@@ -1062,21 +1062,32 @@ async def reset_cmd(ctx, confirm: str = ""):
         )
         return
 
+    # BUGFIX BUG-CR003: останавливаем сканер перед backtest чтобы исключить
+    # race condition — одновременная запись в signals_history.json из двух источников.
+    scanner_was_running = market_scanner.is_running()
+    if scanner_was_running:
+        market_scanner.stop()
+        await asyncio.sleep(1)  # даём текущей итерации завершиться
+
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)
-    clear_history_cache()  # ✅ ИСПРАВЛЕНО: сбрасываем in-memory кэш после удаления файла
+    clear_history_cache()
 
+    # BUGFIX BUG-HI002: ранее сбрасывались только trade_history/active_trade/bars_in_trade.
+    # Не сбрасывались: a_active_trade, u_active_trade, a_in_long/a_in_short, u_in_long/u_in_short,
+    # a_bars_in_trade, u_bars_in_trade, last_*_bar, *_last_closure_notified.
+    # Треки оставались замороженными после !reset. Теперь полный сброс через make_state().
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
-            state[ticker][tf]["trade_history"] = []
-            state[ticker][tf]["active_trade"] = None
-            state[ticker][tf]["bars_in_trade"] = 0
+            state[ticker][tf] = make_state()
 
     await ctx.send("🗑️ History cleared. Running fresh backtest…")
 
     exchange = _exchange_ref
     if exchange is None:
         await ctx.send("❌ Exchange not initialized")
+        if scanner_was_running:
+            market_scanner.start()
         return
 
     total = 0
@@ -1090,6 +1101,10 @@ async def reset_cmd(ctx, confirm: str = ""):
             except Exception as e:
                 logger.error(f"Reset backtest error: {e}")
                 await ctx.send(f"❌ `{ticker}` `{tf}` backtest failed: {e}")
+
+    # Перезапускаем сканер после backtest
+    if scanner_was_running and not market_scanner.is_running():
+        market_scanner.start()
 
     await ctx.send(f"🎓 Fresh backtest complete! Total signals: **{total}**\nRun `!signals` to see statistics.")
 
@@ -1184,7 +1199,6 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # 🆕 FIX: Use lock during sim
     if ticker not in _state_locks:
         _state_locks[ticker] = {}
     if tf not in _state_locks.get(ticker, {}):
@@ -1195,68 +1209,60 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
 
+            # BUGFIX BUG-ME001: отсутствовала проверка — IndexError при пустом ответе биржи
+            if not validate_dataframe(df, 50):
+                await ctx.send("❌ Not enough data from exchange")
+                return
+
             last_close = float(df["close"].iloc[-2])
 
             atr14 = calculate_atr(df, ATR_PERIOD)
-
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-
             idx = len(df) - 2
 
             sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-
             tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
-
             risk = abs(last_close - sl)
 
+            # BUGFIX BUG-HI003: ранее делали state[ticker][tf] = make_state() через st,
+            # что безвозвратно уничтожало активные позиции и всю историю сделок.
+            # Теперь обновляем только нужные поля существующего state.
+            if ticker not in state or tf not in state.get(ticker, {}):
+                state.setdefault(ticker, {})[tf] = make_state()
 
-            st = state.get(ticker, {}).get(tf) or make_state()
-
-            st["active_trade"] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
-
+            st = state[ticker][tf]
+            track_key = "a_active_trade"  # forcerun всегда на A-треке
+            st[track_key] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
+            st["a_bars_in_trade"] = 0
+            st["a_in_long"] = (side == "long")
+            st["a_in_short"] = (side == "short")
+            # Обновляем legacy поле для совместимости
+            st["active_trade"] = st[track_key]
             st["bars_in_trade"] = 0
 
-            state[ticker][tf] = st
-
             add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
-
             stats = get_signal_stats(ticker, tf, side)
 
-
             rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
-
             tp_pct = abs(tp - last_close) / last_close * 100
 
-
             embed = discord.Embed(
-
-            title=f"⚡ FORCE SIGNAL {'📈 LONG' if side == 'long' else '📉 SHORT'}",
-            color=discord.Color.green() if side == "long" else discord.Color.red(),
+                title=f"⚡ FORCE SIGNAL {'📈 LONG' if side == 'long' else '📉 SHORT'}",
+                color=discord.Color.green() if side == "long" else discord.Color.red(),
             )
-
             embed.add_field(name="Pair", value=f"**{ticker}**", inline=True)
-
             embed.add_field(name="TF", value=tf.upper(), inline=True)
-
             embed.add_field(name="Entry", value=f"${round(last_close, 2):,.2f}", inline=True)
-
             embed.add_field(name="SL", value=f"${round(sl, 2):,.2f}", inline=True)
-
             embed.add_field(name="TP", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
-
             embed.add_field(name="R:R", value=f"1:{rr}", inline=True)
-
             embed.add_field(name="⚠️ WARNING", value="Bypassed all filters — for testing only!", inline=False)
-
             await ctx.send(embed=embed)
 
         except Exception as e:
             logger.error(f"Forcerun error: {e}", exc_info=True)
-
             await ctx.send(f"❌ Force run failed: {e}")
-
             import traceback
-
             await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
 
 
@@ -1273,15 +1279,16 @@ async def onchain_cmd(ctx):
 
     msg = await ctx.send("⏳ Получаю on-chain данные...")
     try:
-        # Первый вызов — может быть first_run (сохраняет baseline)
         bias = await get_onchain_bias()
 
-        # Если first_run — делаем паузу и второй запрос чтобы получить реальную дельту
+        # BUGFIX BUG-HI004: НЕ вызываем clear_onchain_cache() при first_run —
+        # это сбрасывало _prev_balances и следующий вызов снова давал first_run (infinite loop).
+        # При первом запуске baseline уже сохранён в _prev_balances, следующий hourly
+        # цикл в market_scanner сам посчитает реальную дельту. Просто сообщаем об этом.
         if bias.get("flow_data", {}).get("note") == "first_run":
-            await msg.edit(content="⏳ Первый запуск — жду 5 секунд для сбора дельты...")
-            await asyncio.sleep(5)
-            clear_onchain_cache()
-            bias = await get_onchain_bias()
+            report = format_onchain_report(bias)
+            await msg.edit(content=report + "\n\n⏳ _ETH flow дельта будет доступна через ~1 час (первый запуск)._")
+            return
 
         global _onchain_bias_cache, _onchain_last_fetch
         _onchain_bias_cache = bias
@@ -1296,7 +1303,7 @@ async def onchain_cmd(ctx):
 async def reset_cache_cmd(ctx):
     """Сбрасывает HTF bias cache и on-chain cache вручную."""
     clear_htf_cache()
-    clear_onchain_cache()
+    clear_onchain_cache_full()  # полный сброс включая baseline балансов
     global _onchain_bias_cache, _onchain_last_fetch
     _onchain_bias_cache = None
     _onchain_last_fetch = 0.0

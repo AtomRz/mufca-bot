@@ -166,17 +166,32 @@ def calculate_sl(
     atr14: pd.Series,
     idx: int
 ) -> float:
-    """Рассчитывает Stop Loss с валидацией (SL не пересекает цену входа)."""
+    """Рассчитывает Stop Loss с валидацией (SL не пересекает цену входа).
+
+    BUGFIX BUG-CR002: FRAMA возвращает NaN для первых ~22 баров (rolling windows
+    не заполнены). max(NaN, x) = NaN в Python (IEEE 754), поэтому SL становился NaN,
+    проверки rr < MIN_RR и bar_low <= sl давали False, позиция открывалась без
+    рабочего стопа и никогда не закрывалась по SL.
+    Исправление: если sl_frama = NaN, используем только sl_atr.
+    """
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     if side == "long":
         sl_frama = float(fl.iloc[idx])
         sl_atr = entry_price - 1.5 * atr_v
-        sl = max(sl_frama, sl_atr)
+        # NaN-защита: если FRAMA не прогрелась — падаем обратно на ATR-стоп
+        if np.isnan(sl_frama):
+            sl = sl_atr
+        else:
+            sl = max(sl_frama, sl_atr)
         return min(sl, entry_price * 0.995)
     else:
         sl_frama = float(fu.iloc[idx])
         sl_atr = entry_price + 1.5 * atr_v
-        sl = min(sl_frama, sl_atr)
+        # NaN-защита
+        if np.isnan(sl_frama):
+            sl = sl_atr
+        else:
+            sl = min(sl_frama, sl_atr)
         return max(sl, entry_price * 1.005)
 
 # =====================================================================
@@ -577,7 +592,6 @@ async def check_signals(
             reward = abs(tp - close_v)
             rr = reward / max(risk, 1e-8)
 
-            # 🆕 FIX: Применяем on-chain с safety check
             tp, sl, oc_desc, oc_ok = apply_onchain_with_safety(
                 close_v, sl, tp, "long", onchain_bias, min_rr=MIN_RR
             )
@@ -590,9 +604,20 @@ async def check_signals(
             if rr < MIN_RR:
                 logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
                 sig_a_long = False
+                # BUGFIX BUG-CR001: откатываем флаги трека — active_trade не создан,
+                # иначе трек "замерзает" и блокирует все следующие сигналы
+                if not dry_run:
+                    state["a_in_long"] = False
+                    state["a_in_short"] = False
+                    state["last_a_long_bar"] = None
             elif bar_low <= sl:
                 logger.info(f"[FILTER] {ticker} {timeframe} A-LONG skipped — bar low below SL")
                 sig_a_long = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["a_in_long"] = False
+                    state["a_in_short"] = False
+                    state["last_a_long_bar"] = None
             else:
                 state["a_active_trade"] = {
                     "side": "long",
@@ -628,9 +653,19 @@ async def check_signals(
             if rr < MIN_RR:
                 logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — R:R={rr:.2f} < {MIN_RR}")
                 sig_u_long = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["u_in_long"] = False
+                    state["u_in_short"] = False
+                    state["last_u_long_bar"] = None
             elif bar_low <= sl:
                 logger.info(f"[FILTER] {ticker} {timeframe} U-LONG skipped — bar low below SL")
                 sig_u_long = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["u_in_long"] = False
+                    state["u_in_short"] = False
+                    state["last_u_long_bar"] = None
             else:
                 state["u_active_trade"] = {
                     "side": "long",
@@ -666,9 +701,19 @@ async def check_signals(
             if rr < MIN_RR:
                 logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
                 sig_a_short = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["a_in_short"] = False
+                    state["a_in_long"] = False
+                    state["last_a_short_bar"] = None
             elif bar_high >= sl:
                 logger.info(f"[FILTER] {ticker} {timeframe} A-SHORT skipped — bar high above SL")
                 sig_a_short = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["a_in_short"] = False
+                    state["a_in_long"] = False
+                    state["last_a_short_bar"] = None
             else:
                 state["a_active_trade"] = {
                     "side": "short",
@@ -704,9 +749,19 @@ async def check_signals(
             if rr < MIN_RR:
                 logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — R:R={rr:.2f} < {MIN_RR}")
                 sig_u_short = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["u_in_short"] = False
+                    state["u_in_long"] = False
+                    state["last_u_short_bar"] = None
             elif bar_high >= sl:
                 logger.info(f"[FILTER] {ticker} {timeframe} U-SHORT skipped — bar high above SL")
                 sig_u_short = False
+                # BUGFIX BUG-CR001: откатываем флаги трека
+                if not dry_run:
+                    state["u_in_short"] = False
+                    state["u_in_long"] = False
+                    state["last_u_short_bar"] = None
             else:
                 state["u_active_trade"] = {
                     "side": "short",
@@ -781,7 +836,13 @@ def backtest_history(
                         if htf_idx >= FRAMA_LEN * 2:
                             htf_close = float(df_htf["close"].iloc[htf_idx])
                             htf_frama_val = float(fs_htf.iloc[htf_idx])
-                            htf_bias_arr[i] = 1 if htf_close > htf_frama_val else -1
+                            # BUGFIX BUG-ME003: FRAMA может вернуть NaN на первых ~22 барах.
+                            # htf_close > NaN = False (IEEE 754) → bias = -1 (bear) вместо 0 (neutral).
+                            # Это создаёт ложный медвежий bias и искажает backtest статистику.
+                            if np.isnan(htf_frama_val):
+                                htf_bias_arr[i] = 0
+                            else:
+                                htf_bias_arr[i] = 1 if htf_close > htf_frama_val else -1
         except Exception as e:
             logger.warning(f"[BACKTEST] HTF bias fetch failed for {ticker} {tf}: {e}")
 
