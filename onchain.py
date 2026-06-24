@@ -69,8 +69,13 @@ def clear_onchain_cache_full():
 # 🔗  ETHERSCAN — балансы бирж
 # =====================================================================
 
-async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str) -> Optional[float]:
-    """Возвращает ETH баланс адреса (в ETH, не в Wei)."""
+async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retries: int = 3) -> Optional[float]:
+    """Возвращает ETH баланс адреса (в ETH, не в Wei).
+
+    BUGFIX BUG-ME002: Etherscan имеет rate limit 5 calls/second для бесплатных ключей.
+    4 параллельных запроса через asyncio.gather могут вызвать 429 Too Many Requests.
+    Добавлен retry с exponential backoff.
+    """
     url = (
         f"https://api.etherscan.io/api"
         f"?module=account&action=balance"
@@ -78,13 +83,39 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str) -> Op
         f"&tag=latest"
         f"&apikey={ETHERSCAN_API_KEY}"
     )
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-            if data.get("status") == "1":
-                return int(data["result"]) / 1e18   # Wei → ETH
-    except Exception as e:
-        logger.warning(f"[ONCHAIN] Etherscan balance error {address[:10]}…: {e}")
+    for attempt in range(retries):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    # Rate limit — ждём и повторяем
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(f"[ONCHAIN] Etherscan 429 for {address[:10]}…, retrying in {wait}s (attempt {attempt+1}/{retries})")
+                    await asyncio.sleep(wait)
+                    continue
+                data = await resp.json()
+                if data.get("status") == "1":
+                    return int(data["result"]) / 1e18   # Wei → ETH
+                # status == "0" может быть rate limit или другая ошибка
+                if data.get("message") == "NOTOK" and "rate limit" in str(data.get("result", "")).lower():
+                    wait = 2 ** attempt
+                    logger.warning(f"[ONCHAIN] Etherscan rate limit (message), retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                # Ошибка но не rate limit — не retry
+                logger.warning(f"[ONCHAIN] Etherscan error for {address[:10]}…: {data.get('message')} — {data.get('result')}")
+                return None
+        except asyncio.TimeoutError:
+            logger.warning(f"[ONCHAIN] Etherscan timeout for {address[:10]}… (attempt {attempt+1}/{retries})")
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+            else:
+                return None
+        except Exception as e:
+            logger.warning(f"[ONCHAIN] Etherscan balance error {address[:10]}…: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+            else:
+                return None
     return None
 
 
@@ -193,8 +224,10 @@ async def get_coingecko_data() -> Dict:
         "fear_and_greed": 50,
         "fg_label": "Neutral",
         "btc_dominance": 50.0,
-        "eth_volume_change_24h": 0.0,
-        "btc_volume_change_24h": 0.0,
+        "eth_total_volume_24h": 0.0,
+        "btc_total_volume_24h": 0.0,
+        "eth_volume_change_24h": None,  # BUG-LO003: требует отдельного endpoint
+        "btc_volume_change_24h": None,  # BUG-LO003: требует отдельного endpoint
         "error": None,
     }
 
@@ -217,12 +250,18 @@ async def get_coingecko_data() -> Dict:
             ) as resp:
                 coins = await resp.json()
                 for coin in coins:
-                    # CoinGecko не даёт volume_change напрямую, используем price_change как прокси
-                    price_change = coin.get("price_change_percentage_24h", 0.0) or 0.0
+                    # 🆕 FIX BUG-LO003: CoinGecko markets endpoint не предоставляет
+                    # volume_change_24h. Использование price_change как прокси вводит
+                    # в заблуждение — изменение цены ≠ изменение объёма.
+                    # Убираем некорректные поля; реальный volume_change доступен только
+                    # через /coins/{id}/market_chart (volume) с ручным расчётом дельты.
+                    # Пока оставляем total_volume для справки, но volume_change = N/A.
                     if coin["id"] == "ethereum":
-                        result["eth_volume_change_24h"] = round(price_change, 2)
+                        result["eth_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
+                        result["eth_volume_change_24h"] = None  # недоступно без доп. запросов
                     elif coin["id"] == "bitcoin":
-                        result["btc_volume_change_24h"] = round(price_change, 2)
+                        result["btc_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
+                        result["btc_volume_change_24h"] = None  # недоступно без доп. запросов
 
             # 3. Fear & Greed Index (альтернативный эндпоинт)
             async with session.get(
