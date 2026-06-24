@@ -746,7 +746,6 @@ async def htf_cmd(ctx, new_htf: str = ""):
                    f"⚠️ Position states have been reset.")
 
 @bot.command(name="tpconfig")
-@bot.command(name="tpconfig")
 async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
     try:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
