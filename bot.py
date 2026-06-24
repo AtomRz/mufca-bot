@@ -746,75 +746,76 @@ async def htf_cmd(ctx, new_htf: str = ""):
                    f"⚠️ Position states have been reset.")
 
 @bot.command(name="tpconfig")
+@bot.command(name="tpconfig")
 async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
     try:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
-    active_mode = "SAFE 🛡️" if _cfg.USE_SAFE_TP else "AGGRESSIVE ⚡"
+        active_mode = "SAFE 🛡️" if _cfg.USE_SAFE_TP else "AGGRESSIVE ⚡"
 
-    if not param:
-        await ctx.send(
-            f"**📚 Adaptive TP Configuration:**\n"
-            f"• Active mode: **{active_mode}** | Percentile: **{active_pct*100:.0f}th**\n"
-            f"• Aggressive percentile: **{_cfg.TP_PERCENTILE*100:.0f}th**\n"
-            f"• Safe percentile: **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th**\n"
-            f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals\n"
-            f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
-            f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
-            f"\nTo change: `!tpconfig mode safe` | `!tpconfig mode aggressive` | "
-            f"`!tpconfig limit 30` | `!tpconfig percentile 70` | `!tpconfig safe 50`"
-        )
-        return
+        if not param:
+            await ctx.send(
+                "**📚 Adaptive TP Configuration:**\n"
+                f"• Active mode: **{active_mode}** | Percentile: **{active_pct*100:.0f}th**\n"
+                f"• Aggressive percentile: **{_cfg.TP_PERCENTILE*100:.0f}th**\n"
+                f"• Safe percentile: **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th**\n"
+                f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals\n"
+                f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
+                f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
+                "\nTo change: `!tpconfig mode safe` | `!tpconfig mode aggressive` | "
+                "`!tpconfig limit 30` | `!tpconfig percentile 70` | `!tpconfig safe 50`"
+            )
+            return
 
-    param = param.lower()
-    if param == "mode":
-        if value.lower() == "safe":
-            _cfg.USE_SAFE_TP = True
-            save_tp_config()
-            await ctx.send(f"🛡️ **Safe mode enabled** — TP now uses **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th percentile**.")
-        elif value.lower() in ("aggressive", "aggr"):
-            _cfg.USE_SAFE_TP = False
-            save_tp_config()
-            await ctx.send(f"⚡ **Aggressive mode enabled** — TP now uses **{_cfg.TP_PERCENTILE*100:.0f}th percentile**.")
+        param = param.lower()
+        if param == "mode":
+            if value.lower() == "safe":
+                _cfg.USE_SAFE_TP = True
+                save_tp_config()
+                await ctx.send(f"🛡️ **Safe mode enabled** — TP now uses **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th percentile**.")
+            elif value.lower() in ("aggressive", "aggr"):
+                _cfg.USE_SAFE_TP = False
+                save_tp_config()
+                await ctx.send(f"⚡ **Aggressive mode enabled** — TP now uses **{_cfg.TP_PERCENTILE*100:.0f}th percentile**.")
+            else:
+                await ctx.send("❌ Mode must be `safe` or `aggressive`")
+        elif param == "limit":
+            try:
+                new_limit = int(value)
+                if not (5 <= new_limit <= 200):
+                    await ctx.send("❌ Limit must be between 5 and 200")
+                    return
+                old = _cfg.SIGNAL_HISTORY_LIMIT
+                _cfg.SIGNAL_HISTORY_LIMIT = new_limit
+                save_tp_config()
+                await ctx.send(f"✅ History limit changed: **{old}** → **{new_limit}** signals")
+            except ValueError:
+                await ctx.send("❌ Invalid number")
+        elif param == "percentile":
+            try:
+                new_pct = float(value)
+                if not (10 <= new_pct <= 99):
+                    await ctx.send("❌ Percentile must be between 10 and 99")
+                    return
+                old = _cfg.TP_PERCENTILE
+                _cfg.TP_PERCENTILE = new_pct / 100
+                save_tp_config()
+                await ctx.send(f"✅ Aggressive percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
+            except ValueError:
+                await ctx.send("❌ Invalid number")
+        elif param == "safe":
+            try:
+                new_pct = float(value)
+                if not (10 <= new_pct <= 99):
+                    await ctx.send("❌ Safe percentile must be between 10 and 99")
+                    return
+                old = _cfg.SAFE_TP_PERCENTILE
+                _cfg.SAFE_TP_PERCENTILE = new_pct / 100
+                save_tp_config()
+                await ctx.send(f"✅ Safe percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
+            except ValueError:
+                await ctx.send("❌ Invalid number")
         else:
-            await ctx.send("❌ Mode must be `safe` or `aggressive`")
-    elif param == "limit":
-        try:
-            new_limit = int(value)
-            if not (5 <= new_limit <= 200):
-                await ctx.send("❌ Limit must be between 5 and 200")
-                return
-            old = _cfg.SIGNAL_HISTORY_LIMIT
-            _cfg.SIGNAL_HISTORY_LIMIT = new_limit
-            save_tp_config()
-            await ctx.send(f"✅ History limit changed: **{old}** → **{new_limit}** signals")
-        except ValueError:
-            await ctx.send("❌ Invalid number")
-    elif param == "percentile":
-        try:
-            new_pct = float(value)
-            if not (10 <= new_pct <= 99):
-                await ctx.send("❌ Percentile must be between 10 and 99")
-                return
-            old = _cfg.TP_PERCENTILE
-            _cfg.TP_PERCENTILE = new_pct / 100
-            save_tp_config()
-            await ctx.send(f"✅ Aggressive percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
-        except ValueError:
-            await ctx.send("❌ Invalid number")
-    elif param == "safe":
-        try:
-            new_pct = float(value)
-            if not (10 <= new_pct <= 99):
-                await ctx.send("❌ Safe percentile must be between 10 and 99")
-                return
-            old = _cfg.SAFE_TP_PERCENTILE
-            _cfg.SAFE_TP_PERCENTILE = new_pct / 100
-            save_tp_config()
-            await ctx.send(f"✅ Safe percentile changed: **{old*100:.0f}th** → **{new_pct:.0f}th**")
-        except ValueError:
-            await ctx.send("❌ Invalid number")
-    else:
-        await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `percentile`, or `safe`")
+            await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `percentile`, or `safe`")
     except Exception as e:
         logger.error(f"TPConfig command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -823,33 +824,33 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
 async def chop_cmd(ctx, tf: str = "", value: str = ""):
     try:
         if not tf:
-        lines = ["**📊 CHOP Threshold Settings:**"]
-        for t, v in CHOP_THRESHOLD.items():
-            lines.append(f"• `{t}`: **{v}** (below = trend, above = sideways)")
-        lines.append("\nTo change: `!chop 1h 55` or `!chop 4h 61.8`")
-        await ctx.send("\n".join(lines))
-        return
-
-    tf = tf.lower()
-    if tf not in TIMEFRAMES:
-        await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(f'`{t}`' for t in TIMEFRAMES)}")
-        return
-
-    if not value:
-        current = CHOP_THRESHOLD.get(tf, 61.8)
-        await ctx.send(f"📊 CHOP threshold for `{tf}`: **{current}**\nTo change: `!chop {tf} 55`")
-        return
-
-    try:
-        new_val = float(value)
-        if not (20.0 <= new_val <= 90.0):
-            await ctx.send("❌ Value must be between 20 and 90")
+            lines = ["**📊 CHOP Threshold Settings:**"]
+            for t, v in CHOP_THRESHOLD.items():
+                lines.append(f"• `{t}`: **{v}** (below = trend, above = sideways)")
+            lines.append("\nTo change: `!chop 1h 55` or `!chop 4h 61.8`")
+            await ctx.send("\n".join(lines))
             return
-        old = CHOP_THRESHOLD.get(tf, 61.8)
-        CHOP_THRESHOLD[tf] = new_val
-        await ctx.send(f"✅ CHOP threshold for `{tf}` changed: **{old}** → **{new_val}**")
-    except ValueError:
-        await ctx.send("❌ Invalid number")
+
+        tf = tf.lower()
+        if tf not in TIMEFRAMES:
+            await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(f'`{t}`' for t in TIMEFRAMES)}")
+            return
+
+        if not value:
+            current = CHOP_THRESHOLD.get(tf, 61.8)
+            await ctx.send(f"📊 CHOP threshold for `{tf}`: **{current}**\nTo change: `!chop {tf} 55`")
+            return
+
+        try:
+            new_val = float(value)
+            if not (20.0 <= new_val <= 90.0):
+                await ctx.send("❌ Value must be between 20 and 90")
+                return
+            old = CHOP_THRESHOLD.get(tf, 61.8)
+            CHOP_THRESHOLD[tf] = new_val
+            await ctx.send(f"✅ CHOP threshold for `{tf}` changed: **{old}** → **{new_val}**")
+        except ValueError:
+            await ctx.send("❌ Invalid number")
     except Exception as e:
         logger.error(f"Chop command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -859,57 +860,57 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
     try:
         lines = []
 
-    if not ticker:
-        lines = ["**📊 Trade History:**\n"]
-        for t in TICKERS:
-            for timeframe in TIMEFRAMES:
-                st = state[t][timeframe]
-                trades = st.get("trade_history", [])
-                if trades:
-                    lines.append(f"\n**`{t}` `{timeframe}` — {len(trades)} trades:**")
-                    for i, trade in enumerate(trades[-5:], 1):
-                        emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                        lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
-
-        if len(lines) == 1:
-            await ctx.send("📭 No trade history yet.")
-            return
-    else:
-        ticker = ticker.upper()
-        if tf:
-            tf = tf.lower()
-            st = state.get(ticker, {}).get(tf)
-            if not st:
-                await ctx.send(f"❌ No data for `{ticker}` `{tf}`")
-                return
-            trades = st.get("trade_history", [])
-            if not trades:
-                await ctx.send(f"📭 No trade history for `{ticker}` `{tf}`")
-                return
-            lines = [f"**📊 `{ticker}` `{tf}` Trade History ({len(trades)} trades):**\n"]
-            for i, trade in enumerate(trades[-10:], 1):
-                emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
-        else:
-            lines = [f"**📊 `{ticker}` Trade History:**\n"]
-            for timeframe in TIMEFRAMES:
-                st = state.get(ticker, {}).get(timeframe)
-                if st:
+        if not ticker:
+            lines = ["**📊 Trade History:**\n"]
+            for t in TICKERS:
+                for timeframe in TIMEFRAMES:
+                    st = state[t][timeframe]
                     trades = st.get("trade_history", [])
                     if trades:
-                        lines.append(f"\n**`{timeframe}` — {len(trades)} trades:**")
+                        lines.append(f"\n**`{t}` `{timeframe}` — {len(trades)} trades:**")
                         for i, trade in enumerate(trades[-5:], 1):
                             emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
                             lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
 
-    msg = "\n".join(lines)
-    # ✅ ИСПРАВЛЕНО: разбиваем длинные сообщения
-    while msg:
-        chunk = msg[:1900]
-        if len(msg) > 1900:
-            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
-        await ctx.send(chunk)
-        msg = msg[len(chunk):].lstrip("\n")
+            if len(lines) == 1:
+                await ctx.send("📭 No trade history yet.")
+                return
+        else:
+            ticker = ticker.upper()
+            if tf:
+                tf = tf.lower()
+                st = state.get(ticker, {}).get(tf)
+                if not st:
+                    await ctx.send(f"❌ No data for `{ticker}` `{tf}`")
+                    return
+                trades = st.get("trade_history", [])
+                if not trades:
+                    await ctx.send(f"📭 No trade history for `{ticker}` `{tf}`")
+                    return
+                lines = [f"**📊 `{ticker}` `{tf}` Trade History ({len(trades)} trades):**\n"]
+                for i, trade in enumerate(trades[-10:], 1):
+                    emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
+                    lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+            else:
+                lines = [f"**📊 `{ticker}` Trade History:**\n"]
+                for timeframe in TIMEFRAMES:
+                    st = state.get(ticker, {}).get(timeframe)
+                    if st:
+                        trades = st.get("trade_history", [])
+                        if trades:
+                            lines.append(f"\n**`{timeframe}` — {len(trades)} trades:**")
+                            for i, trade in enumerate(trades[-5:], 1):
+                                emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
+                                lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+
+        msg = "\n".join(lines)
+        # ✅ ИСПРАВЛЕНО: разбиваем длинные сообщения
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"History command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -919,79 +920,78 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
     try:
         history = load_signals_history()
 
-    if not ticker:
-        lines = ["**📚 Signal History Summary:**\n"]
-        for t in history:
-            for timeframe in history[t]:
+        if not ticker:
+            lines = ["**📚 Signal History Summary:**\n"]
+            for t in history:
+                for timeframe in history[t]:
+                    for s in ("long", "short"):
+                        records = [r for r in history[t][timeframe].get(s, []) if r["exit_type"] != "open"]
+                        if records:
+                            wins = sum(1 for r in records if r["moved_pct"] > 0)
+                            avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
+                            lines.append(f"• `{t}` `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
+            if len(lines) == 1:
+                await ctx.send("📭 No signal history yet.")
+                return
+            await ctx.send("\n".join(lines))
+            return
+
+        ticker = ticker.upper()
+        if ticker not in history:
+            await ctx.send(f"📭 No history for `{ticker}`")
+            return
+
+        if not tf:
+            lines = [f"**📚 `{ticker}` Signal History:**\n"]
+            for timeframe in history[ticker]:
                 for s in ("long", "short"):
-                    records = [r for r in history[t][timeframe].get(s, []) if r["exit_type"] != "open"]
+                    records = [r for r in history[ticker][timeframe].get(s, []) if r["exit_type"] != "open"]
                     if records:
                         wins = sum(1 for r in records if r["moved_pct"] > 0)
                         avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                        lines.append(f"• `{t}` `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-        if len(lines) == 1:
-            await ctx.send("📭 No signal history yet.")
+                        lines.append(f"• `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
+            await ctx.send("\n".join(lines))
             return
-        await ctx.send("\n".join(lines))
-        return
 
-    ticker = ticker.upper()
-    if ticker not in history:
-        await ctx.send(f"📭 No history for `{ticker}`")
-        return
+        tf = tf.lower()
+        if tf not in history[ticker]:
+            await ctx.send(f"📭 No history for `{ticker}` `{tf}`")
+            return
 
-    if not tf:
-        lines = [f"**📚 `{ticker}` Signal History:**\n"]
-        for timeframe in history[ticker]:
+        if not side:
+            lines = [f"**📚 `{ticker}` `{tf}` Signal History:**\n"]
             for s in ("long", "short"):
-                records = [r for r in history[ticker][timeframe].get(s, []) if r["exit_type"] != "open"]
+                records = [r for r in history[ticker][tf].get(s, []) if r["exit_type"] != "open"]
                 if records:
                     wins = sum(1 for r in records if r["moved_pct"] > 0)
                     avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                    lines.append(f"• `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
+                    lines.append(f"• {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
+            await ctx.send("\n".join(lines))
+            return
+
+        side = side.lower()
+        if side not in ("long", "short"):
+            await ctx.send("❌ Side must be `long` or `short`")
+            return
+
+        records = [r for r in history[ticker][tf].get(side, []) if r["exit_type"] != "open"]
+        if not records:
+            await ctx.send(f"📭 No {side} history for `{ticker}` `{tf}`")
+            return
+
+        lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**\n"]
+        for i, rec in enumerate(records[-15:], 1):
+            emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
+            lines.append(
+                f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | "
+                f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
+                f"Result: {rec['exit_type'].upper()}"
+            )
         await ctx.send("\n".join(lines))
-        return
-
-    tf = tf.lower()
-    if tf not in history[ticker]:
-        await ctx.send(f"📭 No history for `{ticker}` `{tf}`")
-        return
-
-    if not side:
-        lines = [f"**📚 `{ticker}` `{tf}` Signal History:**\n"]
-        for s in ("long", "short"):
-            records = [r for r in history[ticker][tf].get(s, []) if r["exit_type"] != "open"]
-            if records:
-                wins = sum(1 for r in records if r["moved_pct"] > 0)
-                avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
-                lines.append(f"• {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-        await ctx.send("\n".join(lines))
-        return
-
-    side = side.lower()
-    if side not in ("long", "short"):
-        await ctx.send("❌ Side must be `long` or `short`")
-        return
-
-    records = [r for r in history[ticker][tf].get(side, []) if r["exit_type"] != "open"]
-    if not records:
-        await ctx.send(f"📭 No {side} history for `{ticker}` `{tf}`")
-        return
-
-    lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**\n"]
-    for i, rec in enumerate(records[-15:], 1):
-        emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
-        lines.append(
-            f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | "
-            f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
-            f"Result: {rec['exit_type'].upper()}"
-        )
-    await ctx.send("\n".join(lines))
     except Exception as e:
         logger.error(f"Signals command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
-@bot.command(name="tp")
 async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
     side = side.lower()
     if side not in ("long", "short"):
