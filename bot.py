@@ -1029,9 +1029,14 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
             # Индикаторы (ATR, FRAMA) считаем по закрытым барам (iloc[-2]) как обычно.
             try:
                 ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
-                last_close = float(ticker_data["last"])
+                last_close = float(
+                    ticker_data.get("last") or
+                    ticker_data.get("close") or
+                    ticker_data.get("bid") or
+                    df["close"].iloc[-1]
+                )
             except Exception:
-                last_close = float(df["close"].iloc[-2])  # fallback
+                last_close = float(df["close"].iloc[-1])  # последний бар (живой)
 
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
