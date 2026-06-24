@@ -1024,7 +1024,15 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
                 await ctx.send("❌ Not enough data")
                 return
 
-            last_close = float(df["close"].iloc[-2])
+            # Берём реальную текущую цену через fetch_ticker (не iloc[-2]),
+            # иначе на 1h бот показывает цену до 59 минут устаревшей.
+            # Индикаторы (ATR, FRAMA) считаем по закрытым барам (iloc[-2]) как обычно.
+            try:
+                ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
+                last_close = float(ticker_data["last"])
+            except Exception:
+                last_close = float(df["close"].iloc[-2])  # fallback
+
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
             idx = len(df) - 2
