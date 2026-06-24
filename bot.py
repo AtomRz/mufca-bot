@@ -188,7 +188,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             rel_vol = vol_info["rel_vol"]
-            is_long = "BUY" in signal_type or "LONG" in signal_type
+            # 🆕 FIX BUG-LO005: Убрано дублирующее присваивание is_long
+            # Переменная is_long уже определена в начале функции
             dir_score = volume_score_for_side(vol_info, "long" if is_long else "short")
             lev_adj = "+" if dir_score > 0.3 else "-" if dir_score < -0.3 else "="
             vol_text = f"{_flow_label(vol_flow)} RV:{rel_vol:.1f}x [{lev_adj}lev]"
@@ -331,8 +332,17 @@ async def on_scanner_error(error):
 # 🤖  DISCORD COMMANDS
 # =====================================================================
 
+# 🆕 FIX BUG-LO002: Флаг защиты от множественных вызовов on_ready
+_startup_completed = False
+
 @bot.event
 async def on_ready():
+    global _startup_completed
+    if _startup_completed:
+        logger.info("🔄 Reconnect detected — skipping startup sequence.")
+        return
+    _startup_completed = True
+
     logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {_cfg.HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
 
     if MARKET_MODE == "futures":
@@ -437,20 +447,23 @@ async def status_cmd(ctx):
             a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
             u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
 
+            # 🆕 FIX BUG-HI001: Убрано двойное присваивание a_pos
+            # Ранее: a_pos = f"⚠️{a_flag}" → затем a_pos = "—" (перезаписывало!)
+            # Теперь: одно присваивание с информативным сообщением
             if a_flag and not a_trade:
-                a_pos = f"⚠️{a_flag}"   # флаг есть, trade нет — рассинхрон
+                logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
                 state[ticker][tf]["a_in_long"] = False   # auto-heal
                 state[ticker][tf]["a_in_short"] = False
-                a_pos = "—"
-                logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
+                a_pos = f"⚠️{a_flag} (fixed)"  # ← Одно присваивание, пользователь видит предупреждение
             else:
                 a_pos = a_flag or "—"
 
+            # 🆕 FIX BUG-HI001: Аналогично для U-трека
             if u_flag and not u_trade:
+                logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
                 state[ticker][tf]["u_in_long"] = False   # auto-heal
                 state[ticker][tf]["u_in_short"] = False
-                u_pos = "—"
-                logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
+                u_pos = f"⚠️{u_flag} (fixed)"  # ← Аналогично для U-трека
             else:
                 u_pos = u_flag or "—"
             trade_info = ""
@@ -620,9 +633,11 @@ async def remove_cmd(ctx, ticker: str = ""):
 
 @bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
-    global MARKET_MODE
+    # 🆕 FIX BUG-LO001: Не используем global MARKET_MODE напрямую
+    # Ранее: global MARKET_MODE — не работает корректно с from config import MARKET_MODE
+    # Теперь: модифицируем _cfg.MARKET_MODE, к которому обращаются все модули
     if not new_mode:
-        label = "🔵 Spot" if MARKET_MODE == "spot" else "🟠 Futures"
+        label = "🔵 Spot" if _cfg.MARKET_MODE == "spot" else "🟠 Futures"
         await ctx.send(f"Current mode: **{label}**\nTo switch: `!mode spot` or `!mode futures`")
         return
 
@@ -631,16 +646,16 @@ async def mode_cmd(ctx, new_mode: str = ""):
         await ctx.send("❌ Valid modes: `spot` or `futures`")
         return
 
-    if new_mode == MARKET_MODE:
-        await ctx.send(f"⚠️ Already in **{MARKET_MODE}** mode.")
+    if new_mode == _cfg.MARKET_MODE:
+        await ctx.send(f"⚠️ Already in **{_cfg.MARKET_MODE}** mode.")
         return
 
-    MARKET_MODE = new_mode
+    _cfg.MARKET_MODE = new_mode  # ← Меняем через модуль, не через global
 
     from config import MODE_FILE, save_mode
-    save_mode(MARKET_MODE)
+    save_mode(_cfg.MARKET_MODE)
 
-    if MARKET_MODE == "futures":
+    if _cfg.MARKET_MODE == "futures":
         exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     else:
         exchange = ccxt.gate({"enableRateLimit": True})
@@ -659,7 +674,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
                 pass
             state[ticker][tf] = st
 
-    label = "🔵 Spot (Gate.io Spot)" if MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
+    label = "🔵 Spot (Gate.io Spot)" if _cfg.MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
     await ctx.send(f"✅ Switched to **{label}**\n⚠️ Position states have been reset.")
 
 @bot.command(name="utha")
@@ -1153,7 +1168,17 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
             tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
 
 
+            # 🆕 FIX BUG-HI005: Рассчитываем реалистичный MFE/MAE перед закрытием
+            # Ранее: update_signal_mae_mfe НЕ вызывался, max_favorable_pct и max_adverse_pct
+            # оставались 0.0, искажая перцентиль TP.
+            # Теперь: вызываем update_signal_mae_mfe для SL и TP, чтобы записать реалистичные
+            # значения MAE/MFE в историю.
             add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+
+            # Рассчитываем MFE (максимально благоприятное движение = TP)
+            # и MAE (максимально неблагоприятное = SL) для корректной статистики
+            update_signal_mae_mfe(ticker, tf, side, tp)   # MFE = (TP - entry)/entry
+            update_signal_mae_mfe(ticker, tf, side, sl)   # MAE = (entry - SL)/entry
 
             update_signal_record(ticker, tf, side, tp, "tp", 5)
 
