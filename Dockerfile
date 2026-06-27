@@ -16,6 +16,7 @@ COPY indicators.py .
 COPY utils.py .
 COPY volume_indicators.py .
 COPY onchain.py .
+COPY execution.py .
 
 # Директория для данных
 RUN mkdir -p /app/data

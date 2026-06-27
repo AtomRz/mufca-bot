@@ -21,14 +21,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # 🔑  ВНЕШНИЕ API КЛЮЧИ
 # =====================================================================
 ETHERSCAN_API_KEY  = os.getenv("ETHERSCAN_API_KEY", "")
-COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")   # Demo key (бесплатный)
+COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")
+GATE_API_KEY       = os.getenv("GATE_API_KEY", "")
+GATE_SECRET        = os.getenv("GATE_SECRET", "")
 
 # =====================================================================
 # 📡  ON-CHAIN НАСТРОЙКИ
 # =====================================================================
-ONCHAIN_CACHE_TTL             = 3600    # секунд (1 час) — обновление балансов
-ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — порог "normal" сигнала
-ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — порог "large" сигнала
+ONCHAIN_CACHE_TTL             = 3600
+ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000
+ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000
 ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
 
 # =====================================================================
@@ -87,12 +89,12 @@ TICKERS: List[str] = load_tickers()
 TIMEFRAMES = ["1h", "4h"]
 
 # =====================================================================
-# 🔧  FILTER TOGGLES (зеркало Pine Script input.bool)
+# 🔧  FILTER TOGGLES
 # =====================================================================
-ENABLE_FRAMA_FILTER = True   # use_frama_filter
-ENABLE_CHOP_FILTER  = True   # use_chop
-ENABLE_ATR_FILTER   = True   # use_atr_f
-ENABLE_MTF_BIAS     = True   # enable_mtf_bias
+ENABLE_FRAMA_FILTER = True
+ENABLE_CHOP_FILTER  = True
+ENABLE_ATR_FILTER   = True
+ENABLE_MTF_BIAS     = True
 
 # =====================================================================
 # 📈  ПАРАМЕТРЫ ИНДИКАТОРОВ
@@ -114,6 +116,7 @@ UT_SENSITIVITY = 1.0
 UT_PERIOD = 10
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
+MAX_HOLD_BARS = 20
 
 # =====================================================================
 # 🎯  АДАПТИВНЫЙ ТП
@@ -126,18 +129,15 @@ MIN_TP_PCT = 0.3
 MAX_TP_PCT = 8.0
 MAX_HOLD_BARS = 20
 
-# 🆕 TP FEEDBACK LOOP — автоподстройка на основе реального hit rate
-TP_HIT_RATE_TARGET = 0.35      # Целевой процент достижения TP (35%)
-TP_AUTO_ADJUST = True          # Включить автоподстройку перцентиля
-TP_CAPTURE_RATE = 0.70         # Realistic MFE capture rate (0.5-0.8)
-TP_ADJUST_MIN_PCT = 0.30       # Минимальный перцентиль после корректировки
-TP_ADJUST_MAX_PCT = 0.85       # Максимальный перцентиль после корректировки
+TP_HIT_RATE_TARGET = 0.35
+TP_AUTO_ADJUST = True
+TP_CAPTURE_RATE = 0.70
+TP_ADJUST_MIN_PCT = 0.30
+TP_ADJUST_MAX_PCT = 0.85
 
-# Персистенс TP конфига
 TP_CONFIG_FILE = os.path.join(DATA_DIR, "tp_config.json")
 
 def load_tp_config():
-    """Загружает TP конфиг из файла."""
     global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
     global TP_HIT_RATE_TARGET, TP_AUTO_ADJUST, TP_CAPTURE_RATE
     global TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT
@@ -155,7 +155,6 @@ def load_tp_config():
     TP_ADJUST_MAX_PCT    = data.get("tp_adjust_max_pct",    TP_ADJUST_MAX_PCT)
 
 def save_tp_config():
-    """Сохраняет текущий TP конфиг в файл."""
     safe_json_save(TP_CONFIG_FILE, {
         "tp_percentile":        TP_PERCENTILE,
         "safe_tp_percentile":   SAFE_TP_PERCENTILE,
@@ -168,7 +167,6 @@ def save_tp_config():
         "tp_adjust_max_pct":    TP_ADJUST_MAX_PCT,
     })
 
-# Загружаем при старте
 load_tp_config()
 
 # =====================================================================

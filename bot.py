@@ -3,13 +3,15 @@ import math
 import json
 import os
 import time
+import re
 import numpy as np
 import pandas as pd
 import discord
 from discord.ext import tasks, commands
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Optional, Dict, List
 import logging
-from typing import Optional, Dict
 
 import ccxt
 
@@ -33,6 +35,8 @@ from config import (
     save_tickers,
     save_tp_config,
     ONCHAIN_ENABLED,
+    GATE_API_KEY,
+    GATE_SECRET,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
@@ -40,11 +44,11 @@ from volume_indicators import volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, calculate_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache, get_signal_stats
+from execution import GateExecutor
 
 logger = logging.getLogger(__name__)
 
 def _flow_label(flow: str) -> str:
-    """Переводит internal flow в читаемый лейбл для Discord."""
     return {"inflow": "BUY PRESSURE", "outflow": "SELL PRESSURE"}.get(flow, "NEUTRAL")
 
 # =====================================================================
@@ -55,15 +59,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Глобальное состояние
 state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
 
 def _heal_state():
-    """Исправляет рассинхрон флагов треков при старте."""
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             st = state[ticker][tf]
-            # Если флаг стоит но active_trade нет — сбрасываем флаг
             if (st.get("a_in_long") or st.get("a_in_short")) and not st.get("a_active_trade"):
                 st["a_in_long"] = False
                 st["a_in_short"] = False
@@ -76,12 +77,10 @@ def _heal_state():
 _heal_state()
 scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
 
-# 🆕 FIX: Per-ticker/tf asyncio locks to prevent race conditions
 _state_locks: Dict[str, Dict[str, asyncio.Lock]] = {}
 _tickers_lock = asyncio.Lock()
 
 def _ensure_locks():
-    """Ensure locks exist for all tickers/timeframes."""
     for ticker in TICKERS:
         if ticker not in _state_locks:
             _state_locks[ticker] = {}
@@ -91,14 +90,12 @@ def _ensure_locks():
 
 _ensure_locks()
 
-# 🆕 FIX: Module-level exchange reference (more robust than task attribute)
 _exchange_ref: Optional[ccxt.Exchange] = None
+_executor: Optional[GateExecutor] = None
 
-# 🆕 FIX: Persisted closure notifications
 _closure_notified_file = os.path.join(DATA_DIR, "closure_notified.json")
 
 def _load_closure_notified() -> set:
-    """Load set of already-notified trade IDs."""
     try:
         with open(_closure_notified_file, "r") as f:
             return set(json.load(f))
@@ -106,7 +103,6 @@ def _load_closure_notified() -> set:
         return set()
 
 def _save_closure_notified(notified: set):
-    """Save notified trade IDs."""
     try:
         temp = _closure_notified_file + ".tmp"
         with open(temp, "w") as f:
@@ -115,15 +111,76 @@ def _save_closure_notified(notified: set):
     except Exception as e:
         logger.warning(f"Failed to save closure notifications: {e}")
 
+# =====================================================================
+# 🆕 SIGNAL REGISTRY
+# =====================================================================
+
+@dataclass
+class SignalEntry:
+    id: str
+    ticker: str
+    tf: str
+    side: str
+    track: str
+    entry_price: float
+    sl: float
+    tp: float
+    lev: int
+    confidence: int
+    regime: str
+    timestamp: float
+    message_id: Optional[int] = None
+
+class SignalRegistry:
+    TTL = 1800
+
+    def __init__(self):
+        self._signals: Dict[str, SignalEntry] = {}
+        self._counter = 0
+
+    def register(self, ticker, tf, side, track, entry, sl, tp, lev, conf, regime) -> str:
+        self._counter += 1
+        sig_id = f"sig{self._counter:03d}"
+        self._signals[sig_id] = SignalEntry(
+            id=sig_id, ticker=ticker.upper(), tf=tf, side=side, track=track,
+            entry_price=entry, sl=sl, tp=tp, lev=lev,
+            confidence=conf, regime=regime, timestamp=time.time(),
+        )
+        self._cleanup()
+        return sig_id
+
+    def _cleanup(self):
+        now = time.time()
+        expired = [k for k, v in self._signals.items() if now - v.timestamp > self.TTL]
+        for k in expired:
+            del self._signals[k]
+
+    def list_active(self) -> List[SignalEntry]:
+        self._cleanup()
+        return sorted(self._signals.values(), key=lambda x: x.timestamp)
+
+    def get(self, sig_id: str) -> Optional[SignalEntry]:
+        self._cleanup()
+        return self._signals.get(sig_id.lower())
+
+    def find(self, ticker: str, side: str) -> Optional[SignalEntry]:
+        self._cleanup()
+        ticker = ticker.upper()
+        side = side.lower()
+        matches = [v for v in self._signals.values() if v.ticker == ticker and v.side == side]
+        return matches[-1] if matches else None
+
+_signal_registry = SignalRegistry()
 
 # =====================================================================
 # 🚀  ЗАПУСК
 # =====================================================================
 
 async def startup_sequence(exchange: ccxt.Exchange):
-    global _exchange_ref
+    global _exchange_ref, _executor
     _exchange_ref = exchange
-    """Запуск: сначала бэктест, потом сканер."""
+    _executor = GateExecutor(exchange)
+    
     logger.info("=" * 60)
     logger.info("[STARTUP] Running historical backtest to populate signal history...")
     logger.info("=" * 60)
@@ -182,15 +239,12 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
     embed.add_field(name=f"{conf_color} AI Conf", value=f"{confidence}%", inline=True)
     embed.add_field(name="🕯️ UT Bot", value=f"Heikin Ashi: {'✅' if _cfg.UT_HEIKIN_ASHI else '❌'}", inline=True)
-    # 🆕 Volume info (display only, not a filter)
     if df is not None:
         try:
             vol_info = volume_flow_signal_v3(df)
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             rel_vol = vol_info["rel_vol"]
-            # 🆕 FIX BUG-LO005: Убрано дублирующее присваивание is_long
-            # Переменная is_long уже определена в начале функции
             dir_score = volume_score_for_side(vol_info, "long" if is_long else "short")
             lev_adj = "+" if dir_score > 0.3 else "-" if dir_score < -0.3 else "="
             vol_text = f"{_flow_label(vol_flow)} RV:{rel_vol:.1f}x [{lev_adj}lev]"
@@ -212,13 +266,11 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
 # 📡  SCANNER LOOP
 # =====================================================================
 
-# On-chain bias кэш (обновляется раз в час в market_scanner)
 _onchain_bias_cache: Optional[Dict] = None
 _onchain_last_fetch: float = 0.0
 
 @tasks.loop(seconds=20)
 async def market_scanner():
-    """Основной цикл сканирования."""
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
     if channel is None:
         logger.warning(f"[WARN] Channel '{CHANNEL_NAME}' not found!")
@@ -228,15 +280,12 @@ async def market_scanner():
     if exchange is None:
         return
 
-    # 🆕 Обновляем on-chain bias раз в час (кэш TTL управляется внутри onchain.py)
     global _onchain_bias_cache, _onchain_last_fetch
     now_ts = time.time()
     if ONCHAIN_ENABLED and (now_ts - _onchain_last_fetch) >= 3600:
         try:
             _onchain_bias_cache = await get_onchain_bias()
             _onchain_last_fetch = now_ts
-            # Если первый запуск — сбрасываем onchain_bias кеш чтобы следующий
-            # hourly цикл пересчитал реальную дельту (baseline уже сохранён в _prev_balances)
             if _onchain_bias_cache.get("flow_data", {}).get("note") == "first_run":
                 from onchain import _cache
                 _cache.pop("onchain_bias", None)
@@ -246,13 +295,11 @@ async def market_scanner():
         except Exception as e:
             logger.warning(f"[ONCHAIN] Refresh failed: {e}")
 
-    # 🆕 FIX: Load persisted closure notifications
     notified_ids = _load_closure_notified()
 
-    for ticker in list(TICKERS):  # копия списка — защита от мутации через !add/!remove
+    for ticker in list(TICKERS):
         for tf in TIMEFRAMES:
             try:
-                # 🆕 FIX: Use lock to prevent race with commands
                 lock = _state_locks.get(ticker, {}).get(tf)
                 if lock is None:
                     lock = asyncio.Lock()
@@ -272,19 +319,28 @@ async def market_scanner():
 
                     if bar_time and bar_time != st["last_bar_time"]:
                         st["last_bar_time"] = bar_time
-                        # 🆕 Fetch df for volume info
                         bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
                         df = parse_ohlcv(bars) if bars else None
                         for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
                             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
+                            
+                            is_long = "BUY" in sig_type or "LONG" in sig_type
+                            side_clean = "long" if is_long else "short"
+                            track_clean = "a" if ("Andean" in sig_type or "A " in sig_type) else "u"
+                            sig_id = _signal_registry.register(
+                                ticker, tf, side_clean, track_clean,
+                                price, sl, tp, leverage, conf, reg
+                            )
+                            embed.add_field(name="🆔 Signal ID", value=f"`{sig_id}`", inline=True)
+                            
                             try:
-                                await channel.send(embed=embed)
+                                msg = await channel.send(embed=embed)
+                                _signal_registry._signals[sig_id].message_id = msg.id
                                 scan_stats["signals_generated"] += 1
                             except discord.HTTPException as e:
                                 logger.error(f"Failed to send signal: {e}")
-                            logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
+                            logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f} | ID={sig_id}")
 
-                    # 🆕 FIX: Check BOTH tracks for closures independently
                     for track in ("a", "u"):
                         trade_key = f"{track}_active_trade"
                         history_key = f"{track}_trade_history"
@@ -294,7 +350,6 @@ async def market_scanner():
                         if not trade and st.get(history_key) and not st.get(notified_key, False):
                             last = st[history_key][-1]
                             if last.get("exit_time"):
-                                # Generate unique trade ID with track
                                 trade_id = f"{ticker}_{tf}_{track}_{last['exit_time']}"
                                 if trade_id not in notified_ids:
                                     try:
@@ -319,10 +374,8 @@ async def market_scanner():
                 logger.error(f"Scanner error for {ticker} {tf}: {e}", exc_info=True)
                 await asyncio.sleep(0.5)
 
-# 🆕 FIX: CRITICAL - Task error handler to prevent silent death
 @market_scanner.error
 async def on_scanner_error(error):
-    """Handle scanner loop errors and restart if needed."""
     logger.exception(f"[CRITICAL] Scanner loop crashed: {error}")
     await asyncio.sleep(10)
     if not market_scanner.is_running():
@@ -333,7 +386,6 @@ async def on_scanner_error(error):
 # 🤖  DISCORD COMMANDS
 # =====================================================================
 
-# 🆕 FIX BUG-LO002: Флаг защиты от множественных вызовов on_ready
 _startup_completed = False
 
 @bot.event
@@ -346,22 +398,28 @@ async def on_ready():
 
     logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {_cfg.HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
 
-    if MARKET_MODE == "futures":
-        exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    ex_config = {"enableRateLimit": True}
+    if GATE_API_KEY and GATE_SECRET:
+        ex_config["apiKey"] = GATE_API_KEY
+        ex_config["secret"] = GATE_SECRET
+        logger.info("[GATE] API keys loaded — trading enabled")
     else:
-        exchange = ccxt.gate({"enableRateLimit": True})
+        logger.info("[GATE] No API keys — read-only mode")
+
+    if MARKET_MODE == "futures":
+        ex_config["options"] = {"defaultType": "swap"}
+    
+    exchange = ccxt.gate(ex_config)
 
     global _exchange_ref
     _exchange_ref = exchange
     asyncio.create_task(startup_sequence(exchange))
-    await asyncio.sleep(0)  # satisfy async convention
+    await asyncio.sleep(0)
 
-# 🆕 FIX: Global command error handler
 @bot.event
 async def on_command_error(ctx, error):
-    """Global handler for command errors."""
     if isinstance(error, commands.CommandNotFound):
-        return  # Ignore unknown commands
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"❌ Missing argument: {error.param.name}")
         return
@@ -373,42 +431,49 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="help", aliases=["?"])
 async def help_cmd(ctx):
-    """Список всех команд MUFCA Bot."""
     lines = [
         "**📖 MUFCA v3.1 — Команды**\n",
 
         "**📊 Мониторинг**",
         "`!status`       — состояние сканера: пары, треки A/U, volume",
-        "`!scan <pair> <tf>` — ручной скан (напр. `!scan BTC/USDT 1h`)",
-        "`!history <pair> <tf>` — история сделок (напр. `!history BTC/USDT 4h`)",
+        "`!scan <pair> <tf>` — ручной скан",
+        "`!history <pair> <tf>` — история сделок",
         "`!signals <pair> <tf>` — статистика сигналов по паре",
         "`!tp <pair> <tf>` — текущий адаптивный TP",
         "`!debug`        — расширенная отладочная информация",
-        "`!onchain`      — on-chain анализ (F&G, ETH flows)",
+        "`!onchain`      — on-chain анализ",
+        "",
+        
+        "**💰 Торговля**",
+        "`!trade`        — список активных сигналов",
+        "`!trade sig001` — открыть по ID сигнала",
+        "`!trade 1`      — открыть по номеру из списка",
+        "`!trade ETH/USDT long` — по паре (ищет сигнал, иначе ручной)",
+        "`!trade BTC/USDT long qty=50 lev=5 tp=4% sl=2%` — с переопределениями",
+        "`!positions`    — открытые позиции",
+        "`!close <pair>` — закрыть позицию по рынку",
         "",
 
         "**⚙️ Настройки**",
         "`!mode spot|futures` — переключить режим торговли",
-        "`!htf <tf>`     — HTF Bias таймфрейм (напр. `!htf 4h`)",
+        "`!htf <tf>`     — HTF Bias таймфрейм",
         "`!utha on|off`  — Heikin Ashi для UT Bot",
-        "`!chop <tf> <val>` — порог CHOP (напр. `!chop 1h 55`)",
+        "`!chop <tf> <val>` — порог CHOP",
         "",
 
         "**📚 Адаптивный TP**",
         "`!tpconfig`           — показать текущий конфиг TP",
-        "`!tpconfig mode safe` — безопасный режим (50-й %ile)",
-        "`!tpconfig mode aggressive` — агрессивный (75-й %ile)",
-        "`!tpconfig percentile 70` — изменить агрессивный %ile",
-        "`!tpconfig safe 45`   — изменить безопасный %ile",
+        "`!tpconfig mode safe` — безопасный режим",
+        "`!tpconfig mode aggressive` — агрессивный",
         "`!tpconfig limit 30`  — кол-во сигналов для обучения",
         "",
 
         "**📋 Пары**",
         "`!pairs`        — список активных пар",
-        "`!add <pair>`   — добавить пару (напр. `!add SOL/USDT`)",
+        "`!add <pair>`   — добавить пару",
         "`!remove <pair>` — удалить пару",
         "",
-
+        
         "**🛠️ Утилиты**",
         "`!sim <pair> <tf> <side>` — симуляция сделки",
         "`!forcerun`     — принудительный запуск сканера",
@@ -418,6 +483,225 @@ async def help_cmd(ctx):
     ]
     await ctx.send("\n".join(lines))
 
+# =====================================================================
+# 🆕 TRADE VIEW & HELPERS
+# =====================================================================
+
+class TradeConfirmView(discord.ui.View):
+    def __init__(self, ticker, side, amount, leverage, tp, sl, order_type, limit_price, use_cost):
+        super().__init__(timeout=120)
+        self.ticker = ticker
+        self.side = side
+        self.amount = amount
+        self.leverage = leverage
+        self.tp = tp
+        self.sl = sl
+        self.order_type = order_type
+        self.limit_price = limit_price
+        self.use_cost = use_cost
+
+    @discord.ui.button(label="🚀 Открыть позицию", style=discord.ButtonStyle.green, custom_id="confirm_trade")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ok, msg, order = await _executor.open_position(
+            symbol=self.ticker,
+            side=self.side,
+            amount=self.amount,
+            leverage=self.leverage,
+            tp_price=self.tp,
+            sl_price=self.sl,
+            order_type=self.order_type,
+            limit_price=self.limit_price,
+            use_cost=self.use_cost,
+        )
+        if ok:
+            embed = discord.Embed(title="✅ Позиция открыта", color=discord.Color.green())
+            embed.add_field(name="Order ID", value=order.get("id", "N/A"), inline=True)
+            embed.add_field(name="Status", value=order.get("status", "open"), inline=True)
+            embed.add_field(name="Filled", value=f"{order.get('filled', 0)} / {order.get('amount', 0)}", inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=False)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="❌ Отмена", style=discord.ButtonStyle.red, custom_id="cancel_trade")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("❌ Отменено", ephemeral=True)
+        self.stop()
+
+
+def _parse_trade_args(raw: str) -> dict:
+    return {m.group(1).lower(): m.group(2) for m in re.finditer(r'(\w+)=([^\s]+)', raw or "")}
+
+
+@bot.command(name="trade")
+async def trade_cmd(ctx, arg1: str = "", arg2: str = "", *, raw_args: str = ""):
+    exchange = _exchange_ref
+    if exchange is None or _executor is None:
+        await ctx.send("❌ Executor не готов. Проверьте API-ключи Gate.io.")
+        return
+
+    if not arg1:
+        active = _signal_registry.list_active()
+        if not active:
+            await ctx.send(
+                "📭 Нет активных сигналов (истекли 30 мин).\n"
+                "Для ручной торговли: `!trade <pair> <long|short>`"
+            )
+            return
+
+        lines = ["**🎯 Активные сигналы (последние 30 мин):**\n"]
+        for i, sig in enumerate(active, 1):
+            emoji = "🟢" if sig.side == "long" else "🔴"
+            lines.append(
+                f"{emoji} **#{i}** `{sig.id}` | `{sig.ticker}` `{sig.tf}` | "
+                f"{sig.side.upper()} | Entry: ${sig.entry_price:,.2f} | "
+                f"TP: ${sig.tp:,.2f} | SL: ${sig.sl:,.2f} | Lev: {sig.lev}x"
+            )
+        lines.append("\n**Открыть:** `!trade <ID>` или `!trade <#номер>` или `!trade <pair> <side>`")
+        await ctx.send("\n".join(lines))
+        return
+
+    sig = None
+    is_pair = "/" in arg1
+    is_id = arg1.lower().startswith("sig")
+    is_number = arg1.isdigit() and not is_pair
+
+    if is_id:
+        sig = _signal_registry.get(arg1)
+    elif is_number:
+        active = _signal_registry.list_active()
+        idx = int(arg1) - 1
+        if 0 <= idx < len(active):
+            sig = active[idx]
+
+    manual = False
+    if sig is None and is_pair:
+        ticker = arg1.upper()
+        side = arg2.lower()
+        if side not in ("long", "short"):
+            await ctx.send("❌ Сторона должна быть `long` или `short`")
+            return
+        sig = _signal_registry.find(ticker, side)
+        if sig is None:
+            manual = True
+    elif sig is None and not is_pair:
+        await ctx.send(
+            f"❌ Не понял аргумент `{arg1}`.\n"
+            f"Используйте: `!trade <ID>`, `!trade <#номер>`, или `!trade <pair> <long|short>`"
+        )
+        return
+
+    ticker = sig.ticker if sig else arg1.upper()
+    side = sig.side if sig else arg2.lower()
+    if side not in ("long", "short"):
+        await ctx.send("❌ Укажите сторону: `long` или `short`")
+        return
+
+    try:
+        tick = await asyncio.to_thread(exchange.fetch_ticker, ticker)
+        current_price = float(tick.get("last") or tick.get("close"))
+    except Exception as e:
+        await ctx.send(f"❌ Не получить цену: {e}")
+        return
+
+    args = _parse_trade_args(raw_args)
+
+    qty_raw = args.get("qty", "auto")
+    if qty_raw.endswith("%"):
+        pct = float(qty_raw[:-1]) / 100
+        balance = await _executor.fetch_balance_usdt()
+        qty_usdt = balance * pct
+    elif qty_raw.lower() == "auto":
+        balance = await _executor.fetch_balance_usdt()
+        qty_usdt = balance * 0.05
+    else:
+        qty_usdt = float(qty_raw) if qty_raw else 0
+    use_cost = True
+
+    lev = int(args.get("lev", sig.lev if sig else 1))
+
+    def parse_price(raw, default):
+        if not raw or raw.lower() == "auto":
+            return default
+        if raw.endswith("%"):
+            pct = float(raw[:-1]) / 100
+            return current_price * (1 + pct) if side == "long" else current_price * (1 - pct)
+        return float(raw)
+
+    default_tp = sig.tp if sig else (current_price * 1.02 if side == "long" else current_price * 0.98)
+    default_sl = sig.sl if sig else (current_price * 0.98 if side == "long" else current_price * 1.02)
+    tp = parse_price(args.get("tp"), default_tp)
+    sl = parse_price(args.get("sl"), default_sl)
+
+    order_type = args.get("type", "market").lower()
+    limit_price = float(args["price"]) if "price" in args else None
+
+    if _cfg.MARKET_MODE != "futures" and lev > 1:
+        await ctx.send("⚠️ Плечо доступно только в futures. `!mode futures`")
+        lev = 1
+
+    source = "📡 Сигнал" if sig else "✋ Ручной режим"
+    embed = discord.Embed(
+        title=f"{'🟢' if side=='long' else '🔴'} Подтверждение | {source}",
+        description=f"**{ticker}** | {_cfg.MARKET_MODE.upper()}",
+        color=discord.Color.green() if side == "long" else discord.Color.red(),
+    )
+    embed.add_field(name="Side", value=side.upper(), inline=True)
+    embed.add_field(name="Type", value=order_type.upper(), inline=True)
+    embed.add_field(name="Leverage", value=f"{lev}x", inline=True)
+    embed.add_field(name="Entry (est.)", value=f"${current_price:,.2f}", inline=True)
+    embed.add_field(name="Qty", value=f"{qty_usdt:,.2f} USDT", inline=True)
+    balance = await _executor.fetch_balance_usdt()
+    embed.add_field(name="Balance", value=f"${balance:,.2f} USDT", inline=True)
+    embed.add_field(name="🎯 TP", value=f"${tp:,.2f} ({((tp/current_price-1)*100 if side=='long' else (1-tp/current_price)*100):+.2f}%)", inline=True)
+    embed.add_field(name="🛑 SL", value=f"${sl:,.2f} ({((sl/current_price-1)*100 if side=='long' else (1-sl/current_price)*100):+.2f}%)", inline=True)
+    if limit_price:
+        embed.add_field(name="Limit", value=f"${limit_price:,.2f}", inline=True)
+    if sig:
+        embed.add_field(name="🆔 Signal", value=f"`{sig.id}` | Conf: {sig.confidence}%", inline=True)
+        embed.set_footer(text=f"Track: {sig.track.upper()} | Regime: {sig.regime} | ID: {sig.id}")
+
+    view = TradeConfirmView(
+        ticker=ticker,
+        side="buy" if side == "long" else "sell",
+        amount=qty_usdt,
+        leverage=lev,
+        tp=tp,
+        sl=sl,
+        order_type=order_type,
+        limit_price=limit_price,
+        use_cost=use_cost,
+    )
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="positions")
+async def positions_cmd(ctx):
+    pos = _executor.get_positions() if _executor else {}
+    if not pos:
+        await ctx.send("📭 Нет открытых позиций в памяти бота")
+        return
+    lines = ["**📊 Открытые позиции:**\n"]
+    for sym, p in pos.items():
+        lines.append(
+            f"• `{sym}` {p['side'].upper()} | Entry: ${p['entry']:,.2f} | "
+            f"Lev: {p['leverage']}x | TP: ${p['tp']:,.2f} | SL: ${p['sl']:,.2f}"
+        )
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="close")
+async def close_cmd(ctx, ticker: str = ""):
+    if not ticker:
+        await ctx.send("❌ Укажите пару: `!close BTC/USDT`")
+        return
+    ticker = ticker.upper()
+    if _executor is None:
+        await ctx.send("❌ Executor не инициализирован")
+        return
+    success, msg = await _executor.close_position(ticker)
+    await ctx.send(msg)
 
 @bot.command(name="status")
 async def status_cmd(ctx):
@@ -433,7 +717,6 @@ async def status_cmd(ctx):
         for tf in TIMEFRAMES:
             st = state[ticker][tf]
             last = st["last_bar_time"]
-            # 🆕 FIX: Handle both int and string timestamps
             ts = "no data"
             if last is not None:
                 try:
@@ -444,29 +727,23 @@ async def status_cmd(ctx):
             a_trade = st.get("a_active_trade")
             u_trade = st.get("u_active_trade")
 
-            # Показываем позицию только если флаг И active_trade оба установлены
-            # Если только флаг без trade — рассинхрон, показываем предупреждение
             a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
             u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
 
-            # 🆕 FIX BUG-HI001: Убрано двойное присваивание a_pos
-            # Ранее: a_pos = f"⚠️{a_flag}" → затем a_pos = "—" (перезаписывало!)
-            # Теперь: одно присваивание с информативным сообщением
             async with _state_locks[ticker][tf]:
                 if a_flag and not a_trade:
                     logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
-                    state[ticker][tf]["a_in_long"] = False   # auto-heal
+                    state[ticker][tf]["a_in_long"] = False
                     state[ticker][tf]["a_in_short"] = False
-                    a_pos = f"⚠️{a_flag} (fixed)"  # ← Одно присваивание, пользователь видит предупреждение
+                    a_pos = f"⚠️{a_flag} (fixed)"
                 else:
                     a_pos = a_flag or "—"
 
-                # 🆕 FIX BUG-HI001: Аналогично для U-трека
                 if u_flag and not u_trade:
                     logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
-                    state[ticker][tf]["u_in_long"] = False   # auto-heal
+                    state[ticker][tf]["u_in_long"] = False
                     state[ticker][tf]["u_in_short"] = False
-                    u_pos = f"⚠️{u_flag} (fixed)"  # ← Аналогично для U-трека
+                    u_pos = f"⚠️{u_flag} (fixed)"
                 else:
                     u_pos = u_flag or "—"
             trade_info = ""
@@ -475,7 +752,6 @@ async def status_cmd(ctx):
             if u_trade:
                 trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${round(u_trade['entry'], 2)}"
 
-            # 🆕 Volume info
             vol_info = ""
             if exchange:
                 try:
@@ -513,14 +789,12 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # 🆕 FIX: Use lock during scan command
     if ticker not in _state_locks:
         _state_locks[ticker] = {}
     if tf not in _state_locks.get(ticker, {}):
         _state_locks[ticker][tf] = asyncio.Lock()
 
     async with _state_locks[ticker][tf]:
-        # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
         temp_state = make_state()
         try:
             signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state, dry_run=True)
@@ -529,7 +803,6 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             await ctx.send(f"❌ Scan error: {e}")
             return
 
-    # 🆕 Fetch df for volume info
     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
     df = parse_ohlcv(bars) if bars else None
 
@@ -538,7 +811,6 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
             await ctx.send(embed=embed)
     else:
-        # 🆕 Show volume info even when no signal
         vol_info = ""
         try:
             vol_data = volume_flow_signal_v3(df)
@@ -588,17 +860,14 @@ async def add_cmd(ctx, ticker: str = ""):
         TICKERS.append(ticker)
         state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
-    # 🆕 FIX: Ensure locks for new ticker
     if ticker not in _state_locks:
         _state_locks[ticker] = {}
     for tf in TIMEFRAMES:
         if tf not in _state_locks[ticker]:
             _state_locks[ticker][tf] = asyncio.Lock()
 
-    # ✅ ИСПРАВЛЕНО: сохраняем через функцию config
     save_tickers(TICKERS)
 
-    # ✅ ИСПРАВЛЕНО: запускаем бэктест для новой пары
     await ctx.send(f"🔄 Running backtest for `{ticker}`...")
     total = 0
     for tf in TIMEFRAMES:
@@ -637,9 +906,6 @@ async def remove_cmd(ctx, ticker: str = ""):
 
 @bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
-    # 🆕 FIX BUG-LO001: Не используем global MARKET_MODE напрямую
-    # Ранее: global MARKET_MODE — не работает корректно с from config import MARKET_MODE
-    # Теперь: модифицируем _cfg.MARKET_MODE, к которому обращаются все модули
     if not new_mode:
         label = "🔵 Spot" if _cfg.MARKET_MODE == "spot" else "🟠 Futures"
         await ctx.send(f"Current mode: **{label}**\nTo switch: `!mode spot` or `!mode futures`")
@@ -654,14 +920,17 @@ async def mode_cmd(ctx, new_mode: str = ""):
         await ctx.send(f"⚠️ Already in **{_cfg.MARKET_MODE}** mode.")
         return
 
-    _cfg.MARKET_MODE = new_mode  # ← Меняем через модуль, не через global
+    _cfg.MARKET_MODE = new_mode
+    _cfg.save_mode(_cfg.MARKET_MODE)
 
-    save_mode(_cfg.MARKET_MODE)
-
+    ex_config = {"enableRateLimit": True}
+    if GATE_API_KEY and GATE_SECRET:
+        ex_config["apiKey"] = GATE_API_KEY
+        ex_config["secret"] = GATE_SECRET
     if _cfg.MARKET_MODE == "futures":
-        exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-    else:
-        exchange = ccxt.gate({"enableRateLimit": True})
+        ex_config["options"] = {"defaultType": "swap"}
+    
+    exchange = ccxt.gate(ex_config)
     global _exchange_ref
     _exchange_ref = exchange
 
@@ -903,7 +1172,6 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
                                 lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
 
         msg = "\n".join(lines)
-        # ✅ ИСПРАВЛЕНО: разбиваем длинные сообщения
         while msg:
             chunk = msg[:1900]
             if len(msg) > 1900:
@@ -1010,7 +1278,6 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # 🆕 FIX: Use lock during sim
     if ticker not in _state_locks:
         _state_locks[ticker] = {}
     if tf not in _state_locks.get(ticker, {}):
@@ -1024,9 +1291,6 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
                 await ctx.send("❌ Not enough data")
                 return
 
-            # Берём реальную текущую цену через fetch_ticker (не iloc[-2]),
-            # иначе на 1h бот показывает цену до 59 минут устаревшей.
-            # Индикаторы (ATR, FRAMA) считаем по закрытым барам (iloc[-2]) как обычно.
             try:
                 ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
                 last_close = float(
@@ -1036,7 +1300,7 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
                     df["close"].iloc[-1]
                 )
             except Exception:
-                last_close = float(df["close"].iloc[-1])  # последний бар (живой)
+                last_close = float(df["close"].iloc[-1])
 
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
@@ -1081,7 +1345,6 @@ async def debug_cmd(ctx):
     active_count = sum(1 for t in TICKERS for tf in TIMEFRAMES if state[t][tf].get("active_trade"))
     lines.append(f"• Active trades: **{active_count}**")
 
-    # Volume overview
     exchange = _exchange_ref
     lines.append("\n**📊 Volume Overview:**")
     if exchange is None:
@@ -1111,26 +1374,19 @@ async def reset_cmd(ctx, confirm: str = ""):
         )
         return
 
-    # BUGFIX BUG-CR003: останавливаем сканер перед backtest чтобы исключить
-    # race condition — одновременная запись в signals_history.json из двух источников.
     scanner_was_running = market_scanner.is_running()
     if scanner_was_running:
         market_scanner.stop()
-        await asyncio.sleep(1)  # даём текущей итерации завершиться
+        await asyncio.sleep(1)
 
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)
     clear_history_cache()
 
-    # BUGFIX BUG-HI002: ранее сбрасывались только trade_history/active_trade/bars_in_trade.
-    # Не сбрасывались: a_active_trade, u_active_trade, a_in_long/a_in_short, u_in_long/u_in_short,
-    # a_bars_in_trade, u_bars_in_trade, last_*_bar, *_last_closure_notified.
-    # Треки оставались замороженными после !reset. Теперь полный сброс через make_state().
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             state[ticker][tf] = make_state()
 
-    # 🆕 FIX: Clear on-chain cache on reset
     global _onchain_bias_cache, _onchain_last_fetch
     _onchain_bias_cache = None
     _onchain_last_fetch = 0.0
@@ -1156,7 +1412,6 @@ async def reset_cmd(ctx, confirm: str = ""):
                 logger.error(f"Reset backtest error: {e}")
                 await ctx.send(f"❌ `{ticker}` `{tf}` backtest failed: {e}")
 
-    # Перезапускаем сканер после backtest
     if scanner_was_running and not market_scanner.is_running():
         market_scanner.start()
 
@@ -1183,7 +1438,6 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
         await ctx.send("❌ Exchange not initialized")
         return
 
-    # 🆕 FIX: Use lock during sim
     if ticker not in _state_locks:
         _state_locks[ticker] = {}
     if tf not in _state_locks.get(ticker, {}):
@@ -1206,23 +1460,14 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
 
-
-            # 🆕 FIX BUG-HI005: Рассчитываем реалистичный MFE/MAE перед закрытием
-            # Ранее: update_signal_mae_mfe НЕ вызывался, max_favorable_pct и max_adverse_pct
-            # оставались 0.0, искажая перцентиль TP.
-            # Теперь: вызываем update_signal_mae_mfe для SL и TP, чтобы записать реалистичные
-            # значения MAE/MFE в историю.
             add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
 
-            # Рассчитываем MFE (максимально благоприятное движение = TP)
-            # и MAE (максимально неблагоприятное = SL) для корректной статистики
-            update_signal_mae_mfe(ticker, tf, side, tp)   # MFE = (TP - entry)/entry
-            update_signal_mae_mfe(ticker, tf, side, sl)   # MAE = (entry - SL)/entry
+            update_signal_mae_mfe(ticker, tf, side, tp)
+            update_signal_mae_mfe(ticker, tf, side, sl)
 
             update_signal_record(ticker, tf, side, tp, "tp", 5)
 
             stats = get_signal_stats(ticker, tf, side)
-
 
             lines = [f"✅ Simulated {side.upper()} signal recorded!"]
 
@@ -1240,7 +1485,6 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
             logger.error(f"Sim command error: {e}", exc_info=True)
 
             await ctx.send(f"❌ Simulation failed: {e}")
-
 
 @bot.command(name="forcerun")
 async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
@@ -1273,7 +1517,6 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
 
-            # BUGFIX BUG-ME001: отсутствовала проверка — IndexError при пустом ответе биржи
             if not validate_dataframe(df, 50):
                 await ctx.send("❌ Not enough data from exchange")
                 return
@@ -1288,19 +1531,15 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
             risk = abs(last_close - sl)
 
-            # BUGFIX BUG-HI003: ранее делали state[ticker][tf] = make_state() через st,
-            # что безвозвратно уничтожало активные позиции и всю историю сделок.
-            # Теперь обновляем только нужные поля существующего state.
             if ticker not in state or tf not in state.get(ticker, {}):
                 state.setdefault(ticker, {})[tf] = make_state()
 
             st = state[ticker][tf]
-            track_key = "a_active_trade"  # forcerun всегда на A-треке
+            track_key = "a_active_trade"
             st[track_key] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
             st["a_bars_in_trade"] = 0
             st["a_in_long"] = (side == "long")
             st["a_in_short"] = (side == "short")
-            # Обновляем legacy поле для совместимости
             st["active_trade"] = st[track_key]
             st["bars_in_trade"] = 0
 
@@ -1329,10 +1568,8 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             import traceback
             await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
 
-
 @bot.command(name="onchain")
 async def onchain_cmd(ctx):
-    """Показывает текущий on-chain анализ (F&G, ETH flows, влияние на сигналы)."""
     if not ONCHAIN_ENABLED:
         await ctx.send(
             "⚠️ On-Chain анализ отключён.\n"
@@ -1345,10 +1582,6 @@ async def onchain_cmd(ctx):
     try:
         bias = await get_onchain_bias()
 
-        # BUGFIX BUG-HI004: НЕ вызываем clear_onchain_cache() при first_run —
-        # это сбрасывало _prev_balances и следующий вызов снова давал first_run (infinite loop).
-        # При первом запуске baseline уже сохранён в _prev_balances, следующий hourly
-        # цикл в market_scanner сам посчитает реальную дельту. Просто сообщаем об этом.
         if bias.get("flow_data", {}).get("note") == "first_run":
             report = format_onchain_report(bias)
             await msg.edit(content=report + "\n\n⏳ _ETH flow дельта будет доступна через ~1 час (первый запуск)._")
@@ -1362,12 +1595,10 @@ async def onchain_cmd(ctx):
     except Exception as e:
         await msg.edit(content=f"❌ Ошибка on-chain: `{e}`")
 
-
 @bot.command(name="reset_cache")
 async def reset_cache_cmd(ctx):
-    """Сбрасывает HTF bias cache и on-chain cache вручную."""
     clear_htf_cache()
-    clear_onchain_cache_full()  # полный сброс включая baseline балансов
+    clear_onchain_cache_full()
     global _onchain_bias_cache, _onchain_last_fetch
     _onchain_bias_cache = None
     _onchain_last_fetch = 0.0
