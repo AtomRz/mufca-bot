@@ -383,6 +383,7 @@ async def help_cmd(ctx):
         "`!history <pair> <tf>` — история сделок (напр. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — статистика сигналов по паре",
         "`!tp <pair> <tf>` — текущий адаптивный TP",
+        "`!chart <pair> <tf>` — свечной график с индикаторами (напр. `!chart BTC 1h`)",
         "`!debug`        — расширенная отладочная информация",
         "`!onchain`      — on-chain анализ (F&G, ETH flows)",
         "",
@@ -1062,6 +1063,76 @@ async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1
         except Exception as e:
             logger.error(f"TP command error: {e}", exc_info=True)
             await ctx.send(f"❌ Error: {e}")
+
+
+@bot.command(name="chart")
+async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
+    """
+    !chart [PAIR] [TIMEFRAME] [LIMIT]
+    Примеры:
+      !chart          → BTC/USDT 1h 50 свечей
+      !chart ETH      → ETH/USDT 1h 50 свечей
+      !chart BTC 4h   → BTC/USDT 4h 50 свечей
+      !chart BTC 1h 100
+    """
+    pair = pair.upper()
+    if "/" not in pair:
+        pair = pair + "/USDT"
+    tf = tf.lower()
+
+    if tf not in TIMEFRAMES:
+        await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(TIMEFRAMES)}")
+        return
+
+    limit = max(20, min(200, limit))
+
+    exchange = _exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Exchange not initialized")
+        return
+
+    msg = await ctx.send(f"📊 Generating chart `{pair}` `{tf}` ({limit} bars)...")
+
+    try:
+        from chart import generate_chart
+
+        # Snapshot активной сделки если есть
+        state_snapshot = None
+        pair_state = state.get(pair, {})
+        for _tf_key, st in pair_state.items():
+            if _tf_key == tf:
+                a_trade = st.get("a_active_trade")
+                u_trade = st.get("u_active_trade") or st.get("active_trade")
+                active = a_trade or u_trade
+                if active:
+                    state_snapshot = {
+                        "entry": active.get("entry"),
+                        "tp":    active.get("tp"),
+                        "sl":    active.get("sl"),
+                        "side":  active.get("side"),
+                        "signal_bar": active.get("bar_opened"),
+                    }
+                break
+
+        buf = await generate_chart(
+            exchange=exchange,
+            symbol=pair,
+            timeframe=tf,
+            limit=limit,
+            state_snapshot=state_snapshot,
+        )
+
+        await msg.delete()
+        has_trade = state_snapshot is not None
+        trade_note = f" | 🎯 Active {state_snapshot['side'].upper()} @ ${state_snapshot['entry']:,.2f}" if has_trade else ""
+        await ctx.send(
+            content=f"📊 **{pair}** `{tf}` · {limit} bars{trade_note}",
+            file=discord.File(buf, filename=f"{pair.replace('/', '')}_{tf}.png")
+        )
+
+    except Exception as e:
+        logger.error(f"Chart command error: {e}", exc_info=True)
+        await msg.edit(content=f"❌ Chart error: `{e}`")
 
 @bot.command(name="debug")
 async def debug_cmd(ctx):
