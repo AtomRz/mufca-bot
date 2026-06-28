@@ -209,6 +209,74 @@ async def get_eth_flow_delta() -> Dict:
 # 📊  COINGECKO — Fear & Greed, dominance, volume
 # =====================================================================
 
+def _fg_label_from_value(value: int) -> str:
+    """Конвертирует числовое значение F&G в текстовый лейбл."""
+    if value <= 20:   return "Extreme Fear"
+    if value <= 40:   return "Fear"
+    if value <= 60:   return "Neutral"
+    if value <= 80:   return "Greed"
+    return "Extreme Greed"
+
+
+async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
+    """
+    Получает Fear & Greed Index с fallback цепочкой:
+      1. CoinGecko Pro/Demo API (/fear-greed-index) — если есть ключ
+      2. alternative.me/fng — публичный, но нестабильный
+      3. Дефолт 50 (Neutral) — если оба упали
+
+    Returns: (value: int, label: str)
+    """
+    # ── Источник 1: CoinGecko Fear & Greed (платный/demo endpoint) ──
+    if COINGECKO_API_KEY:
+        try:
+            async with session.get(
+                "https://pro-api.coingecko.com/api/v3/fear-greed-index"
+                if not COINGECKO_API_KEY.startswith("CG-") else
+                "https://api.coingecko.com/api/v3/fear-greed-index",
+                headers={"x-cg-demo-api-key": COINGECKO_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    val = int(data.get("data", [{}])[0].get("value", 0))
+                    lbl = data.get("data", [{}])[0].get("value_classification",
+                                                         _fg_label_from_value(val))
+                    logger.info(f"[ONCHAIN] F&G from CoinGecko: {val} ({lbl})")
+                    return val, lbl
+                else:
+                    logger.warning(f"[ONCHAIN] CoinGecko F&G status={resp.status}, trying fallback")
+        except Exception as e:
+            logger.warning(f"[ONCHAIN] CoinGecko F&G failed: {e}, trying fallback")
+
+    # ── Источник 2: alternative.me ──────────────────────────────────
+    try:
+        async with session.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as resp:
+            if resp.status == 200:
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type or "text/json" in content_type:
+                    fg_data = await resp.json()
+                    val = int(fg_data["data"][0]["value"])
+                    lbl = fg_data["data"][0]["value_classification"]
+                    logger.info(f"[ONCHAIN] F&G from alternative.me: {val} ({lbl})")
+                    return val, lbl
+                else:
+                    # HTML вместо JSON — сервис недоступен
+                    text = await resp.text()
+                    logger.warning(f"[ONCHAIN] alternative.me returned non-JSON ({content_type}): {text[:80]}")
+            else:
+                logger.warning(f"[ONCHAIN] alternative.me F&G status={resp.status}")
+    except Exception as e:
+        logger.warning(f"[ONCHAIN] alternative.me F&G failed: {e}")
+
+    # ── Источник 3: дефолт ──────────────────────────────────────────
+    logger.warning("[ONCHAIN] All F&G sources failed, using default 50 (Neutral)")
+    return 50, "Neutral"
+
+
 async def get_coingecko_data() -> Dict:
     """
     Получает с CoinGecko:
@@ -266,16 +334,11 @@ async def get_coingecko_data() -> Dict:
                         result["btc_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
                         result["btc_volume_change_24h"] = None  # недоступно без доп. запросов
 
-            # 3. Fear & Greed Index (альтернативный эндпоинт)
-            async with session.get(
-                "https://api.alternative.me/fng/?limit=1",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                fg_data = await resp.json()
-                fg_value = int(fg_data["data"][0]["value"])
-                fg_label = fg_data["data"][0]["value_classification"]
-                result["fear_and_greed"] = fg_value
-                result["fg_label"] = fg_label
+            # 3. Fear & Greed Index
+            # Цепочка источников: CoinGecko → alternative.me → дефолт 50
+            fg_value, fg_label = await _fetch_fear_greed(session)
+            result["fear_and_greed"] = fg_value
+            result["fg_label"] = fg_label
 
     except Exception as e:
         result["error"] = str(e)
