@@ -144,6 +144,7 @@ def build_chart(
     df: pd.DataFrame,
     symbol: str,
     timeframe: str,
+    df_full: Optional[pd.DataFrame] = None,
     frama: Optional[pd.Series] = None,
     frama_upper: Optional[pd.Series] = None,
     frama_lower: Optional[pd.Series] = None,
@@ -205,15 +206,20 @@ def build_chart(
     ax_c.set_xticks(tick_positions)
     ax_c.set_xticklabels([""] * len(tick_positions))  # скрываем на верхней панели
 
-    # ── Bollinger Bands ─────────────────────────────────────────────
-    bb_u, bb_m, bb_l = calc_bollinger_bands(df["close"])
+    # ── Bollinger Bands — считаем из полного df, берём tail(limit) ──
+    _bb_src = df_full["close"] if df_full is not None and len(df_full) > len(df) else df["close"]
+    _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(_bb_src)
+    bb_u = _bb_u_full.tail(limit).values
+    bb_m = _bb_m_full.tail(limit).values
+    bb_l = _bb_l_full.tail(limit).values
     ax_c.fill_between(x, bb_l, bb_u, alpha=0.06, color=T["bb_fill"], zorder=1)
     ax_c.plot(x, bb_u, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
     ax_c.plot(x, bb_m, color=T["bb_mid"], linewidth=0.8, alpha=0.6, linestyle="--", zorder=2)
     ax_c.plot(x, bb_l, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
 
-    # ── S/R уровни ──────────────────────────────────────────────────
-    sr = calc_support_resistance(df)
+    # ── S/R уровни — считаем из полного df (200+ баров) ─────────────
+    _sr_df = df_full if df_full is not None and len(df_full) > len(df) else df
+    sr = calc_support_resistance(_sr_df)
     x_start = -0.5
     x_end   = n - 0.5
 
@@ -477,6 +483,7 @@ async def generate_chart(
         df=df,
         symbol=symbol,
         timeframe=timeframe,
+        df_full=df,
         frama=frama_s,
         frama_upper=frama_u,
         frama_lower=frama_l,
