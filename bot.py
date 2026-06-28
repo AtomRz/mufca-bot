@@ -278,7 +278,33 @@ async def market_scanner():
                         for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
                             embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
                             try:
-                                await channel.send(embed=embed)
+                                # Генерируем и прикладываем график к сигналу
+                                chart_file = None
+                                try:
+                                    from chart import generate_chart
+                                    is_long = "BUY" in sig_type or "LONG" in sig_type
+                                    state_snapshot = {
+                                        "entry": price,
+                                        "tp":    tp,
+                                        "sl":    sl,
+                                        "side":  "long" if is_long else "short",
+                                        "signal_bar": None,
+                                    }
+                                    chart_buf = await generate_chart(
+                                        exchange=exchange,
+                                        symbol=ticker,
+                                        timeframe=tf,
+                                        limit=50,
+                                        state_snapshot=state_snapshot,
+                                    )
+                                    chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
+                                except Exception as chart_err:
+                                    logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
+
+                                if chart_file:
+                                    await channel.send(embed=embed, file=chart_file)
+                                else:
+                                    await channel.send(embed=embed)
                                 scan_stats["signals_generated"] += 1
                             except discord.HTTPException as e:
                                 logger.error(f"Failed to send signal: {e}")
