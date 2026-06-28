@@ -70,7 +70,6 @@ def calc_bollinger_bands(
 def calc_support_resistance(
     df: pd.DataFrame,
     pivot_window: int = 10,
-    round_factor: Optional[float] = None,
     max_levels: int = 4
 ) -> Dict[str, List[float]]:
     """
@@ -99,38 +98,17 @@ def calc_support_resistance(
         if low.iloc[i] == lo_window.min():
             supports.append(float(low.iloc[i]))
 
-    # 2. Round Numbers
-    if round_factor is None:
-        # Авто-шаг в зависимости от цены
-        if last_close > 10000:
-            round_factor = 1000.0
-        elif last_close > 1000:
-            round_factor = 100.0
-        elif last_close > 100:
-            round_factor = 10.0
-        else:
-            round_factor = 1.0
-
-    price_range_low  = df["low"].min()
-    price_range_high = df["high"].max()
-    rn = price_range_low - (price_range_low % round_factor)
-    while rn <= price_range_high:
-        if rn > 0:
-            pivots.append(float(rn))
-        rn += round_factor
-
     # Фильтруем — оставляем только вблизи текущей цены
     def near_price(levels, price, pct=0.05):
         return [l for l in levels if abs(l - price) / price < pct]
 
     supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels)
     resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels)
-    pivots      = _cluster_levels(near_price(pivots,      last_close, 0.12), max_levels)
 
     return {
         "support":    [l for l in supports    if l < last_close],
         "resistance": [l for l in resistances if l > last_close],
-        "pivot":      pivots,
+        "pivot":      [],
     }
 
 
@@ -255,14 +233,6 @@ def build_chart(
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
 
-    for lvl in sr["pivot"]:
-        ax_c.hlines(lvl, x_start, x_end, colors=T["pivot"],
-                    linewidth=1.0, linestyles=":", alpha=0.7, zorder=7)
-        ax_c.text(1, lvl, f"P {lvl:,.0f}", color=T["pivot"],
-                  fontsize=7, va="bottom", ha="left",
-                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
-                  zorder=8)
-
     # ── FRAMA ───────────────────────────────────────────────────────
     if frama is not None and len(frama) >= limit:
         fs = frama.tail(limit).values
@@ -382,7 +352,6 @@ def build_chart(
         Line2D([0], [0], color=T["bb_band"], linewidth=0.8, label="BB bands"),
         Line2D([0], [0], color=T["support"], linewidth=0.8, linestyle="--", label="Support"),
         Line2D([0], [0], color=T["resist"],  linewidth=0.8, linestyle="--", label="Resist"),
-        Line2D([0], [0], color=T["pivot"],   linewidth=0.6, linestyle=":",  label="Round lvl"),
     ]
     if entry_price:
         legend_elements.append(
