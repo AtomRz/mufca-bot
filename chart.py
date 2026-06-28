@@ -37,8 +37,8 @@ THEME = {
     "bb_mid":     "#a5d6ff",
     "bb_band":    "#388bfd",
     "bb_fill":    "#388bfd",
-    "support":    "#26a641",
-    "resist":     "#f85149",
+    "support":    "#00bcd4",
+    "resist":     "#9e9e9e",
     "pivot":      "#d29922",
     "entry":      "#f0883e",
     "tp":         "#26a641",
@@ -123,9 +123,9 @@ def calc_support_resistance(
     def near_price(levels, price, pct=0.05):
         return [l for l in levels if abs(l - price) / price < pct]
 
-    supports    = _cluster_levels(near_price(supports,    last_close, 0.06), max_levels)
-    resistances = _cluster_levels(near_price(resistances, last_close, 0.06), max_levels)
-    pivots      = _cluster_levels(near_price(pivots,      last_close, 0.08), max_levels)
+    supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels)
+    resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels)
+    pivots      = _cluster_levels(near_price(pivots,      last_close, 0.12), max_levels)
 
     return {
         "support":    [l for l in supports    if l < last_close],
@@ -241,21 +241,27 @@ def build_chart(
 
     for lvl in sr["support"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["support"],
-                    linewidth=0.8, linestyles="--", alpha=0.55, zorder=2)
-        ax_c.text(n - 0.5, lvl, f" S {lvl:,.0f}", color=T["support"],
-                  fontsize=7, va="center", ha="left", alpha=0.8)
+                    linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
+        ax_c.text(1, lvl, f"S {lvl:,.0f}", color=T["support"],
+                  fontsize=8, va="bottom", ha="left", fontweight="bold",
+                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
+                  zorder=8)
 
     for lvl in sr["resistance"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["resist"],
-                    linewidth=0.8, linestyles="--", alpha=0.55, zorder=2)
-        ax_c.text(n - 0.5, lvl, f" R {lvl:,.0f}", color=T["resist"],
-                  fontsize=7, va="center", ha="left", alpha=0.8)
+                    linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
+        ax_c.text(1, lvl, f"R {lvl:,.0f}", color=T["resist"],
+                  fontsize=8, va="bottom", ha="left", fontweight="bold",
+                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
+                  zorder=8)
 
     for lvl in sr["pivot"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["pivot"],
-                    linewidth=0.6, linestyles=":", alpha=0.45, zorder=2)
-        ax_c.text(n - 0.5, lvl, f" P {lvl:,.0f}", color=T["pivot"],
-                  fontsize=6, va="center", ha="left", alpha=0.6)
+                    linewidth=1.0, linestyles=":", alpha=0.7, zorder=7)
+        ax_c.text(1, lvl, f"P {lvl:,.0f}", color=T["pivot"],
+                  fontsize=7, va="bottom", ha="left",
+                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
+                  zorder=8)
 
     # ── FRAMA ───────────────────────────────────────────────────────
     if frama is not None and len(frama) >= limit:
