@@ -101,7 +101,16 @@ ATR_PERIOD = 14
 ATR_MIN = 0.3
 ATR_MAX = 4.5
 CHOP_LENGTH = 14
-CHOP_THRESHOLD = {"1h": 55.0, "4h": 61.8}
+CHOP_FILE = os.path.join(DATA_DIR, "chop_threshold.json")
+
+def load_chop() -> dict:
+    data = safe_json_load(CHOP_FILE, {"1h": 55.0, "4h": 61.8})
+    return data
+
+def save_chop(data: dict):
+    safe_json_save(CHOP_FILE, data)
+
+CHOP_THRESHOLD: dict = load_chop()
 FRAMA_LEN = 22
 FRAMA_MULT = 2.1
 MFI_LEN = 8

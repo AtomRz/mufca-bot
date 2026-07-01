@@ -234,7 +234,11 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
                 "https://pro-api.coingecko.com/api/v3/fear-greed-index"
                 if not COINGECKO_API_KEY.startswith("CG-") else
                 "https://api.coingecko.com/api/v3/fear-greed-index",
-                headers={"x-cg-demo-api-key": COINGECKO_API_KEY},
+                headers={
+                    "x-cg-demo-api-key": COINGECKO_API_KEY
+                } if COINGECKO_API_KEY.startswith("CG-") else {
+                    "x-cg-pro-api-key": COINGECKO_API_KEY
+                },
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as resp:
                 if resp.status == 200:
@@ -290,7 +294,10 @@ async def get_coingecko_data() -> Dict:
     if cached is not None:
         return cached
 
-    headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+    headers = (
+        {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY.startswith("CG-")
+        else {"x-cg-pro-api-key": COINGECKO_API_KEY}
+    ) if COINGECKO_API_KEY else {}
     result = {
         "fear_and_greed": 50,
         "fg_label": "Neutral",

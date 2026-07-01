@@ -32,6 +32,7 @@ from config import (
     FRAMA_MULT,
     save_tickers,
     save_tp_config,
+    save_mode,
     ONCHAIN_ENABLED,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
@@ -39,7 +40,7 @@ from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
 from signals import check_signals, backtest_history, make_state, calculate_sl, calculate_adaptive_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
-from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache, get_signal_stats
+from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, update_signal_mae_mfe, clear_history_cache, get_signal_stats
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
     track_emoji = "🔵" if is_a_track else "🟢" if is_u_track else "⚪"
     conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
-    mode_label = "Spot" if MARKET_MODE == "spot" else "Futures"
+    mode_label = "Spot" if _cfg.MARKET_MODE == "spot" else "Futures"
     ha_label = "HA" if _cfg.UT_HEIKIN_ASHI else "Normal"
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
     tp1_pct = abs(tp1 - price) / price * 100
@@ -604,10 +605,11 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         # 🆕 Show volume info even when no signal
         vol_info = ""
         try:
-            vol_data = volume_flow_signal_v3(df)
-            vol_flow = vol_data["flow"]
-            vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
-            vol_info = f" | {vol_emoji} Vol:{_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
+            if df is not None and len(df) >= 35:
+                vol_data = volume_flow_signal_v3(df)
+                vol_flow = vol_data["flow"]
+                vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
+                vol_info = f" | {vol_emoji} Vol:{_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
         except Exception as e:
             logger.debug(f"Volume info error in build_embed: {e}")
         await ctx.send(f"⏳ No signals for `{ticker}` `{tf}`. Regime: **{regime}**{vol_info}")
@@ -910,6 +912,7 @@ async def chop_cmd(ctx, tf: str = "", value: str = ""):
                 return
             old = CHOP_THRESHOLD.get(tf, 61.8)
             CHOP_THRESHOLD[tf] = new_val
+            _cfg.save_chop(CHOP_THRESHOLD)
             await ctx.send(f"✅ CHOP threshold for `{tf}` changed: **{old}** → **{new_val}**")
         except ValueError:
             await ctx.send("❌ Invalid number")
@@ -1099,7 +1102,7 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
                     df["close"].iloc[-1]
                 )
             except Exception:
-                last_close = float(df["close"].iloc[-1])  # последний бар (живой)
+                last_close = float(df["close"].iloc[-2])  # fallback на закрытый бар
 
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)

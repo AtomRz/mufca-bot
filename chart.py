@@ -157,6 +157,7 @@ def build_chart(
     signal_side: Optional[str] = None,  # "long" | "short"
     signal_bar: Optional[int] = None,   # индекс бара сигнала
     limit: int = 50,
+    original_len: Optional[int] = None, # длина df ДО tail() для корректного offset
 ) -> io.BytesIO:
     """
     Строит полный свечной график и возвращает BytesIO PNG.
@@ -168,6 +169,9 @@ def build_chart(
     """
     df = df.tail(limit).copy().reset_index(drop=True)
     n = len(df)
+    # Используем original_len (до tail) чтобы правильно вычислить offset для signal_bar
+    _orig = original_len if original_len is not None else n
+    _offset = max(0, _orig - limit)
 
     has_mfi = mfi is not None and len(mfi) >= limit
 
@@ -226,16 +230,16 @@ def build_chart(
     for lvl in sr["support"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["support"],
                     linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        ax_c.text(1, lvl, f"S {lvl:,.0f}", color=T["support"],
-                  fontsize=8, va="bottom", ha="left", fontweight="bold",
+        ax_c.text(n - 0.5, lvl, f"S {lvl:,.0f}", color=T["support"],
+                  fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
 
     for lvl in sr["resistance"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["resist"],
                     linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        ax_c.text(1, lvl, f"R {lvl:,.0f}", color=T["resist"],
-                  fontsize=8, va="bottom", ha="left", fontweight="bold",
+        ax_c.text(n - 0.5, lvl, f"R {lvl:,.0f}", color=T["resist"],
+                  fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
 
@@ -276,9 +280,8 @@ def build_chart(
     # ── Сигнал (стрелка) ────────────────────────────────────────────
     if signal_bar is not None and signal_side is not None:
         # signal_bar — абсолютный индекс в оригинальном df до tail()
-        # Переводим в индекс после tail()
-        offset = len(df) - limit  # сколько срезали tail
-        idx = signal_bar - offset if signal_bar is not None else n - 2
+        # _offset вычислен выше через original_len, корректно при любом limit
+        idx = signal_bar - _offset if signal_bar is not None else n - 2
         idx = max(0, min(idx, n - 1))
 
         if signal_side == "long":
@@ -496,4 +499,5 @@ async def generate_chart(
         signal_side=signal_side,
         signal_bar=signal_bar,
         limit=limit,
+        original_len=len(df),
     )

@@ -498,6 +498,15 @@ async def open_position(
     )
     tp_desc += oc_desc
 
+    # Пересчитываем TP1 пропорционально если on-chain изменил TP2
+    # Без этого при tp_mult < 1.0 возможна ситуация TP1 > TP2 (для шорта TP1 < TP2)
+    if abs(tp - close_v) > 1e-8 and abs(tp2 - close_v) > 1e-8:
+        ratio = abs(tp - close_v) / abs(tp2 - close_v)
+        if side == "long":
+            tp1 = round(close_v + (tp1 - close_v) * ratio, 4)
+        else:
+            tp1 = round(close_v - (close_v - tp1) * ratio, 4)
+
     if side == "long":
         risk = abs(close_v - sl)
         reward = abs(tp - close_v)
