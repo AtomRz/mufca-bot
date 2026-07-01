@@ -195,6 +195,91 @@ def calculate_sl(
         return max(sl, entry_price * 1.005)
 
 # =====================================================================
+# 🛑  АДАПТИВНЫЙ SL (на основе исторического MAE)
+# =====================================================================
+
+def calculate_adaptive_sl(
+    entry_price: float,
+    side: str,
+    ticker: str,
+    timeframe: str,
+    fs: pd.Series,
+    fu: pd.Series,
+    fl: pd.Series,
+    atr14: pd.Series,
+    idx: int,
+) -> tuple[float, str]:
+    """
+    Адаптивный SL на основе исторического MAE выигрышных сделок.
+
+    Логика:
+    - Берём только сделки где цена вернулась (exit_type == "tp" или "cancelled") —
+      истинный MAE: цена уходила против нас, но вернулась и не задела стоп.
+    - Берём перцентиль SL_MAE_PERCENTILE от этих MAE значений + буфер SL_MAE_BUFFER.
+    - Если выигрышных сделок меньше SL_MIN_HISTORY — fallback на фиксированный % или ATR-SL.
+
+    Returns:
+        (sl_price, description)
+    """
+    atr_sl = calculate_sl(entry_price, side, fs, fu, fl, atr14, idx)
+
+    if not _cfg.SL_ADAPTIVE_ENABLED:
+        return atr_sl, "frama/atr"
+
+    try:
+        history = load_signals_history()
+        records = history.get(ticker, {}).get(timeframe, {}).get(side, [])
+
+        # Только выигрышные сделки (цена вернулась, не задев стоп)
+        winning = [
+            r for r in records
+            if r.get("exit_type") in ("tp", "cancelled")
+            and r.get("max_adverse_pct", 0) > 0
+        ]
+
+        if len(winning) < _cfg.SL_MIN_HISTORY:
+            # Недостаточно истории — fallback на противоположную линию FRAMA
+            # Лонг: fu (верхняя) — дальше от цены, даёт широкий стоп
+            # Шорт: fl (нижняя) — дальше от цены, даёт широкий стоп
+            if side == "long":
+                sl_opposite = float(fu.iloc[idx])
+                sl = sl_opposite if not np.isnan(sl_opposite) else entry_price * (1 - _cfg.SL_FALLBACK_PCT)
+            else:
+                sl_opposite = float(fl.iloc[idx])
+                sl = sl_opposite if not np.isnan(sl_opposite) else entry_price * (1 + _cfg.SL_FALLBACK_PCT)
+            logger.debug(
+                f"[ADAPTIVE_SL] {ticker} {timeframe} {side}: "
+                f"only {len(winning)} winning trades < {_cfg.SL_MIN_HISTORY} min, "
+                f"fallback opposite FRAMA -> SL={sl:.4f}"
+            )
+            return sl, f"frama-opposite ({len(winning)}/{_cfg.SL_MIN_HISTORY} wins)"
+
+        mae_values = [r["max_adverse_pct"] / 100 for r in winning]  # переводим % → доли
+        mae_percentile = float(np.percentile(mae_values, _cfg.SL_MAE_PERCENTILE * 100))
+        mae_with_buffer = mae_percentile + _cfg.SL_MAE_BUFFER
+
+        if side == "long":
+            sl_adaptive = entry_price * (1 - mae_with_buffer)
+            # Не ставим SL выше цены входа
+            sl = min(sl_adaptive, entry_price * 0.999)
+        else:
+            sl_adaptive = entry_price * (1 + mae_with_buffer)
+            # Не ставим SL ниже цены входа
+            sl = max(sl_adaptive, entry_price * 1.001)
+
+        desc = (
+            f"adaptive MAE p{_cfg.SL_MAE_PERCENTILE*100:.0f} "
+            f"{mae_percentile*100:.2f}%+{_cfg.SL_MAE_BUFFER*100:.1f}% "
+            f"({len(winning)} wins)"
+        )
+        logger.debug(f"[ADAPTIVE_SL] {ticker} {timeframe} {side}: {desc} → SL={sl:.4f}")
+        return sl, desc
+
+    except Exception as e:
+        logger.warning(f"[ADAPTIVE_SL] Error, falling back to ATR-SL: {e}")
+        return atr_sl, "frama/atr (error)"
+
+# =====================================================================
 # 🆕 ON-CHAIN TP/SL SAFETY WRAPPER
 # =====================================================================
 
@@ -395,8 +480,9 @@ async def open_position(
     if state.get(trade_key):
         return None
 
-    sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
+    sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx)
     tp, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
+    tp_desc = f"SL:{sl_desc} | {tp_desc}"
 
     if side == "long":
         risk = abs(close_v - sl)
