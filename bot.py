@@ -149,7 +149,7 @@ async def startup_sequence(exchange: ccxt.Exchange):
 # =====================================================================
 
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
-                sl, tp, risk, stats, tp_desc: str = "", df=None) -> discord.Embed:
+                sl, tp, tp1, risk, stats, tp_desc: str = "", df=None) -> discord.Embed:
     is_long = "BUY" in signal_type or "LONG" in signal_type
     is_a_track = "Andean" in signal_type or "A " in signal_type
     is_u_track = "UT Bot" in signal_type or "U " in signal_type
@@ -159,7 +159,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     mode_label = "Spot" if MARKET_MODE == "spot" else "Futures"
     ha_label = "HA" if _cfg.UT_HEIKIN_ASHI else "Normal"
     rr = round(abs(tp - price) / max(risk, 1e-8), 2)
-    tp_pct = abs(tp - price) / price * 100
+    tp1_pct = abs(tp1 - price) / price * 100
+    tp2_pct = abs(tp - price) / price * 100
 
     tp_source = (
         f"📚 Adaptive (last {stats['count']} signals, {_cfg.TP_PERCENTILE*100:.0f}th %ile)"
@@ -176,7 +177,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="🧬 HTF Bias", value=f"✅ {_cfg.HTF_BIAS.upper()} FRAMA confirmed", inline=True)
     embed.add_field(name="💵 Entry", value=f"${round(price, 2):,.2f}", inline=True)
     embed.add_field(name="🛑 Stop Loss", value=f"${round(sl, 2):,.2f}", inline=True)
-    embed.add_field(name="🎯 Take Profit", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
+    embed.add_field(name="🎯 TP1 (50%)", value=f"${round(tp1, 2):,.2f} (+{tp1_pct:.2f}%)", inline=True)
+    embed.add_field(name="🏁 TP2 (100%)", value=f"${round(tp, 2):,.2f} (+{tp2_pct:.2f}%)", inline=True)
     embed.add_field(name="📊 Risk/Reward", value=f"1:{rr}", inline=True)
     embed.add_field(name="⚙️ Regime", value=regime, inline=True)
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)
@@ -275,8 +277,8 @@ async def market_scanner():
                         # 🆕 Fetch df for volume info
                         bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
                         df = parse_ohlcv(bars) if bars else None
-                        for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
-                            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
+                        for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
+                            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
                             try:
                                 # Генерируем и прикладываем график к сигналу
                                 chart_file = None
@@ -286,6 +288,7 @@ async def market_scanner():
                                     state_snapshot = {
                                         "entry": price,
                                         "tp":    tp,
+                                        "tp1":   tp1,
                                         "sl":    sl,
                                         "side":  "long" if is_long else "short",
                                         "signal_bar": None,
@@ -339,6 +342,39 @@ async def market_scanner():
                                         st[notified_key] = True
                                     except ValueError:
                                         logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
+
+                    # ── TP1 hit check ─────────────────────────────────────────
+                    for track in ("a", "u"):
+                        trade_key = f"{track}_active_trade"
+                        trade = st.get(trade_key)
+                        if not trade:
+                            continue
+                        tp1_price = trade.get("tp1")
+                        if tp1_price is None or trade.get("tp1_hit"):
+                            continue
+                        current_price = None
+                        try:
+                            ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
+                            current_price = ticker_data.get("last")
+                        except Exception:
+                            pass
+                        if current_price is None:
+                            continue
+                        side = trade.get("side")
+                        tp1_reached = (
+                            (side == "long"  and current_price >= tp1_price) or
+                            (side == "short" and current_price <= tp1_price)
+                        )
+                        if tp1_reached:
+                            trade["tp1_hit"] = True
+                            track_label = "A" if track == "a" else "U"
+                            entry = trade.get("entry", 0)
+                            await channel.send(
+                                f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
+                                f"⚠️ **Закрой 50% позиции и перенеси SL в безубыток (${round(entry, 2):,.2f})**"
+                            )
+                            logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price}")
 
                 await asyncio.sleep(0.5)
             except Exception as e:
@@ -561,8 +597,8 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
     df = parse_ohlcv(bars) if bars else None
 
     if signals:
-        for sig_type, price, reg, leverage, bt, conf, sl, tp, risk, stats, tp_desc in signals:
-            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, risk, stats, tp_desc, df)
+        for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
+            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
             await ctx.send(embed=embed)
     else:
         # 🆕 Show volume info even when no signal

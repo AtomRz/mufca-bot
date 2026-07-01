@@ -461,15 +461,29 @@ def calculate_combined_tp(
     idx: int,
     atr14,
     regime: Optional[str] = None
-) -> Tuple[float, str]:
-    """Комбинированный TP: адаптивный (гибридный) + R:R 2.0 как fallback."""
-    stats = get_signal_stats(ticker, tf, side, regime)
-    tp = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr14, regime)
-    risk = abs(entry - sl)
-    rr = round(abs(tp - entry) / max(risk, 1e-8), 2)
+) -> Tuple[float, float, str]:
+    """
+    Комбинированный TP с двумя уровнями:
+      TP1 — статистический (перцентиль MFE без RR cap), цель для 50% позиции
+      TP2 — с RR cap (минимум R:R 1.5), цель для оставшихся 50%
 
+    Returns: (tp1, tp2, desc)
+    """
+    stats = get_signal_stats(ticker, tf, side, regime)
+    risk = abs(entry - sl)
     mode_label = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
+
+    # ── TP1: чистый статистический, без RR cap ───────────────────────
+    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr14, regime)
+
+    # ── TP2: с RR cap (минимум 1.5) ──────────────────────────────────
+    min_rr_tp = entry + 1.5 * risk if side == "long" else entry - 1.5 * risk
+    if side == "long":
+        tp2 = max(tp1, min_rr_tp)
+    else:
+        tp2 = min(tp1, min_rr_tp)
+    tp2 = round(tp2, 4)
 
     if stats["count"] >= 5:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
@@ -478,4 +492,4 @@ def calculate_combined_tp(
     else:
         desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
 
-    return tp, desc
+    return tp1, tp2, desc

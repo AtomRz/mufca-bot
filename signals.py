@@ -481,7 +481,8 @@ async def open_position(
         return None
 
     sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx)
-    tp, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
+    tp1, tp2, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
+    tp = tp2  # основной TP для R:R расчётов и фильтров — используем tp2
     tp_desc = f"SL:{sl_desc} | {tp_desc}"
 
     if side == "long":
@@ -538,9 +539,11 @@ async def open_position(
         "side": side,
         "entry": close_v,
         "sl": sl,
-        "tp": tp,
+        "tp": tp,    # TP2 — цель для 100% позиции
+        "tp1": tp1,  # TP1 — статистический, цель для 50% позиции
         "lev": sugg_lev,
-        "bar_opened": idx
+        "bar_opened": idx,
+        "tp1_hit": False,  # флаг: уведомление по TP1 уже отправлено
     }
     state[bars_key] = 0
 
@@ -550,7 +553,7 @@ async def open_position(
     stats = get_signal_stats(ticker, timeframe, side)
     conf = calc_confidence(side == "long")
 
-    return (signal_label, close_v, regime, sugg_lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, risk, stats, tp_desc)
+    return (signal_label, close_v, regime, sugg_lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
 
 # =====================================================================
 # 🧠  CHECK SIGNALS (ОСНОВНАЯ ЛОГИКА)
