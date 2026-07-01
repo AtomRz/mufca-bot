@@ -37,7 +37,7 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
-from signals import check_signals, backtest_history, make_state, calculate_sl, clear_htf_cache
+from signals import check_signals, backtest_history, make_state, calculate_sl, calculate_adaptive_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
 from state import load_signals_history, calculate_combined_tp, add_signal_record, update_signal_record, clear_history_cache, get_signal_stats
 
@@ -1104,17 +1104,19 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
             idx = len(df) - 2
-            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)
+            tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
             stats = get_signal_stats(ticker, tf, side)
             risk = abs(last_close - sl)
-            rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)
-            tp_pct = abs(tp - last_close) / last_close * 100
+            rr = round(abs(tp2 - last_close) / max(risk, 1e-8), 2)
+            tp1_pct = abs(tp1 - last_close) / last_close * 100
+            tp2_pct = abs(tp2 - last_close) / last_close * 100
 
             lines = [f"**📊 Adaptive TP Preview — `{ticker}` `{tf}` {side.upper()}:**"]
             lines.append(f"• Current price: **${round(last_close, 2):,.2f}**")
-            lines.append(f"• Stop Loss: **${round(sl, 2):,.2f}** (risk: ${round(risk, 2):,.2f})")
-            lines.append(f"• Take Profit: **${round(tp, 2):,.2f}** (+{tp_pct:.2f}%)")
+            lines.append(f"• Stop Loss: **${round(sl, 2):,.2f}** ({sl_desc})")
+            lines.append(f"• 🎯 TP1 (50%): **${round(tp1, 2):,.2f}** (+{tp1_pct:.2f}%)")
+            lines.append(f"• 🏁 TP2 (100%): **${round(tp2, 2):,.2f}** (+{tp2_pct:.2f}%)")
             lines.append(f"• Risk/Reward: **1:{rr}**")
             if stats["count"] >= 5:
                 lines.append(f"• Based on **{stats['count']}** historical signals")
@@ -1335,9 +1337,10 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             idx = len(df) - 2
 
-            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
+            sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)
 
-            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            tp = tp2
 
 
             # 🆕 FIX BUG-HI005: Рассчитываем реалистичный MFE/MAE перед закрытием
@@ -1417,8 +1420,9 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
             idx = len(df) - 2
 
-            sl = calculate_sl(last_close, side, fs, fu, fl, atr14, idx)
-            tp, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)
+            tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
+            tp = tp2
             risk = abs(last_close - sl)
 
             # BUGFIX BUG-HI003: ранее делали state[ticker][tf] = make_state() через st,
