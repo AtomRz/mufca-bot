@@ -1055,7 +1055,7 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name="tp")
-async def tp_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
+async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "long"):
     side = side.lower()
     if side not in ("long", "short"):
         await ctx.send("Side must be `long` or `short`")
