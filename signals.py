@@ -507,6 +507,14 @@ async def open_position(
         else:
             tp1 = round(close_v - (close_v - tp1) * ratio, 4)
 
+    # 🆕 GUARD: гарантируем что tp1 между entry и tp (не дальше tp, не ближе entry)
+    if side == "long":
+        tp1 = min(tp1, tp)       # tp1 не дальше tp
+        tp1 = max(tp1, close_v)  # tp1 не ближе entry (или равен entry)
+    else:
+        tp1 = max(tp1, tp)       # tp1 не дальше tp (для short tp < entry)
+        tp1 = min(tp1, close_v)  # tp1 не ближе entry
+
     if side == "long":
         risk = abs(close_v - sl)
         reward = abs(tp - close_v)
@@ -860,7 +868,7 @@ def backtest_history(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
         mfi = calculate_mfi(df, MFI_LEN)
-        level_os, level_ob = 20.0, 80.0
+        level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 

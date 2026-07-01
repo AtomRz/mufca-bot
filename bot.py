@@ -286,13 +286,14 @@ async def market_scanner():
                                 try:
                                     from chart import generate_chart
                                     is_long = "BUY" in sig_type or "LONG" in sig_type
+                                    # 🆕 FIX: передаём реальный bar index для корректной стрелки на графике
                                     state_snapshot = {
                                         "entry": price,
                                         "tp":    tp,
                                         "tp1":   tp1,
                                         "sl":    sl,
                                         "side":  "long" if is_long else "short",
-                                        "signal_bar": None,
+                                        "signal_bar": len(df) - 2 if df is not None else None,
                                     }
                                     chart_buf = await generate_chart(
                                         exchange=exchange,
@@ -543,7 +544,7 @@ async def status_cmd(ctx):
             vol_info = ""
             if exchange:
                 try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
+                    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=50)
                     if bars and len(bars) >= 25:
                         df_v = parse_ohlcv(bars)
                         vol_data = volume_flow_signal_v3(df_v)
@@ -1096,10 +1097,10 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
             try:
                 ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
                 last_close = float(
+                    ticker_data.get("close") or      # ← приоритет close (консистентно с ботом)
                     ticker_data.get("last") or
-                    ticker_data.get("close") or
                     ticker_data.get("bid") or
-                    df["close"].iloc[-1]
+                    df["close"].iloc[-2]             # fallback на закрытый бар
                 )
             except Exception:
                 last_close = float(df["close"].iloc[-2])  # fallback на закрытый бар
@@ -1228,7 +1229,7 @@ async def debug_cmd(ctx):
         for ticker in list(TICKERS):
             for tf in TIMEFRAMES:
                 try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=50)
+                    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=50)
                     if bars and len(bars) >= 25:
                         df_d = parse_ohlcv(bars)
                         vol_data = volume_flow_signal_v3(df_d)
