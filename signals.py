@@ -240,21 +240,23 @@ def calculate_adaptive_sl(
         ]
 
         if len(winning) < _cfg.SL_MIN_HISTORY:
-            # Недостаточно истории — fallback на противоположную линию FRAMA
-            # Лонг: fu (верхняя) — дальше от цены, даёт широкий стоп
-            # Шорт: fl (нижняя) — дальше от цены, даёт широкий стоп
-            if side == "long":
-                sl_opposite = float(fu.iloc[idx])
-                sl = sl_opposite if not np.isnan(sl_opposite) else entry_price * (1 - _cfg.SL_FALLBACK_PCT)
-            else:
-                sl_opposite = float(fl.iloc[idx])
-                sl = sl_opposite if not np.isnan(sl_opposite) else entry_price * (1 + _cfg.SL_FALLBACK_PCT)
+            # 🆕 FIX КРИТИЧНЫЙ БАГ: раньше здесь брали "противоположную" линию
+            # FRAMA — fu (верхнюю) для LONG и fl (нижнюю) для SHORT — в попытке
+            # получить "широкий" стоп. На деле это ставило SL НЕ С ТОЙ стороны
+            # входа: для лонга fu почти всегда лежит ВЫШЕ цены входа, то есть SL
+            # оказывался выше входа и не защищал позицию (срабатывал как "SL" при
+            # росте цены, с положительным PnL — именно то, что видно в !signals
+            # при недостатке истории, < SL_MIN_HISTORY=10 выигрышных сделок).
+            # atr_sl уже посчитан выше через calculate_sl() — гарантированно с
+            # правильной стороны (fl для long, fu для short) плюс защита от NaN
+            # и кламп, чтобы SL не пересекал цену входа. Просто переиспользуем его.
+            sl = atr_sl
             logger.debug(
                 f"[ADAPTIVE_SL] {ticker} {timeframe} {side}: "
                 f"only {len(winning)} winning trades < {_cfg.SL_MIN_HISTORY} min, "
-                f"fallback opposite FRAMA -> SL={sl:.4f}"
+                f"fallback ATR/FRAMA-SL -> SL={sl:.4f}"
             )
-            return sl, f"frama-opposite ({len(winning)}/{_cfg.SL_MIN_HISTORY} wins)"
+            return sl, f"frama/atr-fallback ({len(winning)}/{_cfg.SL_MIN_HISTORY} wins)"
 
         mae_values = [r["max_adverse_pct"] / 100 for r in winning]  # переводим % → доли
         mae_percentile = float(np.percentile(mae_values, _cfg.SL_MAE_PERCENTILE * 100))

@@ -129,9 +129,23 @@ async def startup_sequence(exchange: ccxt.Exchange):
     logger.info("[STARTUP] Running historical backtest to populate signal history...")
     logger.info("=" * 60)
 
+    # 🆕 FIX: backtest_history() ничего не проверяет и просто ДОПИСЫВАЕТ сигналы
+    # поверх существующей истории. Раньше startup_sequence гонял бэктест
+    # безусловно на КАЖДОМ рестарте контейнера — а бэктест детерминирован (те же
+    # прошлые свечи → те же сигналы), поэтому каждый рестарт задваивал историю
+    # (видно по !signals: пары идентичных записей). Теперь бэктест для
+    # ticker/tf пропускается, если история для него уже непустая — считаем,
+    # что она уже была накоплена (первым запуском или бэктестом, или живой
+    # торговлей). Принудительно пересобрать историю — `!reset yes`.
+    history = load_signals_history()
     total = 0
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
+            existing = history.get(ticker, {}).get(tf, {})
+            already_populated = any(len(existing.get(side, [])) > 0 for side in ("long", "short"))
+            if already_populated:
+                logger.info(f"[STARTUP] {ticker} {tf} already has signal history — skipping backtest (use `!reset yes` to force re-run).")
+                continue
             count = await asyncio.to_thread(
                 backtest_history, exchange, ticker, tf, 3000
             )
