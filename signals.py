@@ -982,9 +982,10 @@ def backtest_history(
                 if not sig_ok:
                     continue
 
-                sl = calculate_sl(close_v, side, fs, fu, fl, atr14, idx)
+                sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx)
                 risk_fixed = abs(close_v - sl)
-                tp = close_v + (2.0 * risk_fixed) if side == "long" else close_v - (2.0 * risk_fixed)
+                tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime)
+                tp = tp1  # бэктест: статистический TP без RR-cap
 
                 tp_hit = sl_hit = False
                 max_favorable = max_adverse = 0.0
