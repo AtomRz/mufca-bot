@@ -2,24 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Зависимости
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Код бота (все модули)
-COPY main.py .
-COPY config.py .
-COPY bot.py .
-COPY signals.py .
-COPY state.py .
-COPY indicators.py .
-COPY utils.py .
-COPY volume_indicators.py .
-COPY onchain.py .
-COPY chart.py .
+# Copy all bot modules from the local 'app' directory into the container
+COPY app/*.py ./
 
-# Директория для данных
+# Create directory for persistent data storage
 RUN mkdir -p /app/data
 
-# Запуск
+# Run the bot with unbuffered logging
 CMD ["python", "-u", "main.py"]
