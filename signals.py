@@ -231,10 +231,12 @@ def calculate_adaptive_sl(
         records = history.get(ticker, {}).get(timeframe, {}).get(side, [])
 
         # Только выигрышные сделки (цена вернулась, не задев стоп)
+        # 🆕 FIX: исключаем synthetic-записи (!sim) — они не отражают реальные MAE.
         winning = [
             r for r in records
             if r.get("exit_type") in ("tp", "cancelled")
             and r.get("max_adverse_pct", 0) > 0
+            and not r.get("synthetic", False)
         ]
 
         if len(winning) < _cfg.SL_MIN_HISTORY:
@@ -258,6 +260,15 @@ def calculate_adaptive_sl(
         mae_percentile = float(np.percentile(mae_values, _cfg.SL_MAE_PERCENTILE * 100))
         mae_with_buffer = mae_percentile + _cfg.SL_MAE_BUFFER
 
+        # 🆕 FIX: у TP есть ATR-кап (calculate_adaptive_tp), у SL его не было —
+        # перцентиль MAE без ограничения мог дать неадекватно широкий стоп при
+        # выбросах в истории. Ограничиваем максимум SL_MAX_ATR_MULT × ATR.
+        atr_v = max(float(atr14.iloc[idx]), 1e-8)
+        max_risk_pct = (_cfg.SL_MAX_ATR_MULT * atr_v) / entry_price
+        capped = mae_with_buffer > max_risk_pct
+        if capped:
+            mae_with_buffer = max_risk_pct
+
         if side == "long":
             sl_adaptive = entry_price * (1 - mae_with_buffer)
             # Не ставим SL выше цены входа
@@ -269,7 +280,8 @@ def calculate_adaptive_sl(
 
         desc = (
             f"adaptive MAE p{_cfg.SL_MAE_PERCENTILE*100:.0f} "
-            f"{mae_percentile*100:.2f}%+{_cfg.SL_MAE_BUFFER*100:.1f}% "
+            f"{mae_percentile*100:.2f}%+{_cfg.SL_MAE_BUFFER*100:.1f}%"
+            f"{' [ATR-capped]' if capped else ''} "
             f"({len(winning)} wins)"
         )
         logger.debug(f"[ADAPTIVE_SL] {ticker} {timeframe} {side}: {desc} → SL={sl:.4f}")
@@ -426,7 +438,9 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     state["trade_history"].append(closed_trade)
     state["trade_history"] = state["trade_history"][-50:]
 
-    update_signal_record(ticker, tf, side, exit_price, result, bars_held)
+    # 🆕 FIX: передаём track, чтобы не закрыть по ошибке запись другого трека
+    # (A и U могут одновременно держать позицию в одну сторону на одном ticker/tf)
+    update_signal_record(ticker, tf, side, exit_price, result, bars_held, track=track)
 
     state[trade_key] = None
     state[bars_key] = 0
@@ -466,7 +480,8 @@ async def open_position(
     ticker: str,
     timeframe: str,
     regime: str,
-    sugg_lev: int,
+    vol_info: Dict,
+    oc_lev_delta: int,
     onchain_bias: Optional[Dict],
     dry_run: bool,
     calc_confidence,
@@ -481,6 +496,21 @@ async def open_position(
         return None
 
     sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx)
+
+    # 🆕 FIX: раньше leverage считался ДО вызова calculate_adaptive_sl, по грубой
+    # оценке ширины канала FRAMA (frama_sl_long/short в check_signals) — то есть
+    # плечо не соответствовало реальному риску, который определял adaptive SL
+    # (перцентиль исторического MAE). Теперь считаем от фактического sl.
+    atr_v = max(float(atr14.iloc[idx]), 1e-8)
+    sl_atr_mult = max(1.0, min(3.5, abs(close_v - sl) / atr_v))
+    lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sl_atr_mult, 0.1))))
+    if regime == "CHAOS":
+        lev = max(1, int(lev * 0.5))
+    if regime == "TREND":
+        lev = min(MAX_ALLOWED_LEV, int(lev * 1.2))
+    lev, vol_lev_reason = volume_leverage_adjustment_v3(vol_info, side, lev)
+    lev = max(1, min(MAX_ALLOWED_LEV, lev + oc_lev_delta))
+
     tp1, tp2, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
     tp = tp2  # основной TP для R:R расчётов и фильтров — используем tp2
     tp_desc = f"SL:{sl_desc} | {tp_desc}"
@@ -536,12 +566,17 @@ async def open_position(
     last_bar_key = f"last_{track}_{side}_bar"
     bars_key = f"{track}_bars_in_trade"
 
+    # 🆕 FIX: раньше здесь сбрасывался last_bar_key = None при провале фильтра,
+    # что обнуляло cooldown и заставляло сигнал пытаться открыться заново на
+    # каждом цикле сканирования (каждые ~20с) до прихода нового бара — лишняя
+    # нагрузка и спам в логах. Теперь last_bar_key не трогаем: cooldown
+    # (COOLDOWN_BARS) отрабатывает как задумано, in_long/in_short просто гасим
+    # флаг "в позиции".
     if rr < MIN_RR:
         logger.info(f"[FILTER] {ticker} {timeframe} {track_label}-{side.upper()} skipped — R:R={rr:.2f} < {MIN_RR}")
         if not dry_run:
             state[in_long_key] = False
             state[in_short_key] = False
-            state[last_bar_key] = None
         return None
 
     if extreme_violation:
@@ -549,7 +584,6 @@ async def open_position(
         if not dry_run:
             state[in_long_key] = False
             state[in_short_key] = False
-            state[last_bar_key] = None
         return None
 
     state[trade_key] = {
@@ -558,19 +592,24 @@ async def open_position(
         "sl": sl,
         "tp": tp,    # TP2 — цель для 100% позиции
         "tp1": tp1,  # TP1 — статистический, цель для 50% позиции
-        "lev": sugg_lev,
+        "lev": lev,
         "bar_opened": idx,
+        # 🆕 FIX: помимо позиционного idx (валиден только для df, на котором был
+        # посчитан сигнал) сохраняем реальный timestamp бара — по нему !chart может
+        # надёжно найти нужный бар в СВОЁМ, независимо нафетченном df.
+        "bar_opened_time": int(df["timestamp"].iloc[idx]),
         "tp1_hit": False,  # флаг: уведомление по TP1 уже отправлено
     }
     state[bars_key] = 0
 
     if not dry_run:
-        add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime)
+        # 🆕 FIX: передаём track, чтобы записи A- и U-трека не путались в истории
+        add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
 
     stats = get_signal_stats(ticker, timeframe, side)
     conf = calc_confidence(side == "long")
 
-    return (signal_label, close_v, regime, sugg_lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
+    return (signal_label, close_v, regime, lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
 
 # =====================================================================
 # 🧠  CHECK SIGNALS (ОСНОВНАЯ ЛОГИКА)
@@ -615,7 +654,7 @@ async def check_signals(
         for track in ("a", "u"):
             trade = state.get(f"{track}_active_trade")
             if trade:
-                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close)
+                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track)
                 hit = check_tp_sl_hit(state, last_high, last_low, track)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
@@ -749,6 +788,11 @@ async def check_signals(
                 state["u_short_bar"] = bar_idx
                 state["last_u_short_bar"] = bar_idx
 
+        # 🆕 NOTE: sugg_lev здесь — грубая информационная оценка (по ширине канала
+        # FRAMA), используется только как fallback-значение при отсутствии сигнала
+        # (возврат из функции) и для регимного логирования. Реальное плечо для
+        # каждой открытой позиции теперь считается ВНУТРИ open_position от
+        # фактического adaptive SL (см. fix там) — эта оценка на него не влияет.
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
@@ -759,15 +803,6 @@ async def check_signals(
         if regime == "TREND":
             sugg_lev = min(MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
 
-        if (sig_a_long or sig_u_long):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
-                vol_info, "long", sugg_lev
-            )
-        elif (sig_a_short or sig_u_short):
-            sugg_lev, vol_lev_reason = volume_leverage_adjustment_v3(
-                vol_info, "short", sugg_lev
-            )
-
         oc_bias_long  = 0
         oc_bias_short = 0
         oc_lev_delta  = 0
@@ -776,9 +811,6 @@ async def check_signals(
             oc_bias_long      = onchain_bias.get("bias_long",      0)
             oc_bias_short     = onchain_bias.get("bias_short",     0)
             oc_lev_delta      = onchain_bias.get("lev_delta",      0)
-
-        if (sig_a_long or sig_u_long) or (sig_a_short or sig_u_short):
-            sugg_lev = max(1, min(MAX_ALLOWED_LEV, sugg_lev + oc_lev_delta))
 
         def calc_confidence(is_long: bool) -> int:
             score = 20 if chop_ok else 0
@@ -797,7 +829,7 @@ async def check_signals(
         # --- A-track LONG ---
         if sig_a_long:
             sig = await open_position(state, "a", "long", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
                                       calc_confidence, MIN_RR)
             if sig:
                 signals.append(sig)
@@ -807,7 +839,7 @@ async def check_signals(
         # --- U-track LONG ---
         if sig_u_long:
             sig = await open_position(state, "u", "long", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
                                       calc_confidence, MIN_RR)
             if sig:
                 signals.append(sig)
@@ -817,7 +849,7 @@ async def check_signals(
         # --- A-track SHORT ---
         if sig_a_short:
             sig = await open_position(state, "a", "short", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
                                       calc_confidence, MIN_RR)
             if sig:
                 signals.append(sig)
@@ -827,7 +859,7 @@ async def check_signals(
         # --- U-track SHORT ---
         if sig_u_short:
             sig = await open_position(state, "u", "short", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, sugg_lev, onchain_bias, dry_run,
+                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
                                       calc_confidence, MIN_RR)
             if sig:
                 signals.append(sig)

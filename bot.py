@@ -286,14 +286,20 @@ async def market_scanner():
                                 try:
                                     from chart import generate_chart
                                     is_long = "BUY" in sig_type or "LONG" in sig_type
-                                    # 🆕 FIX: передаём реальный bar index для корректной стрелки на графике
+                                    # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
+                                    # который фетчился ЗДЕСЬ (limit=100), а generate_chart
+                                    # внутри себя делает свой отдельный fetch (limit≈300+) —
+                                    # индексы не совпадали, и стрелка почти всегда улетала
+                                    # в начало графика. Сигнал всегда формируется на последнем
+                                    # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
+                                    # это верно для df ЛЮБОЙ длины — используем offset от конца.
                                     state_snapshot = {
                                         "entry": price,
                                         "tp":    tp,
                                         "tp1":   tp1,
                                         "sl":    sl,
                                         "side":  "long" if is_long else "short",
-                                        "signal_bar": len(df) - 2 if df is not None else None,
+                                        "signal_bar_offset": -2,
                                     }
                                     chart_buf = await generate_chart(
                                         exchange=exchange,
@@ -1173,12 +1179,17 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
                 u_trade = st.get("u_active_trade") or st.get("active_trade")
                 active = a_trade or u_trade
                 if active:
+                    # 🆕 FIX: раньше передавался позиционный "bar_opened" индекс,
+                    # посчитанный на df сигнала — но !chart строит свой df отдельным
+                    # fetch'ем (возможно днями позже), и индексы не совпадали, стрелка
+                    # уезжала в произвольное место. Теперь передаём реальный timestamp
+                    # бара входа, и chart.py сам находит нужный бар в своём df.
                     state_snapshot = {
                         "entry": active.get("entry"),
                         "tp":    active.get("tp"),
                         "sl":    active.get("sl"),
                         "side":  active.get("side"),
-                        "signal_bar": active.get("bar_opened"),
+                        "entry_time_ms": active.get("bar_opened_time"),
                     }
                 break
 
@@ -1352,14 +1363,23 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
             # оставались 0.0, искажая перцентиль TP.
             # Теперь: вызываем update_signal_mae_mfe для SL и TP, чтобы записать реалистичные
             # значения MAE/MFE в историю.
-            add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+            #
+            # 🆕 FIX: помечаем track="sim" + synthetic=True — эта запись идеализированная
+            # (полный ход до TP И до SL одновременно) и раньше писалась под тем же track,
+            # что и реальные A/U сделки, искажая calculate_adaptive_sl/tp (в т.ч. раздувая
+            # адаптивный SL, т.к. max_adverse_pct тут равен полной дистанции до SL).
+            # Теперь такие записи исключены из статистики/калибровки (см. state.py).
+            add_signal_record(
+                ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(),
+                track="sim", synthetic=True,
+            )
 
             # Рассчитываем MFE (максимально благоприятное движение = TP)
             # и MAE (максимально неблагоприятное = SL) для корректной статистики
-            update_signal_mae_mfe(ticker, tf, side, tp)   # MFE = (TP - entry)/entry
-            update_signal_mae_mfe(ticker, tf, side, sl)   # MAE = (entry - SL)/entry
+            update_signal_mae_mfe(ticker, tf, side, tp, track="sim")   # MFE = (TP - entry)/entry
+            update_signal_mae_mfe(ticker, tf, side, sl, track="sim")   # MAE = (entry - SL)/entry
 
-            update_signal_record(ticker, tf, side, tp, "tp", 5)
+            update_signal_record(ticker, tf, side, tp, "tp", 5, track="sim")
 
             stats = get_signal_stats(ticker, tf, side)
 
@@ -1372,7 +1392,9 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             lines.append(f"• TP: **${round(tp, 2):,.2f}**")
 
-            lines.append(f"• History now has **{stats['count']}** closed {side} signals")
+            # 🆕 NOTE: stats['count'] теперь считается только по реальным (не-sim)
+            # закрытым сигналам — синтетическая sim-запись в калибровку не входит.
+            lines.append(f"• Real closed {side} signals in history: **{stats['count']}** (sim-запись помечена отдельно и не влияет на adaptive TP/SL)")
 
             await ctx.send("\n".join(lines))
 
@@ -1437,7 +1459,24 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
 
             st = state[ticker][tf]
             track_key = "a_active_trade"  # forcerun всегда на A-треке
-            st[track_key] = {"side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3, "bar_opened": idx}
+
+            # 🆕 FIX: раньше forcerun безусловно перезаписывал a_active_trade —
+            # если A-трек уже держал реальную позицию, она терялась бесследно
+            # (без закрытия и без записи в историю), а её "open"-запись в
+            # signals_history зависала навсегда. Теперь просто отказываем.
+            existing = st.get(track_key)
+            if existing:
+                await ctx.send(
+                    f"⚠️ У A-трека уже есть открытая позиция `{existing['side'].upper()}` "
+                    f"по `{ticker}` `{tf}` (entry ${existing['entry']:,.2f}). "
+                    f"Сначала дождитесь её закрытия или закройте вручную."
+                )
+                return
+
+            st[track_key] = {
+                "side": side, "entry": last_close, "sl": sl, "tp": tp, "lev": 3,
+                "bar_opened": idx, "bar_opened_time": int(df["timestamp"].iloc[idx]),
+            }
             st["a_bars_in_trade"] = 0
             st["a_in_long"] = (side == "long")
             st["a_in_short"] = (side == "short")
@@ -1445,7 +1484,8 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             st["active_trade"] = st[track_key]
             st["bars_in_trade"] = 0
 
-            add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat())
+            # 🆕 FIX: явно помечаем track="a", т.к. forcerun открывает именно a_active_trade
+            add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(), track="a")
             stats = get_signal_stats(ticker, tf, side)
 
             rr = round(abs(tp - last_close) / max(risk, 1e-8), 2)

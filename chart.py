@@ -155,9 +155,8 @@ def build_chart(
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     signal_side: Optional[str] = None,  # "long" | "short"
-    signal_bar: Optional[int] = None,   # индекс бара сигнала
+    signal_bar_offset: int = -2,        # смещение бара сигнала ОТ КОНЦА отображаемого df
     limit: int = 50,
-    original_len: Optional[int] = None, # длина df ДО tail() для корректного offset
 ) -> io.BytesIO:
     """
     Строит полный свечной график и возвращает BytesIO PNG.
@@ -166,12 +165,18 @@ def build_chart(
       [0] Свечи + FRAMA + BB + S/R + Entry/TP/SL + сигнальные стрелки
       [1] Объём
       [2] KMeans MFI (если передан)
+
+    🆕 FIX: signal_bar раньше был "абсолютным индексом в оригинальном df до
+    tail()", который вызывающий код (bot.py) считал от СВОЕГО df (limit=100),
+    а generate_chart внутри делает СВОЙ независимый fetch (limit≈300+). Индексы
+    двух разных серий не совпадали, и стрелка почти всегда улетала в начало
+    графика (clamp в 0). Теперь signal_bar_offset — это смещение ОТ КОНЦА уже
+    отображаемого (tail-нутого) df, не зависящее от того, сколько баров и как
+    было исходно нафетчено. По правилам бота сигнал всегда формируется на
+    последнем подтверждённом закрытом баре (iloc[-2]), поэтому дефолт -2.
     """
     df = df.tail(limit).copy().reset_index(drop=True)
     n = len(df)
-    # Используем original_len (до tail) чтобы правильно вычислить offset для signal_bar
-    _orig = original_len if original_len is not None else n
-    _offset = max(0, _orig - limit)
 
     has_mfi = mfi is not None and len(mfi) >= limit
 
@@ -278,10 +283,11 @@ def build_chart(
         ax_c.add_patch(rect)
 
     # ── Сигнал (стрелка) ────────────────────────────────────────────
-    if signal_bar is not None and signal_side is not None:
-        # signal_bar — абсолютный индекс в оригинальном df до tail()
-        # _offset вычислен выше через original_len, корректно при любом limit
-        idx = signal_bar - _offset if signal_bar is not None else n - 2
+    if signal_side is not None:
+        # signal_bar_offset — смещение от конца отображаемого df (напр. -2 = последний
+        # подтверждённый закрытый бар). Не зависит от того, каким fetch был построен df.
+        offset = signal_bar_offset if signal_bar_offset is not None else -2
+        idx = n + offset if offset < 0 else offset
         idx = max(0, min(idx, n - 1))
 
         if signal_side == "long":
@@ -439,7 +445,8 @@ async def generate_chart(
         symbol:          "BTC/USDT"
         timeframe:       "1h" | "4h"
         limit:           количество свечей (default 50)
-        state_snapshot:  dict с полями entry, tp, sl, side, signal_bar (опционально)
+        state_snapshot:  dict с полями entry, tp, sl, side, signal_bar_offset (опционально;
+                          смещение от конца df, по умолчанию -2 — последний закрытый бар)
 
     Returns:
         BytesIO PNG buffer
@@ -469,18 +476,32 @@ async def generate_chart(
     mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=config.MFI_TRAINING)
 
     # ── Данные активной сделки ────────────────────────────────────
-    entry_price  = None
-    tp_price     = None
-    sl_price     = None
-    signal_side  = None
-    signal_bar   = None
+    entry_price       = None
+    tp_price          = None
+    sl_price          = None
+    signal_side       = None
+    signal_bar_offset = -2
 
     if state_snapshot:
         entry_price = state_snapshot.get("entry")
         tp_price    = state_snapshot.get("tp")
         sl_price    = state_snapshot.get("sl")
         signal_side = state_snapshot.get("side")
-        signal_bar  = state_snapshot.get("signal_bar")
+
+        entry_time_ms = state_snapshot.get("entry_time_ms")
+        if entry_time_ms is not None:
+            # 🆕 FIX: сделка могла быть открыта много баров назад, на другом df.
+            # Ищем реальный бар по timestamp в СВОЁМ только что нафетченном df,
+            # вместо того чтобы доверять позиционному индексу из чужого df.
+            try:
+                ts_arr = df["timestamp"].values
+                closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
+                signal_bar_offset = closest_i - len(df)  # смещение от конца, всегда <= -1
+            except Exception as e:
+                logger.warning(f"[CHART] Failed to resolve entry_time_ms to bar index: {e}")
+                signal_bar_offset = -2
+        else:
+            signal_bar_offset = state_snapshot.get("signal_bar_offset", -2)
 
     return build_chart(
         df=df,
@@ -497,7 +518,6 @@ async def generate_chart(
         tp_price=tp_price,
         sl_price=sl_price,
         signal_side=signal_side,
-        signal_bar=signal_bar,
+        signal_bar_offset=signal_bar_offset,
         limit=limit,
-        original_len=len(df),
     )

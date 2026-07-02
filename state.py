@@ -65,8 +65,26 @@ def _normalize_timestamp(timestamp) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp, regime: str = "unknown"):
-    """Добавляет запись о новом сигнале."""
+def add_signal_record(
+    ticker: str,
+    tf: str,
+    side: str,
+    entry: float,
+    timestamp,
+    regime: str = "unknown",
+    track: str = "a",
+    synthetic: bool = False,
+):
+    """Добавляет запись о новом сигнале.
+
+    🆕 FIX: записи теперь помечаются `track` ("a" | "u" | "sim" | ...).
+    Раньше история хранилась только по ключу ticker/tf/side, и если A- и U-трек
+    одновременно держали позицию в одну сторону на одном ticker/tf, в истории
+    оказывалось две записи exit_type="open" без возможности их различить —
+    update_signal_record/update_signal_mae_mfe закрывали/обновляли не ту сделку.
+    `synthetic` — метка для записей, созданных не реальным сканером (например !sim),
+    чтобы они не участвовали в калибровке adaptive TP/SL.
+    """
     history = load_signals_history()
     _ensure_history_slot(history, ticker, tf)
 
@@ -80,42 +98,64 @@ def add_signal_record(ticker: str, tf: str, side: str, entry: float, timestamp, 
         "max_favorable_pct": 0.0,
         "max_adverse_pct": 0.0,
         "regime": regime,
+        "track": track,
+        "synthetic": synthetic,
     }
 
     history[ticker][tf][side].append(record)
     history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
     save_signals_history(history)
-    logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Regime: {regime}")
+    logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Track: {track} | Regime: {regime}")
 
 
-def update_signal_record(ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int):
-    """Закрывает открытый сигнал."""
+def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
+    """
+    Находит открытую запись для данного трека.
+
+    🆕 FIX: сначала ищем запись с точным совпадением track (новые данные).
+    Если не нашли — fallback на запись без поля track вообще (старые данные,
+    записанные до этого фикса), чтобы не ломать существующую историю.
+    Берём самую последнюю подходящую запись (reversed).
+    """
+    for rec in reversed(records):
+        if rec.get("exit_type") == "open" and rec.get("track") == track:
+            return rec
+    for rec in reversed(records):
+        if rec.get("exit_type") == "open" and "track" not in rec:
+            return rec
+    return None
+
+
+def update_signal_record(
+    ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int, track: str = "a"
+):
+    """Закрывает открытый сигнал (для указанного трека)."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         logger.warning(f"Cannot update signal: no history for {ticker} {tf}")
         return
 
     records = history[ticker][tf][side]
-    for rec in reversed(records):
-        if rec["exit_type"] == "open":
-            rec["exit"] = round(exit_price, 4)
-            rec["exit_type"] = exit_type
-            rec["bars_held"] = bars_held
-            entry = rec["entry"]
-            if side == "long":
-                rec["moved_pct"] = round((exit_price - entry) / entry * 100, 4)
-            else:
-                rec["moved_pct"] = round((entry - exit_price) / entry * 100, 4)
-            save_signals_history(history)
-            logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | PnL: {rec['moved_pct']:.2f}% | Regime: {rec.get('regime', 'unknown')}")
-            return
+    rec = _find_open_record(records, track)
+    if rec is None:
+        logger.warning(f"No open signal found to close for {ticker} {tf} {side} (track={track})")
+        return
 
-    logger.warning(f"No open signal found to close for {ticker} {tf} {side}")
+    rec["exit"] = round(exit_price, 4)
+    rec["exit_type"] = exit_type
+    rec["bars_held"] = bars_held
+    entry = rec["entry"]
+    if side == "long":
+        rec["moved_pct"] = round((exit_price - entry) / entry * 100, 4)
+    else:
+        rec["moved_pct"] = round((entry - exit_price) / entry * 100, 4)
+    save_signals_history(history)
+    logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | Track: {track} | PnL: {rec['moved_pct']:.2f}% | Regime: {rec.get('regime', 'unknown')}")
 
 
-def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, save_every: int = 5):
+def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, save_every: int = 5, track: str = "a"):
     """
-    Обновляет MFE/MAE для открытого сигнала.
+    Обновляет MFE/MAE для открытого сигнала указанного трека.
     Сохраняет на диск не чаще, чем каждые `save_every` вызовов.
     """
     history = load_signals_history()
@@ -123,22 +163,21 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
         return
 
     records = history[ticker][tf][side]
+    rec = _find_open_record(records, track)
     updated = False
 
-    for rec in reversed(records):
-        if rec["exit_type"] == "open":
-            entry = rec["entry"]
-            if side == "long":
-                favorable = (current_price - entry) / entry * 100
-                adverse = (entry - current_price) / entry * 100
-            else:
-                favorable = (entry - current_price) / entry * 100
-                adverse = (current_price - entry) / entry * 100
+    if rec is not None:
+        entry = rec["entry"]
+        if side == "long":
+            favorable = (current_price - entry) / entry * 100
+            adverse = (entry - current_price) / entry * 100
+        else:
+            favorable = (entry - current_price) / entry * 100
+            adverse = (current_price - entry) / entry * 100
 
-            rec["max_favorable_pct"] = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
-            rec["max_adverse_pct"] = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
-            updated = True
-            break
+        rec["max_favorable_pct"] = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
+        rec["max_adverse_pct"] = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
+        updated = True
 
     update_signal_mae_mfe._counter = getattr(update_signal_mae_mfe, "_counter", 0) + 1
 
@@ -171,7 +210,9 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         return empty
 
     records = history[ticker][tf][side]
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
+    # 🆕 FIX: синтетические записи (!sim) исключаются из статистики/калибровки —
+    # они не отражают реальное поведение рынка и искажали перцентили.
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
     if not closed:
         return empty
 
@@ -359,7 +400,8 @@ def calculate_adaptive_tp(
         return round(fallback_tp, 4)
 
     records = history[ticker][tf][side]
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled")]
+    # 🆕 FIX: синтетические записи (!sim) исключаются — см. get_signal_stats.
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
 
     if len(closed) < 3:
         return round(fallback_tp, 4)
