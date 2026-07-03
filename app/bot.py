@@ -97,6 +97,7 @@ _exchange_ref: Optional[ccxt.Exchange] = None
 
 # 🆕 FIX: Persisted closure notifications
 _closure_notified_file = os.path.join(DATA_DIR, "closure_notified.json")
+_CLOSURE_NOTIFIED_MAX = 2000  # 🆕 FIX: раньше набор рос бесконечно (по 1 ID на закрытую сделку навсегда)
 
 def _load_closure_notified() -> set:
     """Load set of already-notified trade IDs."""
@@ -107,11 +108,14 @@ def _load_closure_notified() -> set:
         return set()
 
 def _save_closure_notified(notified: set):
-    """Save notified trade IDs."""
+    """Save notified trade IDs. Обрезаем до последних _CLOSURE_NOTIFIED_MAX, чтобы файл не рос бесконечно."""
     try:
+        ids = list(notified)
+        if len(ids) > _CLOSURE_NOTIFIED_MAX:
+            ids = ids[-_CLOSURE_NOTIFIED_MAX:]
         temp = _closure_notified_file + ".tmp"
         with open(temp, "w") as f:
-            json.dump(list(notified), f)
+            json.dump(ids, f)
         os.replace(temp, _closure_notified_file)
     except Exception as e:
         logger.warning(f"Failed to save closure notifications: {e}")
@@ -277,6 +281,14 @@ async def market_scanner():
                         _state_locks[ticker] = {}
                     _state_locks[ticker][tf] = lock
 
+                # 🆕 FIX: раньше лок держался весь цикл — check_signals, fetch OHLCV
+                # для чарта, генерация чарта (ещё один fetch) и все Discord-сообщения.
+                # Из-за этого любая команда (!forcerun/!sim/!tp) на ТУ ЖЕ пару/TF
+                # блокировалась на несколько секунд, пока сканер не закончит всю
+                # сетевую/Discord-работу. Теперь под локом остаётся только
+                # check_signals (там происходит реальное открытие/закрытие позиций
+                # и мутация state — это должно быть атомарным относительно команд).
+                # Все сетевые вызовы и отправки в Discord вынесены НАРУЖУ лока.
                 async with lock:
                     st = state[ticker][tf]
                     signals, bar_time, regime, lev = await check_signals(
@@ -287,116 +299,120 @@ async def market_scanner():
                     scan_stats["total_scans"] += 1
                     scan_stats["last_scan_time"] = datetime.now(timezone.utc).isoformat()
 
-                    if bar_time and bar_time != st["last_bar_time"]:
+                    is_new_bar = bool(bar_time and bar_time != st["last_bar_time"])
+                    if is_new_bar:
                         st["last_bar_time"] = bar_time
-                        # 🆕 Fetch df for volume info
-                        bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
-                        df = parse_ohlcv(bars) if bars else None
-                        for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
-                            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
-                            try:
-                                # Генерируем и прикладываем график к сигналу
-                                chart_file = None
-                                try:
-                                    from chart import generate_chart
-                                    is_long = "BUY" in sig_type or "LONG" in sig_type
-                                    # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
-                                    # который фетчился ЗДЕСЬ (limit=100), а generate_chart
-                                    # внутри себя делает свой отдельный fetch (limit≈300+) —
-                                    # индексы не совпадали, и стрелка почти всегда улетала
-                                    # в начало графика. Сигнал всегда формируется на последнем
-                                    # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
-                                    # это верно для df ЛЮБОЙ длины — используем offset от конца.
-                                    state_snapshot = {
-                                        "entry": price,
-                                        "tp":    tp,
-                                        "tp1":   tp1,
-                                        "sl":    sl,
-                                        "side":  "long" if is_long else "short",
-                                        "signal_bar_offset": -2,
-                                    }
-                                    chart_buf = await generate_chart(
-                                        exchange=exchange,
-                                        symbol=ticker,
-                                        timeframe=tf,
-                                        limit=50,
-                                        state_snapshot=state_snapshot,
-                                    )
-                                    chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
-                                except Exception as chart_err:
-                                    logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
 
-                                if chart_file:
-                                    await channel.send(embed=embed, file=chart_file)
-                                else:
-                                    await channel.send(embed=embed)
-                                scan_stats["signals_generated"] += 1
-                            except discord.HTTPException as e:
-                                logger.error(f"Failed to send signal: {e}")
-                            logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
-
-                    # 🆕 FIX: Check BOTH tracks for closures independently
-                    for track in ("a", "u"):
-                        trade_key = f"{track}_active_trade"
-                        history_key = f"{track}_trade_history"
-                        notified_key = f"{track}_last_closure_notified"
-
-                        trade = st.get(trade_key)
-                        if not trade and st.get(history_key) and not st.get(notified_key, False):
-                            last = st[history_key][-1]
-                            if last.get("exit_time"):
-                                # Generate unique trade ID with track
-                                trade_id = f"{ticker}_{tf}_{track}_{last['exit_time']}"
-                                if trade_id not in notified_ids:
-                                    try:
-                                        exit_dt = datetime.fromisoformat(last["exit_time"])
-                                        age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
-                                        if age < 35:
-                                            emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
-                                            track_label = "A" if track == "a" else "U"
-                                            await channel.send(
-                                                f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                                f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
-                                                f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
-                                            )
-                                            notified_ids.add(trade_id)
-                                            _save_closure_notified(notified_ids)
-                                        st[notified_key] = True
-                                    except ValueError:
-                                        logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
-
-                    # ── TP1 hit check ─────────────────────────────────────────
-                    for track in ("a", "u"):
-                        trade_key = f"{track}_active_trade"
-                        trade = st.get(trade_key)
-                        if not trade:
-                            continue
-                        tp1_price = trade.get("tp1")
-                        if tp1_price is None or trade.get("tp1_hit"):
-                            continue
-                        current_price = None
+                # ── лок отпущен — дальше только чтение/уведомления, без критичных мутаций ──
+                if is_new_bar and signals:
+                    # 🆕 Fetch df for volume info
+                    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
+                    df = parse_ohlcv(bars) if bars else None
+                    for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
+                        embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
                         try:
-                            ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
-                            current_price = ticker_data.get("last")
-                        except Exception:
-                            pass
-                        if current_price is None:
-                            continue
-                        side = trade.get("side")
-                        tp1_reached = (
-                            (side == "long"  and current_price >= tp1_price) or
-                            (side == "short" and current_price <= tp1_price)
+                            # Генерируем и прикладываем график к сигналу
+                            chart_file = None
+                            try:
+                                from chart import generate_chart
+                                is_long = "BUY" in sig_type or "LONG" in sig_type
+                                # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
+                                # который фетчился ЗДЕСЬ (limit=100), а generate_chart
+                                # внутри себя делает свой отдельный fetch (limit≈300+) —
+                                # индексы не совпадали, и стрелка почти всегда улетала
+                                # в начало графика. Сигнал всегда формируется на последнем
+                                # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
+                                # это верно для df ЛЮБОЙ длины — используем offset от конца.
+                                state_snapshot = {
+                                    "entry": price,
+                                    "tp":    tp,
+                                    "tp1":   tp1,
+                                    "sl":    sl,
+                                    "side":  "long" if is_long else "short",
+                                    "signal_bar_offset": -2,
+                                }
+                                chart_buf = await generate_chart(
+                                    exchange=exchange,
+                                    symbol=ticker,
+                                    timeframe=tf,
+                                    limit=50,
+                                    state_snapshot=state_snapshot,
+                                )
+                                chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
+                            except Exception as chart_err:
+                                logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
+
+                            if chart_file:
+                                await channel.send(embed=embed, file=chart_file)
+                            else:
+                                await channel.send(embed=embed)
+                            scan_stats["signals_generated"] += 1
+                        except discord.HTTPException as e:
+                            logger.error(f"Failed to send signal: {e}")
+                        logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
+
+                # 🆕 FIX: Check BOTH tracks for closures independently
+                for track in ("a", "u"):
+                    trade_key = f"{track}_active_trade"
+                    history_key = f"{track}_trade_history"
+                    notified_key = f"{track}_last_closure_notified"
+
+                    trade = st.get(trade_key)
+                    if not trade and st.get(history_key) and not st.get(notified_key, False):
+                        last = st[history_key][-1]
+                        if last.get("exit_time"):
+                            # Generate unique trade ID with track
+                            trade_id = f"{ticker}_{tf}_{track}_{last['exit_time']}"
+                            if trade_id not in notified_ids:
+                                try:
+                                    exit_dt = datetime.fromisoformat(last["exit_time"])
+                                    age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
+                                    if age < 35:
+                                        emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
+                                        track_label = "A" if track == "a" else "U"
+                                        await channel.send(
+                                            f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                            f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                            f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                                        )
+                                        notified_ids.add(trade_id)
+                                        _save_closure_notified(notified_ids)
+                                    st[notified_key] = True
+                                except ValueError:
+                                    logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
+
+                # ── TP1 hit check ─────────────────────────────────────────
+                for track in ("a", "u"):
+                    trade_key = f"{track}_active_trade"
+                    trade = st.get(trade_key)
+                    if not trade:
+                        continue
+                    tp1_price = trade.get("tp1")
+                    if tp1_price is None or trade.get("tp1_hit"):
+                        continue
+                    current_price = None
+                    try:
+                        ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
+                        current_price = ticker_data.get("last")
+                    except Exception:
+                        pass
+                    if current_price is None:
+                        continue
+                    side = trade.get("side")
+                    tp1_reached = (
+                        (side == "long"  and current_price >= tp1_price) or
+                        (side == "short" and current_price <= tp1_price)
+                    )
+                    if tp1_reached:
+                        trade["tp1_hit"] = True
+                        track_label = "A" if track == "a" else "U"
+                        entry = trade.get("entry", 0)
+                        await channel.send(
+                            f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
+                            f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
+                            f"⚠️ **Закрой 50% позиции и перенеси SL в безубыток (${round(entry, 2):,.2f})**"
                         )
-                        if tp1_reached:
-                            trade["tp1_hit"] = True
-                            track_label = "A" if track == "a" else "U"
-                            entry = trade.get("entry", 0)
-                            await channel.send(
-                                f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
-                                f"⚠️ **Закрой 50% позиции и перенеси SL в безубыток (${round(entry, 2):,.2f})**"
-                            )
-                            logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price}")
+                        logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price}")
 
                 await asyncio.sleep(0.5)
             except Exception as e:
