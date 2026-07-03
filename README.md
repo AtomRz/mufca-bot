@@ -11,19 +11,26 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - **FRAMA channel** — fractal adaptive MA for trend direction and SL reference
 - **Per-timeframe CHOP filter** — 1h: 55, 4h: 61.8 (configurable via `!chop`)
 - **Fake breakout & liquidity sweep filters**
-- **Adaptive TP** — self-learning from historical MFE with hybrid regime-aware logic:
+- **Adaptive TP (two-level)** — self-learning from historical MFE with hybrid regime-aware logic:
   - ≥10 signals in current regime → uses regime-specific percentile
   - 5–9 signals → blends regime + general history with discount
   - <5 signals → uses all history with exit-type weighting (TP=1.0, SL=0.6, cancelled=0.4)
   - ATR cap (3×ATR max) to prevent unrealistic targets
+  - **TP1** — pure statistical percentile (no R:R cap), target for closing 50% of the position
+  - **TP2** — same distribution but with a minimum R:R 1.5 cap, target for the remaining 50%
+- **Adaptive SL** — based on historical MAE of winning trades: 85th percentile of true MAE (price went against the trade but recovered without hitting stop) + a small buffer; falls back to the opposite FRAMA line when there isn't enough history
+- **TP hit-rate auto-adjust (`TP_AUTO_ADJUST`)** — feedback loop that nudges the TP percentile up/down based on recent real hit-rate vs. target
 - **Aggressive / Safe TP modes** — 75th vs 50th percentile, switchable via `!tpconfig mode`
+- **On-chain module** — Etherscan (exchange ETH wallet in/outflows) + CoinGecko (Fear & Greed, BTC dominance, volume change), hourly cache; adjusts confidence score, TP/SL multipliers and leverage. Fully optional — disabled automatically if API keys aren't set
+- **Volume flow score** — OBV-based, score-based confidence/leverage adjustment
+- **Candlestick chart generation (`!chart`)** — dark-themed PNG with FRAMA bands, Bollinger Bands, support/resistance levels, signal arrows, volume panel and K-means MFI panel, attached directly to Discord signal embeds
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.0 or SL already hit by bar
-- **Trade tracking** — TP/SL hit detection, MAE/MFE recording, force-close after N bars
+- **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording, force-close after N bars
 - **Startup backtest** — auto-populates signal history from 3000 bars using fixed R:R 2.0
 - **Thread-safe file I/O** — atomic writes via `.tmp` files, per-file mutex locks
 - **Retry fetch** — exponential backoff on Gate.io rate limits
 - **Full data persistence** — all settings and history survive container restarts
-- **Multi-module architecture** — `config`, `indicators`, `signals`, `state`, `bot`, `utils`
+- **Multi-module architecture** — `config`, `indicators`, `signals`, `state`, `bot`, `discord_commands`, `chart`, `embeds`, `onchain`, `volume_indicators`, `utils`
 
 ---
 
@@ -33,6 +40,8 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - `discord.py` — bot framework
 - `ccxt` — Gate.io API (spot & futures)
 - `pandas`, `numpy` — indicator calculations
+- `matplotlib`, `mplfinance` — candlestick chart rendering
+- `aiohttp` — async Etherscan/CoinGecko requests for the on-chain module
 - Docker + GitHub Actions CI/CD
 
 ---
@@ -40,16 +49,24 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 ## Project Structure
 
 ```
-mufca_bot/
-├── main.py          # Entry point
-├── config.py        # Settings, file I/O helpers, thread locks
-├── indicators.py    # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means
-├── signals.py       # Signal logic, filters, backtest, HTF bias
-├── state.py         # Signal history, MFE/MAE tracking, adaptive TP
-├── bot.py           # All Discord commands
-├── utils.py         # safe_fetch_ohlcv, parse_ohlcv, Timer cache
+mufca-bot/
+├── app/
+│   ├── main.py               # Entry point
+│   ├── config.py             # Settings, file I/O helpers, thread locks
+│   ├── indicators.py         # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means
+│   ├── volume_indicators.py  # OBV-based volume flow score (confidence & leverage)
+│   ├── signals.py            # Signal logic, filters, backtest, HTF bias, adaptive TP/SL
+│   ├── state.py              # Signal history, MFE/MAE tracking, TP1/TP2 adaptive TP
+│   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
+│   ├── chart.py              # Candlestick chart (PNG) generation
+│   ├── embeds.py             # Discord embed builders for signals
+│   ├── discord_commands.py   # All Discord command handlers
+│   ├── bot.py                # Bot setup, scanner loop, command registration
+│   └── utils.py              # safe_fetch_ohlcv, parse_ohlcv, Timer cache
 ├── requirements.txt
-└── .env
+├── Dockerfile
+├── docker-compose.yml
+└── .env.example
 ```
 
 ---
@@ -69,6 +86,11 @@ Edit `.env`:
 ```env
 DISCORD_TOKEN=your_discord_bot_token
 CHANNEL_NAME=general
+
+# Optional — enables the on-chain bias module (confidence/TP/SL/leverage adjustments).
+# If either key is missing, on-chain analysis is automatically disabled.
+ETHERSCAN_API_KEY=
+COINGECKO_API_KEY=
 ```
 
 ### 2. Run with Docker
@@ -92,11 +114,15 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 
 | File | Purpose |
 |---|---|
-| `signals_history.json` | Historical MFE/MAE data for adaptive TP |
+| `signals_history.json` | Historical MFE/MAE data for adaptive TP/SL |
 | `mode.json` | Spot / Futures mode |
 | `htf_bias.json` | Active HTF timeframe |
 | `ut_ha.json` | UT Bot Heikin Ashi toggle |
 | `pairs.json` | Scanned pairs list |
+| `chop_threshold.json` | Per-timeframe CHOP thresholds |
+| `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
+
+Note: on-chain data (Etherscan/CoinGecko) is cached in-memory only (TTL 1h) and is not persisted to disk — it rebuilds automatically after a restart.
 
 **Docker Compose volume example:**
 ```yaml
@@ -145,7 +171,15 @@ volumes:
 | `!tpconfig limit 30` | Set signal history limit (default: 25) |
 | `!tpconfig percentile 70` | Change aggressive percentile |
 | `!tpconfig safe 50` | Change safe percentile |
-| `!tp long ETH/USDT 4h` | Preview adaptive TP/SL without firing a signal |
+| `!tp long ETH/USDT 4h` | Preview adaptive TP1/TP2/SL without firing a signal |
+
+### 📈 Charts & On-Chain
+
+| Command | Description |
+|---|---|
+| `!chart [PAIR] [TF] [LIMIT]` | Candlestick PNG with FRAMA, BB, S/R, volume & MFI panels. Example: `!chart ETH 4h 100` |
+| `!onchain` | Show current on-chain bias (exchange flows, Fear & Greed, BTC dominance) |
+| `!resetcache` | Clear the on-chain data cache and force a fresh fetch |
 
 ### 📚 History & Stats
 
@@ -188,24 +222,38 @@ volumes:
 | Max Hold Bars | 20 | Force-close after N bars |
 | Max Leverage | 10x | Safety cap |
 | SL Risk | 5% | Target risk per trade for leverage calc |
+| SL MAE Percentile | 85% | Percentile of historical winning-trade MAE used for adaptive SL |
+| SL MAE Buffer | 0.2% | Extra padding added on top of the MAE percentile |
+| Min TP2 R:R | 1.5 | Minimum R:R cap applied to TP2 |
 
 ---
 
-## Adaptive TP Logic
+## Adaptive TP / SL Logic
 
-On startup the bot backtests 3000 historical bars per pair/timeframe using **fixed R:R 2.0** to accumulate clean MFE history. Live signals then use a percentile of this distribution as TP target.
+On startup the bot backtests 3000 historical bars per pair/timeframe using **fixed R:R 2.0** to accumulate clean MFE/MAE history. Live signals then use percentiles of this distribution as TP/SL targets.
 
-**Hybrid regime-aware logic:**
+**Hybrid regime-aware TP logic:**
 1. ≥10 signals in current market regime (TREND/CHAOS/NORMAL) → uses only regime signals
 2. 5–9 regime signals → blends with general history at 0.85× discount
 3. <5 regime signals → uses all signals with exit-type weighting
 4. ATR cap: TP cannot exceed 3×ATR from entry
+
+**Two-level TP:**
+- **TP1** — statistical percentile of MFE, no R:R cap, closes 50% of the position
+- **TP2** — same percentile logic but with a minimum R:R of 1.5, closes the remaining 50%
+- If on-chain adjustment changes TP2, TP1 is recomputed proportionally so it never ends up past TP2
 
 **Modes:**
 - **Aggressive** (default): 75th percentile
 - **Safe**: 50th percentile (median)
 
 Fallback to fixed R:R 2.0 when fewer than 3 closed signals exist.
+
+**TP hit-rate auto-adjust:** once at least 15 recent signals are recorded and `TP_AUTO_ADJUST` is on, the active percentile is nudged up or down automatically to keep the real hit-rate close to the configured target.
+
+**Adaptive SL:** the stop is set from the 85th percentile of historical MAE on *winning* trades (synthetic `!sim` entries are excluded so they don't skew real market behavior), plus a small fixed buffer. If there isn't enough history yet, SL falls back to the opposite FRAMA line.
+
+**On-chain adjustment:** when `ONCHAIN_ENABLED`, exchange-flow bias and market-wide sentiment from `onchain.py` can multiply TP/SL distances and shift leverage before the signal is finalized, with safety caps so on-chain data can never push R:R below the configured minimum.
 
 ---
 
