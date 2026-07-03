@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 async def help_cmd(ctx):
     """Список всех команд MUFCA Bot."""
     lines = [
-        "**📖 MUFCA v3.1 — Команды**\n",
+        "**📖 MUFCA v4.0 — Команды**\n",
 
         "**📊 Мониторинг**",
         "`!status`       — состояние сканера: пары, треки A/U, volume",
@@ -126,7 +126,7 @@ async def help_cmd(ctx):
 async def status_cmd(ctx):
     ha_status = "✅ ON" if _cfg.UT_HEIKIN_ASHI else "❌ OFF"
     lines = [
-        f"**MUFCA v3.1 — Scanner Status**\n",
+        f"**MUFCA v4.0 — Scanner Status**\n",
         f"🧬 HTF Bias: **{_cfg.HTF_BIAS.upper()}**\n",
         f"🕯️ UT Bot Heikin Ashi: **{ha_status}**\n",
         f"📚 Adaptive TP: last **{_cfg.SIGNAL_HISTORY_LIMIT}** signals | **{(_cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if _cfg.USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",

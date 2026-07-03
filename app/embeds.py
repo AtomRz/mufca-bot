@@ -44,7 +44,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     )
 
     embed = discord.Embed(
-        title=f"🚨 MUFCA v3.1 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
+        title=f"🚨 MUFCA v4.0 {coin_emoji} {'📈 LONG' if is_long else '📉 SHORT'}",
         color=discord.Color.green() if is_long else discord.Color.red(),
     )
     embed.add_field(name="📈 Pair", value=f"**{ticker}**", inline=True)
@@ -83,5 +83,5 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                         inline=False)
     if tp_desc:
         embed.add_field(name="🧠 TP Logic", value=tp_desc, inline=False)
-    embed.set_footer(text=f"MUFCA [AtomDC] v3.1 • Gate.io {mode_label} • HTF:{_cfg.HTF_BIAS.upper()} • UT:{ha_label}")
+    embed.set_footer(text=f"MUFCA [AtomDC] v4.0 • Gate.io {mode_label} • HTF:{_cfg.HTF_BIAS.upper()} • UT:{ha_label}")
     return embed

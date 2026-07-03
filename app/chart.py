@@ -1,5 +1,5 @@
 """
-MUFCA v3.1 — Chart Module
+MUFCA v4.0 — Chart Module
 Генерация свечных графиков с индикаторами для Discord.
 Команда: !chart [PAIR] [TIMEFRAME] [LIMIT]
 """

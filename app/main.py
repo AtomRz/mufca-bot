@@ -1,5 +1,5 @@
 """
-MUFCA v3.1 — Multi-Timeframe Adaptive Trading Bot
+MUFCA v4.0 — Multi-Timeframe Adaptive Trading Bot
 Запуск: python main.py
 """
 
