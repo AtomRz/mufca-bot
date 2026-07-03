@@ -66,7 +66,13 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tu
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    fatr = tr.rolling(window=length).mean()
+    # 🆕 FIX: раньше ширина канала FRAMA считалась через простое SMA (tr.rolling().mean()),
+    # а не через Wilder RMA, как в оригинальном Pine (ta.atr(frama_len)) и как уже
+    # реализовано в calculate_atr() этого файла. A/B на живой истории (Pine-индикатор)
+    # показал, что Wilder RMA даёт заметно выше винрейт (A: +2.0 п.п., U: +4.9 п.п.),
+    # поэтому переводим и бота на ту же формулу — это меняет момент переключения
+    # frama_bullish/frama_bearish, то есть влияет на вход всех сигналов.
+    fatr = tr.ewm(alpha=1.0 / length, adjust=False).mean()
     
     fu = fs + fatr * mult
     fl = fs - fatr * mult
