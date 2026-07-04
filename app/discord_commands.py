@@ -56,6 +56,7 @@ from signals import check_signals, backtest_history, make_state, calculate_adapt
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
 from state import (
     load_signals_history,
+    save_signals_history,
     calculate_combined_tp,
     add_signal_record,
     update_signal_record,
@@ -110,6 +111,7 @@ async def help_cmd(ctx):
         "`!pairs`        — список активных пар",
         "`!add <pair>`   — добавить пару (напр. `!add SOL/USDT`)",
         "`!remove <pair>` — удалить пару",
+        "`!delsignals <pair> [tf]` — удалить историю сигналов пары",
         "",
 
         "**🛠️ Утилиты**",
@@ -338,6 +340,64 @@ async def remove_cmd(ctx, ticker: str = ""):
     save_tickers(TICKERS)
 
     await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}")
+
+@core.bot.command(name="delsignals")
+async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = ""):
+    """Удаляет историю сигналов (signals_history.json) для конкретной пары.
+
+    !delsignals SOL/USDT           — предпросмотр (все таймфреймы)
+    !delsignals SOL/USDT yes       — удалить все таймфреймы
+    !delsignals SOL/USDT 1h        — предпросмотр (только 1h)
+    !delsignals SOL/USDT 1h yes    — удалить только 1h
+
+    🆕 Команда `!remove` чистит только TICKERS/live-state, но НЕ трогает
+    signals_history.json — после удаления пары из сканирования её адаптивная
+    TP/SL-статистика оставалась висеть в файле истории. Эта команда закрывает
+    тот пробел точечно, без полного !reset.
+    """
+    if not ticker:
+        await ctx.send("❌ Please specify a pair. Example: `!delsignals SOL/USDT` or `!delsignals SOL/USDT 1h`")
+        return
+    ticker = ticker.upper()
+
+    # Поддержка "!delsignals SOL/USDT yes" (tf пропущен, confirm пришёл вторым аргументом)
+    if tf.lower() == "yes":
+        confirm, tf = tf, ""
+
+    history = load_signals_history()
+    if ticker not in history:
+        await ctx.send(f"⚠️ No signal history found for `{ticker}`.")
+        return
+
+    if tf and tf not in history[ticker]:
+        available = ", ".join(history[ticker].keys())
+        await ctx.send(f"⚠️ No signal history found for `{ticker}` `{tf}`. Available: {available}")
+        return
+
+    scope = f"`{ticker}` `{tf}`" if tf else f"`{ticker}` (all timeframes)"
+    tf_suffix = f" {tf}" if tf else ""
+
+    if confirm.lower() != "yes":
+        counts = {
+            k: len(v.get("long", [])) + len(v.get("short", []))
+            for k, v in ([(tf, history[ticker][tf])] if tf else history[ticker].items())
+        }
+        total = sum(counts.values())
+        await ctx.send(
+            f"⚠️ This will DELETE {total} signal record(s) for {scope}!\n"
+            f"To confirm, type: `!delsignals {ticker}{tf_suffix} yes`"
+        )
+        return
+
+    if tf:
+        del history[ticker][tf]
+        if not history[ticker]:
+            del history[ticker]
+    else:
+        del history[ticker]
+
+    save_signals_history(history)
+    await ctx.send(f"🗑️ Signal history for {scope} deleted.")
 
 @core.bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
