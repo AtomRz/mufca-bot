@@ -160,7 +160,7 @@ async def startup_sequence(exchange: ccxt.Exchange):
 _onchain_bias_cache: Optional[Dict] = None
 _onchain_last_fetch: float = 0.0
 
-@tasks.loop(seconds=20)
+@tasks.loop(seconds=60)
 async def market_scanner():
     """Основной цикл сканирования."""
     channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
