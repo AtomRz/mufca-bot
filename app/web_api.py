@@ -21,6 +21,7 @@ FastAPI-бэкенд для веб-морды. Работает В ТОМ ЖЕ �
 
 import asyncio
 import logging
+import re
 from typing import Optional, List, Set
 from urllib.parse import unquote
 
@@ -183,6 +184,18 @@ async def get_config():
             "max_tp_pct": _cfg.MAX_TP_PCT,
             "max_hold_bars": _cfg.MAX_HOLD_BARS,
         },
+        "indicators": {
+            "frama_len": _cfg.FRAMA_LEN,
+            "frama_mult": _cfg.FRAMA_MULT,
+            "mfi_len": _cfg.MFI_LEN,
+            "mfi_training": _cfg.MFI_TRAINING,
+            "and_len": _cfg.AND_LEN,
+            "and_sig_len": _cfg.AND_SIG_LEN,
+            "lookback": _cfg.LOOKBACK,
+            "ut_sensitivity": _cfg.UT_SENSITIVITY,
+            "ut_period": _cfg.UT_PERIOD,
+        },
+        "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
         "pairs": _cfg.TICKERS,
     }
@@ -328,6 +341,107 @@ async def set_tpconfig(body: TpConfigIn):
         "safe_tp_percentile": _cfg.SAFE_TP_PERCENTILE,
         "signal_history_limit": _cfg.SIGNAL_HISTORY_LIMIT,
     }
+
+
+# =====================================================================
+# 📐  ПАРАМЕТРЫ ИНДИКАТОРОВ (FRAMA / MFI / Andean / UT Bot)
+# Меняют логику сигналов на лету — как и mode/htf, требуют сброса стейта,
+# чтобы warmed_up/bars_since не считались по вперемешку старым/новым окном.
+# =====================================================================
+_INDICATOR_BOUNDS = {
+    "frama_len": ("FRAMA_LEN", int, 5, 100),
+    "frama_mult": ("FRAMA_MULT", float, 0.5, 5.0),
+    "mfi_len": ("MFI_LEN", int, 2, 50),
+    "mfi_training": ("MFI_TRAINING", int, 100, 3000),
+    "and_len": ("AND_LEN", int, 5, 100),
+    "and_sig_len": ("AND_SIG_LEN", int, 2, 50),
+    "lookback": ("LOOKBACK", int, 1, 20),
+    "ut_sensitivity": ("UT_SENSITIVITY", float, 0.1, 10.0),
+    "ut_period": ("UT_PERIOD", int, 2, 50),
+}
+
+
+class IndicatorsIn(BaseModel):
+    # Любое подмножество полей — как partial PATCH. Ключи см. _INDICATOR_BOUNDS.
+    frama_len: Optional[int] = None
+    frama_mult: Optional[float] = None
+    mfi_len: Optional[int] = None
+    mfi_training: Optional[int] = None
+    and_len: Optional[int] = None
+    and_sig_len: Optional[int] = None
+    lookback: Optional[int] = None
+    ut_sensitivity: Optional[float] = None
+    ut_period: Optional[int] = None
+
+
+@app.post("/api/config/indicators")
+async def set_indicators(body: IndicatorsIn):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "Нужно передать хотя бы одно поле")
+
+    for key, value in updates.items():
+        attr, caster, lo, hi = _INDICATOR_BOUNDS[key]
+        if not (lo <= value <= hi):
+            raise HTTPException(400, f"{key} должен быть между {lo} и {hi}")
+        setattr(_cfg, attr, caster(value))
+
+    _cfg.save_indicators({
+        "FRAMA_LEN": _cfg.FRAMA_LEN,
+        "FRAMA_MULT": _cfg.FRAMA_MULT,
+        "MFI_LEN": _cfg.MFI_LEN,
+        "MFI_TRAINING": _cfg.MFI_TRAINING,
+        "AND_LEN": _cfg.AND_LEN,
+        "AND_SIG_LEN": _cfg.AND_SIG_LEN,
+        "LOOKBACK": _cfg.LOOKBACK,
+        "UT_SENSITIVITY": _cfg.UT_SENSITIVITY,
+        "UT_PERIOD": _cfg.UT_PERIOD,
+    })
+    await _reset_states_after_regime_change()
+    await broadcast_event({"type": "config_changed", "key": "indicators"})
+    return {
+        "frama_len": _cfg.FRAMA_LEN,
+        "frama_mult": _cfg.FRAMA_MULT,
+        "mfi_len": _cfg.MFI_LEN,
+        "mfi_training": _cfg.MFI_TRAINING,
+        "and_len": _cfg.AND_LEN,
+        "and_sig_len": _cfg.AND_SIG_LEN,
+        "lookback": _cfg.LOOKBACK,
+        "ut_sensitivity": _cfg.UT_SENSITIVITY,
+        "ut_period": _cfg.UT_PERIOD,
+    }
+
+
+# =====================================================================
+# 🎨  ЦВЕТА ГРАФИКА — чисто визуальные, стейт сбрасывать не нужно
+# =====================================================================
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+class ColorsIn(BaseModel):
+    frama: Optional[str] = None
+    bb: Optional[str] = None
+    support: Optional[str] = None
+    resistance: Optional[str] = None
+    mfi_line: Optional[str] = None
+    mfi_overbought: Optional[str] = None
+    mfi_oversold: Optional[str] = None
+    candle_up: Optional[str] = None
+    candle_down: Optional[str] = None
+
+
+@app.post("/api/config/colors")
+async def set_colors(body: ColorsIn):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "Нужно передать хотя бы одно поле")
+    for key, value in updates.items():
+        if not _HEX_RE.match(value):
+            raise HTTPException(400, f"{key}: цвет должен быть в формате #RRGGBB")
+        _cfg.CHART_COLORS[key] = value
+    _cfg.save_colors(_cfg.CHART_COLORS)
+    await broadcast_event({"type": "config_changed", "key": "colors"})
+    return _cfg.CHART_COLORS
 
 
 # =====================================================================

@@ -42,8 +42,6 @@ from config import (
     CHOP_THRESHOLD,
     SIGNALS_HISTORY_FILE,
     ATR_PERIOD,
-    FRAMA_LEN,
-    FRAMA_MULT,
     save_tickers,
     save_tp_config,
     save_mode,
@@ -803,7 +801,7 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
                 last_close = float(df["close"].iloc[-2])  # fallback на закрытый бар
 
             atr14 = calculate_atr(df, ATR_PERIOD)
-            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+            fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
             idx = len(df) - 2
             sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)
             tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
@@ -1038,7 +1036,7 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             atr14 = calculate_atr(df, ATR_PERIOD)
 
-            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+            fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
 
             idx = len(df) - 2
 
@@ -1133,7 +1131,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             last_close = float(df["close"].iloc[-2])
 
             atr14 = calculate_atr(df, ATR_PERIOD)
-            fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
+            fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
             idx = len(df) - 2
 
             sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)

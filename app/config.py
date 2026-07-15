@@ -111,18 +111,68 @@ def save_chop(data: dict):
     safe_json_save(CHOP_FILE, data)
 
 CHOP_THRESHOLD: dict = load_chop()
-FRAMA_LEN = 22
-FRAMA_MULT = 2.1
-MFI_LEN = 8
-MFI_TRAINING = 800
-AND_LEN = 23
-AND_SIG_LEN = 6
-LOOKBACK = 3
+
+INDICATOR_FILE = os.path.join(DATA_DIR, "indicator_config.json")
+_INDICATOR_DEFAULTS = {
+    "FRAMA_LEN": 22,
+    "FRAMA_MULT": 2.1,
+    "MFI_LEN": 8,
+    "MFI_TRAINING": 800,
+    "AND_LEN": 23,
+    "AND_SIG_LEN": 6,
+    "LOOKBACK": 3,
+    "UT_SENSITIVITY": 1.0,
+    "UT_PERIOD": 10,
+}
+
+def load_indicators() -> dict:
+    data = safe_json_load(INDICATOR_FILE, _INDICATOR_DEFAULTS)
+    # на случай если файл со старой версией — подмешиваем недостающие ключи дефолтами
+    merged = {**_INDICATOR_DEFAULTS, **data}
+    return merged
+
+def save_indicators(data: dict):
+    safe_json_save(INDICATOR_FILE, data)
+
+_indicators = load_indicators()
+FRAMA_LEN = _indicators["FRAMA_LEN"]
+FRAMA_MULT = _indicators["FRAMA_MULT"]
+MFI_LEN = _indicators["MFI_LEN"]
+MFI_TRAINING = _indicators["MFI_TRAINING"]
+AND_LEN = _indicators["AND_LEN"]
+AND_SIG_LEN = _indicators["AND_SIG_LEN"]
+LOOKBACK = _indicators["LOOKBACK"]
+UT_SENSITIVITY = _indicators["UT_SENSITIVITY"]
+UT_PERIOD = _indicators["UT_PERIOD"]
+
 COOLDOWN_BARS = 2
-UT_SENSITIVITY = 1.0
-UT_PERIOD = 10
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
+
+# =====================================================================
+# 🎨  ЦВЕТА ГРАФИКА (веб-морда + !chart) — настраиваются из Settings
+# =====================================================================
+COLORS_FILE = os.path.join(DATA_DIR, "chart_colors.json")
+_COLOR_DEFAULTS = {
+    "frama": "#e8a33d",
+    "bb": "#7c8797",
+    "support": "#45d0a5",
+    "resistance": "#f2637a",
+    "mfi_line": "#8b93ff",
+    "mfi_overbought": "#f2637a",
+    "mfi_oversold": "#45d0a5",
+    "candle_up": "#45d0a5",
+    "candle_down": "#f2637a",
+}
+
+def load_colors() -> dict:
+    data = safe_json_load(COLORS_FILE, _COLOR_DEFAULTS)
+    return {**_COLOR_DEFAULTS, **data}
+
+def save_colors(data: dict):
+    safe_json_save(COLORS_FILE, data)
+
+CHART_COLORS: dict = load_colors()
 
 # =====================================================================
 # 🎯  АДАПТИВНЫЙ ТП

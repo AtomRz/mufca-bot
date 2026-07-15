@@ -41,6 +41,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ param, value: String(value) }),
     }),
+  setIndicators: (patch) =>
+    request('/api/config/indicators', { method: 'POST', body: JSON.stringify(patch) }),
+  setColors: (patch) =>
+    request('/api/config/colors', { method: 'POST', body: JSON.stringify(patch) }),
 }
 
 /**

@@ -70,7 +70,7 @@ export default function App() {
 
       <main className="content">
         {tab === 'status' && <StatusPanel lastEvent={lastEvent} pairs={config?.pairs} />}
-        {tab === 'chart' && <ChartPanel pairs={config?.pairs} lastEvent={lastEvent} />}
+        {tab === 'chart' && <ChartPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}

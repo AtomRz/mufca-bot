@@ -17,16 +17,7 @@ from config import (
     ATR_MAX,
     CHOP_LENGTH,
     CHOP_THRESHOLD,
-    FRAMA_LEN,
-    FRAMA_MULT,
-    MFI_LEN,
-    MFI_TRAINING,
-    AND_LEN,
-    AND_SIG_LEN,
-    LOOKBACK,
     COOLDOWN_BARS,
-    UT_SENSITIVITY,
-    UT_PERIOD,
     MAX_ALLOWED_LEV,
     TARGET_RISK_DEP,
     MAX_HOLD_BARS,
@@ -38,6 +29,10 @@ from config import (
     ENABLE_ATR_FILTER,
     ENABLE_MTF_BIAS,
 )
+# 🆕 Параметры индикаторов (FRAMA/MFI/Andean/UT Bot) теперь редактируются на
+# лету из веб-морды (Settings), поэтому обращаемся к ним как _cfg.FRAMA_LEN и
+# т.д. по месту использования, а не через bare-импорт — иначе после
+# `_cfg.FRAMA_LEN = ...` в web_api.py эта копия имени осталась бы старой.
 from indicators import (
     calculate_atr,
     calculate_chop,
@@ -141,7 +136,7 @@ async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> 
         if not validate_dataframe(df_htf, 50):
             return 0
 
-        fs, fu, fl, fdir = calculate_frama(df_htf, FRAMA_LEN, FRAMA_MULT)
+        fs, fu, fl, fdir = calculate_frama(df_htf, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
         htf_close = float(df_htf["close"].iloc[-2])
         htf_frama = float(fs.iloc[-2])
         bias = 1 if htf_close > htf_frama else -1
@@ -671,11 +666,11 @@ async def check_signals(
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
         chop = calculate_chop(df, CHOP_LENGTH)
-        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        mfi = calculate_mfi(df, MFI_LEN)
-        level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
-        and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+        fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
+        mfi = calculate_mfi(df, _cfg.MFI_LEN)
+        level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
+        and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
+        ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
         idx = len(df) - 2
         bar_idx = idx
@@ -716,7 +711,7 @@ async def check_signals(
         vol_info = volume_flow_signal_v3(df)
         vol_lev_reason = "no signal"
 
-        warmed_up = len(df) >= MFI_TRAINING
+        warmed_up = len(df) >= _cfg.MFI_TRAINING
 
         filter_long = (
             (not ENABLE_FRAMA_FILTER or frama_bull)
@@ -742,13 +737,13 @@ async def check_signals(
         and_bull_sig = crossover2(and_osc, and_sig, idx)
         and_bear_sig = crossunder2(and_osc, and_sig, idx)
 
-        bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, LOOKBACK)
-        bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, LOOKBACK)
-        bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, LOOKBACK)
-        bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, LOOKBACK)
+        bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, _cfg.LOOKBACK)
+        bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, _cfg.LOOKBACK)
+        bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, _cfg.LOOKBACK)
+        bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, _cfg.LOOKBACK)
 
-        confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
-        confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
+        confirm_long_a = (mfi_bull_sig and bs_and_bull <= _cfg.LOOKBACK) or (and_bull_sig and bs_mfi_bull <= _cfg.LOOKBACK)
+        confirm_short_a = (mfi_bear_sig and bs_and_bear <= _cfg.LOOKBACK) or (and_bear_sig and bs_mfi_bear <= _cfg.LOOKBACK)
 
         def cooldown_ok(last_bar):
             return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
@@ -900,11 +895,11 @@ def backtest_history(
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
         chop = calculate_chop(df, CHOP_LENGTH)
-        fs, fu, fl, fdir = calculate_frama(df, FRAMA_LEN, FRAMA_MULT)
-        mfi = calculate_mfi(df, MFI_LEN)
-        level_os, level_ob = run_kmeans_mfi(mfi, MFI_TRAINING)
-        and_osc, and_sig = calculate_andean(df, AND_LEN, AND_SIG_LEN)
-        ut_buy, ut_sell = calculate_ut_bot(df, UT_SENSITIVITY, UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+        fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
+        mfi = calculate_mfi(df, _cfg.MFI_LEN)
+        level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
+        and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
+        ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
 
         htf = _cfg.HTF_BIAS
         htf_bias_arr = np.zeros(len(df))
@@ -914,7 +909,7 @@ def backtest_history(
             if htf_bars and len(htf_bars) >= 100:
                 df_htf = parse_ohlcv(htf_bars)
                 if validate_dataframe(df_htf, 50):
-                    fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, FRAMA_LEN, FRAMA_MULT)
+                    fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
                     ltf_times = df["timestamp"].values
                     htf_times = df_htf["timestamp"].values
                     htf_idx = 0
@@ -924,7 +919,7 @@ def backtest_history(
                             continue
                         while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] <= ltf_times[i]:
                             htf_idx += 1
-                        if htf_idx >= FRAMA_LEN * 2:
+                        if htf_idx >= _cfg.FRAMA_LEN * 2:
                             htf_close = float(df_htf["close"].iloc[htf_idx])
                             htf_frama_val = float(fs_htf.iloc[htf_idx])
                             # BUGFIX BUG-ME003: FRAMA может вернуть NaN на первых ~22 барах.
@@ -969,7 +964,7 @@ def backtest_history(
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
-            warmed_up_bt = idx >= MFI_TRAINING
+            warmed_up_bt = idx >= _cfg.MFI_TRAINING
 
             filter_long = (
                 (not ENABLE_FRAMA_FILTER or frama_bull)
@@ -993,13 +988,13 @@ def backtest_history(
             and_bull_sig = crossover2(and_osc, and_sig, idx)
             and_bear_sig = crossunder2(and_osc, and_sig, idx)
 
-            bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, LOOKBACK)
-            bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, LOOKBACK)
-            bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, LOOKBACK)
-            bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, LOOKBACK)
+            bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, _cfg.LOOKBACK)
+            bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, _cfg.LOOKBACK)
+            bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, _cfg.LOOKBACK)
+            bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, _cfg.LOOKBACK)
 
-            confirm_long_a = (mfi_bull_sig and bs_and_bull <= LOOKBACK) or (and_bull_sig and bs_mfi_bull <= LOOKBACK)
-            confirm_short_a = (mfi_bear_sig and bs_and_bear <= LOOKBACK) or (and_bear_sig and bs_mfi_bear <= LOOKBACK)
+            confirm_long_a = (mfi_bull_sig and bs_and_bull <= _cfg.LOOKBACK) or (and_bull_sig and bs_mfi_bull <= _cfg.LOOKBACK)
+            confirm_short_a = (mfi_bear_sig and bs_and_bear <= _cfg.LOOKBACK) or (and_bear_sig and bs_mfi_bear <= _cfg.LOOKBACK)
 
             htf_bull_bt = htf_bias_arr[idx] == 1
             htf_bear_bt = htf_bias_arr[idx] == -1

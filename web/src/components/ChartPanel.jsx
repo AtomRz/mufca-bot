@@ -1,8 +1,27 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { createChart, ColorType, LineStyle } from 'lightweight-charts'
 import { api } from '../api'
 
 const TIMEFRAMES = ['1h', '4h']
+
+const DEFAULT_COLORS = {
+  frama: '#e8a33d',
+  bb: '#7c8797',
+  support: '#45d0a5',
+  resistance: '#f2637a',
+  mfi_line: '#8b93ff',
+  mfi_overbought: '#f2637a',
+  mfi_oversold: '#45d0a5',
+  candle_up: '#45d0a5',
+  candle_down: '#f2637a',
+}
+
+function hexToRgba(hex, alpha) {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '')
+  if (!m) return hex
+  const [r, g, b] = [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)]
+  return `rgba(${r},${g},${b},${alpha})`
+}
 
 function toLineData(times, values) {
   const out = []
@@ -14,7 +33,7 @@ function toLineData(times, values) {
   return out
 }
 
-export default function ChartPanel({ pairs, lastEvent }) {
+export default function ChartPanel({ pairs, lastEvent, colors }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
@@ -23,6 +42,8 @@ export default function ChartPanel({ pairs, lastEvent }) {
   const [track, setTrack] = useState('a')
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+
+  const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
 
   useEffect(() => {
     if (!ticker && pairs?.length) setTicker(pairs[0])
@@ -48,6 +69,8 @@ export default function ChartPanel({ pairs, lastEvent }) {
     if (!lastEvent || !ticker) return
     if (lastEvent.type === 'scan_tick') load()
     if (lastEvent.type === 'signal' && lastEvent.ticker === ticker && lastEvent.tf === tf) load()
+    // смена цветов/индикаторов в Settings — перечитать данные (пороги MFI могли измениться)
+    if (lastEvent.type === 'config_changed') load()
   }, [lastEvent, ticker, tf, load])
 
   // init chart один раз
@@ -72,24 +95,24 @@ export default function ChartPanel({ pairs, lastEvent }) {
     chartRef.current = chart
 
     const candle = chart.addCandlestickSeries({
-      upColor: '#45d0a5',
-      downColor: '#f2637a',
+      upColor: C.candle_up,
+      downColor: C.candle_down,
       borderVisible: false,
-      wickUpColor: '#45d0a5',
-      wickDownColor: '#f2637a',
+      wickUpColor: C.candle_up,
+      wickDownColor: C.candle_down,
       priceScaleId: 'right',
     })
     candle.priceScale().applyOptions({ scaleMargins: { top: 0.04, bottom: 0.42 } })
 
     const framaMid = chart.addLineSeries({
-      color: '#e8a33d',
+      color: C.frama,
       lineWidth: 2,
       priceScaleId: 'right',
       priceLineVisible: false,
       lastValueVisible: false,
     })
     const framaUpper = chart.addLineSeries({
-      color: 'rgba(232,163,61,0.45)',
+      color: hexToRgba(C.frama, 0.45),
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       priceScaleId: 'right',
@@ -97,7 +120,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
       lastValueVisible: false,
     })
     const framaLower = chart.addLineSeries({
-      color: 'rgba(232,163,61,0.45)',
+      color: hexToRgba(C.frama, 0.45),
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       priceScaleId: 'right',
@@ -105,14 +128,14 @@ export default function ChartPanel({ pairs, lastEvent }) {
       lastValueVisible: false,
     })
     const bbUpper = chart.addLineSeries({
-      color: 'rgba(124,135,151,0.5)',
+      color: hexToRgba(C.bb, 0.5),
       lineWidth: 1,
       priceScaleId: 'right',
       priceLineVisible: false,
       lastValueVisible: false,
     })
     const bbLower = chart.addLineSeries({
-      color: 'rgba(124,135,151,0.5)',
+      color: hexToRgba(C.bb, 0.5),
       lineWidth: 1,
       priceScaleId: 'right',
       priceLineVisible: false,
@@ -127,7 +150,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
     volume.priceScale().applyOptions({ scaleMargins: { top: 0.62, bottom: 0.28 } })
 
     const mfi = chart.addLineSeries({
-      color: '#8b93ff',
+      color: C.mfi_line,
       lineWidth: 1,
       priceScaleId: 'mfi',
       priceLineVisible: false,
@@ -148,7 +171,24 @@ export default function ChartPanel({ pairs, lastEvent }) {
       chart.remove()
       chartRef.current = null
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // цвета поменяли в Settings — перекрашиваем уже созданные серии без пересоздания чарта
+  useEffect(() => {
+    const s = seriesRef.current
+    if (!s.candle) return
+    s.candle.applyOptions({
+      upColor: C.candle_up, downColor: C.candle_down,
+      wickUpColor: C.candle_up, wickDownColor: C.candle_down,
+    })
+    s.framaMid.applyOptions({ color: C.frama })
+    s.framaUpper.applyOptions({ color: hexToRgba(C.frama, 0.45) })
+    s.framaLower.applyOptions({ color: hexToRgba(C.frama, 0.45) })
+    s.bbUpper.applyOptions({ color: hexToRgba(C.bb, 0.5) })
+    s.bbLower.applyOptions({ color: hexToRgba(C.bb, 0.5) })
+    s.mfi.applyOptions({ color: C.mfi_line })
+  }, [C])
 
   // заливка данных при их обновлении
   useEffect(() => {
@@ -166,7 +206,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
       data.candles.map((c) => ({
         time: c.time,
         value: c.volume,
-        color: c.close >= c.open ? 'rgba(69,208,165,0.5)' : 'rgba(242,99,122,0.5)',
+        color: c.close >= c.open ? hexToRgba(C.candle_up, 0.5) : hexToRgba(C.candle_down, 0.5),
       })),
     )
     s.mfi.setData(toLineData(times, data.mfi))
@@ -178,7 +218,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
     if (data.mfi_overbought != null) {
       s.mfiLines.push(
         s.mfi.createPriceLine({
-          price: data.mfi_overbought, color: 'rgba(242,99,122,0.6)', lineWidth: 1,
+          price: data.mfi_overbought, color: hexToRgba(C.mfi_overbought, 0.6), lineWidth: 1,
           lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OB',
         }),
       )
@@ -186,7 +226,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
     if (data.mfi_oversold != null) {
       s.mfiLines.push(
         s.mfi.createPriceLine({
-          price: data.mfi_oversold, color: 'rgba(69,208,165,0.6)', lineWidth: 1,
+          price: data.mfi_oversold, color: hexToRgba(C.mfi_oversold, 0.6), lineWidth: 1,
           lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OS',
         }),
       )
@@ -202,7 +242,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
     data.support?.forEach((level) => {
       s.srLines.push(
         s.candle.createPriceLine({
-          price: level, color: '#45d0a5', lineWidth: 1,
+          price: level, color: C.support, lineWidth: 1,
           lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'S',
         }),
       )
@@ -210,7 +250,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
     data.resistance?.forEach((level) => {
       s.srLines.push(
         s.candle.createPriceLine({
-          price: level, color: '#f2637a', lineWidth: 1,
+          price: level, color: C.resistance, lineWidth: 1,
           lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'R',
         }),
       )
@@ -219,11 +259,12 @@ export default function ChartPanel({ pairs, lastEvent }) {
     if (data.active_trade) {
       const t = data.active_trade
       if (t.entry) s.tradeLines.push(s.candle.createPriceLine({ price: t.entry, color: '#dde3ec', lineWidth: 1, lineStyle: LineStyle.Solid, title: 'Entry' }))
-      if (t.tp) s.tradeLines.push(s.candle.createPriceLine({ price: t.tp, color: '#45d0a5', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'TP' }))
-      if (t.sl) s.tradeLines.push(s.candle.createPriceLine({ price: t.sl, color: '#f2637a', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'SL' }))
+      if (t.tp) s.tradeLines.push(s.candle.createPriceLine({ price: t.tp, color: C.support, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'TP' }))
+      if (t.sl) s.tradeLines.push(s.candle.createPriceLine({ price: t.sl, color: C.resistance, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'SL' }))
     }
 
     chartRef.current.timeScale().fitContent()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
 
   return (
@@ -255,13 +296,13 @@ export default function ChartPanel({ pairs, lastEvent }) {
       {error && <div className="error-banner">{error}</div>}
 
       <div className="chart-legend">
-        <span><span className="legend-dot" style={{ background: '#e8a33d' }} />FRAMA</span>
-        <span><span className="legend-dot" style={{ background: '#7c8797' }} />Bollinger</span>
-        <span><span className="legend-dot" style={{ background: '#45d0a5' }} />Support</span>
-        <span><span className="legend-dot" style={{ background: '#f2637a' }} />Resistance</span>
-        <span><span className="legend-dot" style={{ background: '#8b93ff' }} />MFI</span>
-        <span><span className="legend-dot" style={{ background: '#f2637a' }} />MFI overbought</span>
-        <span><span className="legend-dot" style={{ background: '#45d0a5' }} />MFI oversold</span>
+        <span><span className="legend-dot" style={{ background: C.frama }} />FRAMA</span>
+        <span><span className="legend-dot" style={{ background: C.bb }} />Bollinger</span>
+        <span><span className="legend-dot" style={{ background: C.support }} />Support</span>
+        <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
+        <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
+        <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />MFI overbought</span>
+        <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>
       </div>
 
       <div className="chart-wrap panel" style={{ padding: 8 }}>
