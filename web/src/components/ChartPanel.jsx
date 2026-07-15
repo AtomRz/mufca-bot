@@ -67,9 +67,14 @@ export default function ChartPanel({ pairs, lastEvent }) {
       rightPriceScale: { borderColor: '#232c3a' },
       timeScale: { borderColor: '#232c3a', timeVisible: true },
       crosshair: { mode: 0 },
-      height: 560,
+      height: 640,
     })
     chartRef.current = chart
+
+    // ── Раскладка по высоте: цена сверху, объём и MFI — отдельными панелями снизу ──
+    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.04, bottom: 0.42 } })
+    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.62, bottom: 0.28 } })
+    chart.priceScale('mfi').applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } })
 
     const candle = chart.addCandlestickSeries({
       upColor: '#45d0a5',
@@ -78,7 +83,6 @@ export default function ChartPanel({ pairs, lastEvent }) {
       wickUpColor: '#45d0a5',
       wickDownColor: '#f2637a',
       priceScaleId: 'right',
-      scaleMargins: { top: 0.04, bottom: 0.38 },
     })
 
     const framaMid = chart.addLineSeries({
@@ -122,20 +126,18 @@ export default function ChartPanel({ pairs, lastEvent }) {
     const volume = chart.addHistogramSeries({
       priceScaleId: 'volume',
       priceFormat: { type: 'volume' },
-      scaleMargins: { top: 0.68, bottom: 0.18 },
       color: '#232c3a',
     })
 
     const mfi = chart.addLineSeries({
-      color: '#7c8797',
+      color: '#8b93ff',
       lineWidth: 1,
       priceScaleId: 'mfi',
-      scaleMargins: { top: 0.86, bottom: 0 },
       priceLineVisible: false,
       lastValueVisible: false,
     })
 
-    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], tradeLines: [] }
+    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], tradeLines: [], mfiLines: [] }
 
     const handleResize = () => {
       if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth })
@@ -170,6 +172,27 @@ export default function ChartPanel({ pairs, lastEvent }) {
       })),
     )
     s.mfi.setData(toLineData(times, data.mfi))
+
+    s.mfiLines?.forEach((line) => {
+      try { s.mfi.removePriceLine(line) } catch (_) {}
+    })
+    s.mfiLines = []
+    if (data.mfi_overbought != null) {
+      s.mfiLines.push(
+        s.mfi.createPriceLine({
+          price: data.mfi_overbought, color: 'rgba(242,99,122,0.6)', lineWidth: 1,
+          lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OB',
+        }),
+      )
+    }
+    if (data.mfi_oversold != null) {
+      s.mfiLines.push(
+        s.mfi.createPriceLine({
+          price: data.mfi_oversold, color: 'rgba(69,208,165,0.6)', lineWidth: 1,
+          lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OS',
+        }),
+      )
+    }
 
     // S/R уровни и entry/tp/sl — как horizontal price lines на свечной серии
     ;[...s.srLines, ...s.tradeLines].forEach((line) => {
@@ -238,7 +261,9 @@ export default function ChartPanel({ pairs, lastEvent }) {
         <span><span className="legend-dot" style={{ background: '#7c8797' }} />Bollinger</span>
         <span><span className="legend-dot" style={{ background: '#45d0a5' }} />Support</span>
         <span><span className="legend-dot" style={{ background: '#f2637a' }} />Resistance</span>
-        <span><span className="legend-dot" style={{ background: '#7c8797' }} />MFI (KMeans)</span>
+        <span><span className="legend-dot" style={{ background: '#8b93ff' }} />MFI</span>
+        <span><span className="legend-dot" style={{ background: '#f2637a' }} />MFI overbought</span>
+        <span><span className="legend-dot" style={{ background: '#45d0a5' }} />MFI oversold</span>
       </div>
 
       <div className="chart-wrap panel" style={{ padding: 8 }}>
