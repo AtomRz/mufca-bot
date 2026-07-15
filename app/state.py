@@ -153,10 +153,17 @@ def update_signal_record(
     logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | Track: {track} | PnL: {rec['moved_pct']:.2f}% | Regime: {rec.get('regime', 'unknown')}")
 
 
-def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, save_every: int = 5, track: str = "a"):
+def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a"):
     """
     Обновляет MFE/MAE для открытого сигнала указанного трека.
-    Сохраняет на диск не чаще, чем каждые `save_every` вызовов.
+
+    🆕 FIX: раньше сохраняли на диск не чаще чем раз в save_every вызовов через
+    функцию-атрибут-счётчик, общий на ВСЕ пары/tf/сторону сразу. history в памяти
+    кэширован (_history_cache) и не терялся между вызовами, но при неожиданном
+    завершении процесса (crash/OOM/`docker stop` без graceful shutdown, см. main.py)
+    несохранённый прогресс по MFE/MAE между сохранениями пропадал. Вызывается редко
+    (раз в скан на открытую позицию), atomic-write в safe_json_save дешёвый —
+    троттлинг не нужен, сохраняем при каждом реальном изменении.
     """
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
@@ -164,7 +171,6 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 
     records = history[ticker][tf][side]
     rec = _find_open_record(records, track)
-    updated = False
 
     if rec is not None:
         entry = rec["entry"]
@@ -175,14 +181,13 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
             favorable = (entry - current_price) / entry * 100
             adverse = (current_price - entry) / entry * 100
 
-        rec["max_favorable_pct"] = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
-        rec["max_adverse_pct"] = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
-        updated = True
+        new_favorable = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
+        new_adverse = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
 
-    update_signal_mae_mfe._counter = getattr(update_signal_mae_mfe, "_counter", 0) + 1
-
-    if updated and update_signal_mae_mfe._counter % save_every == 0:
-        save_signals_history(history)
+        if new_favorable != rec.get("max_favorable_pct") or new_adverse != rec.get("max_adverse_pct"):
+            rec["max_favorable_pct"] = new_favorable
+            rec["max_adverse_pct"] = new_adverse
+            save_signals_history(history)
 
 
 # =====================================================================
