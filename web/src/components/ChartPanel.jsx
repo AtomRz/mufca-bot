@@ -71,11 +71,6 @@ export default function ChartPanel({ pairs, lastEvent }) {
     })
     chartRef.current = chart
 
-    // ── Раскладка по высоте: цена сверху, объём и MFI — отдельными панелями снизу ──
-    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.04, bottom: 0.42 } })
-    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.62, bottom: 0.28 } })
-    chart.priceScale('mfi').applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } })
-
     const candle = chart.addCandlestickSeries({
       upColor: '#45d0a5',
       downColor: '#f2637a',
@@ -84,6 +79,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
       wickDownColor: '#f2637a',
       priceScaleId: 'right',
     })
+    candle.priceScale().applyOptions({ scaleMargins: { top: 0.04, bottom: 0.42 } })
 
     const framaMid = chart.addLineSeries({
       color: '#e8a33d',
@@ -128,6 +124,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
       priceFormat: { type: 'volume' },
       color: '#232c3a',
     })
+    volume.priceScale().applyOptions({ scaleMargins: { top: 0.62, bottom: 0.28 } })
 
     const mfi = chart.addLineSeries({
       color: '#8b93ff',
@@ -136,6 +133,7 @@ export default function ChartPanel({ pairs, lastEvent }) {
       priceLineVisible: false,
       lastValueVisible: false,
     })
+    mfi.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 }, visible: true })
 
     seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], tradeLines: [], mfiLines: [] }
 
