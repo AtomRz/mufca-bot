@@ -328,3 +328,19 @@ async def set_tpconfig(body: TpConfigIn):
         "safe_tp_percentile": _cfg.SAFE_TP_PERCENTILE,
         "signal_history_limit": _cfg.SIGNAL_HISTORY_LIMIT,
     }
+
+
+# =====================================================================
+# 🌐  СТАТИКА ФРОНТА (собранный web/dist, см. корневой Dockerfile)
+# Регистрируется ПОСЛЕДНЕЙ: /api/*, /ws/*, /docs и т.д. выше по файлу
+# матчатся первыми, а этот mount ловит всё остальное — index.html и ассеты.
+# =====================================================================
+import os
+from fastapi.staticfiles import StaticFiles
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if os.path.isdir(_STATIC_DIR):
+    app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="frontend")
+else:
+    logger.warning(f"[WEB] Static dir not found at {_STATIC_DIR} — фронт не будет отдаваться "
+                    f"(нормально при локальном запуске без сборки web/, посмотри README)")

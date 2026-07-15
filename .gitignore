@@ -18,3 +18,6 @@ venv/
 
 # Docker
 *.tar
+app/static/
+web/node_modules/
+web/dist/
