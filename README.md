@@ -24,25 +24,35 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - **On-chain module** — Etherscan (exchange ETH wallet in/outflows) + CoinGecko (Fear & Greed, BTC dominance, volume change), hourly cache; adjusts confidence score, TP/SL multipliers and leverage. Fully optional — disabled automatically if API keys aren't set
 - **Volume flow score** — OBV-based, score-based confidence/leverage adjustment
 - **Candlestick chart generation (`!chart`)** — dark-themed PNG with FRAMA bands, Bollinger Bands, support/resistance levels, signal arrows, volume panel and K-means MFI panel, attached directly to Discord signal embeds
+- **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Live status (per-pair/timeframe active trades), an interactive chart (candles, FRAMA channel, Bollinger Bands, support/resistance, volume, MFI with overbought/oversold bands) pushed over WebSocket, and a Settings UI to edit market mode, HTF bias, CHOP thresholds, adaptive TP, all indicator parameters (FRAMA/MFI/Andean/UT Bot), and chart colors — no redeploy needed
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.0 or SL already hit by bar
-- **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording, force-close after N bars
-- **Startup backtest** — auto-populates signal history from 3000 bars using fixed R:R 2.0
-- **Thread-safe file I/O** — atomic writes via `.tmp` files, per-file mutex locks
+- **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording (saved immediately on every change, not throttled), force-close after N bars
+- **Startup backtest** — auto-populates signal history from 3000 bars, using the same adaptive TP logic as live signals (`calculate_combined_tp`) so backtest and live are trained on the same distribution
+- **Thread-safe file I/O** — atomic writes via `.tmp` files, per-ticker/timeframe async locks
 - **Retry fetch** — exponential backoff on Gate.io rate limits
+- **Graceful shutdown** — on `SIGTERM`/`SIGINT` the bot flushes all in-memory signal history to disk and closes the Discord connection cleanly before exiting
 - **Full data persistence** — all settings and history survive container restarts
-- **Multi-module architecture** — `config`, `indicators`, `signals`, `state`, `bot`, `discord_commands`, `chart`, `embeds`, `onchain`, `volume_indicators`, `utils`
+- **Multi-module architecture** — `config`, `indicators`, `signals`, `state`, `bot`, `discord_commands`, `chart`, `chart_data`, `web_api`, `embeds`, `onchain`, `volume_indicators`, `utils`
 
 ---
 
 ## Stack
 
+**Backend**
 - Python 3.11
 - `discord.py` — bot framework
 - `ccxt` — Gate.io API (spot & futures)
 - `pandas`, `numpy` — indicator calculations
-- `matplotlib`, `mplfinance` — candlestick chart rendering
+- `matplotlib`, `mplfinance` — candlestick chart rendering (Discord `!chart`)
 - `aiohttp` — async Etherscan/CoinGecko requests for the on-chain module
-- Docker + GitHub Actions CI/CD
+- `FastAPI` + `uvicorn` — web API, runs in the same asyncio event loop as the Discord bot
+
+**Frontend (`web/`)**
+- React 18 + Vite
+- `lightweight-charts` — candlestick/indicator chart, WebSocket-driven live updates
+
+**Infra**
+- Docker (multi-stage: Node build → Python runtime, single image/container) + GitHub Actions CI/CD
 
 ---
 
@@ -51,20 +61,28 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 ```
 mufca-bot/
 ├── app/
-│   ├── main.py               # Entry point
+│   ├── main.py               # Entry point — runs Discord bot + web API together, graceful shutdown
 │   ├── config.py             # Settings, file I/O helpers, thread locks
 │   ├── indicators.py         # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means
 │   ├── volume_indicators.py  # OBV-based volume flow score (confidence & leverage)
 │   ├── signals.py            # Signal logic, filters, backtest, HTF bias, adaptive TP/SL
 │   ├── state.py              # Signal history, MFE/MAE tracking, TP1/TP2 adaptive TP
 │   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
-│   ├── chart.py              # Candlestick chart (PNG) generation
+│   ├── chart.py              # Candlestick chart (PNG) generation for Discord `!chart`
+│   ├── chart_data.py         # Same indicator data as chart.py, as JSON for the web dashboard
+│   ├── web_api.py            # FastAPI app — status/chart/config endpoints + WebSocket live feed
 │   ├── embeds.py             # Discord embed builders for signals
 │   ├── discord_commands.py   # All Discord command handlers
 │   ├── bot.py                # Bot setup, scanner loop, command registration
 │   └── utils.py              # safe_fetch_ohlcv, parse_ohlcv, Timer cache
+├── web/                       # React + Vite dashboard, built into app/static/ at image build time
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── api.js             # REST + WebSocket client
+│   │   └── components/        # StatusPanel, ChartPanel, SettingsPanel
+│   └── package.json
 ├── requirements.txt
-├── Dockerfile
+├── Dockerfile                 # multi-stage: builds web/ with Node, copies dist/ into the Python image
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -99,6 +117,8 @@ COINGECKO_API_KEY=
 docker compose up -d
 ```
 
+The web dashboard is served on **`http://<host>:8585`** by the same container (built into the image from `web/` — no separate frontend container needed).
+
 ### 3. Run locally
 
 ```bash
@@ -121,6 +141,8 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `pairs.json` | Scanned pairs list |
 | `chop_threshold.json` | Per-timeframe CHOP thresholds |
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
+| `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
+| `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
 
 Note: on-chain data (Etherscan/CoinGecko) is cached in-memory only (TTL 1h) and is not persisted to disk — it rebuilds automatically after a restart.
 
@@ -201,7 +223,30 @@ volumes:
 
 ---
 
+## Web Dashboard
+
+FastAPI + React, served from the same container as the bot on port **`8585`** — no separate deployment, no duplicate exchange fetches (the dashboard reads the same `bot.state` and `config` the scanner already computed each 60s pass).
+
+**Tabs:**
+- **Status** — scanner stats, active A-track/U-track trades per pair/timeframe, live-updated over WebSocket
+- **Chart** — candlestick chart (FRAMA channel, Bollinger Bands, support/resistance, volume, MFI with K-means overbought/oversold bands), per pair/timeframe/track, auto-refreshes on each scan tick and new signal
+- **Settings** — everything below is editable at runtime, no redeploy or restart required:
+  - Market mode (spot/futures), HTF bias, UT Bot Heikin Ashi toggle
+  - Per-timeframe CHOP threshold
+  - Adaptive TP mode/percentiles/history limit
+  - Tracked pairs (add/remove)
+  - All indicator parameters — FRAMA length/multiplier, MFI length/K-means training size, Andean length/signal smoothing/confirmation window, UT Bot sensitivity/ATR period
+  - Chart colors (FRAMA, Bollinger, support, resistance, MFI line, MFI overbought/oversold, candle up/down)
+
+Changing market mode, HTF bias, or any indicator parameter resets active position tracking state — same behavior as the equivalent Discord commands, since these changes affect what "warmed up" and "in-progress signal" mean for the scanner.
+
+**REST API** (all under `/api/`): `status`, `pairs`, `chart`, `config` (GET full config; POST `mode`/`htf`/`utha`/`chop`/`tpconfig`/`indicators`/`colors`). **WebSocket** `/ws/live` pushes `signal`, `scan_tick`, and `config_changed` events.
+
+---
+
 ## Indicator Parameters
+
+Defaults below (all editable at runtime from the **web dashboard → Settings**, persisted in `indicator_config.json`):
 
 | Parameter | Value | Description |
 |---|---|---|
@@ -230,7 +275,7 @@ volumes:
 
 ## Adaptive TP / SL Logic
 
-On startup the bot backtests 3000 historical bars per pair/timeframe using **fixed R:R 2.0** to accumulate clean MFE/MAE history. Live signals then use percentiles of this distribution as TP/SL targets.
+On startup the bot backtests 3000 historical bars per pair/timeframe using the **same adaptive TP logic as live** (`calculate_combined_tp`) to accumulate clean, consistently-trained MFE/MAE history — backtest and live signals are never trained on different TP distributions. Live signals then use percentiles of this distribution as TP/SL targets.
 
 **Hybrid regime-aware TP logic:**
 1. ≥10 signals in current market regime (TREND/CHAOS/NORMAL) → uses only regime signals
@@ -283,15 +328,22 @@ All signals fire on the **last confirmed closed bar** (`iloc[-2]`) — no repain
 ## Architecture
 
 ```
-market_scanner (every 20s)
-├── get_htf_bias()              — cached 5 min per ticker
-├── safe_fetch_ohlcv()          — retry with exponential backoff
-├── check_signals()             — all indicators on iloc[-2]
-│   ├── check_tp_sl_hit()       — every scan
-│   ├── bars_in_trade++         — only on new bar
-│   ├── R:R + bar guard         — skip bad signals
-│   └── calculate_combined_tp() — hybrid regime-aware adaptive TP
-└── send Discord embed           — only on new bar_time
+main.py (single asyncio event loop)
+├── Discord bot (bot.start)
+│   └── market_scanner (every 60s)
+│       ├── get_htf_bias()              — cached 5 min per ticker
+│       ├── safe_fetch_ohlcv()          — retry with exponential backoff
+│       ├── check_signals()             — all indicators on iloc[-2]
+│       │   ├── check_tp_sl_hit()       — every scan
+│       │   ├── update_signal_mae_mfe() — saved immediately on change
+│       │   ├── bars_in_trade++         — only on new bar
+│       │   ├── R:R + bar guard         — skip bad signals
+│       │   └── calculate_combined_tp() — hybrid regime-aware adaptive TP
+│       ├── send Discord embed          — only on new bar_time
+│       └── broadcast_event()           — pushes signal/scan_tick to web dashboard over WebSocket
+└── Web API (uvicorn, port 8585) — reads the same state/config, no duplicate fetches
+
+SIGTERM/SIGINT → flush signals_history.json to disk → close Discord connection → exit
 ```
 
 ---
