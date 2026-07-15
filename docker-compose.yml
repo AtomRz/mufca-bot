@@ -7,6 +7,22 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+    expose:
+      - "8585"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mufca-web:
+    build: ./web
+    container_name: mufca-web
+    restart: unless-stopped
+    depends_on:
+      - mufca-bot
+    ports:
+      - "8585:80"
     logging:
       driver: "json-file"
       options:

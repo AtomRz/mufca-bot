@@ -270,6 +270,21 @@ async def market_scanner():
                             else:
                                 await channel.send(embed=embed)
                             scan_stats["signals_generated"] += 1
+                            # 🆕 веб-морда: пушим сигнал всем подключенным WS-клиентам
+                            try:
+                                from web_api import broadcast_event
+                                await broadcast_event({
+                                    "type": "signal",
+                                    "ticker": ticker,
+                                    "tf": tf,
+                                    "sig_type": sig_type,
+                                    "price": price,
+                                    "sl": sl,
+                                    "tp": tp,
+                                    "tp1": tp1,
+                                })
+                            except Exception as ws_err:
+                                logger.warning(f"[WS] broadcast failed: {ws_err}")
                         except discord.HTTPException as e:
                             logger.error(f"Failed to send signal: {e}")
                         logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
@@ -341,6 +356,13 @@ async def market_scanner():
             except Exception as e:
                 logger.error(f"Scanner error for {ticker} {tf}: {e}", exc_info=True)
                 await asyncio.sleep(0.5)
+
+    # 🆕 веб-морда: тик сканера — фронт может обновить статус-панель
+    try:
+        from web_api import broadcast_event
+        await broadcast_event({"type": "scan_tick", "scan_stats": scan_stats})
+    except Exception as ws_err:
+        logger.warning(f"[WS] broadcast failed: {ws_err}")
 
 # 🆕 FIX: CRITICAL - Task error handler to prevent silent death
 @market_scanner.error
