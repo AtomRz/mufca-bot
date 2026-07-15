@@ -45,6 +45,11 @@ export const api = {
     request('/api/config/indicators', { method: 'POST', body: JSON.stringify(patch) }),
   setColors: (patch) =>
     request('/api/config/colors', { method: 'POST', body: JSON.stringify(patch) }),
+  getHistorySummary: () => request('/api/history/summary'),
+  getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30) =>
+    request(
+      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}`,
+    ),
 }
 
 /**

@@ -401,6 +401,80 @@ input {
   padding: 30px 0;
 }
 
+/* ── Таблицы (History) ──────────────────────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+}
+table.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.data-table th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+table.data-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+table.data-table tbody tr {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+table.data-table tbody tr:hover {
+  background: var(--bg-panel-raised);
+}
+table.data-table tbody tr.selected {
+  background: var(--accent-dim);
+}
+.winrate-bar {
+  display: inline-block;
+  width: 46px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg-panel-raised);
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+.winrate-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+.stat-card {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.stat-card .label {
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.stat-card .value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+}
 /* ── Chart controls ──────────────────────────────────────────── */
 .chart-toolbar {
   display: flex;

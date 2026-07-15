@@ -49,6 +49,7 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data
+from state import load_signals_history
 
 # =====================================================================
 # 📡  WEBSOCKET BROADCAST
@@ -163,6 +164,82 @@ async def chart(ticker: str, tf: str, limit: int = 150, track: str = "a"):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return data
+
+
+# =====================================================================
+# 📚  ИСТОРИЯ СИГНАЛОВ / ВИНРЕЙТ
+# То же, что !signals в Discord, но JSON + разбивка по track (A/U), которую
+# !signals не делает (там a+u+sim смешаны в одну кучу).
+# =====================================================================
+def _aggregate_records(records: list) -> Optional[dict]:
+    """Агрегирует закрытые сигналы: винрейт, средние MFE/MAE/PnL, разбивка TP/SL/cancelled.
+    Синтетические (!sim) записи исключены — как и в get_signal_stats/calculate_adaptive_tp,
+    они не отражают реальное поведение рынка."""
+    closed = [r for r in records if r.get("exit_type") in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
+    if not closed:
+        return None
+    wins = sum(1 for r in closed if r.get("moved_pct", 0) > 0)
+    tp_hits = sum(1 for r in closed if r["exit_type"] == "tp")
+    sl_hits = sum(1 for r in closed if r["exit_type"] == "sl")
+    cancelled = sum(1 for r in closed if r["exit_type"] == "cancelled")
+    mfes = [r.get("max_favorable_pct", 0) for r in closed]
+    maes = [r.get("max_adverse_pct", 0) for r in closed]
+    pnls = [r.get("moved_pct", 0) for r in closed]
+    n = len(closed)
+    return {
+        "count": n,
+        "wins": wins,
+        "win_rate": round(wins / n, 3),
+        "avg_pnl": round(sum(pnls) / n, 2),
+        "avg_mfe": round(sum(mfes) / n, 2),
+        "avg_mae": round(sum(maes) / n, 2),
+        "tp_hits": tp_hits,
+        "sl_hits": sl_hits,
+        "cancelled": cancelled,
+    }
+
+
+@app.get("/api/history/summary")
+async def history_summary():
+    """Винрейт/статистика по каждой комбинации ticker/tf/side/track, у которой есть закрытые сигналы,
+    плюс итоговая строка по всем вместе."""
+    history = load_signals_history()
+    rows = []
+    all_closed_for_total: list = []
+
+    for ticker, tfs in history.items():
+        for tf, sides in tfs.items():
+            for side in ("long", "short"):
+                records = sides.get(side, [])
+                by_track: dict = {}
+                for r in records:
+                    by_track.setdefault(r.get("track", "a"), []).append(r)
+                for track, recs in by_track.items():
+                    agg = _aggregate_records(recs)
+                    if agg:
+                        rows.append({"ticker": ticker, "tf": tf, "side": side, "track": track, **agg})
+                        all_closed_for_total.extend(
+                            r for r in recs
+                            if r.get("exit_type") in ("tp", "sl", "cancelled") and not r.get("synthetic", False)
+                        )
+
+    rows.sort(key=lambda r: (r["ticker"], r["tf"], r["side"], r["track"]))
+    total = _aggregate_records(all_closed_for_total)
+    return {"rows": rows, "total": total}
+
+
+@app.get("/api/history/records")
+async def history_records(ticker: str, tf: str, side: str, track: str = "a", limit: int = 30):
+    ticker = unquote(ticker).upper().strip()
+    side = side.lower()
+    if side not in ("long", "short"):
+        raise HTTPException(400, "side должен быть 'long' или 'short'")
+
+    history = load_signals_history()
+    records = history.get(ticker, {}).get(tf, {}).get(side, [])
+    closed = [r for r in records if r.get("track") == track and r.get("exit_type") != "open"]
+    closed = list(reversed(closed[-limit:]))  # свежие первыми
+    return {"ticker": ticker, "tf": tf, "side": side, "track": track, "records": closed}
 
 
 # =====================================================================

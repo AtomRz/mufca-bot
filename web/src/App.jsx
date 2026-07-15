@@ -2,11 +2,13 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { api, connectLive } from './api'
 import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
+import HistoryPanel from './components/HistoryPanel'
 import SettingsPanel from './components/SettingsPanel'
 
 const TABS = [
   { id: 'status', label: 'Status' },
   { id: 'chart', label: 'Chart' },
+  { id: 'history', label: 'History' },
   { id: 'settings', label: 'Settings' },
 ]
 
@@ -71,6 +73,7 @@ export default function App() {
       <main className="content">
         {tab === 'status' && <StatusPanel lastEvent={lastEvent} pairs={config?.pairs} />}
         {tab === 'chart' && <ChartPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} />}
+        {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}
