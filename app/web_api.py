@@ -639,6 +639,10 @@ class ColorsIn(BaseModel):
     mfi_oversold: Optional[str] = None
     candle_up: Optional[str] = None
     candle_down: Optional[str] = None
+    tp_line: Optional[str] = None
+    sl_line: Optional[str] = None
+    signal_long: Optional[str] = None
+    signal_short: Optional[str] = None
 
 
 @app.post("/api/config/colors")

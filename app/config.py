@@ -176,6 +176,10 @@ _COLOR_DEFAULTS = {
     "mfi_oversold": "#45d0a5",
     "candle_up": "#45d0a5",
     "candle_down": "#f2637a",
+    "tp_line": "#45d0a5",
+    "sl_line": "#f2637a",
+    "signal_long": "#45d0a5",
+    "signal_short": "#f2637a",
 }
 
 def load_colors() -> dict:

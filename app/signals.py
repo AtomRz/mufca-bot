@@ -412,7 +412,20 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     side = trade["side"]
     bars_key = f"{track}_bars_in_trade"
     bars_held = state.get(bars_key, 0)
-    pnl_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
+
+    tp1_hit = bool(trade.get("tp1_hit"))
+    tp1_price = trade.get("tp1")
+
+    # 🆕 FIX: если TP1 уже был достигнут (50% закрыто по факту вручную на бирже,
+    # SL остальных 50% — в безубытке), реальный PnL — среднее между зафиксированной
+    # на TP1 половиной и результатом второй половины, а не наивное entry→exit_price
+    # по всей позиции (см. подробный комментарий в state.update_signal_record).
+    if tp1_hit and tp1_price is not None:
+        tp1_leg_pct = (tp1_price - entry) / entry * 100 if side == "long" else (entry - tp1_price) / entry * 100
+        remainder_leg_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
+        pnl_pct = (tp1_leg_pct + remainder_leg_pct) / 2
+    else:
+        pnl_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
 
     closed_trade = {
         "side": side,
@@ -426,6 +439,7 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         "bars_held": bars_held,
         "lev": trade.get("lev", 1),
         "track": track,
+        "tp1_hit": tp1_hit,
     }
 
     history_key = f"{track}_trade_history"
@@ -437,7 +451,8 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
     # 🆕 FIX: передаём track, чтобы не закрыть по ошибке запись другого трека
     # (A и U могут одновременно держать позицию в одну сторону на одном ticker/tf)
-    update_signal_record(ticker, tf, side, exit_price, result, bars_held, track=track)
+    update_signal_record(ticker, tf, side, exit_price, result, bars_held, track=track,
+                          tp1_hit=tp1_hit, tp1_price=tp1_price)
 
     state[trade_key] = None
     state[bars_key] = 0

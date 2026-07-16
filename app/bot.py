@@ -343,6 +343,12 @@ async def market_scanner():
                     )
                     if tp1_reached:
                         trade["tp1_hit"] = True
+                        # 🆕 FIX: раньше бот только слал уведомление, но внутри себя
+                        # продолжал проверять SL по СТАРОМУ уровню — хотя реально Атом
+                        # переносит стоп в безубыток вручную. Из-за этого check_tp_sl_hit
+                        # мог зафиксировать "sl" (полный лосс) для сделки, которая по факту
+                        # уже была в безубытке/плюсе после TP1. Теперь двигаем SL бота тоже.
+                        trade["sl"] = trade["entry"]
                         track_label = "A" if track == "a" else "U"
                         entry = trade.get("entry", 0)
                         await channel.send(
@@ -351,6 +357,19 @@ async def market_scanner():
                             f"⚠️ **Закрой 50% позиции и перенеси SL в безубыток (${round(entry, 2):,.2f})**"
                         )
                         logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price}")
+                        try:
+                            from web_api import broadcast_event
+                            await broadcast_event({
+                                "type": "tp1_hit",
+                                "ticker": ticker,
+                                "tf": tf,
+                                "track": track,
+                                "side": side,
+                                "entry": entry,
+                                "tp1": tp1_price,
+                            })
+                        except Exception as ws_err:
+                            logger.warning(f"[WS] broadcast failed: {ws_err}")
 
                 await asyncio.sleep(0.5)
             except Exception as e:

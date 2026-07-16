@@ -126,10 +126,26 @@ def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
     return None
 
 
+def _pct_move(side: str, entry: float, price: float) -> float:
+    """% движения цены в пользу позиции — общая формула для long/short."""
+    return (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
+
+
 def update_signal_record(
-    ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int, track: str = "a"
+    ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int,
+    track: str = "a", tp1_hit: bool = False, tp1_price: Optional[float] = None,
 ):
-    """Закрывает открытый сигнал (для указанного трека)."""
+    """Закрывает открытый сигнал (для указанного трека).
+
+    🆕 FIX: раньше PnL всегда считался наивно entry→exit_price по ВСЕЙ позиции.
+    Но если TP1 уже был достигнут, по факту закрыто 50% с прибылью TP1, а SL
+    на оставшиеся 50% Атом переносит в безубыток вручную (бот это делает только
+    как уведомление, реальную позицию на бирже не трогает — см. bot.py). Значит
+    итоговый result "sl" по СТАРОМУ SL для такой сделки в реальности никогда бы
+    не наступил: цена сначала должна была откатиться через безубыток. Поэтому
+    когда tp1_hit=True, PnL считаем как среднее между зафиксированной на TP1
+    половиной и результатом второй половины — это и есть реальная экономика
+    сделки, а не искажённая "закрыли всё по старому SL"."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         logger.warning(f"Cannot update signal: no history for {ticker} {tf}")
@@ -144,13 +160,19 @@ def update_signal_record(
     rec["exit"] = round(exit_price, 4)
     rec["exit_type"] = exit_type
     rec["bars_held"] = bars_held
+    rec["tp1_hit"] = bool(tp1_hit)
     entry = rec["entry"]
-    if side == "long":
-        rec["moved_pct"] = round((exit_price - entry) / entry * 100, 4)
+
+    if tp1_hit and tp1_price is not None:
+        tp1_leg_pct = _pct_move(side, entry, tp1_price)      # первые 50%, зафиксировано на TP1
+        remainder_leg_pct = _pct_move(side, entry, exit_price)  # вторые 50%, закрыты позже (обычно безубыток или TP2)
+        rec["moved_pct"] = round((tp1_leg_pct + remainder_leg_pct) / 2, 4)
     else:
-        rec["moved_pct"] = round((entry - exit_price) / entry * 100, 4)
+        rec["moved_pct"] = round(_pct_move(side, entry, exit_price), 4)
+
     save_signals_history(history)
-    logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | Track: {track} | PnL: {rec['moved_pct']:.2f}% | Regime: {rec.get('regime', 'unknown')}")
+    logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | Track: {track} | PnL: {rec['moved_pct']:.2f}% | "
+                f"TP1 hit: {tp1_hit} | Regime: {rec.get('regime', 'unknown')}")
 
 
 def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a"):

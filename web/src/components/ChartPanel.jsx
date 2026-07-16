@@ -14,6 +14,10 @@ const DEFAULT_COLORS = {
   mfi_oversold: '#45d0a5',
   candle_up: '#45d0a5',
   candle_down: '#f2637a',
+  tp_line: '#45d0a5',
+  sl_line: '#f2637a',
+  signal_long: '#45d0a5',
+  signal_short: '#f2637a',
 }
 
 function hexToRgba(hex, alpha) {
@@ -261,8 +265,36 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     if (data.active_trade) {
       const t = data.active_trade
       if (t.entry) s.tradeLines.push(s.candle.createPriceLine({ price: t.entry, color: '#dde3ec', lineWidth: 1, lineStyle: LineStyle.Solid, title: 'Entry' }))
-      if (t.tp) s.tradeLines.push(s.candle.createPriceLine({ price: t.tp, color: C.support, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'TP' }))
-      if (t.sl) s.tradeLines.push(s.candle.createPriceLine({ price: t.sl, color: C.resistance, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'SL' }))
+      if (t.tp1 && t.tp1 !== t.tp) {
+        s.tradeLines.push(s.candle.createPriceLine({
+          price: t.tp1, color: hexToRgba(C.tp_line, 0.7), lineWidth: 1,
+          lineStyle: LineStyle.Dashed, title: t.tp1_hit ? 'TP1 ✓' : 'TP1',
+        }))
+      }
+      if (t.tp) s.tradeLines.push(s.candle.createPriceLine({ price: t.tp, color: C.tp_line, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'TP2' }))
+      if (t.sl) {
+        s.tradeLines.push(s.candle.createPriceLine({
+          price: t.sl, color: C.sl_line, lineWidth: 2, lineStyle: LineStyle.Solid,
+          title: t.tp1_hit ? 'SL (BE)' : 'SL',
+        }))
+      }
+
+      // 🆕 маркер сигнала на баре входа — раньше signal_bar_time всегда был null
+      // из-за бага с именем поля в chart_data.py (entry_time_ms vs bar_opened_time)
+      if (t.signal_bar_time) {
+        const isLong = t.side === 'long'
+        s.candle.setMarkers([{
+          time: t.signal_bar_time,
+          position: isLong ? 'belowBar' : 'aboveBar',
+          color: isLong ? C.signal_long : C.signal_short,
+          shape: isLong ? 'arrowUp' : 'arrowDown',
+          text: isLong ? 'Long' : 'Short',
+        }])
+      } else {
+        s.candle.setMarkers([])
+      }
+    } else {
+      s.candle.setMarkers([])
     }
 
     // 🆕 восстанавливаем позицию вместо сброса к fitContent на каждое обновление
@@ -308,6 +340,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.bb }} />Bollinger</span>
         <span><span className="legend-dot" style={{ background: C.support }} />Support</span>
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
+        <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
+        <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>
         <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
         <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />MFI overbought</span>
         <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>

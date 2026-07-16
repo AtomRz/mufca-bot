@@ -176,6 +176,7 @@ export default function HistoryPanel({ lastEvent }) {
                         <span className={`tag ${rec.exit_type === 'tp' ? 'long' : rec.exit_type === 'sl' ? 'short' : 'flat'}`}>
                           {rec.exit_type}
                         </span>
+                        {rec.tp1_hit && <span className="tag long" style={{ marginLeft: 6 }} title="TP1 was reached before final exit — PnL reflects the blended 50/50 result">TP1 ✓</span>}
                         {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>sim</span>}
                       </td>
                       <td style={{ color: 'var(--text-dim)' }}>{rec.regime || '—'}</td>

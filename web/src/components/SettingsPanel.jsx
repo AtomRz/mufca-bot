@@ -295,6 +295,10 @@ export default function SettingsPanel({ config, onChanged }) {
             <ColorField label="Bollinger Bands" value={colors.bb} onSave={(v) => saveColor('bb', v)} />
             <ColorField label="Support" value={colors.support} onSave={(v) => saveColor('support', v)} />
             <ColorField label="Resistance" value={colors.resistance} onSave={(v) => saveColor('resistance', v)} />
+            <ColorField label="Take Profit line" value={colors.tp_line} onSave={(v) => saveColor('tp_line', v)} />
+            <ColorField label="Stop Loss line" value={colors.sl_line} onSave={(v) => saveColor('sl_line', v)} />
+            <ColorField label="Long signal marker" value={colors.signal_long} onSave={(v) => saveColor('signal_long', v)} />
+            <ColorField label="Short signal marker" value={colors.signal_short} onSave={(v) => saveColor('signal_short', v)} />
             <ColorField label="MFI line" value={colors.mfi_line} onSave={(v) => saveColor('mfi_line', v)} />
             <ColorField label="MFI overbought" value={colors.mfi_overbought} onSave={(v) => saveColor('mfi_overbought', v)} />
             <ColorField label="MFI oversold" value={colors.mfi_oversold} onSave={(v) => saveColor('mfi_oversold', v)} />

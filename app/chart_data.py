@@ -94,15 +94,18 @@ async def get_chart_data(
 
     # ── Активная сделка (если передан state_snapshot из !status/state) ──
     if state_snapshot:
-        entry_time_ms = state_snapshot.get("entry_time_ms")
+        # 🆕 FIX: ключ в trade dict называется bar_opened_time (см. signals.py),
+        # а не entry_time_ms — из-за этого signal_bar_time всегда был None и
+        # маркер сигнала на графике никогда не мог отрисоваться.
+        bar_opened_time_ms = state_snapshot.get("bar_opened_time")
         signal_bar_time = None
-        if entry_time_ms is not None:
+        if bar_opened_time_ms is not None:
             try:
                 ts_arr = df["timestamp"].values
-                closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
+                closest_i = int(np.argmin(np.abs(ts_arr - float(bar_opened_time_ms))))
                 signal_bar_time = int(df["timestamp"].iloc[closest_i] // 1000)
             except Exception as e:
-                logger.warning(f"[CHART_DATA] Failed to resolve entry_time_ms: {e}")
+                logger.warning(f"[CHART_DATA] Failed to resolve bar_opened_time: {e}")
 
         result["active_trade"] = {
             "side": state_snapshot.get("side"),
@@ -110,6 +113,7 @@ async def get_chart_data(
             "tp": state_snapshot.get("tp"),
             "tp1": state_snapshot.get("tp1"),
             "sl": state_snapshot.get("sl"),
+            "tp1_hit": state_snapshot.get("tp1_hit", False),
             "signal_bar_time": signal_bar_time,
         }
 
