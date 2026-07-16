@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api, connectLive, getAuthToken, clearAuthToken } from './api'
 import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
@@ -24,20 +24,41 @@ export default function App() {
   const [lastEvent, setLastEvent] = useState(null)
   const [pulseKey, setPulseKey] = useState(0)
   const [pulse, setPulse] = useState(null)
+  const [chartTicker, setChartTicker] = useState(null)
+  const [chartTf, setChartTf] = useState('1h')
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
   }, [])
 
+  // 🆕 CHOP/Trend/Leverage в топ-баре теперь следуют за парой/tf, выбранными на
+  // вкладке Chart, а не за жёстко зашитой "первой парой всегда на 1h"
   const loadPulse = useCallback(() => {
-    api.getPulse().then(setPulse).catch(() => {})
-  }, [])
+    if (!chartTicker) return
+    api.getPulse(chartTicker, chartTf).then(setPulse).catch(() => {})
+  }, [chartTicker, chartTf])
+
+  useEffect(() => {
+    if (!chartTicker && config?.pairs?.length) setChartTicker(config.pairs[0])
+  }, [config, chartTicker])
 
   useEffect(() => {
     if (!authenticated) return
     loadConfig()
+  }, [authenticated, loadConfig])
+
+  useEffect(() => {
+    if (!authenticated) return
     loadPulse()
-  }, [authenticated, loadConfig, loadPulse])
+  }, [authenticated, loadPulse])
+
+  // 🆕 loadConfig/loadPulse меняют идентичность при каждом ререндере/смене пары —
+  // держим свежие версии в ref, чтобы WS-эффект ниже не пересоздавал соединение
+  // на каждый клик по паре в Chart, а зависел только от authenticated
+  const loadConfigRef = useRef(loadConfig)
+  const loadPulseRef = useRef(loadPulse)
+  loadConfigRef.current = loadConfig
+  loadPulseRef.current = loadPulse
 
   useEffect(() => {
     if (!authenticated) return
@@ -45,13 +66,13 @@ export default function App() {
       (event) => {
         setLastEvent(event)
         setPulseKey((k) => k + 1)
-        if (event.type === 'config_changed') { loadConfig(); loadPulse() }
-        if (event.type === 'scan_tick') loadPulse()
+        if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current() }
+        if (event.type === 'scan_tick') loadPulseRef.current()
       },
       setConnStatus,
     )
     return disconnect
-  }, [authenticated, loadConfig, loadPulse])
+  }, [authenticated])
 
   if (!authenticated) {
     return <LoginScreen onSuccess={() => setAuthenticated(true)} />
@@ -76,7 +97,7 @@ export default function App() {
             title={`${pulse.ticker} ${pulse.tf} — CHOP ${pulse.chop} (threshold ${pulse.chop_threshold})`}
             style={{ color: pulse.chop_trending ? 'var(--long)' : 'var(--text-dim)' }}
           >
-            CHOP {pulse.chop}
+            {pulse.ticker} CHOP {pulse.chop}
           </span>
         )}
         {pulse && (
@@ -116,7 +137,17 @@ export default function App() {
 
       <main className="content">
         {tab === 'status' && <StatusPanel lastEvent={lastEvent} pairs={config?.pairs} />}
-        {tab === 'chart' && <ChartPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} />}
+        {tab === 'chart' && (
+          <ChartPanel
+            pairs={config?.pairs}
+            lastEvent={lastEvent}
+            colors={config?.colors}
+            ticker={chartTicker}
+            tf={chartTf}
+            onTickerChange={setChartTicker}
+            onTfChange={setChartTf}
+          />
+        )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />

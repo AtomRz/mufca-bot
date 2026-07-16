@@ -33,22 +33,16 @@ function toLineData(times, values) {
   return out
 }
 
-export default function ChartPanel({ pairs, lastEvent, colors }) {
+export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTickerChange, onTfChange }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
   const lastSelectionKeyRef = useRef(null) // 🆕 меняется только при смене ticker/tf/track
-  const [ticker, setTicker] = useState(null)
-  const [tf, setTf] = useState('1h')
   const [track, setTrack] = useState('a')
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
 
   const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
-
-  useEffect(() => {
-    if (!ticker && pairs?.length) setTicker(pairs[0])
-  }, [pairs, ticker])
 
   const load = useCallback(() => {
     if (!ticker) return
@@ -286,14 +280,14 @@ export default function ChartPanel({ pairs, lastEvent, colors }) {
       <div className="chart-toolbar">
         <div className="seg">
           {(pairs || []).map((p) => (
-            <button key={p} className={ticker === p ? 'active' : ''} onClick={() => setTicker(p)}>
+            <button key={p} className={ticker === p ? 'active' : ''} onClick={() => onTickerChange?.(p)}>
               {p}
             </button>
           ))}
         </div>
         <div className="seg">
           {TIMEFRAMES.map((t) => (
-            <button key={t} className={tf === t ? 'active' : ''} onClick={() => setTf(t)}>
+            <button key={t} className={tf === t ? 'active' : ''} onClick={() => onTfChange?.(t)}>
               {t}
             </button>
           ))}
