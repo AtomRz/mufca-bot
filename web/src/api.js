@@ -1,10 +1,48 @@
 const BASE = ''
+const AUTH_KEY = 'mufca_auth_token'
+
+// 🆕 Явное хранение auth-токена в sessionStorage вместо расчёта на то, что браузер
+// сам протащит закэшированный Basic Auth на все запросы. Он это делает для fetch(),
+// но НЕ делает для нативного WebSocket API (тот вообще не умеет кастомные заголовки) —
+// поэтому токен явно кладём и в заголовок fetch(), и в query-параметр WS-урла.
+export function getAuthToken() {
+  return sessionStorage.getItem(AUTH_KEY)
+}
+
+export function setAuthToken(token) {
+  sessionStorage.setItem(AUTH_KEY, token)
+}
+
+export function clearAuthToken() {
+  sessionStorage.removeItem(AUTH_KEY)
+}
+
+/** Пробует залогиниться — делает реальный запрос к /api/config с этими кредами.
+ * Если WEB_USERNAME/WEB_PASSWORD не заданы на бэкенде, auth там выключен и это
+ * всегда успешно независимо от введённых значений — так и задумано. */
+export async function login(username, password) {
+  const token = btoa(`${username}:${password}`)
+  const res = await fetch(`${BASE}/api/config`, {
+    headers: { Authorization: `Basic ${token}` },
+  })
+  if (res.status === 401) throw new Error('Invalid username or password')
+  if (!res.ok) throw new Error(`Login failed (${res.status})`)
+  setAuthToken(token)
+  return token
+}
 
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
+  const token = getAuthToken()
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) }
+  if (token) headers.Authorization = `Basic ${token}`
+
+  const res = await fetch(`${BASE}${path}`, { ...options, headers })
+
+  if (res.status === 401) {
+    clearAuthToken()
+    window.location.reload() // покажет форму логина заново
+    throw new Error('Session expired')
+  }
   if (!res.ok) {
     let detail = res.statusText
     try {
@@ -64,7 +102,8 @@ export function connectLive(onEvent, onStatusChange) {
   let attempt = 0
 
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const url = `${proto}://${window.location.host}/ws/live`
+  const token = getAuthToken()
+  const url = `${proto}://${window.location.host}/ws/live${token ? `?auth=${encodeURIComponent(token)}` : ''}`
 
   function connect() {
     if (closed) return

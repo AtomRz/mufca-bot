@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { api, connectLive } from './api'
+import { api, connectLive, getAuthToken, clearAuthToken } from './api'
 import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
 import SettingsPanel from './components/SettingsPanel'
+import LoginScreen from './components/LoginScreen'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -16,6 +17,7 @@ const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 
 const TREND_LABEL = { bullish: 'Bullish', bearish: 'Bearish', neutral: 'Neutral' }
 
 export default function App() {
+  const [authenticated, setAuthenticated] = useState(!!getAuthToken())
   const [tab, setTab] = useState('status')
   const [connStatus, setConnStatus] = useState('connecting')
   const [config, setConfig] = useState(null)
@@ -32,11 +34,13 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!authenticated) return
     loadConfig()
     loadPulse()
-  }, [loadConfig, loadPulse])
+  }, [authenticated, loadConfig, loadPulse])
 
   useEffect(() => {
+    if (!authenticated) return
     const disconnect = connectLive(
       (event) => {
         setLastEvent(event)
@@ -47,7 +51,11 @@ export default function App() {
       setConnStatus,
     )
     return disconnect
-  }, [loadConfig, loadPulse])
+  }, [authenticated, loadConfig, loadPulse])
+
+  if (!authenticated) {
+    return <LoginScreen onSuccess={() => setAuthenticated(true)} />
+  }
 
   return (
     <div className="app">
@@ -85,6 +93,13 @@ export default function App() {
         <span className="conn-label">
           {connStatus === 'connected' ? 'live' : connStatus}
         </span>
+        <button
+          className="btn"
+          style={{ padding: '4px 10px', fontSize: 11 }}
+          onClick={() => { clearAuthToken(); window.location.reload() }}
+        >
+          Log out
+        </button>
       </header>
 
       <nav className="tabs">

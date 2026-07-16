@@ -475,6 +475,22 @@ table.data-table tbody tr.selected {
   font-size: 20px;
   font-weight: 600;
 }
+/* ── Login screen ────────────────────────────────────────────── */
+.login-screen {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.login-card {
+  width: 300px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 28px 24px;
+}
+
 /* ── Chart controls ──────────────────────────────────────────── */
 .chart-toolbar {
   display: flex;

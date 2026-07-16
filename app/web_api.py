@@ -71,13 +71,42 @@ if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
 class BasicAuthASGIMiddleware:
     """Чистый ASGI middleware (не BaseHTTPMiddleware!) — тот не видит websocket-scope,
     а /ws/live тоже должен требовать авторизации, иначе фид сигналов остаётся открытым
-    даже когда весь остальной API защищён."""
+    даже когда весь остальной API защищён.
+
+    🆕 FIX: нативный браузерный WebSocket API НЕ умеет выставлять кастомные заголовки —
+    Authorization на handshake он не отправляет, сколько бы креды ни были закэшированы
+    браузером для fetch(). Поэтому для websocket-scope дополнительно принимаем токен как
+    query-параметр (?auth=base64(user:pass), то же значение что было бы в Basic-заголовке) —
+    единственный канал, который реально контролируется JS на WS-соединении."""
 
     def __init__(self, app):
         self.app = app
 
+    @staticmethod
+    def _check_basic_value(raw_b64: str) -> bool:
+        import base64
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8")
+            user, _, pwd = decoded.partition(":")
+        except Exception:
+            return False
+        # constant-time сравнение — не даём определить правильность по времени ответа
+        return (
+            secrets.compare_digest(user, _cfg.WEB_USERNAME)
+            and secrets.compare_digest(pwd, _cfg.WEB_PASSWORD)
+        )
+
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        # 🆕 Защищаем только /api/* и /ws/* — статику фронта (index.html, JS/CSS-бандл)
+        # отдаём свободно, иначе браузер покажет СВОЙ нативный Basic Auth попап поверх
+        # нашего кастомного логин-экрана ещё до того, как React успеет отрендериться.
+        # В самой статике нет ничего чувствительного, только код — секьюрити boundary
+        # именно на API/WS, где реально читаются/меняются данные бота.
+        path = scope.get("path", "")
+        if not (path.startswith("/api/") or path.startswith("/ws/")):
             return await self.app(scope, receive, send)
 
         if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
@@ -88,17 +117,14 @@ class BasicAuthASGIMiddleware:
 
         authorized = False
         if auth_header.startswith("Basic "):
-            import base64
-            try:
-                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-                user, _, pwd = decoded.partition(":")
-                # constant-time сравнение — не даём определить правильность по времени ответа
-                authorized = (
-                    secrets.compare_digest(user, _cfg.WEB_USERNAME)
-                    and secrets.compare_digest(pwd, _cfg.WEB_PASSWORD)
-                )
-            except Exception:
-                authorized = False
+            authorized = self._check_basic_value(auth_header[6:])
+
+        if not authorized and scope["type"] == "websocket":
+            from urllib.parse import parse_qs
+            qs = parse_qs(scope.get("query_string", b"").decode("utf-8", errors="ignore"))
+            token = (qs.get("auth") or [None])[0]
+            if token:
+                authorized = self._check_basic_value(token)
 
         if authorized:
             return await self.app(scope, receive, send)
