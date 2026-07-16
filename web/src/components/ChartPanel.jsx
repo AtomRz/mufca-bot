@@ -37,6 +37,7 @@ export default function ChartPanel({ pairs, lastEvent, colors }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
+  const lastSelectionKeyRef = useRef(null) // 🆕 меняется только при смене ticker/tf/track
   const [ticker, setTicker] = useState(null)
   const [tf, setTf] = useState('1h')
   const [track, setTrack] = useState('a')
@@ -196,6 +197,13 @@ export default function ChartPanel({ pairs, lastEvent, colors }) {
     const s = seriesRef.current
     const times = data.candles.map((c) => c.time)
 
+    // 🆕 запоминаем текущий видимый диапазон ДО обновления данных — иначе
+    // каждый scan_tick/новый сигнал прыгает график к fitContent(), сбивая
+    // скролл/зум, который выставил пользователь
+    const selectionKey = `${ticker}-${tf}-${track}`
+    const isNewSelection = lastSelectionKeyRef.current !== selectionKey
+    const savedRange = isNewSelection ? null : chartRef.current.timeScale().getVisibleLogicalRange()
+
     s.candle.setData(data.candles)
     s.framaMid.setData(toLineData(times, data.frama))
     s.framaUpper.setData(toLineData(times, data.frama_upper))
@@ -263,7 +271,13 @@ export default function ChartPanel({ pairs, lastEvent, colors }) {
       if (t.sl) s.tradeLines.push(s.candle.createPriceLine({ price: t.sl, color: C.resistance, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'SL' }))
     }
 
-    chartRef.current.timeScale().fitContent()
+    // 🆕 восстанавливаем позицию вместо сброса к fitContent на каждое обновление
+    if (isNewSelection || !savedRange) {
+      chartRef.current.timeScale().fitContent()
+    } else {
+      chartRef.current.timeScale().setVisibleLogicalRange(savedRange)
+    }
+    lastSelectionKeyRef.current = selectionKey
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
 

@@ -12,7 +12,7 @@ function Toggle({ checked, onChange, disabled }) {
   )
 }
 
-// Числовое поле с сохранением по blur — общий паттерн для всех индикаторных параметров
+// Numeric field, saved on blur — shared pattern for every indicator parameter
 function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, onSave }) {
   return (
     <div className="field">
@@ -58,7 +58,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const [newPair, setNewPair] = useState('')
   const [chopDraft, setChopDraft] = useState({})
 
-  if (!config) return <div className="empty-state">Загрузка…</div>
+  if (!config) return <div className="empty-state">Loading…</div>
 
   const run = async (key, fn) => {
     setBusy(key)
@@ -86,7 +86,7 @@ export default function SettingsPanel({ config, onChanged }) {
       <div className="grid-2">
         <div>
           <div className="panel">
-            <h3 className="panel-title">Режим торговли</h3>
+            <h3 className="panel-title">Trading Mode</h3>
             <div className="field">
               <label>Market mode</label>
               <select
@@ -111,7 +111,7 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="toggle-row">
-              <span className="row-label">Heikin Ashi для UT Bot</span>
+              <span className="row-label">Heikin Ashi for UT Bot</span>
               <Toggle
                 checked={config.ut_heikin_ashi}
                 disabled={busy === 'utha'}
@@ -119,7 +119,7 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Смена mode/HTF сбрасывает активные позиционные состояния — как и в Discord-командах.
+              Changing mode/HTF resets active position-tracking state — same as the equivalent Discord commands.
             </p>
           </div>
 
@@ -127,7 +127,7 @@ export default function SettingsPanel({ config, onChanged }) {
             <h3 className="panel-title">CHOP Threshold</h3>
             {Object.keys(config.chop_threshold).map((tf) => (
               <div className="field" key={tf}>
-                <label>{tf} (20–90, ниже = тренд)</label>
+                <label>{tf} (20–90, lower = trending)</label>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input
                     type="number"
@@ -142,7 +142,7 @@ export default function SettingsPanel({ config, onChanged }) {
                     disabled={busy === `chop_${tf}`}
                     onClick={() => run(`chop_${tf}`, () => api.setChop(tf, parseFloat(chopValue(tf))))}
                   >
-                    Сохранить
+                    Save
                   </button>
                 </div>
               </div>
@@ -152,7 +152,7 @@ export default function SettingsPanel({ config, onChanged }) {
           <div className="panel">
             <h3 className="panel-title">Adaptive TP</h3>
             <div className="field">
-              <label>Режим</label>
+              <label>Mode</label>
               <select
                 value={config.tp_config.use_safe_tp ? 'safe' : 'aggressive'}
                 disabled={busy === 'tp_mode'}
@@ -175,7 +175,7 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => run('tp_safe', () => api.setTpConfig('safe', v))}
             />
             <NumberField
-              label="История сигналов, лимит" hint="5–200"
+              label="Signal history limit" hint="5–200"
               value={config.tp_config.signal_history_limit}
               min={5} max={200} busyKey="tp_limit" busy={busy}
               onSave={(v) => run('tp_limit', () => api.setTpConfig('limit', v))}
@@ -191,13 +191,13 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Отслеживаемые пары</h3>
+            <h3 className="panel-title">Tracked Pairs</h3>
             <div className="chip-row">
               {config.pairs.map((p) => (
                 <span className="chip" key={p}>
                   {p}
                   <button
-                    title="Убрать пару"
+                    title="Remove pair"
                     onClick={() => run(`rm_${p}`, () => api.removePair(p))}
                     disabled={busy === `rm_${p}`}
                   >
@@ -222,7 +222,7 @@ export default function SettingsPanel({ config, onChanged }) {
                 disabled={!newPair.trim() || busy === 'add_pair'}
                 onClick={() => run('add_pair', () => api.addPair(newPair.trim())).then(() => setNewPair(''))}
               >
-                Добавить
+                Add
               </button>
             </div>
           </div>
@@ -258,24 +258,48 @@ export default function SettingsPanel({ config, onChanged }) {
             <NumberField label="ATR Period" hint="2–50" value={ind.ut_period} min={2} max={50}
               busyKey="ind_ut_period" busy={busy} onSave={(v) => saveIndicator('ut_period', v)} />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Heikin Ashi Candles — переключатель выше, в блоке «Режим торговли».
-            </p>
-            <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-              Изменение любого параметра сбрасывает активные позиционные состояния — как mode/HTF.
+              Heikin Ashi Candles toggle is above, in the "Trading Mode" panel.
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Цвета графика</h3>
+            <h3 className="panel-title">Bollinger Bands</h3>
+            <NumberField label="Length" hint="5–100" value={ind.bb_period} min={5} max={100}
+              busyKey="ind_bb_period" busy={busy} onSave={(v) => saveIndicator('bb_period', v)} />
+            <NumberField label="StdDev" hint="0.5–5.0" value={ind.bb_stddev} min={0.5} max={5} step={0.1}
+              busyKey="ind_bb_stddev" busy={busy} onSave={(v) => saveIndicator('bb_stddev', v)} />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Basis MA type and source are fixed (SMA of Close) — not configurable yet.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">S&amp;R Power Channel</h3>
+            <NumberField label="Lookback Length" hint="3–50, pivot confirmation window" value={ind.sr_pivot_window} min={3} max={50}
+              busyKey="ind_sr_pivot_window" busy={busy} onSave={(v) => saveIndicator('sr_pivot_window', v)} />
+            <NumberField label="Max Levels Shown" hint="1–10, per support/resistance" value={ind.sr_max_levels} min={1} max={10}
+              busyKey="ind_sr_max_levels" busy={busy} onSave={(v) => saveIndicator('sr_max_levels', v)} />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              A pivot needs Lookback Length bars <em>after</em> it to be confirmed — a fresh breakout won't show
+              as resistance until price pulls back. This is standard pivot-based S/R behavior, not a bug.
+              "Extend Bars" from the reference indicator doesn't apply here — our lines already span the full chart.
+            </p>
+            <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+              Changing any indicator parameter above resets active position-tracking state — same as mode/HTF.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Chart Colors</h3>
             <ColorField label="FRAMA" value={colors.frama} onSave={(v) => saveColor('frama', v)} />
             <ColorField label="Bollinger Bands" value={colors.bb} onSave={(v) => saveColor('bb', v)} />
             <ColorField label="Support" value={colors.support} onSave={(v) => saveColor('support', v)} />
             <ColorField label="Resistance" value={colors.resistance} onSave={(v) => saveColor('resistance', v)} />
-            <ColorField label="MFI линия" value={colors.mfi_line} onSave={(v) => saveColor('mfi_line', v)} />
+            <ColorField label="MFI line" value={colors.mfi_line} onSave={(v) => saveColor('mfi_line', v)} />
             <ColorField label="MFI overbought" value={colors.mfi_overbought} onSave={(v) => saveColor('mfi_overbought', v)} />
             <ColorField label="MFI oversold" value={colors.mfi_oversold} onSave={(v) => saveColor('mfi_oversold', v)} />
-            <ColorField label="Свеча вверх" value={colors.candle_up} onSave={(v) => saveColor('candle_up', v)} />
-            <ColorField label="Свеча вниз" value={colors.candle_down} onSave={(v) => saveColor('candle_down', v)} />
+            <ColorField label="Candle up" value={colors.candle_up} onSave={(v) => saveColor('candle_up', v)} />
+            <ColorField label="Candle down" value={colors.candle_down} onSave={(v) => saveColor('candle_down', v)} />
           </div>
         </div>
       </div>

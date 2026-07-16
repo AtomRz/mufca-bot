@@ -18,7 +18,7 @@ export default function StatusPanel({ lastEvent }) {
     return () => clearInterval(id)
   }, [])
 
-  // при тике сканера или новом сигнале — подтягиваем статус сразу, не дожидаясь интервала
+  // scanner tick or new signal — refresh right away instead of waiting for the interval
   useEffect(() => {
     if (!lastEvent) return
     if (lastEvent.type === 'scan_tick' || lastEvent.type === 'signal') {
@@ -27,24 +27,24 @@ export default function StatusPanel({ lastEvent }) {
   }, [lastEvent])
 
   if (error) return <div className="error-banner">{error}</div>
-  if (!status) return <div className="empty-state">Загрузка…</div>
+  if (!status) return <div className="empty-state">Loading…</div>
 
   const pairs = Object.entries(status.pairs || {})
 
   return (
     <div>
       <div className="panel">
-        <h3 className="panel-title">Сканер</h3>
+        <h3 className="panel-title">Scanner</h3>
         <div className="row">
-          <span className="row-label">Всего проходов</span>
+          <span className="row-label">Total scans</span>
           <span className="row-value">{status.scan_stats?.total_scans ?? '—'}</span>
         </div>
         <div className="row">
-          <span className="row-label">Сгенерировано сигналов</span>
+          <span className="row-label">Signals generated</span>
           <span className="row-value">{status.scan_stats?.signals_generated ?? '—'}</span>
         </div>
         <div className="row">
-          <span className="row-label">Режим</span>
+          <span className="row-label">Mode</span>
           <span className="row-value">{status.market_mode}</span>
         </div>
         <div className="row">
@@ -74,7 +74,7 @@ export default function StatusPanel({ lastEvent }) {
 
       {lastEvent?.type === 'signal' && (
         <div className="panel">
-          <h3 className="panel-title">Последний сигнал</h3>
+          <h3 className="panel-title">Latest signal</h3>
           <div className="row">
             <span className="row-label">{lastEvent.ticker} · {lastEvent.tf}</span>
             <span className={`tag ${lastEvent.sig_type?.includes('SHORT') ? 'short' : 'long'}`}>

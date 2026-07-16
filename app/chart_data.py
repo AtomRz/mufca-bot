@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
-from indicators import calculate_frama, calculate_mfi, run_kmeans_mfi
+from indicators import calculate_frama, calculate_mfi, run_kmeans_mfi, calculate_chop, calculate_atr
 from chart import calc_bollinger_bands, calc_support_resistance
 import config
 
@@ -58,8 +58,8 @@ async def get_chart_data(
     mfi_s = calculate_mfi(df, length=config.MFI_LEN)
     mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=config.MFI_TRAINING)
 
-    bb_u, bb_m, bb_l = calc_bollinger_bands(df["close"])
-    sr = calc_support_resistance(df)
+    bb_u, bb_m, bb_l = calc_bollinger_bands(df["close"], period=config.BB_PERIOD, std_mult=config.BB_STDDEV)
+    sr = calc_support_resistance(df, pivot_window=config.SR_PIVOT_WINDOW, max_levels=config.SR_MAX_LEVELS)
 
     df_tail = df.tail(limit).reset_index(drop=True)
 
@@ -114,3 +114,57 @@ async def get_chart_data(
         }
 
     return result
+
+
+async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
+    """
+    Лёгкая сводка для верхней плашки дашборда: текущий CHOP, направление FRAMA
+    (тренд) и грубая informational-оценка leverage — та же формула, что в
+    signals.py check_signals (frama_sl_long/short + TARGET_RISK_DEP), но это
+    ТОЛЬКО индикативное число для UI, реальный sizing она не определяет
+    (см. комментарий в signals.py рядом с sugg_lev).
+    """
+    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=300)
+    df = parse_ohlcv(bars)
+    if not validate_dataframe(df, min_rows=50):
+        raise ValueError(f"Недостаточно данных для {ticker} {tf}")
+
+    idx = -2  # последний подтверждённый бар — как везде в сигналах
+    close_v = float(df["close"].iloc[idx])
+
+    chop_s = calculate_chop(df, length=config.CHOP_LENGTH)
+    chop_v = float(chop_s.iloc[idx])
+    chop_threshold = config.CHOP_THRESHOLD.get(tf, 61.8)
+
+    frama_s, frama_u, frama_l, frama_dir = calculate_frama(df, length=config.FRAMA_LEN, mult=config.FRAMA_MULT)
+    dir_v = int(frama_dir.iloc[idx])
+    trend = "bullish" if dir_v == 1 else "bearish" if dir_v == -1 else "neutral"
+
+    atr_s = calculate_atr(df, config.ATR_PERIOD)
+    atr_v = float(atr_s.iloc[idx])
+    fu = float(frama_u.iloc[idx])
+    fl = float(frama_l.iloc[idx])
+
+    if atr_v > 0:
+        frama_sl_long = max(1.0, min(3.5, abs(close_v - fl) / atr_v))
+        frama_sl_short = max(1.0, min(3.5, abs(fu - close_v) / atr_v))
+        sugg_sl = frama_sl_long if dir_v >= 0 else frama_sl_short
+        sugg_lev = max(1, min(config.MAX_ALLOWED_LEV, int(config.TARGET_RISK_DEP / max(sugg_sl, 0.1))))
+
+        atr_pct_v = (atr_v / close_v) * 100
+        if atr_pct_v > config.ATR_MAX:
+            sugg_lev = max(1, int(sugg_lev * 0.5))
+        elif atr_pct_v > config.ATR_MIN * 1.5:
+            sugg_lev = min(config.MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
+    else:
+        sugg_lev = 1
+
+    return {
+        "ticker": ticker,
+        "tf": tf,
+        "chop": round(chop_v, 1),
+        "chop_threshold": chop_threshold,
+        "chop_trending": chop_v < chop_threshold,
+        "trend": trend,
+        "suggested_leverage": sugg_lev,
+    }

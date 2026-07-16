@@ -22,12 +22,14 @@ FastAPI-бэкенд для веб-морды. Работает В ТОМ ЖЕ �
 import asyncio
 import logging
 import re
+import secrets
 from typing import Optional, List, Set
 from urllib.parse import unquote
 
 import ccxt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import Response
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -48,8 +50,72 @@ import bot as core
 import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config
 from signals import make_state, clear_htf_cache
-from chart_data import get_chart_data
+from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history
+
+
+# =====================================================================
+# 🔒  HTTP BASIC AUTH — защищает и /api/*, и раздачу статики фронта.
+# Если WEB_USERNAME/WEB_PASSWORD не заданы в .env — дашборд остаётся
+# открытым (для локальной разработки), но громко предупреждаем в логах
+# при каждом старте, чтобы это нельзя было не заметить.
+# =====================================================================
+if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
+    logger.warning(
+        "[AUTH] ⚠️  WEB_USERNAME/WEB_PASSWORD не заданы в .env — веб-дашборд "
+        "ОТКРЫТ БЕЗ АВТОРИЗАЦИИ. Любой с доступом к порту 8585 может менять "
+        "настройки бота. Задай оба значения в .env, чтобы включить защиту."
+    )
+
+
+class BasicAuthASGIMiddleware:
+    """Чистый ASGI middleware (не BaseHTTPMiddleware!) — тот не видит websocket-scope,
+    а /ws/live тоже должен требовать авторизации, иначе фид сигналов остаётся открытым
+    даже когда весь остальной API защищён."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
+            return await self.app(scope, receive, send)  # auth выключен — креды не заданы
+
+        headers = dict(scope.get("headers") or [])
+        auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
+
+        authorized = False
+        if auth_header.startswith("Basic "):
+            import base64
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                user, _, pwd = decoded.partition(":")
+                # constant-time сравнение — не даём определить правильность по времени ответа
+                authorized = (
+                    secrets.compare_digest(user, _cfg.WEB_USERNAME)
+                    and secrets.compare_digest(pwd, _cfg.WEB_PASSWORD)
+                )
+            except Exception:
+                authorized = False
+
+        if authorized:
+            return await self.app(scope, receive, send)
+
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4401})
+            return
+
+        response = Response(
+            content="Authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="MUFCA"'},
+        )
+        await response(scope, receive, send)
+
+
+app.add_middleware(BasicAuthASGIMiddleware)
 
 # =====================================================================
 # 📡  WEBSOCKET BROADCAST
@@ -143,6 +209,28 @@ async def remove_pair(ticker: str):
 # =====================================================================
 # 📈  CHART DATA
 # =====================================================================
+@app.get("/api/pulse")
+async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
+    """Сводка для верхней плашки: CHOP/тренд/suggested leverage по одной referens-паре
+    (по умолчанию — первая отслеживаемая пара). Не привязан к выбору на вкладке Chart."""
+    ticker = unquote(ticker).upper().strip() if ticker else (_cfg.TICKERS[0] if _cfg.TICKERS else None)
+    if not ticker:
+        raise HTTPException(404, "Нет отслеживаемых пар")
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} не отслеживается")
+    if tf not in TIMEFRAMES:
+        raise HTTPException(400, f"tf должен быть одним из {TIMEFRAMES}")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
+
+    try:
+        return await get_market_pulse(exchange, ticker, tf)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 @app.get("/api/chart")
 async def chart(ticker: str, tf: str, limit: int = 150, track: str = "a"):
     ticker = unquote(ticker).upper().strip()
@@ -271,6 +359,10 @@ async def get_config():
             "lookback": _cfg.LOOKBACK,
             "ut_sensitivity": _cfg.UT_SENSITIVITY,
             "ut_period": _cfg.UT_PERIOD,
+            "bb_period": _cfg.BB_PERIOD,
+            "bb_stddev": _cfg.BB_STDDEV,
+            "sr_pivot_window": _cfg.SR_PIVOT_WINDOW,
+            "sr_max_levels": _cfg.SR_MAX_LEVELS,
         },
         "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
@@ -435,6 +527,10 @@ _INDICATOR_BOUNDS = {
     "lookback": ("LOOKBACK", int, 1, 20),
     "ut_sensitivity": ("UT_SENSITIVITY", float, 0.1, 10.0),
     "ut_period": ("UT_PERIOD", int, 2, 50),
+    "bb_period": ("BB_PERIOD", int, 5, 100),
+    "bb_stddev": ("BB_STDDEV", float, 0.5, 5.0),
+    "sr_pivot_window": ("SR_PIVOT_WINDOW", int, 3, 50),
+    "sr_max_levels": ("SR_MAX_LEVELS", int, 1, 10),
 }
 
 
@@ -449,6 +545,10 @@ class IndicatorsIn(BaseModel):
     lookback: Optional[int] = None
     ut_sensitivity: Optional[float] = None
     ut_period: Optional[int] = None
+    bb_period: Optional[int] = None
+    bb_stddev: Optional[float] = None
+    sr_pivot_window: Optional[int] = None
+    sr_max_levels: Optional[int] = None
 
 
 @app.post("/api/config/indicators")
@@ -473,6 +573,10 @@ async def set_indicators(body: IndicatorsIn):
         "LOOKBACK": _cfg.LOOKBACK,
         "UT_SENSITIVITY": _cfg.UT_SENSITIVITY,
         "UT_PERIOD": _cfg.UT_PERIOD,
+        "BB_PERIOD": _cfg.BB_PERIOD,
+        "BB_STDDEV": _cfg.BB_STDDEV,
+        "SR_PIVOT_WINDOW": _cfg.SR_PIVOT_WINDOW,
+        "SR_MAX_LEVELS": _cfg.SR_MAX_LEVELS,
     })
     await _reset_states_after_regime_change()
     await broadcast_event({"type": "config_changed", "key": "indicators"})
@@ -486,6 +590,10 @@ async def set_indicators(body: IndicatorsIn):
         "lookback": _cfg.LOOKBACK,
         "ut_sensitivity": _cfg.UT_SENSITIVITY,
         "ut_period": _cfg.UT_PERIOD,
+        "bb_period": _cfg.BB_PERIOD,
+        "bb_stddev": _cfg.BB_STDDEV,
+        "sr_pivot_window": _cfg.SR_PIVOT_WINDOW,
+        "sr_max_levels": _cfg.SR_MAX_LEVELS,
     }
 
 

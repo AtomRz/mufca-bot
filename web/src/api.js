@@ -50,6 +50,8 @@ export const api = {
     request(
       `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}`,
     ),
+  getPulse: (ticker, tf = '1h') =>
+    request(`/api/pulse?tf=${tf}${ticker ? `&ticker=${encodeURIComponent(ticker)}` : ''}`),
 }
 
 /**

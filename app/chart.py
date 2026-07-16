@@ -16,6 +16,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from typing import Optional, Tuple, List, Dict
+import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +103,13 @@ def calc_support_resistance(
     def near_price(levels, price, pct=0.05):
         return [l for l in levels if abs(l - price) / price < pct]
 
-    supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels)
-    resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels)
+    # 🆕 FIX: раньше при отборе max_levels из кластеров сортировали по близости к
+    # МЕДИАНЕ набора кандидатов, а не к текущей цене — в результате реально близкие
+    # к цене (и потому самые торгуемо-релевантные) уровни могли отсеиваться в пользу
+    # более "типичных для выборки", но далёких от цены. Теперь сортируем по
+    # близости к last_close — ближайшие уровни всегда в приоритете.
+    supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels, last_close)
+    resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels, last_close)
 
     return {
         "support":    [l for l in supports    if l < last_close],
@@ -112,8 +118,8 @@ def calc_support_resistance(
     }
 
 
-def _cluster_levels(levels: List[float], max_n: int, tol: float = 0.005) -> List[float]:
-    """Кластеризует близкие уровни, оставляет до max_n."""
+def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: float = 0.005) -> List[float]:
+    """Кластеризует близкие уровни, оставляет до max_n БЛИЖАЙШИХ к ref_price (текущей цене)."""
     if not levels:
         return []
     levels = sorted(set(levels))
@@ -128,11 +134,9 @@ def _cluster_levels(levels: List[float], max_n: int, tol: float = 0.005) -> List
                 cluster.append(levels[j])
                 used[j] = True
         clustered.append(float(np.mean(cluster)))
-    # Возвращаем max_n ближайших к середине
     if len(clustered) <= max_n:
-        return clustered
-    mid = np.median(clustered)
-    clustered.sort(key=lambda x: abs(x - mid))
+        return sorted(clustered)
+    clustered.sort(key=lambda x: abs(x - ref_price))
     return sorted(clustered[:max_n])
 
 
@@ -217,7 +221,7 @@ def build_chart(
 
     # ── Bollinger Bands — считаем из полного df, берём tail(limit) ──
     _bb_src = df_full["close"] if df_full is not None and len(df_full) > len(df) else df["close"]
-    _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(_bb_src)
+    _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(_bb_src, period=_cfg.BB_PERIOD, std_mult=_cfg.BB_STDDEV)
     bb_u = _bb_u_full.tail(limit).values
     bb_m = _bb_m_full.tail(limit).values
     bb_l = _bb_l_full.tail(limit).values
@@ -228,7 +232,7 @@ def build_chart(
 
     # ── S/R уровни — считаем из полного df (200+ баров) ─────────────
     _sr_df = df_full if df_full is not None and len(df_full) > len(df) else df
-    sr = calc_support_resistance(_sr_df)
+    sr = calc_support_resistance(_sr_df, pivot_window=_cfg.SR_PIVOT_WINDOW, max_levels=_cfg.SR_MAX_LEVELS)
     x_start = -0.5
     x_end   = n - 0.5
 
@@ -457,7 +461,6 @@ async def generate_chart(
         calculate_frama, calculate_mfi, run_kmeans_mfi,
         calculate_atr
     )
-    import config
 
     # Грузим больше данных для прогрева индикаторов
     fetch_limit = max(limit + 250, 300)
@@ -467,13 +470,13 @@ async def generate_chart(
     if not validate_dataframe(df, min_rows=50):
         raise ValueError(f"Недостаточно данных для {symbol} {timeframe}")
 
-    # ── Индикаторы ────────────────────────────────────────────────
+    # ── Индикаторы (module-level _cfg — видит live-правки из веб-морды) ──
     frama_s, frama_u, frama_l, _ = calculate_frama(
-        df, length=config.FRAMA_LEN, mult=config.FRAMA_MULT
+        df, length=_cfg.FRAMA_LEN, mult=_cfg.FRAMA_MULT
     )
 
-    mfi_s = calculate_mfi(df, length=config.MFI_LEN)
-    mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=config.MFI_TRAINING)
+    mfi_s = calculate_mfi(df, length=_cfg.MFI_LEN)
+    mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=_cfg.MFI_TRAINING)
 
     # ── Данные активной сделки ────────────────────────────────────
     entry_price       = None

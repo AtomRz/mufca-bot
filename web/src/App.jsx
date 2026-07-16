@@ -12,32 +12,42 @@ const TABS = [
   { id: 'settings', label: 'Settings' },
 ]
 
+const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 'var(--text-dim)' }
+const TREND_LABEL = { bullish: 'Bullish', bearish: 'Bearish', neutral: 'Neutral' }
+
 export default function App() {
   const [tab, setTab] = useState('status')
   const [connStatus, setConnStatus] = useState('connecting')
   const [config, setConfig] = useState(null)
   const [lastEvent, setLastEvent] = useState(null)
   const [pulseKey, setPulseKey] = useState(0)
+  const [pulse, setPulse] = useState(null)
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
   }, [])
 
+  const loadPulse = useCallback(() => {
+    api.getPulse().then(setPulse).catch(() => {})
+  }, [])
+
   useEffect(() => {
     loadConfig()
-  }, [loadConfig])
+    loadPulse()
+  }, [loadConfig, loadPulse])
 
   useEffect(() => {
     const disconnect = connectLive(
       (event) => {
         setLastEvent(event)
         setPulseKey((k) => k + 1)
-        if (event.type === 'config_changed') loadConfig()
+        if (event.type === 'config_changed') { loadConfig(); loadPulse() }
+        if (event.type === 'scan_tick') loadPulse()
       },
       setConnStatus,
     )
     return disconnect
-  }, [loadConfig])
+  }, [loadConfig, loadPulse])
 
   return (
     <div className="app">
@@ -46,12 +56,31 @@ export default function App() {
           <span
             key={pulseKey}
             className={`pulse ${connStatus === 'connected' ? 'live' : ''}`}
-            title={connStatus === 'connected' ? 'На связи' : 'Нет соединения'}
+            title={connStatus === 'connected' ? 'Connected' : 'Disconnected'}
           />
           MUFCA
         </div>
         {config && <span className="mode-badge">{config.mode}</span>}
         {config && <span className="mode-badge">HTF {config.htf_bias}</span>}
+        {pulse && (
+          <span
+            className="mode-badge"
+            title={`${pulse.ticker} ${pulse.tf} — CHOP ${pulse.chop} (threshold ${pulse.chop_threshold})`}
+            style={{ color: pulse.chop_trending ? 'var(--long)' : 'var(--text-dim)' }}
+          >
+            CHOP {pulse.chop}
+          </span>
+        )}
+        {pulse && (
+          <span className="mode-badge" style={{ color: TREND_COLOR[pulse.trend] }} title={`${pulse.ticker} ${pulse.tf} trend`}>
+            {TREND_LABEL[pulse.trend]}
+          </span>
+        )}
+        {pulse && (
+          <span className="mode-badge" title="Rough informational estimate, not used for real position sizing">
+            {pulse.suggested_leverage}x lev
+          </span>
+        )}
         <div className="spacer" />
         <span className="conn-label">
           {connStatus === 'connected' ? 'live' : connStatus}

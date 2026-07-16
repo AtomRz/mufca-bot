@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 # ⚙️  БАЗОВЫЕ НАСТРОЙКИ
 # =====================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+
+# 🆕 Basic Auth для веб-морды. Если оба не заданы — дашборд остаётся открытым
+# (для локальной разработки), но при старте пишется громкий warning в лог.
+WEB_USERNAME = os.getenv("WEB_USERNAME", "")
+WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "general")
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -123,6 +128,10 @@ _INDICATOR_DEFAULTS = {
     "LOOKBACK": 3,
     "UT_SENSITIVITY": 1.0,
     "UT_PERIOD": 10,
+    "BB_PERIOD": 20,
+    "BB_STDDEV": 2.0,
+    "SR_PIVOT_WINDOW": 10,
+    "SR_MAX_LEVELS": 4,
 }
 
 def load_indicators() -> dict:
@@ -144,6 +153,10 @@ AND_SIG_LEN = _indicators["AND_SIG_LEN"]
 LOOKBACK = _indicators["LOOKBACK"]
 UT_SENSITIVITY = _indicators["UT_SENSITIVITY"]
 UT_PERIOD = _indicators["UT_PERIOD"]
+BB_PERIOD = _indicators["BB_PERIOD"]
+BB_STDDEV = _indicators["BB_STDDEV"]
+SR_PIVOT_WINDOW = _indicators["SR_PIVOT_WINDOW"]
+SR_MAX_LEVELS = _indicators["SR_MAX_LEVELS"]
 
 COOLDOWN_BARS = 2
 MAX_ALLOWED_LEV = 10

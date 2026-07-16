@@ -46,7 +46,7 @@ export default function HistoryPanel({ lastEvent }) {
     return () => clearInterval(id)
   }, [load])
 
-  // новый закрытый сигнал — освежить сводку
+  // a signal just closed — refresh the summary
   useEffect(() => {
     if (lastEvent?.type === 'signal') load()
   }, [lastEvent, load])
@@ -60,12 +60,12 @@ export default function HistoryPanel({ lastEvent }) {
   }, [selected])
 
   if (error) return <div className="error-banner">{error}</div>
-  if (!summary) return <div className="empty-state">Загрузка…</div>
+  if (!summary) return <div className="empty-state">Loading…</div>
 
   const { rows, total } = summary
 
   if (rows.length === 0) {
-    return <div className="empty-state">Пока нет закрытых сигналов — статистика появится после первых TP/SL.</div>
+    return <div className="empty-state">No closed signals yet — stats will appear after the first TP/SL hit.</div>
   }
 
   const isSelected = (r) =>
@@ -75,10 +75,10 @@ export default function HistoryPanel({ lastEvent }) {
     <div>
       {total && (
         <div className="panel">
-          <h3 className="panel-title">Итого по всем парам</h3>
+          <h3 className="panel-title">Overall (all pairs)</h3>
           <div className="stat-cards">
             <StatCard label="Win Rate" value={`${Math.round(total.win_rate * 100)}%`} color={winrateColor(total.win_rate)} />
-            <StatCard label="Сигналов" value={total.count} />
+            <StatCard label="Signals" value={total.count} />
             <StatCard label="Avg PnL" value={fmtPct(total.avg_pnl)} color={total.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)'} />
             <StatCard label="Avg MFE" value={`${total.avg_mfe.toFixed(2)}%`} />
             <StatCard label="Avg MAE" value={`${total.avg_mae.toFixed(2)}%`} />
@@ -88,7 +88,7 @@ export default function HistoryPanel({ lastEvent }) {
       )}
 
       <div className="panel">
-        <h3 className="panel-title">По парам / таймфреймам / трекам</h3>
+        <h3 className="panel-title">By pair / timeframe / track</h3>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -144,16 +144,16 @@ export default function HistoryPanel({ lastEvent }) {
       {selected && (
         <div className="panel">
           <h3 className="panel-title">
-            {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : 'UT Bot'} — последние сделки
+            {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : 'UT Bot'} — recent trades
           </h3>
-          {!records && <div className="empty-state">Загрузка…</div>}
-          {records && records.length === 0 && <div className="empty-state">Нет закрытых сделок для этой комбинации.</div>}
+          {!records && <div className="empty-state">Loading…</div>}
+          {records && records.length === 0 && <div className="empty-state">No closed trades for this combination.</div>}
           {records && records.length > 0 && (
             <div className="table-wrap">
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Дата</th>
+                    <th>Date</th>
                     <th>Entry</th>
                     <th>Exit</th>
                     <th>PnL</th>
