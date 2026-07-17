@@ -8,3 +8,4 @@ mplfinance>=0.12.10b0
 matplotlib>=3.7.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
+firebase-admin>=6.5.0

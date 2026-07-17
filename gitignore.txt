@@ -1,0 +1,30 @@
+# Секреты — никогда не коммитить!
+.env
+firebase-credentials.json
+app/data/firebase-credentials.json
+*firebase-adminsdk*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Логи
+*.log
+
+# Docker
+*.tar
+app/static/
+web/node_modules/
+web/dist/
+# npm install (не npm ci) в Dockerfile каждый раз резолвит зависимости заново —
+# закоммиченный lock-файл рискует зафиксировать платформо-специфичные бинарники
+# (rollup/esbuild) с машины разработчика, а не с Alpine/musl, где реально собирается образ
+web/package-lock.json

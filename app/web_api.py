@@ -52,6 +52,7 @@ from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_conf
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history
+import push as _push
 
 
 # =====================================================================
@@ -196,6 +197,35 @@ async def get_status():
                 "last_bar_time": st.get("last_bar_time"),
             }
     return result
+
+
+# =====================================================================
+# 📱  ANDROID PUSH — регистрация устройств (FCM токены)
+# =====================================================================
+class DeviceRegisterIn(BaseModel):
+    token: str
+    device_name: Optional[str] = None
+
+
+@app.post("/api/devices/register")
+async def register_device(body: DeviceRegisterIn):
+    if not body.token or len(body.token) < 20:
+        raise HTTPException(400, "Некорректный FCM-токен")
+    info = _push.register_device(body.token, body.device_name)
+    return {"registered": True, **info}
+
+
+@app.delete("/api/devices/{token}")
+async def unregister_device(token: str):
+    ok = _push.unregister_device(unquote(token))
+    if not ok:
+        raise HTTPException(404, "Устройство не найдено")
+    return {"unregistered": True}
+
+
+@app.get("/api/devices")
+async def list_devices():
+    return {"devices": _cfg.load_devices()}
 
 
 @app.get("/api/pairs")

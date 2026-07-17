@@ -285,6 +285,19 @@ async def market_scanner():
                                 })
                             except Exception as ws_err:
                                 logger.warning(f"[WS] broadcast failed: {ws_err}")
+                            # 🆕 Android push — та же информация, что в Discord/WS, но приходит
+                            # даже если приложение закрыто. send_push делает блокирующие HTTP-запросы
+                            # (firebase-admin), поэтому через to_thread, не в event loop напрямую.
+                            try:
+                                import push as _push
+                                await asyncio.to_thread(
+                                    _push.send_push,
+                                    title=f"{sig_type} {ticker} {tf}",
+                                    body=f"Entry: {price:.4f} | TP: {tp:.4f} | SL: {sl:.4f}",
+                                    data={"type": "signal", "ticker": ticker, "tf": tf},
+                                )
+                            except Exception as push_err:
+                                logger.warning(f"[PUSH] send failed: {push_err}")
                         except discord.HTTPException as e:
                             logger.error(f"Failed to send signal: {e}")
                         logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
@@ -370,6 +383,16 @@ async def market_scanner():
                             })
                         except Exception as ws_err:
                             logger.warning(f"[WS] broadcast failed: {ws_err}")
+                        try:
+                            import push as _push
+                            await asyncio.to_thread(
+                                _push.send_push,
+                                title=f"🎯 TP1 Hit {ticker} {tf}",
+                                body=f"Close 50%, move SL to breakeven (${round(entry, 2):,.2f})",
+                                data={"type": "tp1_hit", "ticker": ticker, "tf": tf, "track": track},
+                            )
+                        except Exception as push_err:
+                            logger.warning(f"[PUSH] send failed: {push_err}")
 
                 await asyncio.sleep(0.5)
             except Exception as e:

@@ -19,6 +19,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 WEB_USERNAME = os.getenv("WEB_USERNAME", "")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "general")
+
+# 🆕 Push-уведомления на Android через Firebase Cloud Messaging.
+# Файл сервисного аккаунта НЕ коммитится в репо (он публичный!) — кладётся
+# вручную на сервер, в тот же персистентный volume, что signals_history.json.
+FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/app/data/firebase-credentials.json")
+
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -190,6 +196,18 @@ def save_colors(data: dict):
     safe_json_save(COLORS_FILE, data)
 
 CHART_COLORS: dict = load_colors()
+
+# =====================================================================
+# 📱  ЗАРЕГИСТРИРОВАННЫЕ УСТРОЙСТВА (Android push, FCM токены)
+# =====================================================================
+DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
+
+def load_devices() -> dict:
+    """{fcm_token: {"device_name": str, "registered_at": iso str}}"""
+    return safe_json_load(DEVICES_FILE, {})
+
+def save_devices(data: dict):
+    safe_json_save(DEVICES_FILE, data)
 
 # =====================================================================
 # 🎯  АДАПТИВНЫЙ ТП
