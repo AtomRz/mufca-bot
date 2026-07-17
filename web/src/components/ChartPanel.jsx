@@ -102,7 +102,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       wickDownColor: C.candle_down,
       priceScaleId: 'right',
     })
-    candle.priceScale().applyOptions({ scaleMargins: { top: 0.04, bottom: 0.42 } })
+    candle.priceScale().applyOptions({ scaleMargins: { top: 0.04, bottom: 0.36 } })
 
     const framaMid = chart.addLineSeries({
       color: C.frama,
@@ -147,16 +147,18 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       priceFormat: { type: 'volume' },
       color: '#232c3a',
     })
-    volume.priceScale().applyOptions({ scaleMargins: { top: 0.62, bottom: 0.28 } })
+    // 🆕 volume и mfi делят одну и ту же зону шкалы (merged pane) — объём фоном,
+    // MFI-линия поверх, вместо двух раздельных полос друг под другом
+    volume.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 } })
 
     const mfi = chart.addLineSeries({
       color: C.mfi_line,
-      lineWidth: 1,
+      lineWidth: 1.5,
       priceScaleId: 'mfi',
       priceLineVisible: false,
       lastValueVisible: false,
     })
-    mfi.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 }, visible: true })
+    mfi.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 }, visible: true })
 
     seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], tradeLines: [], mfiLines: [] }
 
@@ -213,7 +215,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       data.candles.map((c) => ({
         time: c.time,
         value: c.volume,
-        color: c.close >= c.open ? hexToRgba(C.candle_up, 0.5) : hexToRgba(C.candle_down, 0.5),
+        color: c.close >= c.open ? hexToRgba(C.candle_up, 0.25) : hexToRgba(C.candle_down, 0.25),
       })),
     )
     s.mfi.setData(toLineData(times, data.mfi))
@@ -350,6 +352,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>
+        <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />Volume (bg)</span>
         <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
         <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />MFI overbought</span>
         <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>
