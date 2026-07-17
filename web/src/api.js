@@ -61,7 +61,7 @@ export const api = {
     request('/api/pairs', { method: 'POST', body: JSON.stringify({ ticker }) }),
   removePair: (ticker) =>
     request(`/api/pairs/${encodeURIComponent(ticker)}`, { method: 'DELETE' }),
-  getChart: (ticker, tf, track = 'a', limit = 150) =>
+  getChart: (ticker, tf, track = 'a', limit = 200) =>
     request(
       `/api/chart?ticker=${encodeURIComponent(ticker)}&tf=${tf}&track=${track}&limit=${limit}`,
     ),

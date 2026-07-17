@@ -43,6 +43,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const seriesRef = useRef({})
   const lastSelectionKeyRef = useRef(null) // 🆕 меняется только при смене ticker/tf/track
   const [track, setTrack] = useState('a')
+  const [barsLimit, setBarsLimit] = useState(200)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
 
@@ -51,13 +52,13 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const load = useCallback(() => {
     if (!ticker) return
     api
-      .getChart(ticker, tf, track)
+      .getChart(ticker, tf, track, barsLimit)
       .then((d) => {
         setData(d)
         setError(null)
       })
       .catch((e) => setError(e.message))
-  }, [ticker, tf, track])
+  }, [ticker, tf, track, barsLimit])
 
   useEffect(() => {
     load()
@@ -198,7 +199,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // 🆕 запоминаем текущий видимый диапазон ДО обновления данных — иначе
     // каждый scan_tick/новый сигнал прыгает график к fitContent(), сбивая
     // скролл/зум, который выставил пользователь
-    const selectionKey = `${ticker}-${tf}-${track}`
+    const selectionKey = `${ticker}-${tf}-${track}-${barsLimit}`
     const isNewSelection = lastSelectionKeyRef.current !== selectionKey
     const savedRange = isNewSelection ? null : chartRef.current.timeScale().getVisibleLogicalRange()
 
@@ -328,6 +329,13 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
           {['a', 'u'].map((t) => (
             <button key={t} className={track === t ? 'active' : ''} onClick={() => setTrack(t)}>
               {t === 'a' ? 'Andean' : 'UT Bot'}
+            </button>
+          ))}
+        </div>
+        <div className="seg">
+          {[100, 200, 300, 500].map((n) => (
+            <button key={n} className={barsLimit === n ? 'active' : ''} onClick={() => setBarsLimit(n)}>
+              {n} bars
             </button>
           ))}
         </div>

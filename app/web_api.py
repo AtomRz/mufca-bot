@@ -258,12 +258,14 @@ async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
 
 
 @app.get("/api/chart")
-async def chart(ticker: str, tf: str, limit: int = 150, track: str = "a"):
+async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
     ticker = unquote(ticker).upper().strip()
     if ticker not in _cfg.TICKERS:
         raise HTTPException(404, f"{ticker} не отслеживается")
     if tf not in TIMEFRAMES:
         raise HTTPException(400, f"tf должен быть одним из {TIMEFRAMES}")
+    if not (20 <= limit <= 1000):
+        raise HTTPException(400, "limit должен быть между 20 и 1000")
 
     exchange = core._exchange_ref
     if exchange is None:
