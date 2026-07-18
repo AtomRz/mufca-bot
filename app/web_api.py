@@ -23,26 +23,19 @@ import asyncio
 import logging
 import re
 import secrets
+import time
+from collections import defaultdict
 from typing import Optional, List, Set
 from urllib.parse import unquote
 
 import ccxt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MUFCA Web API")
-
-# Разрешаем локальный dev-фронт (vite и т.п.); в проде фронт и так за тем же nginx/tunnel
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # 🆕 Циклический импорт по тому же паттерну, что discord_commands.py:
 # bot.py импортирует web_api в самом низу, когда bot/state/config уже готовы.
@@ -69,16 +62,84 @@ if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
     )
 
 
+# =====================================================================
+# 🚫  RATE LIMITING — блокировка IP после серии неудачных попыток входа.
+# Без этого Basic Auth, выставленный в интернет, можно долбить паролями
+# неограниченное число раз. In-memory (сбрасывается при рестарте контейнера) —
+# для личного дашборда этого достаточно, распределённый брутфорс не сценарий.
+# =====================================================================
+_LOCKOUT_THRESHOLD = 5             # столько неудачных попыток подряд...
+_LOCKOUT_WINDOW_SECONDS = 300      # ...в течение этого окна...
+_LOCKOUT_DURATION_SECONDS = 900    # ...даёт блокировку на 15 минут
+
+_failed_attempts: dict = defaultdict(list)
+_locked_until: dict = {}
+
+
+def _get_client_ip(scope) -> str:
+    """Реальный IP клиента из-за Cloudflare Tunnel/reverse proxy — не scope['client'],
+    тот покажет адрес самого туннеля/nginx, а не посетителя."""
+    headers = dict(scope.get("headers") or [])
+    for header_name in (b"cf-connecting-ip", b"x-forwarded-for"):
+        value = headers.get(header_name)
+        if value:
+            return value.decode("utf-8", errors="ignore").split(",")[0].strip()
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+
+
+def _is_locked_out(ip: str) -> bool:
+    until = _locked_until.get(ip)
+    return until is not None and time.time() < until
+
+
+def _record_failed_attempt(ip: str):
+    now = time.time()
+    attempts = [t for t in _failed_attempts[ip] if now - t < _LOCKOUT_WINDOW_SECONDS]
+    attempts.append(now)
+    _failed_attempts[ip] = attempts
+    if len(attempts) >= _LOCKOUT_THRESHOLD:
+        _locked_until[ip] = now + _LOCKOUT_DURATION_SECONDS
+        logger.warning(
+            f"[AUTH] IP {ip} locked out for {_LOCKOUT_DURATION_SECONDS}s "
+            f"after {len(attempts)} failed login attempts"
+        )
+
+
+def _record_success(ip: str):
+    _failed_attempts.pop(ip, None)
+    _locked_until.pop(ip, None)
+
+
+# =====================================================================
+# 🎫  WS TICKETS — короткоживущие одноразовые токены для WebSocket-хендшейка.
+# Браузерный WebSocket API не умеет выставлять кастомные заголовки, значит
+# что-то приходится класть в query-параметр URL — а всё, что в query-параметре,
+# оседает в access-логах (uvicorn/nginx/Cloudflare) открытым текстом. Раньше
+# там был сам base64(login:password) — постоянный, реальный пароль. Теперь —
+# тикет: живёт 30 секунд, одноразовый, бесполезен уже через полминуты и не
+# раскрывает ничего о реальных учётных данных, даже если жаднолистая
+# CI/CD-система или Cloudflare сохранят его в логах навсегда.
+# =====================================================================
+_WS_TICKET_TTL_SECONDS = 30
+_ws_tickets: dict = {}
+
+
+def _issue_ws_ticket() -> str:
+    ticket = secrets.token_urlsafe(32)
+    _ws_tickets[ticket] = time.time() + _WS_TICKET_TTL_SECONDS
+    return ticket
+
+
+def _consume_ws_ticket(ticket: str) -> bool:
+    expiry = _ws_tickets.pop(ticket, None)  # pop — одноразовый, повторно не сработает
+    return expiry is not None and time.time() < expiry
+
+
 class BasicAuthASGIMiddleware:
     """Чистый ASGI middleware (не BaseHTTPMiddleware!) — тот не видит websocket-scope,
     а /ws/live тоже должен требовать авторизации, иначе фид сигналов остаётся открытым
-    даже когда весь остальной API защищён.
-
-    🆕 FIX: нативный браузерный WebSocket API НЕ умеет выставлять кастомные заголовки —
-    Authorization на handshake он не отправляет, сколько бы креды ни были закэшированы
-    браузером для fetch(). Поэтому для websocket-scope дополнительно принимаем токен как
-    query-параметр (?auth=base64(user:pass), то же значение что было бы в Basic-заголовке) —
-    единственный канал, который реально контролируется JS на WS-соединении."""
+    даже когда весь остальной API защищён."""
 
     def __init__(self, app):
         self.app = app
@@ -101,17 +162,24 @@ class BasicAuthASGIMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
 
-        # 🆕 Защищаем только /api/* и /ws/* — статику фронта (index.html, JS/CSS-бандл)
+        # Защищаем только /api/* и /ws/* — статику фронта (index.html, JS/CSS-бандл)
         # отдаём свободно, иначе браузер покажет СВОЙ нативный Basic Auth попап поверх
         # нашего кастомного логин-экрана ещё до того, как React успеет отрендериться.
-        # В самой статике нет ничего чувствительного, только код — секьюрити boundary
-        # именно на API/WS, где реально читаются/меняются данные бота.
         path = scope.get("path", "")
         if not (path.startswith("/api/") or path.startswith("/ws/")):
             return await self.app(scope, receive, send)
 
         if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
             return await self.app(scope, receive, send)  # auth выключен — креды не заданы
+
+        ip = _get_client_ip(scope)
+        if _is_locked_out(ip):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 4429})
+                return
+            response = Response(content="Too many failed attempts, try again later", status_code=429)
+            await response(scope, receive, send)
+            return
 
         headers = dict(scope.get("headers") or [])
         auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
@@ -123,12 +191,15 @@ class BasicAuthASGIMiddleware:
         if not authorized and scope["type"] == "websocket":
             from urllib.parse import parse_qs
             qs = parse_qs(scope.get("query_string", b"").decode("utf-8", errors="ignore"))
-            token = (qs.get("auth") or [None])[0]
-            if token:
-                authorized = self._check_basic_value(token)
+            ticket = (qs.get("ticket") or [None])[0]
+            if ticket and _consume_ws_ticket(ticket):
+                authorized = True
 
         if authorized:
+            _record_success(ip)
             return await self.app(scope, receive, send)
+
+        _record_failed_attempt(ip)
 
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 4401})
@@ -179,6 +250,15 @@ async def ws_live(websocket: WebSocket):
 # =====================================================================
 # 📊  STATUS / PAIRS
 # =====================================================================
+@app.post("/api/ws-ticket")
+async def issue_ws_ticket():
+    """Короткоживущий (30 сек) одноразовый тикет для WS-хендшейка — см. комментарий
+    у _issue_ws_ticket() выше. Сам вызов защищён тем же Basic Auth middleware, что
+    и весь /api/*, так что тикет получит только тот, кто уже прошёл нормальную
+    авторизацию по заголовку."""
+    return {"ticket": _issue_ws_ticket()}
+
+
 @app.get("/api/status")
 async def get_status():
     result = {

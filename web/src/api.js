@@ -100,6 +100,16 @@ export const api = {
 /**
  * Хук-обёртка для /ws/live. Переподключается с бэкоффом,
  * зовёт onEvent для каждого JSON-события от бота (сигнал/тик сканера/смена конфига).
+ *
+ * 🆕 Раньше в URL WebSocket-подключения шёл сырой base64(login:password) —
+ * единственный способ передать креды на WS-хендшейк, так как браузерный
+ * WebSocket API не умеет кастомные заголовки. Проблема: всё, что в query-параметре
+ * URL, обычно попадает в access-логи сервера (и потенциально Cloudflare) открытым
+ * текстом — постоянный пароль, который живёт там вечно. Теперь вместо этого
+ * сначала получаем короткоживущий (30 сек) одноразовый тикет через обычный
+ * авторизованный fetch (креды — в заголовке, заголовки в access-логи не пишутся),
+ * и уже с этим тикетом открываем WS. Даже если тикет попадёт в логи — он
+ * бесполезен уже через полминуты или сразу после использования.
  */
 export function connectLive(onEvent, onStatusChange) {
   let ws = null
@@ -107,11 +117,28 @@ export function connectLive(onEvent, onStatusChange) {
   let attempt = 0
 
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const token = getAuthToken()
-  const url = `${proto}://${window.location.host}/ws/live${token ? `?auth=${encodeURIComponent(token)}` : ''}`
 
-  function connect() {
+  async function getTicket() {
+    const token = getAuthToken()
+    if (!token) return null
+    try {
+      const res = await fetch('/api/ws-ticket', {
+        method: 'POST',
+        headers: { Authorization: `Basic ${token}` },
+      })
+      if (!res.ok) return null
+      const data = await res.json()
+      return data.ticket
+    } catch (_) {
+      return null
+    }
+  }
+
+  async function connect() {
     if (closed) return
+    const ticket = await getTicket()
+    if (closed) return // на случай если logout произошёл, пока ждали тикет
+    const url = `${proto}://${window.location.host}/ws/live${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`
     ws = new WebSocket(url)
     ws.onopen = () => {
       attempt = 0
