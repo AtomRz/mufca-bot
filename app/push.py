@@ -93,17 +93,17 @@ def send_push(title: str, body: str, data: Optional[Dict[str, str]] = None) -> D
 
     from firebase_admin import messaging
 
+    # 🆕 FIX: намеренно НЕ используем notification+data гибрид. Гибридные сообщения
+    # при свёрнутом/убитом приложении показываются системой автоматически, минуя
+    # onMessageReceived() на Android — а значит без наших intent-экстра (ticker/tf),
+    # и тап по такому автосозданному уведомлению не мог бы открыть нужный сигнал на
+    # графике. Data-only гарантирует, что Android-клиент сам получает управление и
+    # сам строит уведомление с правильным deep-link — всегда, а не только когда
+    # приложение открыто на экране.
     message = messaging.MulticastMessage(
-        notification=messaging.Notification(title=title, body=body),
-        data={k: str(v) for k, v in (data or {}).items()},
+        data={"title": title, "body": body, **{k: str(v) for k, v in (data or {}).items()}},
         tokens=tokens,
-        android=messaging.AndroidConfig(
-            priority="high",
-            notification=messaging.AndroidNotification(
-                channel_id="mufca_signals",
-                sound="default",
-            ),
-        ),
+        android=messaging.AndroidConfig(priority="high"),
     )
 
     try:

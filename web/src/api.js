@@ -1,20 +1,23 @@
 const BASE = ''
 const AUTH_KEY = 'mufca_auth_token'
 
-// 🆕 Явное хранение auth-токена в sessionStorage вместо расчёта на то, что браузер
-// сам протащит закэшированный Basic Auth на все запросы. Он это делает для fetch(),
-// но НЕ делает для нативного WebSocket API (тот вообще не умеет кастомные заголовки) —
-// поэтому токен явно кладём и в заголовок fetch(), и в query-параметр WS-урла.
+// 🆕 localStorage вместо sessionStorage — токен переживает перезапуск WebView-процесса.
+// Это осознанный компромисс ради Android-приложения: WebView не гарантирует, что
+// sessionStorage доживёт до следующего холодного старта (Android может убить процесс
+// в фоне), значит без этого пришлось бы логиниться заново при каждом открытии
+// приложения. Для персонального дашборда за Basic Auth + Cloudflare Tunnel на своём же
+// телефоне это приемлемый риск (тот же trade-off, что у любого обычного мобильного
+// приложения с сохранённой сессией).
 export function getAuthToken() {
-  return sessionStorage.getItem(AUTH_KEY)
+  return localStorage.getItem(AUTH_KEY)
 }
 
 export function setAuthToken(token) {
-  sessionStorage.setItem(AUTH_KEY, token)
+  localStorage.setItem(AUTH_KEY, token)
 }
 
 export function clearAuthToken() {
-  sessionStorage.removeItem(AUTH_KEY)
+  localStorage.removeItem(AUTH_KEY)
 }
 
 /** Пробует залогиниться — делает реальный запрос к /api/config с этими кредами.

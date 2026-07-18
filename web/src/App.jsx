@@ -73,6 +73,20 @@ export default function App() {
     return disconnect
   }, [authenticated])
 
+  // 🆕 Глобальный хук для Android-приложения (WebView-обёртка): при тапе по
+  // push-уведомлению MainActivity.kt зовёт window.mufcaOpenSignal(ticker, tf, tab)
+  // через evaluateJavascript, чтобы сразу открыть нужный сигнал, а не просто
+  // развернуть дашборд на дефолтной вкладке. В обычном браузере эта функция просто
+  // никогда не вызывается — no-op, безопасно для веб-версии.
+  useEffect(() => {
+    window.mufcaOpenSignal = (ticker, tf, tabId) => {
+      if (tabId) setTab(tabId)
+      if (ticker) setChartTicker(ticker)
+      if (tf) setChartTf(tf)
+    }
+    return () => { delete window.mufcaOpenSignal }
+  }, [])
+
   if (!authenticated) {
     return <LoginScreen onSuccess={() => setAuthenticated(true)} />
   }
