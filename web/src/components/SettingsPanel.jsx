@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { api } from '../api'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
@@ -9,6 +9,59 @@ function Toggle({ checked, onChange, disabled }) {
       <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       <span className="switch-track" />
     </label>
+  )
+}
+
+// Проверяет всю цепочку Android push разом: сервер → Firebase → устройство,
+// вместо того чтобы ждать реального сигнала для проверки.
+function PushPanel({ busy, run }) {
+  const [devices, setDevices] = useState(null)
+  const [result, setResult] = useState(null)
+
+  useEffect(() => {
+    api.getDevices().then((d) => setDevices(Object.values(d.devices))).catch(() => {})
+  }, [])
+
+  const sendTest = () =>
+    run('test_push', () =>
+      api.testPush().then((r) => {
+        setResult(r)
+        return r
+      }),
+    )
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Android Push Notifications</h3>
+      <div className="row">
+        <span className="row-label">Registered devices</span>
+        <span className="row-value">{devices === null ? '…' : devices.length}</span>
+      </div>
+      {devices && devices.length > 0 && (
+        <div className="chip-row" style={{ marginTop: 8 }}>
+          {devices.map((d, i) => (
+            <span className="chip" key={i}>{d.device_name}</span>
+          ))}
+        </div>
+      )}
+      <button
+        className="btn"
+        style={{ marginTop: 12 }}
+        disabled={busy === 'test_push'}
+        onClick={sendTest}
+      >
+        {busy === 'test_push' ? 'Sending…' : 'Send test push'}
+      </button>
+      {result && (
+        <p style={{ fontSize: 12, marginTop: 10, color: result.skipped ? 'var(--short)' : 'var(--long)' }}>
+          {result.skipped === 'firebase_not_configured' &&
+            'Firebase not configured on the server — place firebase-credentials.json and set FIREBASE_CREDENTIALS_PATH in .env.'}
+          {result.skipped === 'no_devices_registered' &&
+            'No devices registered yet — open the Android app once to register this phone.'}
+          {!result.skipped && `Sent to ${result.sent} device(s)${result.failed ? `, ${result.failed} failed` : ''}.`}
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -226,6 +279,8 @@ export default function SettingsPanel({ config, onChanged }) {
               </button>
             </div>
           </div>
+
+          <PushPanel busy={busy} run={run} />
         </div>
 
         <div>
