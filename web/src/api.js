@@ -93,6 +93,8 @@ export const api = {
     ),
   getPulse: (ticker, tf = '1h') =>
     request(`/api/pulse?tf=${tf}${ticker ? `&ticker=${encodeURIComponent(ticker)}` : ''}`),
+  getDevices: () => request('/api/devices'),
+  testPush: () => request('/api/devices/test-push', { method: 'POST' }),
 }
 
 /**

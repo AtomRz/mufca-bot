@@ -228,6 +228,21 @@ async def list_devices():
     return {"devices": _cfg.load_devices()}
 
 
+@app.post("/api/devices/test-push")
+async def test_push():
+    """Шлёт тестовый push всем зарегистрированным устройствам — чтобы проверить
+    всю цепочку (Firebase credentials на сервере → FCM → устройство) без ожидания
+    реального сигнала. Если firebase-credentials.json не настроен на сервере,
+    вернёт skipped='firebase_not_configured', а не молча "успех"."""
+    result = await asyncio.to_thread(
+        _push.send_push,
+        title="MUFCA test push",
+        body="If you see this — the full pipeline works: backend → Firebase → your phone.",
+        data={"type": "test"},
+    )
+    return result
+
+
 @app.get("/api/pairs")
 async def get_pairs():
     return {"tickers": _cfg.TICKERS}
