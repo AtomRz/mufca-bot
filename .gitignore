@@ -1,5 +1,8 @@
 # Секреты — никогда не коммитить!
 .env
+firebase-credentials.json
+app/data/firebase-credentials.json
+*firebase-adminsdk*.json
 
 # Python
 __pycache__/
