@@ -8,9 +8,10 @@ MUFCA v4.0 — Multi-Timeframe Adaptive Trading Bot
 индикаторов — веб-морда читает те же bot.state и config, что видит сканер.
 
 🆕 Graceful shutdown: по SIGTERM (`docker stop`) или SIGINT (Ctrl+C) бот
-досохраняет signals_history.json на диск перед выходом, вместо того чтобы
-просто быть убитым и потерять несохранённый прогресс по MFE/MAE
-(см. update_signal_mae_mfe в state.py).
+досохраняет signals_history.json И снапшот активных позиций (bot_state_snapshot.json)
+на диск перед выходом — раньше при любом рестарте (в том числе обычном деплое
+новой версии) bot.state строился с нуля через make_state(), и все активные,
+ещё не закрытые позиции просто исчезали из Status/графика (см. state.save_bot_state).
 """
 
 import asyncio
@@ -46,10 +47,15 @@ async def _run_web_api():
 def _flush_state_to_disk():
     """Форсит сохранение всего, что накопилось в памяти, но ещё не долетело до диска."""
     try:
-        from state import load_signals_history, save_signals_history
+        from state import load_signals_history, save_signals_history, save_bot_state
+        import bot as _bot_module
+
         history = load_signals_history()  # это тот же закэшированный в памяти dict
         save_signals_history(history)     # принудительно пишет его на диск
         logger.info("[SHUTDOWN] signals_history.json flushed to disk")
+
+        save_bot_state(_bot_module.state)  # снапшот активных позиций — переживёт рестарт
+        logger.info("[SHUTDOWN] bot_state_snapshot.json flushed to disk")
     except Exception as e:
         logger.error(f"[SHUTDOWN] Failed to flush state: {e}", exc_info=True)
 

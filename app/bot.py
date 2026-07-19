@@ -23,7 +23,7 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv
 from signals import check_signals, backtest_history, make_state
 from onchain import get_onchain_bias
-from state import load_signals_history
+from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,25 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Глобальное состояние
-state = {ticker: {tf: make_state() for tf in TIMEFRAMES} for ticker in TICKERS}
+# 🆕 FIX: раньше state строился ТОЛЬКО через make_state() — свежий, пустой,
+# каждый запуск процесса. Signals_history.json (аудиторский журнал) переживал
+# рестарт, а вот сам факт "эта позиция ещё реально открыта, вот её TP/SL/tp1_hit"
+# жил только в памяти и терялся при каждом перезапуске контейнера (в том числе
+# при обычном деплое новой версии) — активные, ещё не закрытые сигналы просто
+# исчезали из Status/графика, хотя в signals_history.json так и оставались
+# висеть с exit_type="open" навсегда. Теперь восстанавливаем снапшот с диска;
+# make_state() используется только для тикеров/tf, которых в снапшоте нет
+# (новая пара, либо самый первый запуск).
+_saved_state = load_bot_state()
+state = {
+    ticker: {
+        tf: _saved_state.get(ticker, {}).get(tf) or make_state()
+        for tf in TIMEFRAMES
+    }
+    for ticker in TICKERS
+}
+if _saved_state:
+    logger.info("[STATE] Restored state snapshot from disk (bot_state_snapshot.json)")
 
 def _heal_state():
     """Исправляет рассинхрон флагов треков при старте."""
@@ -64,6 +81,7 @@ def _heal_state():
                 logger.warning(f"[HEAL] U-track desync fixed at startup: {ticker} {tf}")
 
 _heal_state()
+reconcile_orphaned_signals(state)
 scan_stats = {"total_scans": 0, "signals_generated": 0, "last_scan_time": None}
 
 # 🆕 FIX: Per-ticker/tf asyncio locks to prevent race conditions
@@ -405,6 +423,16 @@ async def market_scanner():
         await broadcast_event({"type": "scan_tick", "scan_stats": scan_stats})
     except Exception as ws_err:
         logger.warning(f"[WS] broadcast failed: {ws_err}")
+
+    # 🆕 Снапшот активных позиций на диск — раз в цикл сканирования (не на каждое
+    # событие: дёшево при таком размере state, но не нужно писать чаще). Это
+    # safety net на случай НЕ-graceful остановки (docker stop -t 0, OOM kill),
+    # когда SIGTERM-хендлер в main.py не успевает сработать — при обычном
+    # graceful restart снапшот и так пишется там же, дублирование безвредно.
+    try:
+        save_bot_state(state)
+    except Exception as snap_err:
+        logger.warning(f"[STATE] snapshot save failed: {snap_err}")
 
 # 🆕 FIX: CRITICAL - Task error handler to prevent silent death
 @market_scanner.error

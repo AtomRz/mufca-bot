@@ -8,11 +8,84 @@ import config as _cfg
 from config import (
     SIGNALS_HISTORY_FILE,
     SIGNAL_HISTORY_LIMIT,
+    BOT_STATE_FILE,
     safe_json_load,
     safe_json_save,
 )
 
 logger = logging.getLogger(__name__)
+
+# =====================================================================
+# 💾  СНАПШОТ ЖИВОГО СОСТОЯНИЯ (bot.state) — активные позиции переживают рестарт
+# =====================================================================
+def save_bot_state(state: Dict[str, Dict[str, dict]]):
+    """Пишет снапшот всего bot.state (ticker -> tf -> state dict) на диск.
+    Вызывается периодически (каждый скан) и на graceful shutdown (SIGTERM/SIGINT,
+    см. main.py), чтобы активные позиции (a_active_trade/u_active_trade — entry,
+    TP1/TP2, SL, tp1_hit) переживали рестарт контейнера, а не терялись как раньше.
+    signals_history.json — это отдельный аудиторский журнал, он и без этого
+    переживал рестарт; данный файл — именно "что бот сейчас реально отслеживает
+    как открытое"."""
+    try:
+        safe_json_save(BOT_STATE_FILE, state)
+    except Exception as e:
+        logger.error(f"[STATE] Failed to save state snapshot: {e}", exc_info=True)
+
+
+def load_bot_state() -> Dict[str, Dict[str, dict]]:
+    """Читает снапшот с диска. Пустой dict, если файла нет (первый запуск) или
+    он повреждён — в этом случае вызывающий код (bot.py) достроит state заново
+    через make_state() для отсутствующих ticker/tf, как и раньше."""
+    try:
+        return safe_json_load(BOT_STATE_FILE, {})
+    except Exception as e:
+        logger.error(f"[STATE] Failed to load state snapshot, starting fresh: {e}", exc_info=True)
+        return {}
+
+
+def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
+    """Помечает как 'cancelled' любые exit_type='open' записи в signals_history.json,
+    для которых нет соответствующего active_trade в переданном (восстановленном) state.
+
+    Зачем: до появления save_bot_state()/load_bot_state() каждый рестарт контейнера
+    полностью стирал bot.state (make_state() с нуля), но записи в signals_history.json
+    оставались висеть с exit_type="open" навсегда — бот больше их не отслеживал, TP/SL
+    для них никогда не проверялся, и они просто зависали "открытыми" без надежды на
+    честный exit_type. Тот же сценарий в принципе возможен и сейчас в узком окне (если
+    контейнер упадёт не-gracefully ровно между открытием сигнала и первым сохранением
+    снапшота) — поэтому это не разовая миграция, а постоянная проверка при каждом
+    старте. cancelled — честная маркировка "не знаем как закрылось", а не притворство,
+    что знаем реальный tp/sl-исход."""
+    history = load_signals_history()
+    changed = False
+
+    for ticker, tfs in history.items():
+        for tf, sides in tfs.items():
+            for side, records in sides.items():
+                for rec in records:
+                    if rec.get("exit_type") != "open":
+                        continue
+                    track = rec.get("track", "a")
+                    if track in ("sim",):
+                        continue  # синтетика !sim к живому bot.state не относится
+
+                    active = state.get(ticker, {}).get(tf, {}).get(f"{track}_active_trade")
+                    matches_active = (
+                        active is not None
+                        and active.get("side") == side
+                        and abs(float(active.get("entry", -1)) - float(rec.get("entry", -2))) < 1e-9
+                    )
+                    if not matches_active:
+                        rec["exit_type"] = "cancelled"
+                        rec["exit"] = None
+                        changed = True
+                        logger.warning(
+                            f"[RECONCILE] Orphaned open signal marked cancelled: "
+                            f"{ticker} {tf} {side} track={track} entry={rec.get('entry')}"
+                        )
+
+    if changed:
+        save_signals_history(history)
 
 # =====================================================================
 # 💾  УПРАВЛЕНИЕ ИСТОРИЕЙ СИГНАЛОВ

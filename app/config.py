@@ -324,3 +324,9 @@ MARKET_MODE = load_mode()
 # 📊  ФАЙЛЫ ИСТОРИИ
 # =====================================================================
 SIGNALS_HISTORY_FILE = os.path.join(DATA_DIR, "signals_history.json")
+
+# 🆕 Снапшот bot.state (активные позиции a_active_trade/u_active_trade и т.п.) —
+# отдельно от signals_history.json. История сигналов и раньше переживала рестарт,
+# а вот сам факт "эта позиция ещё открыта, вот её TP/SL/tp1_hit" жил только в
+# памяти процесса и терялся при каждом перезапуске контейнера. См. state.py.
+BOT_STATE_FILE = os.path.join(DATA_DIR, "bot_state_snapshot.json")
