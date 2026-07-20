@@ -146,6 +146,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       priceScaleId: 'volume',
       priceFormat: { type: 'volume' },
       color: '#232c3a',
+      priceLineVisible: false,
+      lastValueVisible: false,
     })
     // 🆕 volume и mfi делят одну и ту же зону шкалы (merged pane) — объём фоном,
     // MFI-линия поверх, вместо двух раздельных полос друг под другом
