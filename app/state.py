@@ -125,7 +125,7 @@ def _ensure_history_slot(history: Dict, ticker: str, tf: str):
         history[ticker][tf] = {"long": [], "short": []}
 
 
-def _normalize_timestamp(timestamp) -> str:
+def normalize_timestamp(timestamp) -> str:
     """Унифицирует timestamp в ISO формат."""
     if isinstance(timestamp, datetime):
         return timestamp.isoformat()
@@ -167,7 +167,7 @@ def add_signal_record(
         "exit_type": "open",
         "bars_held": 0,
         "moved_pct": 0.0,
-        "timestamp": _normalize_timestamp(timestamp),
+        "timestamp": normalize_timestamp(timestamp),
         "max_favorable_pct": 0.0,
         "max_adverse_pct": 0.0,
         "regime": regime,

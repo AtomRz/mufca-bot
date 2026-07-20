@@ -24,7 +24,15 @@ function fmtPct(v) {
 function fmtDate(ts) {
   if (!ts) return '—'
   try {
-    return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    // 🆕 FIX: записи бэктеста до этого фикса хранили timestamp как строку цифр
+    // ("1721260800000" — эпоха в мс), а не ISO. new Date("1721260800000")
+    // парсит СТРОКУ как формат даты (не как число), не распознаёт такой паттерн
+    // и даёт Invalid Date. new Date(1721260800000) с тем же значением как Number
+    // работает правильно — поэтому явно приводим чисто-числовые строки к Number.
+    const value = typeof ts === 'string' && /^\d+$/.test(ts) ? Number(ts) : ts
+    const d = new Date(value)
+    if (isNaN(d.getTime())) return ts
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   } catch (_) {
     return ts
   }

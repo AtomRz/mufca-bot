@@ -55,6 +55,7 @@ from state import (
     update_signal_mae_mfe,
     get_signal_stats,
     calculate_combined_tp,
+    normalize_timestamp,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer
 from config import ONCHAIN_ENABLED
@@ -1086,7 +1087,7 @@ def backtest_history(
                     "exit_type": exit_type,
                     "bars_held": bars_held,
                     "moved_pct": round(moved_pct, 4),
-                    "timestamp": str(int(df["timestamp"].iloc[idx])),
+                    "timestamp": normalize_timestamp(int(df["timestamp"].iloc[idx])),
                     "max_favorable_pct": round(max_favorable, 4),
                     "max_adverse_pct": round(max_adverse, 4),
                     "regime": bt_regime,
