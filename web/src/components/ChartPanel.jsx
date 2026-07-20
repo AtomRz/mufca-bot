@@ -214,8 +214,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     s.volume.setData(
       data.candles.map((c) => ({
         time: c.time,
-        value: c.volume,
-        color: c.close >= c.open ? hexToRgba(C.candle_up, 0.25) : hexToRgba(C.candle_down, 0.25),
+        value: c.close >= c.open ? c.volume : -c.volume,
+        color: c.close >= c.open ? hexToRgba(C.candle_up, 0.65) : hexToRgba(C.candle_down, 0.65),
       })),
     )
     s.mfi.setData(toLineData(times, data.mfi))
@@ -352,7 +352,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>
-        <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />Volume (bg)</span>
+        <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />Delta Volume</span>
         <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
         <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />MFI overbought</span>
         <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>
