@@ -103,7 +103,17 @@ async def get_chart_data(
             try:
                 ts_arr = df["timestamp"].values
                 closest_i = int(np.argmin(np.abs(ts_arr - float(bar_opened_time_ms))))
-                signal_bar_time = int(df["timestamp"].iloc[closest_i] // 1000)
+                # 🆕 FIX: если сделка открылась раньше видимого на графике диапазона
+                # (например limit=150 баров, а вход был 300 баров назад), argmin всё
+                # равно найдёт "ближайший" бар — обычно самый первый на графике,
+                # что рисует маркер в заведомо неверном месте. Проверяем реальную
+                # близость по времени (в пределах 1.5 интервала бара); если сделка
+                # реально за пределами видимого окна — не рисуем маркер вообще,
+                # вместо того чтобы врать о его местоположении.
+                bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0
+                actual_diff = abs(ts_arr[closest_i] - float(bar_opened_time_ms))
+                if bar_interval_ms <= 0 or actual_diff <= bar_interval_ms * 1.5:
+                    signal_bar_time = int(df["timestamp"].iloc[closest_i] // 1000)
             except Exception as e:
                 logger.warning(f"[CHART_DATA] Failed to resolve bar_opened_time: {e}")
 

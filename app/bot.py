@@ -157,10 +157,19 @@ async def startup_sequence(exchange: ccxt.Exchange):
             if already_populated:
                 logger.info(f"[STARTUP] {ticker} {tf} already has signal history — skipping backtest (use `!reset yes` to force re-run).")
                 continue
-            count = await asyncio.to_thread(
-                backtest_history, exchange, ticker, tf, 3000
-            )
-            total += count
+            # 🆕 FIX: раньше исключение здесь (например сетевой сбой при фетче
+            # исторических баров для ОДНОЙ пары) прерывало всю функцию — и
+            # market_scanner.start() в конце никогда не вызывался. Бот оставался
+            # "живым" в Discord, но реально не сканировал НИЧЕГО, без единой
+            # ошибки в логах кроме отложенного и легко пропускаемого asyncio
+            # warning'а. Теперь сбой одной пары не топит бэктест остальных.
+            try:
+                count = await asyncio.to_thread(
+                    backtest_history, exchange, ticker, tf, 3000
+                )
+                total += count
+            except Exception as e:
+                logger.error(f"[STARTUP] Backtest failed for {ticker} {tf}: {e}", exc_info=True)
             await asyncio.sleep(0.5)
 
     logger.info("=" * 60)
@@ -336,16 +345,23 @@ async def market_scanner():
                                 try:
                                     exit_dt = datetime.fromisoformat(last["exit_time"])
                                     age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
-                                    if age < 35:
-                                        emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
-                                        track_label = "A" if track == "a" else "U"
-                                        await channel.send(
-                                            f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                            f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
-                                            f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
-                                        )
-                                        notified_ids.add(trade_id)
-                                        _save_closure_notified(notified_ids)
+                                    emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
+                                    track_label = "A" if track == "a" else "U"
+                                    # 🆕 FIX: раньше st[notified_key] = True выставлялся ПОСЛЕ if age < 35
+                                    # блока безусловно — если бот обнаруживал закрытие спустя 35+ секунд
+                                    # (например, был недоступен/рестартовал ровно в момент TP/SL), сообщение
+                                    # в Discord тихо не отправлялось, но помечалось как "уже уведомлено"
+                                    # навсегда. Реальная сделка закрылась, а пользователь никогда об этом
+                                    # не узнавал. Теперь отправляем в любом случае, помечая опоздание явно.
+                                    late_note = "" if age < 35 else " ⏱️ *(delayed notification)*"
+                                    await channel.send(
+                                        f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                        f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                        f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                                        f"{late_note}"
+                                    )
+                                    notified_ids.add(trade_id)
+                                    _save_closure_notified(notified_ids)
                                     st[notified_key] = True
                                 except ValueError:
                                     logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")

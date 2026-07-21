@@ -29,7 +29,11 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     is_long = "BUY" in signal_type or "LONG" in signal_type
     is_a_track = "Andean" in signal_type or "A " in signal_type
     is_u_track = "UT Bot" in signal_type or "U " in signal_type
-    coin_emoji = "🟡" if "BTC" in ticker else "🔷" if "ETH" in ticker else "🟣"
+    _COIN_EMOJI = {
+        "BTC": "🟡", "ETH": "🔷", "SOL": "🟢", "XRP": "⚪",
+        "DOGE": "🐕", "BNB": "🟨", "ADA": "🔵", "AVAX": "🔺",
+    }
+    coin_emoji = next((e for sym, e in _COIN_EMOJI.items() if sym in ticker), "🟣")
     track_emoji = "🔵" if is_a_track else "🟢" if is_u_track else "⚪"
     conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label = "Spot" if _cfg.MARKET_MODE == "spot" else "Futures"

@@ -619,7 +619,7 @@ async def open_position(
         # 🆕 FIX: передаём track, чтобы записи A- и U-трека не путались в истории
         add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
 
-    stats = get_signal_stats(ticker, timeframe, side)
+    stats = get_signal_stats(ticker, timeframe, side, regime)
     conf = calc_confidence(side == "long")
 
     return (signal_label, close_v, regime, lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
@@ -1030,7 +1030,13 @@ def backtest_history(
                 sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx)
                 risk_fixed = abs(close_v - sl)
                 tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime)
-                tp = tp1  # бэктест: статистический TP без RR-cap
+                # 🆕 FIX: раньше бэктест проверял tp_hit против tp1 (статистический,
+                # без RR-cap), а live-торговля реально выходит по tp2 (тот же
+                # calculate_combined_tp, но с RR-cap) — см. open_position(), tp = tp2.
+                # Из-за этого статистика (win-rate/MFE/MAE), на которой калибруется
+                # calculate_combined_tp для БУДУЩИХ сигналов, обучалась на другом
+                # критерии выхода, чем реально торгует live. Теперь оба пути совпадают.
+                tp = tp2
 
                 tp_hit = sl_hit = False
                 max_favorable = max_adverse = 0.0

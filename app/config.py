@@ -63,7 +63,15 @@ def safe_json_load(filename: str, default: dict = None) -> dict:
         try:
             with open(filename, "r") as f:
                 return json.load(f)
-        except Exception:
+        except FileNotFoundError:
+            return default  # нормальный сценарий — первый запуск, файла ещё нет
+        except Exception as e:
+            # 🆕 FIX: раньше ЛЮБАЯ ошибка (битый JSON, нет прав на чтение, диск
+            # недоступен) молча проглатывалась и возвращала default — то же самое
+            # поведение, что и для честного "файла ещё нет". Разница в том, что
+            # первое — это реальная потеря/недоступность данных, о которой стоит
+            # знать, а не тихо продолжать с пустым конфигом.
+            logger.error(f"[CONFIG] Failed to load {filename}, using default: {e}")
             return default
 
 def safe_json_save(filename: str, data: dict):

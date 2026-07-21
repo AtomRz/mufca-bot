@@ -1,4 +1,5 @@
 import json
+import threading
 import numpy as np
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone
@@ -92,29 +93,41 @@ def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
 # =====================================================================
 
 _history_cache: Optional[Dict] = None
+# 🆕 FIX: backtest_history выполняется в отдельном потоке (через asyncio.to_thread),
+# одновременно с основным event loop (market_scanner). Оба читают/пишут этот же
+# глобальный кэш без синхронизации — threading.Lock (не asyncio.Lock, нужна
+# защита между РЕАЛЬНЫМИ потоками ОС, не только корутинами) закрывает основной
+# риск: неатомарное "проверить-и-создать"/"переприсвоить-и-сохранить".
+# Полностью узкий сценарий (clear_history_cache() ровно во время работающего в
+# фоне backtest) всё ещё возможен, но требует редкого стечения обстоятельств
+# (одновременный !reset и фоновый backtest) — не защищаемся от него отдельно,
+# несоразмерно усложнять ради личного бота с редкими add/reset.
+_history_lock = threading.Lock()
 
 
 def clear_history_cache():
     """Сбрасывает кэш истории сигналов — вызывать при удалении файла истории."""
     global _history_cache
-    _history_cache = None
+    with _history_lock:
+        _history_cache = None
 
 
 def load_signals_history() -> Dict:
     """Загружает историю сигналов из файла."""
     global _history_cache
-    if _history_cache is not None:
+    with _history_lock:
+        if _history_cache is not None:
+            return _history_cache
+        _history_cache = safe_json_load(SIGNALS_HISTORY_FILE, {})
         return _history_cache
-
-    _history_cache = safe_json_load(SIGNALS_HISTORY_FILE, {})
-    return _history_cache
 
 
 def save_signals_history(history: Dict):
     """Сохраняет историю сигналов в файл."""
     global _history_cache
-    _history_cache = history
-    safe_json_save(SIGNALS_HISTORY_FILE, history)
+    with _history_lock:
+        _history_cache = history
+        safe_json_save(SIGNALS_HISTORY_FILE, history)
 
 
 def _ensure_history_slot(history: Dict, ticker: str, tf: str):

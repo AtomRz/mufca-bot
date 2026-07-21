@@ -499,7 +499,17 @@ async def generate_chart(
             try:
                 ts_arr = df["timestamp"].values
                 closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
-                signal_bar_offset = closest_i - len(df)  # смещение от конца, всегда <= -1
+                # Если реальный вход раньше видимого окна графика (limit баров),
+                # argmin всё равно найдёт "ближайший" — обычно первый бар графика,
+                # рисуя маркер в заведомо неверном месте. Проверяем допуск (1.5
+                # интервала бара); если не попадает — используем дефолтный offset
+                # (-2, последний закрытый бар) вместо ложного местоположения.
+                bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0
+                actual_diff = abs(ts_arr[closest_i] - float(entry_time_ms))
+                if bar_interval_ms > 0 and actual_diff > bar_interval_ms * 1.5:
+                    signal_bar_offset = -2
+                else:
+                    signal_bar_offset = closest_i - len(df)  # смещение от конца, всегда <= -1
             except Exception as e:
                 logger.warning(f"[CHART] Failed to resolve entry_time_ms to bar index: {e}")
                 signal_bar_offset = -2

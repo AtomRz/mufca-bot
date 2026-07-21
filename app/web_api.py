@@ -339,12 +339,31 @@ async def add_pair(body: PairIn):
         raise HTTPException(400, "Формат тикера: BASE/QUOTE, например DOGE/USDT")
     if ticker in _cfg.TICKERS:
         raise HTTPException(409, f"{ticker} уже отслеживается")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
+
     _cfg.TICKERS.append(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
     core.state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
     async with core._tickers_lock:
         core._ensure_locks()
-    return {"tickers": _cfg.TICKERS}
+
+    # 🆕 FIX: раньше пара, добавленная через веб, оставалась с пустой историей —
+    # в отличие от Discord !add, который сразу гоняет backtest_history. Пустая
+    # история значит calculate_combined_tp работает в fallback-режиме (fixed R:R)
+    # до накопления реальных сигналов, что заметно хуже адаптивного TP/SL.
+    from signals import backtest_history
+    total = 0
+    for tf in TIMEFRAMES:
+        try:
+            count = await asyncio.to_thread(backtest_history, exchange, ticker, tf, 3000)
+            total += count
+        except Exception as e:
+            logger.error(f"[API] Backtest failed for {ticker} {tf}: {e}", exc_info=True)
+
+    return {"tickers": _cfg.TICKERS, "backtest_signals": total}
 
 
 @app.delete("/api/pairs/{ticker:path}")
@@ -354,6 +373,12 @@ async def remove_pair(ticker: str):
         raise HTTPException(404, f"{ticker} не отслеживается")
     _cfg.TICKERS.remove(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
+    # 🆕 FIX: раньше тикер убирался из _cfg.TICKERS, но оставался в core.state и
+    # core._state_locks — не крашится (сканер итерирует по TICKERS, не по state),
+    # но осиротевшая запись висит в памяти навсегда и раздувает
+    # bot_state_snapshot.json. Чистим сразу.
+    core.state.pop(ticker, None)
+    core._state_locks.pop(ticker, None)
     return {"tickers": _cfg.TICKERS}
 
 

@@ -93,32 +93,46 @@ def send_push(title: str, body: str, data: Optional[Dict[str, str]] = None) -> D
 
     from firebase_admin import messaging
 
-    # 🆕 FIX: намеренно НЕ используем notification+data гибрид. Гибридные сообщения
-    # при свёрнутом/убитом приложении показываются системой автоматически, минуя
-    # onMessageReceived() на Android — а значит без наших intent-экстра (ticker/tf),
-    # и тап по такому автосозданному уведомлению не мог бы открыть нужный сигнал на
-    # графике. Data-only гарантирует, что Android-клиент сам получает управление и
-    # сам строит уведомление с правильным deep-link — всегда, а не только когда
-    # приложение открыто на экране.
-    message = messaging.MulticastMessage(
-        data={"title": title, "body": body, **{k: str(v) for k, v in (data or {}).items()}},
-        tokens=tokens,
-        android=messaging.AndroidConfig(priority="high"),
-    )
-
-    try:
-        response = messaging.send_each_for_multicast(message)
-    except Exception as e:
-        logger.error(f"[PUSH] Ошибка отправки: {e}", exc_info=True)
-        return {"sent": 0, "failed": len(tokens), "error": str(e)}
-
-    # Чистим протухшие токены (устройство отписалось / удалило приложение)
+    # 🆕 FIX: FCM ограничивает MulticastMessage 500 токенами за один запрос —
+    # без батчинга отправка упала бы целиком при >500 зарегистрированных
+    # устройств. Для личного использования это чисто защитный запас на будущее.
+    _FCM_BATCH_SIZE = 500
+    total_sent = 0
+    total_failed = 0
     stale_tokens: List[str] = []
-    for idx, result in enumerate(response.responses):
-        if not result.success:
-            err = getattr(result.exception, "code", "") or str(result.exception)
-            if "UNREGISTERED" in str(err) or "invalid-registration-token" in str(err).lower():
-                stale_tokens.append(tokens[idx])
+
+    for batch_start in range(0, len(tokens), _FCM_BATCH_SIZE):
+        batch = tokens[batch_start:batch_start + _FCM_BATCH_SIZE]
+
+        # 🆕 FIX: намеренно НЕ используем notification+data гибрид. Гибридные сообщения
+        # при свёрнутом/убитом приложении показываются системой автоматически, минуя
+        # onMessageReceived() на Android — а значит без наших intent-экстра (ticker/tf),
+        # и тап по такому автосозданному уведомлению не мог бы открыть нужный сигнал на
+        # графике. Data-only гарантирует, что Android-клиент сам получает управление и
+        # сам строит уведомление с правильным deep-link — всегда, а не только когда
+        # приложение открыто на экране.
+        message = messaging.MulticastMessage(
+            data={"title": title, "body": body, **{k: str(v) for k, v in (data or {}).items()}},
+            tokens=batch,
+            android=messaging.AndroidConfig(priority="high"),
+        )
+
+        try:
+            response = messaging.send_each_for_multicast(message)
+        except Exception as e:
+            logger.error(f"[PUSH] Ошибка отправки батча: {e}", exc_info=True)
+            total_failed += len(batch)
+            continue
+
+        total_sent += response.success_count
+        total_failed += response.failure_count
+
+        # Чистим протухшие токены (устройство отписалось / удалило приложение)
+        for idx, result in enumerate(response.responses):
+            if not result.success:
+                err = getattr(result.exception, "code", "") or str(result.exception)
+                if "UNREGISTERED" in str(err) or "invalid-registration-token" in str(err).lower():
+                    stale_tokens.append(batch[idx])
 
     if stale_tokens:
         devices = _cfg.load_devices()
@@ -127,5 +141,5 @@ def send_push(title: str, body: str, data: Optional[Dict[str, str]] = None) -> D
         _cfg.save_devices(devices)
         logger.info(f"[PUSH] Убрал {len(stale_tokens)} протухших токенов")
 
-    logger.info(f"[PUSH] Отправлено: {response.success_count}/{len(tokens)} | title={title!r}")
-    return {"sent": response.success_count, "failed": response.failure_count}
+    logger.info(f"[PUSH] Отправлено: {total_sent}/{len(tokens)} | title={title!r}")
+    return {"sent": total_sent, "failed": total_failed}
