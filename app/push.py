@@ -53,10 +53,39 @@ def _get_firebase_app():
 
 
 def register_device(token: str, device_name: Optional[str] = None) -> dict:
-    """Регистрирует/обновляет FCM-токен устройства. Вызывается из /api/devices/register."""
+    """
+    Регистрирует/обновляет FCM-токен устройства. Вызывается из /api/devices/register —
+    как при первой настройке приложения, так и при каждой ротации токена (onNewToken
+    на Android-стороне), которая может произойти в любой момент независимо от
+    переустановки приложения.
+
+    🆕 FIX: раньше запись добавлялась по ключу `token`, поэтому при ротации токена
+    (или переустановке на то же устройство) старая запись с прежним токеном не
+    удалялась — она "протухала" только после того, как send_push реально получал
+    от FCM UNREGISTERED, что могло не происходить долго. В итоге в списке
+    накапливались дубликаты одного и того же физического устройства ("Xiaomi ... "
+    x2), и часть пушей уходила на мёртвый токен как "failed". Теперь при регистрации
+    сначала убираем все существующие записи с тем же device_name (кроме самого
+    нового токена, если он уже был знаком) — для персонального использования
+    device_name достаточно надёжен как идентификатор физического устройства.
+    """
     devices = _cfg.load_devices()
+    resolved_name = device_name or "Android device"
+
+    stale_tokens = [
+        t for t, info in devices.items()
+        if t != token and info.get("device_name") == resolved_name
+    ]
+    for t in stale_tokens:
+        devices.pop(t, None)
+    if stale_tokens:
+        logger.info(
+            f"[PUSH] Убрал {len(stale_tokens)} устаревших записей устройства "
+            f"'{resolved_name}' (новый токен той же ротации)"
+        )
+
     devices[token] = {
-        "device_name": device_name or "Android device",
+        "device_name": resolved_name,
         "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     _cfg.save_devices(devices)
