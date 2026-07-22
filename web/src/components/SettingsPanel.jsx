@@ -67,6 +67,7 @@ function PushPanel({ busy, run }) {
 
 // Numeric field, saved on blur — shared pattern for every indicator parameter
 function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, onSave }) {
+  const [warn, setWarn] = useState(null)
   return (
     <div className="field">
       <label>{label}{hint ? ` (${hint})` : ''}</label>
@@ -79,9 +80,20 @@ function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, on
         disabled={busy === busyKey}
         onBlur={(e) => {
           const v = step === 1 ? parseInt(e.target.value, 10) : parseFloat(e.target.value)
-          if (!Number.isNaN(v) && v !== value) onSave(v)
+          if (Number.isNaN(v)) return
+          // 🆕 FIX: клиентская проверка диапазона — сервер валидирует то же самое
+          // (это не единственная защита), но лучше сказать пользователю сразу,
+          // а не заставлять ждать round-trip к серверу ради очевидной ошибки
+          if (v < min || v > max) {
+            setWarn(`Must be between ${min} and ${max}`)
+            e.target.value = value
+            return
+          }
+          setWarn(null)
+          if (v !== value) onSave(v)
         }}
       />
+      {warn && <p style={{ fontSize: 11, color: 'var(--short)', margin: '4px 0 0' }}>{warn}</p>}
     </div>
   )
 }
@@ -110,6 +122,14 @@ export default function SettingsPanel({ config, onChanged }) {
   const [error, setError] = useState(null)
   const [newPair, setNewPair] = useState('')
   const [chopDraft, setChopDraft] = useState({})
+
+  // 🆕 FIX: если config обновился ИЗВНЕ (WS-событие config_changed от другого
+  // клиента — например Android-приложение поменяло CHOP, пока открыт веб), любой
+  // несохранённый локальный черновик становится враньём — показывает то, что
+  // пользователь когда-то начал печатать, а не актуальное значение с сервера.
+  useEffect(() => {
+    setChopDraft({})
+  }, [config])
 
   if (!config) return <div className="empty-state">Loading…</div>
 

@@ -115,6 +115,7 @@ export function connectLive(onEvent, onStatusChange) {
   let ws = null
   let closed = false
   let attempt = 0
+  let timeoutId = null // 🆕 отслеживаем, чтобы чистить при повторных onclose/cleanup
 
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
 
@@ -154,7 +155,8 @@ export function connectLive(onEvent, onStatusChange) {
       if (closed) return
       attempt += 1
       const delay = Math.min(1000 * 2 ** attempt, 15000)
-      setTimeout(connect, delay)
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(connect, delay)
     }
     ws.onerror = () => ws.close()
   }
@@ -163,6 +165,7 @@ export function connectLive(onEvent, onStatusChange) {
 
   return () => {
     closed = true
+    clearTimeout(timeoutId)
     ws?.close()
   }
 }

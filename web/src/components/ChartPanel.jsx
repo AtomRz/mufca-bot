@@ -46,18 +46,34 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const [barsLimit, setBarsLimit] = useState(200)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const requestIdRef = useRef(0) // 🆕 для игнорирования устаревших ответов (race condition fix)
 
   const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
 
   const load = useCallback(() => {
     if (!ticker) return
+    // 🆕 FIX: при быстром переключении пар (BTC→ETH→SOL) несколько запросов летят
+    // почти одновременно; из-за сетевой изменчивости более РАННИЙ запрос (например
+    // BTC) мог ответить ПОЗЖЕ более позднего (SOL) — .then() из BTC переписал бы
+    // уже показанные корректные данные SOL на устаревшие BTC. Помечаем каждый
+    // запрос номером и применяем только самый свежий.
+    const myRequestId = ++requestIdRef.current
+    setLoading(true)
     api
       .getChart(ticker, tf, track, barsLimit)
       .then((d) => {
+        if (myRequestId !== requestIdRef.current) return // устарел, игнорируем
         setData(d)
         setError(null)
       })
-      .catch((e) => setError(e.message))
+      .catch((e) => {
+        if (myRequestId !== requestIdRef.current) return
+        setError(e.message)
+      })
+      .finally(() => {
+        if (myRequestId === requestIdRef.current) setLoading(false)
+      })
   }, [ticker, tf, track, barsLimit])
 
   useEffect(() => {
@@ -174,6 +190,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       window.removeEventListener('resize', handleResize)
       chart.remove()
       chartRef.current = null
+      seriesRef.current = {}
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -346,6 +363,11 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+      {loading && !error && (
+        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8, fontFamily: 'var(--font-mono)' }}>
+          Loading…
+        </div>
+      )}
 
       <div className="chart-legend">
         <span><span className="legend-dot" style={{ background: C.frama }} />FRAMA</span>
