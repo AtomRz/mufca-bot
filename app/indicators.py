@@ -30,8 +30,8 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     with np.errstate(divide="ignore", invalid="ignore"):
         chop = 100 * np.log10(atr_sum / (range_ + 1e-12)) / np.log10(length)
     # При atr_sum == 0 log10(0) = -inf → заменяем на 0 (совсем не choppy)
-    chop = np.where(np.isfinite(chop), chop, 0.0)
-    return np.clip(chop, 0, 100)
+    chop = pd.Series(np.where(np.isfinite(chop), chop, 0.0), index=df.index)
+    return chop.clip(0, 100)
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """Fractal Adaptive Moving Average."""
