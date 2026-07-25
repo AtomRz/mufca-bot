@@ -25,6 +25,7 @@ export default function App() {
   const [pulse, setPulse] = useState(null)
   const [chartTicker, setChartTicker] = useState(null)
   const [chartTf, setChartTf] = useState('1h')
+  const [chartLoading, setChartLoading] = useState(false)
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
@@ -124,6 +125,7 @@ export default function App() {
           </span>
         )}
         <div className="spacer" />
+        {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>loading…</span>}
         <span className="conn-label">
           {connStatus === 'connected' ? 'live' : connStatus}
         </span>
@@ -172,6 +174,7 @@ export default function App() {
             tf={chartTf}
             onTickerChange={setChartTicker}
             onTfChange={setChartTf}
+            onLoadingChange={setChartLoading}
           />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}

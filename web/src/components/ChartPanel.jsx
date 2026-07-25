@@ -37,7 +37,7 @@ function toLineData(times, values) {
   return out
 }
 
-export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTickerChange, onTfChange }) {
+export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTickerChange, onTfChange, onLoadingChange }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
@@ -46,7 +46,6 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const [barsLimit, setBarsLimit] = useState(200)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
-  const [loading, setLoading] = useState(false)
   const requestIdRef = useRef(0) // 🆕 для игнорирования устаревших ответов (race condition fix)
 
   const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
@@ -59,7 +58,10 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // уже показанные корректные данные SOL на устаревшие BTC. Помечаем каждый
     // запрос номером и применяем только самый свежий.
     const myRequestId = ++requestIdRef.current
-    setLoading(true)
+    // 🆕 FIX: индикатор загрузки теперь живёт в топ-баре (рядом с LIVE), а не
+    // отдельным блоком прямо тут — раньше он вставлялся/убирался в потоке
+    // документа над графиком и на каждое обновление сдвигал сам график вверх-вниз.
+    onLoadingChange?.(true)
     api
       .getChart(ticker, tf, track, barsLimit)
       .then((d) => {
@@ -72,12 +74,14 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         setError(e.message)
       })
       .finally(() => {
-        if (myRequestId === requestIdRef.current) setLoading(false)
+        if (myRequestId === requestIdRef.current) onLoadingChange?.(false)
       })
-  }, [ticker, tf, track, barsLimit])
+  }, [ticker, tf, track, barsLimit, onLoadingChange])
 
   useEffect(() => {
     load()
+    return () => onLoadingChange?.(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load])
 
   // тик сканера / новый сигнал по этой же паре/тф — подтягиваем свежие данные
@@ -363,11 +367,6 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       </div>
 
       {error && <div className="error-banner">{error}</div>}
-      {loading && !error && (
-        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8, fontFamily: 'var(--font-mono)' }}>
-          Loading…
-        </div>
-      )}
 
       <div className="chart-legend">
         <span><span className="legend-dot" style={{ background: C.frama }} />FRAMA</span>
