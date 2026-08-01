@@ -31,9 +31,12 @@ html,
 body,
 #root {
   height: 100%;
+  height: 100dvh; /* fallback выше — если dvh не поддерживается, останется 100% */
   margin: 0;
   /* Топбар на мобильных шире вьюпорта (много бейджей в ряд) — без этого
-     весь документ можно свайпом утащить влево вместе с графиком и вкладками. */
+     весь документ можно свайпом утащить влево вместе с графиком и вкладками.
+     Держим и на .app тоже: .topbar — сосед .content, а не его потомок,
+     поэтому overflow-x:hidden только на .content топбар не сдержит. */
   overflow-x: hidden;
   max-width: 100vw;
 }
@@ -174,7 +177,10 @@ input {
 
 .content {
   flex: 1;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
   padding: 20px;
 }
 
