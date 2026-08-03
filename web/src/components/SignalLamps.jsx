@@ -37,7 +37,7 @@ export default function SignalLamps({ lamps }) {
   if (!lamps) return null
 
   return (
-    <div className="signal-lamps" title="Сигналы и фильтры для выбранной на вкладке Chart пары/tf">
+    <div className="signal-lamps" title="Signals and filters for the pair/tf selected on the Chart tab">
       {Object.keys(SIGNAL_LABELS).map((key) => (
         <SignalDot key={key} label={SIGNAL_LABELS[key]} state={lamps[key]?.state} />
       ))}
@@ -64,19 +64,19 @@ function FilterDot({ label, filter, candidateDir }) {
   if (!filter) return null
 
   let color = 'var(--text-dim)'
-  let title = `${label}: нет чёткого направления сигнала`
+  let title = `${label}: no clear signal direction yet`
 
   if (!filter.enabled) {
     color = 'var(--text-dim)'
-    title = `${label}: фильтр выключен в настройках`
+    title = `${label}: filter disabled in settings`
   } else if (candidateDir) {
     const pass = candidateDir === 'long' ? filter.pass_long : filter.pass_short
     color = pass ? 'var(--long)' : 'var(--short)'
-    title = `${label}: ${pass ? 'пропускает' : 'блокирует'} ${candidateDir === 'long' ? 'long' : 'short'}`
+    title = `${label}: ${pass ? 'allows' : 'blocks'} ${candidateDir === 'long' ? 'long' : 'short'}`
   }
 
   if (filter.value !== undefined) {
-    title += ` (${filter.value}${filter.threshold !== undefined ? ` / порог ${filter.threshold}` : ''})`
+    title += ` (${filter.value}${filter.threshold !== undefined ? ` / threshold ${filter.threshold}` : ''})`
   }
 
   return (
