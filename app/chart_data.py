@@ -12,9 +12,38 @@ import numpy as np
 import pandas as pd
 
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
-from indicators import calculate_frama, calculate_mfi, run_kmeans_mfi, calculate_chop, calculate_atr
+from indicators import (
+    calculate_frama,
+    calculate_mfi,
+    calculate_andean,
+    calculate_ut_bot,
+    run_kmeans_mfi,
+    calculate_chop,
+    calculate_atr,
+)
 from chart import calc_bollinger_bands, calc_support_resistance
+# 🆕 Лампочки сигналов/фильтров в топ-баре: те же crossover/bars_since хелперы
+# и get_htf_bias, что использует signals.check_signals — переиспользуем 1-в-1,
+# чтобы лампочки на UI ТОЧНО совпадали с логикой, которая реально решает,
+# откроется сделка или нет (никакой отдельной "своей" копии условий).
+from signals import (
+    crossover,
+    crossunder,
+    crossover2,
+    crossunder2,
+    bars_since_crossover,
+    bars_since_crossunder,
+    bars_since_crossover2,
+    bars_since_crossunder2,
+    get_htf_bias,
+)
 import config
+from config import (
+    ENABLE_FRAMA_FILTER,
+    ENABLE_CHOP_FILTER,
+    ENABLE_ATR_FILTER,
+    ENABLE_MTF_BIAS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +167,19 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
     ТОЛЬКО индикативное число для UI, реальный sizing она не определяет
     (см. комментарий в signals.py рядом с sugg_lev).
     """
-    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=300)
+    # 🆕 limit=900 (а не 300) — как в signals.check_signals: run_kmeans_mfi
+    # тренируется на MFI_TRAINING (по умолчанию 800) баров, и уровни
+    # перекупленности/перепроданности на меньшей истории будут другими —
+    # лампочки должны совпадать с реальным ботом, а не быть "похожими".
+    bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=900)
     df = parse_ohlcv(bars)
     if not validate_dataframe(df, min_rows=50):
         raise ValueError(f"Недостаточно данных для {ticker} {tf}")
 
-    idx = -2  # последний подтверждённый бар — как везде в сигналах
+    # idx как позитивный целочисленный индекс (не -2!) — bars_since_* хелперы
+    # из signals.py делают range(idx, idx-lookback-1, -1), с отрицательным idx
+    # это была бы пустая/сломанная последовательность.
+    idx = len(df) - 2  # последний подтверждённый бар — как везде в сигналах
     close_v = float(df["close"].iloc[idx])
 
     chop_s = calculate_chop(df, length=config.CHOP_LENGTH)
@@ -172,6 +208,114 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
             sugg_lev = min(config.MAX_ALLOWED_LEV, int(sugg_lev * 1.2))
     else:
         sugg_lev = 1
+        atr_pct_v = 0.0
+
+    # =====================================================================
+    # 🆕 ЛАМПОЧКИ СИГНАЛОВ И ФИЛЬТРОВ (для топ-бара)
+    # Логика 1-в-1 из signals.check_signals — просто без чтения/записи
+    # торгового state (позиции/кулдауны здесь не учитываются, это только
+    # индикация "что сейчас говорят индикаторы и фильтры", а не "откроется
+    # ли сделка на самом деле").
+    # =====================================================================
+    htf_bias = await get_htf_bias(exchange, ticker, tf)
+    htf_bull = htf_bias == 1
+    htf_bear = htf_bias == -1
+
+    mfi = calculate_mfi(df, config.MFI_LEN)
+    level_os, level_ob = run_kmeans_mfi(mfi, config.MFI_TRAINING)
+    and_osc, and_sig = calculate_andean(df, config.AND_LEN, config.AND_SIG_LEN)
+    ut_buy, ut_sell = calculate_ut_bot(df, config.UT_SENSITIVITY, config.UT_PERIOD, use_ha=config.UT_HEIKIN_ASHI)
+
+    mfi_bull_sig = crossover(mfi, level_os, idx)
+    mfi_bear_sig = crossunder(mfi, level_ob, idx)
+    bs_mfi_bull = bars_since_crossover(mfi, level_os, idx, config.LOOKBACK)
+    bs_mfi_bear = bars_since_crossunder(mfi, level_ob, idx, config.LOOKBACK)
+
+    and_bull_sig = crossover2(and_osc, and_sig, idx)
+    and_bear_sig = crossunder2(and_osc, and_sig, idx)
+    bs_and_bull = bars_since_crossover2(and_osc, and_sig, idx, config.LOOKBACK)
+    bs_and_bear = bars_since_crossunder2(and_osc, and_sig, idx, config.LOOKBACK)
+
+    def _lamp_state(bull_active: bool, bear_active: bool) -> str:
+        if bull_active and not bear_active:
+            return "bull"
+        if bear_active and not bull_active:
+            return "bear"
+        return "neutral"
+
+    # MFI/Andean лампочки "держатся" bars_since <= LOOKBACK — как в самом
+    # confirm_long_a/confirm_short_a, а не только на баре самого пересечения.
+    mfi_lamp = _lamp_state(bs_mfi_bull <= config.LOOKBACK, bs_mfi_bear <= config.LOOKBACK)
+    and_lamp = _lamp_state(bs_and_bull <= config.LOOKBACK, bs_and_bear <= config.LOOKBACK)
+
+    # UT Bot реально триггерится только на своём баре (нет "окна" в самой
+    # торговой логике) — лампочка честно гаснет уже на следующем баре.
+    ut_lamp = _lamp_state(bool(ut_buy.iloc[idx]), bool(ut_sell.iloc[idx]))
+
+    frama_slope = float(frama_s.iloc[idx]) - float(frama_s.iloc[idx - 1])
+    slope_long = frama_slope > 0
+    slope_short = frama_slope < 0
+    frama_bull = dir_v == 1
+    frama_bear = dir_v == -1
+
+    chop_ok = chop_v < chop_threshold
+    atr_ok = config.ATR_MIN <= atr_pct_v <= config.ATR_MAX
+
+    hh10_prev = float(df["high"].iloc[max(0, idx - 10):idx].max())
+    ll10_prev = float(df["low"].iloc[max(0, idx - 10):idx].min())
+    fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
+    fake_break_short = float(df["low"].iloc[idx]) < ll10_prev and close_v > ll10_prev
+
+    ll5_prev = float(df["low"].iloc[max(0, idx - 5):idx].min())
+    hh5_prev = float(df["high"].iloc[max(0, idx - 5):idx].max())
+    open_v = float(df["open"].iloc[idx])
+    liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
+    liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
+
+    # pass_long/pass_short повторяют ИМЕННО формулы filter_long/filter_short
+    # из signals.py — включая то, что там liq_sweep_short блокирует LONG, а
+    # liq_sweep_long блокирует SHORT (так в реальной торговой логике, это не
+    # опечатка контроля качества — лампочка обязана показывать как есть).
+    lamps = {
+        "mfi":    {"kind": "signal", "state": mfi_lamp},
+        "andean": {"kind": "signal", "state": and_lamp},
+        "ut_bot": {"kind": "signal", "state": ut_lamp},
+        "filters": {
+            "frama": {
+                "enabled": ENABLE_FRAMA_FILTER,
+                "pass_long": frama_bull and slope_long,
+                "pass_short": frama_bear and slope_short,
+            },
+            "chop": {
+                "enabled": ENABLE_CHOP_FILTER,
+                "pass_long": chop_ok,
+                "pass_short": chop_ok,
+                "value": round(chop_v, 1),
+                "threshold": chop_threshold,
+            },
+            "atr": {
+                "enabled": ENABLE_ATR_FILTER,
+                "pass_long": atr_ok,
+                "pass_short": atr_ok,
+                "value": round(atr_pct_v, 2),
+            },
+            "htf": {
+                "enabled": ENABLE_MTF_BIAS,
+                "pass_long": htf_bull,
+                "pass_short": htf_bear,
+            },
+            "fake_break": {
+                "enabled": True,
+                "pass_long": not fake_break_long,
+                "pass_short": not fake_break_short,
+            },
+            "liq_sweep": {
+                "enabled": True,
+                "pass_long": not liq_sweep_short,
+                "pass_short": not liq_sweep_long,
+            },
+        },
+    }
 
     return {
         "ticker": ticker,
@@ -181,4 +325,5 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
         "chop_trending": chop_v < chop_threshold,
         "trend": trend,
         "suggested_leverage": sugg_lev,
+        "lamps": lamps,
     }

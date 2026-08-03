@@ -5,6 +5,7 @@ import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
+import SignalLamps from './components/SignalLamps'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -124,6 +125,7 @@ export default function App() {
             {pulse.suggested_leverage}x lev
           </span>
         )}
+        {pulse && <SignalLamps lamps={pulse.lamps} />}
         <div className="spacer" />
         {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>loading…</span>}
         <span className="conn-label">
