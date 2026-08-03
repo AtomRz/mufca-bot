@@ -24,10 +24,6 @@ from config import (
     HTF_CACHE_TTL_SECONDS,
     MARKET_MODE,
     SIGNAL_HISTORY_LIMIT,
-    ENABLE_FRAMA_FILTER,
-    ENABLE_CHOP_FILTER,
-    ENABLE_ATR_FILTER,
-    ENABLE_MTF_BIAS,
 )
 # 🆕 Параметры индикаторов (FRAMA/MFI/Andean/UT Bot) теперь редактируются на
 # лету из веб-морды (Settings), поэтому обращаемся к ним как _cfg.FRAMA_LEN и
@@ -730,20 +726,20 @@ async def check_signals(
         warmed_up = len(df) >= _cfg.MFI_TRAINING
 
         filter_long = (
-            (not ENABLE_FRAMA_FILTER or frama_bull)
-            and (not ENABLE_CHOP_FILTER  or chop_ok)
-            and (not ENABLE_ATR_FILTER   or atr_ok)
+            (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
+            and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
+            and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and slope_long
-            and (not ENABLE_MTF_BIAS     or htf_bull)
+            and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
             and not fake_break_long
             and not liq_sweep_short
         )
         filter_short = (
-            (not ENABLE_FRAMA_FILTER or frama_bear)
-            and (not ENABLE_CHOP_FILTER  or chop_ok)
-            and (not ENABLE_ATR_FILTER   or atr_ok)
+            (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
+            and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
+            and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and slope_short
-            and (not ENABLE_MTF_BIAS     or htf_bear)
+            and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
             and not fake_break_short
             and not liq_sweep_long
         )
@@ -983,17 +979,17 @@ def backtest_history(
             warmed_up_bt = idx >= _cfg.MFI_TRAINING
 
             filter_long = (
-                (not ENABLE_FRAMA_FILTER or frama_bull)
-                and (not ENABLE_CHOP_FILTER  or chop_ok)
-                and (not ENABLE_ATR_FILTER   or atr_ok)
+                (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
+                and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
+                and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and slope_long
                 and not fake_break_long
                 and not liq_sweep_short
             )
             filter_short = (
-                (not ENABLE_FRAMA_FILTER or frama_bear)
-                and (not ENABLE_CHOP_FILTER  or chop_ok)
-                and (not ENABLE_ATR_FILTER   or atr_ok)
+                (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
+                and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
+                and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and slope_short
                 and not fake_break_short
                 and not liq_sweep_long
@@ -1015,8 +1011,8 @@ def backtest_history(
             htf_bull_bt = htf_bias_arr[idx] == 1
             htf_bear_bt = htf_bias_arr[idx] == -1
 
-            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt and (not ENABLE_MTF_BIAS or htf_bull_bt)
-            sig_a_short = confirm_short_a and filter_short and warmed_up_bt and (not ENABLE_MTF_BIAS or htf_bear_bt)
+            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
+            sig_a_short = confirm_short_a and filter_short and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
             sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
 

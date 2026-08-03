@@ -3,6 +3,13 @@ import { api } from '../api'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
+const FILTER_TOGGLES = [
+  { key: 'frama', label: 'FRAMA trend + slope' },
+  { key: 'chop', label: 'CHOP' },
+  { key: 'atr', label: 'ATR' },
+  { key: 'htf', label: 'HTF bias' },
+]
+
 function Toggle({ checked, onChange, disabled }) {
   return (
     <label className="switch">
@@ -193,6 +200,23 @@ export default function SettingsPanel({ config, onChanged }) {
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               Changing mode/HTF resets active position-tracking state — same as the equivalent Discord commands.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Signal Filters</h3>
+            {FILTER_TOGGLES.map(({ key, label }) => (
+              <div className="toggle-row" key={key}>
+                <span className="row-label">{label}</span>
+                <Toggle
+                  checked={config.filter_toggles?.[key] ?? true}
+                  disabled={busy === `filter_${key}`}
+                  onChange={(v) => run(`filter_${key}`, () => api.setFilterToggle(key, v))}
+                />
+              </div>
+            ))}
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Off = filter is skipped entirely (always passes) when deciding whether a signal fires. Matches the lamp row in the topbar.
             </p>
           </div>
 

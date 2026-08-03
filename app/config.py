@@ -107,11 +107,34 @@ TIMEFRAMES = ["1h", "4h"]
 
 # =====================================================================
 # 🔧  FILTER TOGGLES (зеркало Pine Script input.bool)
+# 🆕 Раньше это были просто константы True, зашитые в код — их нельзя было
+# выключить из UI. Теперь, как HTF_BIAS/UT_HEIKIN_ASHI, персистятся в JSON и
+# правятся через _cfg.ENABLE_X (НЕ bare import — иначе после runtime-смены
+# через /api/config/filters старые импортированные копии в signals.py и
+# chart_data.py останутся замороженными на исходном значении).
 # =====================================================================
-ENABLE_FRAMA_FILTER = True   # use_frama_filter
-ENABLE_CHOP_FILTER  = True   # use_chop
-ENABLE_ATR_FILTER   = True   # use_atr_f
-ENABLE_MTF_BIAS     = True   # enable_mtf_bias
+FILTERS_FILE = os.path.join(DATA_DIR, "filter_toggles.json")
+
+DEFAULT_FILTER_TOGGLES = {
+    "frama": True,   # use_frama_filter
+    "chop": True,    # use_chop
+    "atr": True,     # use_atr_f
+    "htf": True,     # enable_mtf_bias
+}
+
+def load_filter_toggles() -> dict:
+    data = safe_json_load(FILTERS_FILE, DEFAULT_FILTER_TOGGLES)
+    # на случай если в файле не все ключи (например после добавления нового фильтра)
+    return {**DEFAULT_FILTER_TOGGLES, **data}
+
+def save_filter_toggles(toggles: dict):
+    safe_json_save(FILTERS_FILE, toggles)
+
+_filter_toggles = load_filter_toggles()
+ENABLE_FRAMA_FILTER = _filter_toggles["frama"]   # use_frama_filter
+ENABLE_CHOP_FILTER  = _filter_toggles["chop"]    # use_chop
+ENABLE_ATR_FILTER   = _filter_toggles["atr"]     # use_atr_f
+ENABLE_MTF_BIAS     = _filter_toggles["htf"]     # enable_mtf_bias
 
 # =====================================================================
 # 📈  ПАРАМЕТРЫ ИНДИКАТОРОВ

@@ -41,7 +41,7 @@ app = FastAPI(title="MUFCA Web API")
 # bot.py импортирует web_api в самом низу, когда bot/state/config уже готовы.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history
@@ -518,6 +518,12 @@ async def get_config():
         "htf_bias": _cfg.HTF_BIAS,
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "chop_threshold": CHOP_THRESHOLD,
+        "filter_toggles": {
+            "frama": _cfg.ENABLE_FRAMA_FILTER,
+            "chop": _cfg.ENABLE_CHOP_FILTER,
+            "atr": _cfg.ENABLE_ATR_FILTER,
+            "htf": _cfg.ENABLE_MTF_BIAS,
+        },
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
             "tp_percentile": _cfg.TP_PERCENTILE,
@@ -623,6 +629,53 @@ async def set_utha(body: UthaIn):
     _cfg.UT_HEIKIN_ASHI = body.enabled
     _cfg.save_ut_ha(_cfg.UT_HEIKIN_ASHI)
     return {"ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI, "changed": True}
+
+
+# 🆕 Ключ в API/UI ("frama"/"chop"/"atr"/"htf") -> имя атрибута в config.py.
+# Меняем строго через _cfg.X = ..., НЕ через локальную переменную — иначе
+# signals.py и chart_data.py (которые тоже читают именно _cfg.X/config.X)
+# runtime-изменение не увидят и продолжат работать по старому значению.
+_FILTER_ATTR = {
+    "frama": "ENABLE_FRAMA_FILTER",
+    "chop": "ENABLE_CHOP_FILTER",
+    "atr": "ENABLE_ATR_FILTER",
+    "htf": "ENABLE_MTF_BIAS",
+}
+
+
+class FilterToggleIn(BaseModel):
+    filter: str  # frama | chop | atr | htf
+    enabled: bool
+
+
+@app.post("/api/config/filters")
+async def set_filter_toggle(body: FilterToggleIn):
+    key = body.filter.lower()
+    if key not in _FILTER_ATTR:
+        raise HTTPException(400, f"filter должен быть одним из {list(_FILTER_ATTR)}")
+
+    attr = _FILTER_ATTR[key]
+    if body.enabled == getattr(_cfg, attr):
+        return {"filter_toggles": _current_filter_toggles(), "changed": False}
+
+    setattr(_cfg, attr, body.enabled)
+    save_filter_toggles({
+        "frama": _cfg.ENABLE_FRAMA_FILTER,
+        "chop": _cfg.ENABLE_CHOP_FILTER,
+        "atr": _cfg.ENABLE_ATR_FILTER,
+        "htf": _cfg.ENABLE_MTF_BIAS,
+    })
+    await broadcast_event({"type": "config_changed", "key": f"filter_{key}", "value": body.enabled})
+    return {"filter_toggles": _current_filter_toggles(), "changed": True}
+
+
+def _current_filter_toggles() -> dict:
+    return {
+        "frama": _cfg.ENABLE_FRAMA_FILTER,
+        "chop": _cfg.ENABLE_CHOP_FILTER,
+        "atr": _cfg.ENABLE_ATR_FILTER,
+        "htf": _cfg.ENABLE_MTF_BIAS,
+    }
 
 
 class ChopIn(BaseModel):

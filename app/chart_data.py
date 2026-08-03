@@ -38,12 +38,6 @@ from signals import (
     get_htf_bias,
 )
 import config
-from config import (
-    ENABLE_FRAMA_FILTER,
-    ENABLE_CHOP_FILTER,
-    ENABLE_ATR_FILTER,
-    ENABLE_MTF_BIAS,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -282,25 +276,25 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
         "ut_bot": {"kind": "signal", "state": ut_lamp},
         "filters": {
             "frama": {
-                "enabled": ENABLE_FRAMA_FILTER,
+                "enabled": config.ENABLE_FRAMA_FILTER,
                 "pass_long": frama_bull and slope_long,
                 "pass_short": frama_bear and slope_short,
             },
             "chop": {
-                "enabled": ENABLE_CHOP_FILTER,
+                "enabled": config.ENABLE_CHOP_FILTER,
                 "pass_long": chop_ok,
                 "pass_short": chop_ok,
                 "value": round(chop_v, 1),
                 "threshold": chop_threshold,
             },
             "atr": {
-                "enabled": ENABLE_ATR_FILTER,
+                "enabled": config.ENABLE_ATR_FILTER,
                 "pass_long": atr_ok,
                 "pass_short": atr_ok,
                 "value": round(atr_pct_v, 2),
             },
             "htf": {
-                "enabled": ENABLE_MTF_BIAS,
+                "enabled": config.ENABLE_MTF_BIAS,
                 "pass_long": htf_bull,
                 "pass_short": htf_bear,
             },

@@ -75,6 +75,8 @@ export const api = {
     request('/api/config/htf', { method: 'POST', body: JSON.stringify({ htf }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setFilterToggle: (filter, enabled) =>
+    request('/api/config/filters', { method: 'POST', body: JSON.stringify({ filter, enabled }) }),
   setChop: (tf, value) =>
     request('/api/config/chop', { method: 'POST', body: JSON.stringify({ tf, value }) }),
   setTpConfig: (param, value) =>
