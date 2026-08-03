@@ -299,12 +299,12 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
                 "pass_short": htf_bear,
             },
             "fake_break": {
-                "enabled": True,
+                "enabled": config.ENABLE_FAKE_BREAK_FILTER,
                 "pass_long": not fake_break_long,
                 "pass_short": not fake_break_short,
             },
             "liq_sweep": {
-                "enabled": True,
+                "enabled": config.ENABLE_LIQ_SWEEP_FILTER,
                 "pass_long": not liq_sweep_short,
                 "pass_short": not liq_sweep_long,
             },

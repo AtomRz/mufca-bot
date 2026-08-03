@@ -523,6 +523,8 @@ async def get_config():
             "chop": _cfg.ENABLE_CHOP_FILTER,
             "atr": _cfg.ENABLE_ATR_FILTER,
             "htf": _cfg.ENABLE_MTF_BIAS,
+            "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
+            "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
         },
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
@@ -631,20 +633,22 @@ async def set_utha(body: UthaIn):
     return {"ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI, "changed": True}
 
 
-# 🆕 Ключ в API/UI ("frama"/"chop"/"atr"/"htf") -> имя атрибута в config.py.
-# Меняем строго через _cfg.X = ..., НЕ через локальную переменную — иначе
-# signals.py и chart_data.py (которые тоже читают именно _cfg.X/config.X)
-# runtime-изменение не увидят и продолжат работать по старому значению.
+# 🆕 Ключ в API/UI ("frama"/"chop"/"atr"/"htf"/"fake_break"/"liq_sweep") -> имя
+# атрибута в config.py. Меняем строго через _cfg.X = ..., НЕ через локальную
+# переменную — иначе signals.py и chart_data.py (которые тоже читают именно
+# _cfg.X/config.X) runtime-изменение не увидят и продолжат работать по старому значению.
 _FILTER_ATTR = {
     "frama": "ENABLE_FRAMA_FILTER",
     "chop": "ENABLE_CHOP_FILTER",
     "atr": "ENABLE_ATR_FILTER",
     "htf": "ENABLE_MTF_BIAS",
+    "fake_break": "ENABLE_FAKE_BREAK_FILTER",
+    "liq_sweep": "ENABLE_LIQ_SWEEP_FILTER",
 }
 
 
 class FilterToggleIn(BaseModel):
-    filter: str  # frama | chop | atr | htf
+    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep
     enabled: bool
 
 
@@ -659,12 +663,7 @@ async def set_filter_toggle(body: FilterToggleIn):
         return {"filter_toggles": _current_filter_toggles(), "changed": False}
 
     setattr(_cfg, attr, body.enabled)
-    save_filter_toggles({
-        "frama": _cfg.ENABLE_FRAMA_FILTER,
-        "chop": _cfg.ENABLE_CHOP_FILTER,
-        "atr": _cfg.ENABLE_ATR_FILTER,
-        "htf": _cfg.ENABLE_MTF_BIAS,
-    })
+    save_filter_toggles(_current_filter_toggles())
     await broadcast_event({"type": "config_changed", "key": f"filter_{key}", "value": body.enabled})
     return {"filter_toggles": _current_filter_toggles(), "changed": True}
 
@@ -675,6 +674,8 @@ def _current_filter_toggles() -> dict:
         "chop": _cfg.ENABLE_CHOP_FILTER,
         "atr": _cfg.ENABLE_ATR_FILTER,
         "htf": _cfg.ENABLE_MTF_BIAS,
+        "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
+        "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
     }
 
 

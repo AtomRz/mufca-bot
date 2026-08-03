@@ -8,6 +8,8 @@ const FILTER_TOGGLES = [
   { key: 'chop', label: 'CHOP' },
   { key: 'atr', label: 'ATR' },
   { key: 'htf', label: 'HTF bias' },
+  { key: 'fake_break', label: 'Fake breakout' },
+  { key: 'liq_sweep', label: 'Liquidity sweep' },
 ]
 
 function Toggle({ checked, onChange, disabled }) {

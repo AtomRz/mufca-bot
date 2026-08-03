@@ -116,10 +116,12 @@ TIMEFRAMES = ["1h", "4h"]
 FILTERS_FILE = os.path.join(DATA_DIR, "filter_toggles.json")
 
 DEFAULT_FILTER_TOGGLES = {
-    "frama": True,   # use_frama_filter
-    "chop": True,    # use_chop
-    "atr": True,     # use_atr_f
-    "htf": True,     # enable_mtf_bias
+    "frama": True,       # use_frama_filter
+    "chop": True,        # use_chop
+    "atr": True,         # use_atr_f
+    "htf": True,         # enable_mtf_bias
+    "fake_break": True,  # 🆕 раньше применялся безусловно, без input.bool-аналога
+    "liq_sweep": True,   # 🆕 раньше применялся безусловно, без input.bool-аналога
 }
 
 def load_filter_toggles() -> dict:
@@ -131,10 +133,12 @@ def save_filter_toggles(toggles: dict):
     safe_json_save(FILTERS_FILE, toggles)
 
 _filter_toggles = load_filter_toggles()
-ENABLE_FRAMA_FILTER = _filter_toggles["frama"]   # use_frama_filter
-ENABLE_CHOP_FILTER  = _filter_toggles["chop"]    # use_chop
-ENABLE_ATR_FILTER   = _filter_toggles["atr"]     # use_atr_f
-ENABLE_MTF_BIAS     = _filter_toggles["htf"]     # enable_mtf_bias
+ENABLE_FRAMA_FILTER      = _filter_toggles["frama"]       # use_frama_filter
+ENABLE_CHOP_FILTER       = _filter_toggles["chop"]        # use_chop
+ENABLE_ATR_FILTER        = _filter_toggles["atr"]         # use_atr_f
+ENABLE_MTF_BIAS          = _filter_toggles["htf"]         # enable_mtf_bias
+ENABLE_FAKE_BREAK_FILTER = _filter_toggles["fake_break"]
+ENABLE_LIQ_SWEEP_FILTER  = _filter_toggles["liq_sweep"]
 
 # =====================================================================
 # 📈  ПАРАМЕТРЫ ИНДИКАТОРОВ

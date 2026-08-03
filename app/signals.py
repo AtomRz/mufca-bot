@@ -731,8 +731,8 @@ async def check_signals(
             and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and slope_long
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
-            and not fake_break_long
-            and not liq_sweep_short
+            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
+            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
         )
         filter_short = (
             (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
@@ -740,8 +740,8 @@ async def check_signals(
             and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and slope_short
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
-            and not fake_break_short
-            and not liq_sweep_long
+            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
+            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
         )
 
         mfi_bull_sig = crossover(mfi, level_os, idx)
@@ -983,16 +983,16 @@ def backtest_history(
                 and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
                 and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and slope_long
-                and not fake_break_long
-                and not liq_sweep_short
+                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
+                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
             )
             filter_short = (
                 (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
                 and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
                 and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and slope_short
-                and not fake_break_short
-                and not liq_sweep_long
+                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
+                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
             )
 
             mfi_bull_sig = crossover(mfi, level_os, idx)
