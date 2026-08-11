@@ -757,13 +757,30 @@ async def check_signals(
         confirm_long_a = (mfi_bull_sig and bs_and_bull <= _cfg.LOOKBACK) or (and_bull_sig and bs_mfi_bull <= _cfg.LOOKBACK)
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= _cfg.LOOKBACK) or (and_bear_sig and bs_mfi_bear <= _cfg.LOOKBACK)
 
-        def cooldown_ok(last_bar):
-            return last_bar is None or (bar_idx - last_bar) > COOLDOWN_BARS
+        # 🆕 FIX BUG-LO005: раньше кулдаун считался через bar_idx = len(df) - 2,
+        # который на КАЖДОМ вызове check_signals пересчитывается заново из
+        # свежепойманных limit=900 баров — то есть это почти всегда одно и то
+        # же число (~898), а НЕ сквозной счётчик прошедших баров (в отличие от
+        # backtest_history, где idx реально растёт в цикле по истории). Из-за
+        # этого (bar_idx - last_bar) сравнивал две почти одинаковые позиции и
+        # кулдаун срабатывал непредсказуемо — иногда блокировал сигнал намного
+        # дольше COOLDOWN_BARS, иногда пропускал раньше срока, в зависимости от
+        # случайных колебаний длины полученного от биржи окна свечей.
+        # Теперь считаем кулдаун по РЕАЛЬНОМУ времени бара (bar_time, ms) —
+        # оно не зависит от того, сколько баров вернула биржа в конкретном
+        # запросе, и корректно отражает прошедшее количество таймфреймов.
+        try:
+            tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+        except Exception:
+            tf_ms = 3600_000  # fallback: считаем таймфрейм часом, если parse_timeframe недоступен
 
-        a_long_cd_ok = cooldown_ok(state["last_a_long_bar"])
-        a_short_cd_ok = cooldown_ok(state["last_a_short_bar"])
-        u_long_cd_ok = cooldown_ok(state["last_u_long_bar"])
-        u_short_cd_ok = cooldown_ok(state["last_u_short_bar"])
+        def cooldown_ok(last_time):
+            return last_time is None or (bar_time - last_time) > COOLDOWN_BARS * tf_ms
+
+        a_long_cd_ok = cooldown_ok(state.get("last_a_long_time"))
+        a_short_cd_ok = cooldown_ok(state.get("last_a_short_time"))
+        u_long_cd_ok = cooldown_ok(state.get("last_u_long_time"))
+        u_short_cd_ok = cooldown_ok(state.get("last_u_short_time"))
 
         a_in_pos = state["a_in_long"] or state["a_in_short"]
         u_in_pos = state["u_in_long"] or state["u_in_short"]
@@ -780,22 +797,26 @@ async def check_signals(
                 state["a_in_long"] = True
                 state["a_in_short"] = False
                 state["a_long_bar"] = bar_idx
-                state["last_a_long_bar"] = bar_idx
+                state["last_a_long_bar"] = bar_idx      # оставлено для обратной совместимости/отладки
+                state["last_a_long_time"] = bar_time
             if sig_a_short:
                 state["a_in_short"] = True
                 state["a_in_long"] = False
                 state["a_short_bar"] = bar_idx
                 state["last_a_short_bar"] = bar_idx
+                state["last_a_short_time"] = bar_time
             if sig_u_long:
                 state["u_in_long"] = True
                 state["u_in_short"] = False
                 state["u_long_bar"] = bar_idx
                 state["last_u_long_bar"] = bar_idx
+                state["last_u_long_time"] = bar_time
             if sig_u_short:
                 state["u_in_short"] = True
                 state["u_in_long"] = False
                 state["u_short_bar"] = bar_idx
                 state["last_u_short_bar"] = bar_idx
+                state["last_u_short_time"] = bar_time
 
         # 🆕 NOTE: sugg_lev здесь — грубая информационная оценка (по ширине канала
         # FRAMA), используется только как fallback-значение при отсутствии сигнала
@@ -1119,12 +1140,19 @@ def make_state() -> Dict:
         "a_short_bar": None,
         "last_a_long_bar": None,
         "last_a_short_bar": None,
+        # 🆕 FIX BUG-LO005: time-based кулдаун вместо позиционного bar_idx (см.
+        # cooldown_ok в check_signals) — last_a_long_bar/last_a_short_bar выше
+        # оставлены только для отладки/обратной совместимости, кулдаун их не читает.
+        "last_a_long_time": None,
+        "last_a_short_time": None,
         "u_in_long": False,
         "u_in_short": False,
         "u_long_bar": None,
         "u_short_bar": None,
         "last_u_long_bar": None,
         "last_u_short_bar": None,
+        "last_u_long_time": None,
+        "last_u_short_time": None,
         "last_bar_time": None,
         "last_processed_bar_time": None,
         "a_active_trade": None,
