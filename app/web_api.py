@@ -44,7 +44,7 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
-from state import load_signals_history
+from state import load_signals_history, save_signals_history
 import push as _push
 
 
@@ -367,7 +367,14 @@ async def add_pair(body: PairIn):
 
 
 @app.delete("/api/pairs/{ticker:path}")
-async def remove_pair(ticker: str):
+async def remove_pair(ticker: str, purge_history: bool = False):
+    """purge_history=true — аналог Discord `!delsignals {ticker} yes` (все
+    таймфреймы), выполняется сразу без предпросмотра/подтверждения, так как
+    это уже осознанное действие пользователя из веб-интерфейса (checkbox/confirm
+    делает фронтенд перед вызовом). По умолчанию (false) — прежнее поведение,
+    как у Discord-команды `!remove`: signals_history.json не трогаем, чтобы
+    сохранить накопленную адаптивную TP/SL-статистику на случай, если пара
+    вернётся."""
     ticker = unquote(ticker).upper().strip()
     if ticker not in _cfg.TICKERS:
         raise HTTPException(404, f"{ticker} не отслеживается")
@@ -379,7 +386,19 @@ async def remove_pair(ticker: str):
     # bot_state_snapshot.json. Чистим сразу.
     core.state.pop(ticker, None)
     core._state_locks.pop(ticker, None)
-    return {"tickers": _cfg.TICKERS}
+
+    purged = 0
+    if purge_history:
+        history = load_signals_history()
+        if ticker in history:
+            purged = sum(
+                len(v.get("long", [])) + len(v.get("short", []))
+                for v in history[ticker].values()
+            )
+            del history[ticker]
+            save_signals_history(history)
+
+    return {"tickers": _cfg.TICKERS, "purged_signals": purged}
 
 
 # =====================================================================

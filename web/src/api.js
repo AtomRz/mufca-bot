@@ -62,8 +62,11 @@ export const api = {
   getPairs: () => request('/api/pairs'),
   addPair: (ticker) =>
     request('/api/pairs', { method: 'POST', body: JSON.stringify({ ticker }) }),
-  removePair: (ticker) =>
-    request(`/api/pairs/${encodeURIComponent(ticker)}`, { method: 'DELETE' }),
+  removePair: (ticker, purgeHistory = false) =>
+    request(
+      `/api/pairs/${encodeURIComponent(ticker)}${purgeHistory ? '?purge_history=true' : ''}`,
+      { method: 'DELETE' }
+    ),
   getChart: (ticker, tf, track = 'a', limit = 200) =>
     request(
       `/api/chart?ticker=${encodeURIComponent(ticker)}&tf=${tf}&track=${track}&limit=${limit}`,

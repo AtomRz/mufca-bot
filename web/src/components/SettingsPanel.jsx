@@ -297,7 +297,17 @@ export default function SettingsPanel({ config, onChanged }) {
                   {p}
                   <button
                     title="Remove pair"
-                    onClick={() => run(`rm_${p}`, () => api.removePair(p))}
+                    onClick={() => {
+                      if (!window.confirm(`Stop tracking ${p}?`)) return
+                      // Аналог Discord !remove vs !delsignals: убрать из
+                      // сканирования можно с сохранением накопленной
+                      // адаптивной TP/SL-статистики (на случай возврата пары)
+                      // или полностью стереть её историю сигналов.
+                      const purge = window.confirm(
+                        `Also delete accumulated signal history for ${p}? This cannot be undone.\n\nOK — delete history\nCancel — keep history (in case you re-add ${p} later)`
+                      )
+                      run(`rm_${p}`, () => api.removePair(p, purge))
+                    }}
                     disabled={busy === `rm_${p}`}
                   >
                     ×
