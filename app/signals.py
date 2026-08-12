@@ -611,6 +611,19 @@ async def open_position(
     }
     state[bars_key] = 0
 
+    # 🆕 FIX BUG-LO006: кулдаун (last_{track}_{side}_time, читается cooldown_ok
+    # в check_signals) раньше взводился в check_signals ДО вызова open_position —
+    # то есть даже отклонённая здесь попытка (R:R < MIN_RR или extreme_violation
+    # чуть выше) уже блокировала следующие COOLDOWN_BARS баров, хотя сделка
+    # по факту не открывалась. Теперь взводим кулдаун только тут, в точке
+    # реального открытия позиции.
+    if not dry_run:
+        bar_idx_val = idx
+        bar_time_val = int(df["timestamp"].iloc[idx])
+        state[f"{track}_{side}_bar"] = bar_idx_val
+        state[last_bar_key] = bar_idx_val               # debug/обратная совместимость
+        state[f"last_{track}_{side}_time"] = bar_time_val
+
     if not dry_run:
         # 🆕 FIX: передаём track, чтобы записи A- и U-трека не путались в истории
         add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
@@ -791,32 +804,25 @@ async def check_signals(
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
         # Флаги треков ставятся ТОЛЬКО при реальном открытии (не dry_run)
-        # и ТОЛЬКО вместе с active_trade, чтобы не было рассинхрона
+        # и ТОЛЬКО вместе с active_trade, чтобы не было рассинхрона.
+        # 🆕 FIX BUG-LO006: last_{track}_{side}_bar/_time (кулдаун) сюда больше
+        # не пишем — раньше они взводились здесь, ДО open_position, поэтому
+        # даже отклонённая там попытка (R:R/extreme_violation) уже блокировала
+        # следующие COOLDOWN_BARS баров. Теперь кулдаун взводится только внутри
+        # open_position, в точке реального открытия сделки.
         if not dry_run:
             if sig_a_long:
                 state["a_in_long"] = True
                 state["a_in_short"] = False
-                state["a_long_bar"] = bar_idx
-                state["last_a_long_bar"] = bar_idx      # оставлено для обратной совместимости/отладки
-                state["last_a_long_time"] = bar_time
             if sig_a_short:
                 state["a_in_short"] = True
                 state["a_in_long"] = False
-                state["a_short_bar"] = bar_idx
-                state["last_a_short_bar"] = bar_idx
-                state["last_a_short_time"] = bar_time
             if sig_u_long:
                 state["u_in_long"] = True
                 state["u_in_short"] = False
-                state["u_long_bar"] = bar_idx
-                state["last_u_long_bar"] = bar_idx
-                state["last_u_long_time"] = bar_time
             if sig_u_short:
                 state["u_in_short"] = True
                 state["u_in_long"] = False
-                state["u_short_bar"] = bar_idx
-                state["last_u_short_bar"] = bar_idx
-                state["last_u_short_time"] = bar_time
 
         # 🆕 NOTE: sugg_lev здесь — грубая информационная оценка (по ширине канала
         # FRAMA), используется только как fallback-значение при отсутствии сигнала
