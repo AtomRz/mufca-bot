@@ -168,6 +168,20 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       color: '#232c3a',
       priceLineVisible: false,
       lastValueVisible: false,
+      // 🆕 FIX: без этого шкала объёма автомасштабируется по фактическому
+      // мин/макс видимых баров — если в текущем окне зелёного объёма заметно
+      // больше, чем красного (или наоборот), ноль съезжает вверх/вниз внутри
+      // панели вместо того, чтобы оставаться по центру. Форсируем симметричный
+      // диапазон [-maxAbs, +maxAbs], чтобы ноль был зафиксирован по центру
+      // всегда, независимо от перекоса покупок/продаж в видимой области.
+      autoscaleInfoProvider: (original) => {
+        const res = original()
+        if (res?.priceRange) {
+          const maxAbs = Math.max(Math.abs(res.priceRange.minValue), Math.abs(res.priceRange.maxValue))
+          return { ...res, priceRange: { minValue: -maxAbs, maxValue: maxAbs } }
+        }
+        return res
+      },
     })
     // 🆕 volume и mfi делят одну и ту же зону шкалы (merged pane) — объём фоном,
     // MFI-линия поверх, вместо двух раздельных полос друг под другом
