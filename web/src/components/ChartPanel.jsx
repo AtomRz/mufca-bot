@@ -108,7 +108,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         horzLines: { color: '#1b222b' },
       },
       rightPriceScale: { borderColor: '#232c3a' },
-      timeScale: { borderColor: '#232c3a', timeVisible: true, rightOffset: 10 },
+      timeScale: { borderColor: '#232c3a', timeVisible: true, rightOffset: 20 },
       crosshair: { mode: 0 },
       height: 640,
     })
