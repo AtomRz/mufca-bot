@@ -260,73 +260,84 @@ async def market_scanner():
                     df = parse_ohlcv(bars) if bars else None
                     for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
                         embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
-                        try:
-                            # Генерируем и прикладываем график к сигналу
-                            chart_file = None
-                            try:
-                                from chart import generate_chart
-                                is_long = "BUY" in sig_type or "LONG" in sig_type
-                                # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
-                                # который фетчился ЗДЕСЬ (limit=100), а generate_chart
-                                # внутри себя делает свой отдельный fetch (limit≈300+) —
-                                # индексы не совпадали, и стрелка почти всегда улетала
-                                # в начало графика. Сигнал всегда формируется на последнем
-                                # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
-                                # это верно для df ЛЮБОЙ длины — используем offset от конца.
-                                state_snapshot = {
-                                    "entry": price,
-                                    "tp":    tp,
-                                    "tp1":   tp1,
-                                    "sl":    sl,
-                                    "side":  "long" if is_long else "short",
-                                    "signal_bar_offset": -2,
-                                }
-                                chart_buf = await generate_chart(
-                                    exchange=exchange,
-                                    symbol=ticker,
-                                    timeframe=tf,
-                                    limit=50,
-                                    state_snapshot=state_snapshot,
-                                )
-                                chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
-                            except Exception as chart_err:
-                                logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
 
+                        # 🆕 FIX BUG-LO007: раньше Discord-отправка, WS-бродкаст и push
+                        # были в ОДНОМ try — если channel.send() падал (не обязательно
+                        # discord.HTTPException, чаще всего действительно им и был, но
+                        # ловился только этот один тип), WS и push молча пропускались
+                        # тоже, хотя это независимые каналы уведомлений. На новой паре
+                        # (например, только что добавленный SUI/USDT) сделка реально
+                        # открывалась (state уже мутирован в check_signals ДО этого
+                        # места), но ни бот, ни веб, ни пуш не сообщали об этом — юзер
+                        # узнавал о позиции только зайдя в Status. Теперь каждый канал
+                        # уведомления в своём try: падение одного не блокирует остальные.
+                        chart_file = None
+                        try:
+                            from chart import generate_chart
+                            is_long = "BUY" in sig_type or "LONG" in sig_type
+                            # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
+                            # который фетчился ЗДЕСЬ (limit=100), а generate_chart
+                            # внутри себя делает свой отдельный fetch (limit≈300+) —
+                            # индексы не совпадали, и стрелка почти всегда улетала
+                            # в начало графика. Сигнал всегда формируется на последнем
+                            # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
+                            # это верно для df ЛЮБОЙ длины — используем offset от конца.
+                            state_snapshot = {
+                                "entry": price,
+                                "tp":    tp,
+                                "tp1":   tp1,
+                                "sl":    sl,
+                                "side":  "long" if is_long else "short",
+                                "signal_bar_offset": -2,
+                            }
+                            chart_buf = await generate_chart(
+                                exchange=exchange,
+                                symbol=ticker,
+                                timeframe=tf,
+                                limit=50,
+                                state_snapshot=state_snapshot,
+                            )
+                            chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
+                        except Exception as chart_err:
+                            logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
+
+                        try:
                             if chart_file:
                                 await channel.send(embed=embed, file=chart_file)
                             else:
                                 await channel.send(embed=embed)
                             scan_stats["signals_generated"] += 1
-                            # 🆕 веб-морда: пушим сигнал всем подключенным WS-клиентам
-                            try:
-                                from web_api import broadcast_event
-                                await broadcast_event({
-                                    "type": "signal",
-                                    "ticker": ticker,
-                                    "tf": tf,
-                                    "sig_type": sig_type,
-                                    "price": price,
-                                    "sl": sl,
-                                    "tp": tp,
-                                    "tp1": tp1,
-                                })
-                            except Exception as ws_err:
-                                logger.warning(f"[WS] broadcast failed: {ws_err}")
-                            # 🆕 Android push — та же информация, что в Discord/WS, но приходит
-                            # даже если приложение закрыто. send_push делает блокирующие HTTP-запросы
-                            # (firebase-admin), поэтому через to_thread, не в event loop напрямую.
-                            try:
-                                import push as _push
-                                await asyncio.to_thread(
-                                    _push.send_push,
-                                    title=f"{sig_type} {ticker} {tf}",
-                                    body=f"Entry: {price:.4f} | TP: {tp:.4f} | SL: {sl:.4f}",
-                                    data={"type": "signal", "ticker": ticker, "tf": tf},
-                                )
-                            except Exception as push_err:
-                                logger.warning(f"[PUSH] send failed: {push_err}")
-                        except discord.HTTPException as e:
-                            logger.error(f"Failed to send signal: {e}")
+                        except Exception as discord_err:
+                            logger.error(f"[DISCORD] Failed to send signal for {ticker} {tf}: {discord_err}", exc_info=True)
+
+                        # 🆕 веб-морда: пушим сигнал всем подключенным WS-клиентам
+                        try:
+                            from web_api import broadcast_event
+                            await broadcast_event({
+                                "type": "signal",
+                                "ticker": ticker,
+                                "tf": tf,
+                                "sig_type": sig_type,
+                                "price": price,
+                                "sl": sl,
+                                "tp": tp,
+                                "tp1": tp1,
+                            })
+                        except Exception as ws_err:
+                            logger.warning(f"[WS] broadcast failed: {ws_err}")
+                        # 🆕 Android push — та же информация, что в Discord/WS, но приходит
+                        # даже если приложение закрыто. send_push делает блокирующие HTTP-запросы
+                        # (firebase-admin), поэтому через to_thread, не в event loop напрямую.
+                        try:
+                            import push as _push
+                            await asyncio.to_thread(
+                                _push.send_push,
+                                title=f"{sig_type} {ticker} {tf}",
+                                body=f"Entry: {price:.4f} | TP: {tp:.4f} | SL: {sl:.4f}",
+                                data={"type": "signal", "ticker": ticker, "tf": tf},
+                            )
+                        except Exception as push_err:
+                            logger.warning(f"[PUSH] send failed: {push_err}")
                         logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
 
                 # 🆕 FIX: Check BOTH tracks for closures independently
