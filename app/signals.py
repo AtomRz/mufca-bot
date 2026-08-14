@@ -414,15 +414,26 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     tp1_price = trade.get("tp1")
 
     # 🆕 FIX: если TP1 уже был достигнут (50% закрыто по факту вручную на бирже,
-    # SL остальных 50% — в безубытке), реальный PnL — среднее между зафиксированной
-    # на TP1 половиной и результатом второй половины, а не наивное entry→exit_price
-    # по всей позиции (см. подробный комментарий в state.update_signal_record).
+    # SL остальных 50% — в безубытке/half_tp1), реальный PnL — среднее между
+    # зафиксированной на TP1 половиной и результатом второй половины, а не
+    # наивное entry→exit_price по всей позиции (см. подробный комментарий
+    # в state.update_signal_record).
     if tp1_hit and tp1_price is not None:
         tp1_leg_pct = (tp1_price - entry) / entry * 100 if side == "long" else (entry - tp1_price) / entry * 100
         remainder_leg_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
         pnl_pct = (tp1_leg_pct + remainder_leg_pct) / 2
     else:
         pnl_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
+
+    # 🆕 FIX BUG-LO008: раньше сделка, где TP1 уже дал прибыль, а остаток закрылся
+    # по перенесённому SL (breakeven/half_tp1), помечалась результатом "sl" —
+    # той же меткой, что и полный убыток по исходному SL без единого частичного
+    # закрытия. pnl_pct уже считался корректно (см. выше), но бинарная метка
+    # result/exit_type искажала hit-rate (_calculate_hit_rate в state.py) и
+    # авто-калибровку TP percentile — сделка с итоговым плюсом засчитывалась
+    # как чистый провал наравне с настоящим полным лоссом. Отдельная метка
+    # "sl_after_tp1" позволяет считать её частичным успехом, а не провалом.
+    result_label = "sl_after_tp1" if (result == "sl" and tp1_hit) else result
 
     closed_trade = {
         "side": side,
@@ -431,7 +442,7 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         "tp": trade["tp"],
         "exit": exit_price,
         "exit_time": datetime.now(timezone.utc).isoformat(),
-        "result": result,
+        "result": result_label,
         "pnl_pct": round(pnl_pct, 4),
         "bars_held": bars_held,
         "lev": trade.get("lev", 1),
@@ -448,7 +459,7 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
     # 🆕 FIX: передаём track, чтобы не закрыть по ошибке запись другого трека
     # (A и U могут одновременно держать позицию в одну сторону на одном ticker/tf)
-    update_signal_record(ticker, tf, side, exit_price, result, bars_held, track=track,
+    update_signal_record(ticker, tf, side, exit_price, result_label, bars_held, track=track,
                           tp1_hit=tp1_hit, tp1_price=tp1_price)
 
     state[trade_key] = None

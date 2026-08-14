@@ -325,7 +325,10 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
     records = history[ticker][tf][side]
     # 🆕 FIX: синтетические записи (!sim) исключаются из статистики/калибровки —
     # они не отражают реальное поведение рынка и искажали перцентили.
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
+    # 🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 дал прибыль, остаток закрылся по
+    # перенесённому SL) — тоже реальный закрытый исход, должен участвовать
+    # в статистике наравне с "tp"/"sl"/"cancelled", а не выпадать из выборки.
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
     if not closed:
         return empty
 
@@ -355,6 +358,14 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
             tp_hits += 1
         elif r["exit_type"] == "sl":
             sl_hits += 1
+        elif r["exit_type"] == "sl_after_tp1":
+            # 🆕 FIX BUG-LO008: TP1 уже дал прибыль на 50% позиции, остаток
+            # закрылся по перенесённому SL (breakeven/half_tp1) — это частичный
+            # успех, а не полный провал. Даём половинный вес в обе стороны,
+            # а не считаем чистым "sl" наравне со сделкой, где TP1 вообще
+            # не достигался.
+            tp_hits += 0.5
+            sl_hits += 0.5
 
         bars = r.get("bars_held", 0)
         if bars > 0:
@@ -402,6 +413,11 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
         exit_type = r.get("exit_type", "unknown")
         if exit_type == "tp":
             weight = 1.0
+        elif exit_type == "sl_after_tp1":
+            # 🆕 FIX BUG-LO008: TP1 был реально достигнут (подтверждает, что уровень
+            # был статистически обоснован), остаток просто не дошёл до TP2 —
+            # весомее плана "sl", но менее весомо, чем полный "tp".
+            weight = 0.8
         elif exit_type == "sl":
             weight = 0.6
         elif exit_type == "cancelled":
@@ -429,13 +445,21 @@ def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[flo
 def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
     """
     Возвращает (tp_hit_rate, tp_count, total_exits) по записям.
+
+    🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 дал прибыль на 50%, остаток закрылся
+    по перенесённому SL — breakeven/half_tp1) раньше считался как обычный "sl",
+    хотя итоговый PnL по сделке чаще всего положительный. Теперь даём такому
+    исходу половинный вес и в hit, и в total — частичный успех, а не чистый
+    провал наравне со сделкой, которая вообще не дошла до TP1.
     """
     tp_hits = sum(1 for r in records if r["exit_type"] == "tp")
     sl_hits = sum(1 for r in records if r["exit_type"] == "sl")
-    total = tp_hits + sl_hits
+    partial = sum(1 for r in records if r["exit_type"] == "sl_after_tp1")
+    total = tp_hits + sl_hits + partial
     if total == 0:
         return 0.0, 0, 0
-    return tp_hits / total, tp_hits, total
+    weighted_hits = tp_hits + 0.5 * partial
+    return weighted_hits / total, tp_hits, total
 
 
 def _adjust_percentile_by_hit_rate(
@@ -514,7 +538,8 @@ def calculate_adaptive_tp(
 
     records = history[ticker][tf][side]
     # 🆕 FIX: синтетические записи (!sim) исключаются — см. get_signal_stats.
-    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
+    # 🆕 FIX BUG-LO008: sl_after_tp1 — реальный закрытый исход, участвует в выборке.
+    closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
 
     if len(closed) < 3:
         return round(fallback_tp, 4)

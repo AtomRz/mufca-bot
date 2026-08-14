@@ -743,10 +743,11 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         lines = [f"**📚 `{ticker}` `{tf}` {side.upper()} Signal History ({len(records)} signals):**\n"]
         for i, rec in enumerate(records[-15:], 1):
             emoji = "🟢" if rec["moved_pct"] > 0 else "🔴"
+            result_label = "SL (post-TP1)" if rec["exit_type"] == "sl_after_tp1" else rec["exit_type"].upper()
             lines.append(
                 f"{emoji} #{i} Entry: ${rec['entry']} → Exit: ${rec['exit']} | "
                 f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
-                f"Result: {rec['exit_type'].upper()}"
+                f"Result: {result_label}"
             )
         await ctx.send("\n".join(lines))
     except Exception as e:

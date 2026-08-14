@@ -459,13 +459,18 @@ async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
 def _aggregate_records(records: list) -> Optional[dict]:
     """Агрегирует закрытые сигналы: винрейт, средние MFE/MAE/PnL, разбивка TP/SL/cancelled.
     Синтетические (!sim) записи исключены — как и в get_signal_stats/calculate_adaptive_tp,
-    они не отражают реальное поведение рынка."""
-    closed = [r for r in records if r.get("exit_type") in ("tp", "sl", "cancelled") and not r.get("synthetic", False)]
+    они не отражают реальное поведение рынка.
+    🆕 FIX BUG-LO008: sl_after_tp1 (TP1 дал прибыль, остаток закрылся по перенесённому
+    SL) — реальный закрытый исход, участвует в выборке и в win_rate (win_rate уже и
+    так считается по знаку moved_pct, а не по exit_type, так что тут просто не терялся
+    из выборки); показываем отдельным счётчиком, а не мешаем с чистым "sl"."""
+    closed = [r for r in records if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
     if not closed:
         return None
     wins = sum(1 for r in closed if r.get("moved_pct", 0) > 0)
     tp_hits = sum(1 for r in closed if r["exit_type"] == "tp")
     sl_hits = sum(1 for r in closed if r["exit_type"] == "sl")
+    sl_after_tp1_hits = sum(1 for r in closed if r["exit_type"] == "sl_after_tp1")
     cancelled = sum(1 for r in closed if r["exit_type"] == "cancelled")
     mfes = [r.get("max_favorable_pct", 0) for r in closed]
     maes = [r.get("max_adverse_pct", 0) for r in closed]
@@ -480,6 +485,7 @@ def _aggregate_records(records: list) -> Optional[dict]:
         "avg_mae": round(sum(maes) / n, 2),
         "tp_hits": tp_hits,
         "sl_hits": sl_hits,
+        "sl_after_tp1_hits": sl_after_tp1_hits,
         "cancelled": cancelled,
     }
 
@@ -505,7 +511,7 @@ async def history_summary():
                         rows.append({"ticker": ticker, "tf": tf, "side": side, "track": track, **agg})
                         all_closed_for_total.extend(
                             r for r in recs
-                            if r.get("exit_type") in ("tp", "sl", "cancelled") and not r.get("synthetic", False)
+                            if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)
                         )
 
     rows.sort(key=lambda r: (r["ticker"], r["tf"], r["side"], r["track"]))

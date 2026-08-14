@@ -181,8 +181,8 @@ export default function HistoryPanel({ lastEvent }) {
                       <td>{(rec.max_favorable_pct ?? 0).toFixed(2)}%</td>
                       <td>{(rec.max_adverse_pct ?? 0).toFixed(2)}%</td>
                       <td>
-                        <span className={`tag ${rec.exit_type === 'tp' ? 'long' : rec.exit_type === 'sl' ? 'short' : 'flat'}`}>
-                          {rec.exit_type}
+                        <span className={`tag ${rec.exit_type === 'tp' ? 'long' : rec.exit_type === 'sl' ? 'short' : rec.exit_type === 'sl_after_tp1' ? 'long' : 'flat'}`}>
+                          {rec.exit_type === 'sl_after_tp1' ? 'SL (post-TP1)' : rec.exit_type}
                         </span>
                         {rec.tp1_hit && <span className="tag long" style={{ marginLeft: 6 }} title="TP1 was reached before final exit — PnL reflects the blended 50/50 result">TP1 ✓</span>}
                         {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>sim</span>}
