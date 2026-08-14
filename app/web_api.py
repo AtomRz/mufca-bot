@@ -41,7 +41,7 @@ app = FastAPI(title="MUFCA Web API")
 # bot.py импортирует web_api в самом низу, когда bot/state/config уже готовы.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history
@@ -536,6 +536,7 @@ async def get_config():
         "mode": _cfg.MARKET_MODE,
         "htf_bias": _cfg.HTF_BIAS,
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
+        "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "chop_threshold": CHOP_THRESHOLD,
         "filter_toggles": {
             "frama": _cfg.ENABLE_FRAMA_FILTER,
@@ -637,6 +638,27 @@ async def set_htf(body: HtfIn):
     await _reset_states_after_regime_change()
     await broadcast_event({"type": "config_changed", "key": "htf", "value": _cfg.HTF_BIAS})
     return {"htf_bias": _cfg.HTF_BIAS, "changed": True}
+
+
+class Tp1SlModeIn(BaseModel):
+    tp1_sl_mode: str
+
+
+@app.post("/api/config/tp1-sl-mode")
+async def set_tp1_sl_mode(body: Tp1SlModeIn):
+    """Режим переноса SL после TP1: 'breakeven' (SL = entry) или 'half_tp1'
+    (SL = entry + половина пути до TP1, строже безубытка). Применяется сразу,
+    без рестарта контейнера — bot.py читает _cfg.TP1_SL_MODE на каждом TP1-хите."""
+    new_mode = body.tp1_sl_mode.lower()
+    if new_mode not in ("breakeven", "half_tp1"):
+        raise HTTPException(400, "tp1_sl_mode должен быть 'breakeven' или 'half_tp1'")
+    if new_mode == _cfg.TP1_SL_MODE:
+        return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": False}
+
+    _cfg.TP1_SL_MODE = new_mode
+    save_tp1_sl_mode(_cfg.TP1_SL_MODE)
+    await broadcast_event({"type": "config_changed", "key": "tp1_sl_mode", "value": _cfg.TP1_SL_MODE})
+    return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": True}
 
 
 class UthaIn(BaseModel):

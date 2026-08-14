@@ -401,20 +401,34 @@ async def market_scanner():
                     )
                     if tp1_reached:
                         trade["tp1_hit"] = True
-                        # 🆕 FIX: раньше бот только слал уведомление, но внутри себя
-                        # продолжал проверять SL по СТАРОМУ уровню — хотя реально Атом
-                        # переносит стоп в безубыток вручную. Из-за этого check_tp_sl_hit
-                        # мог зафиксировать "sl" (полный лосс) для сделки, которая по факту
-                        # уже была в безубытке/плюсе после TP1. Теперь двигаем SL бота тоже.
-                        trade["sl"] = trade["entry"]
-                        track_label = "A" if track == "a" else "U"
+                        # 🆕 FIX: раньше SL после TP1 либо не двигался вовсе, либо был
+                        # жёстко захардкожен на безубыток. Теперь берём режим из
+                        # _cfg.TP1_SL_MODE — "breakeven" (SL = entry) или "half_tp1"
+                        # (SL = entry + половина пути до TP1, строже безубытка, но
+                        # каждое срабатывание фиксирует небольшой гарантированный
+                        # профит вместо нуля). check_tp_sl_hit() читает trade["sl"]
+                        # заново на каждой проверке, так что дальше это применится
+                        # само, без дополнительных изменений в signals.py.
                         entry = trade.get("entry", 0)
+                        if _cfg.TP1_SL_MODE == "half_tp1":
+                            if side == "long":
+                                new_sl = entry + (tp1_price - entry) / 2
+                            else:
+                                new_sl = entry - (entry - tp1_price) / 2
+                            sl_label = f"половина пути до TP1 (${round(new_sl, 2):,.2f})"
+                            sl_label_en = f"halfway to TP1 (${round(new_sl, 2):,.2f})"
+                        else:
+                            new_sl = entry
+                            sl_label = f"безубыток (${round(entry, 2):,.2f})"
+                            sl_label_en = f"breakeven (${round(entry, 2):,.2f})"
+                        trade["sl"] = new_sl
+                        track_label = "A" if track == "a" else "U"
                         await channel.send(
                             f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
                             f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
-                            f"⚠️ **Закрой 50% позиции и перенеси SL в безубыток (${round(entry, 2):,.2f})**"
+                            f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
                         )
-                        logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price}")
+                        logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price} | SL mode={_cfg.TP1_SL_MODE} → {new_sl}")
                         try:
                             from web_api import broadcast_event
                             await broadcast_event({
@@ -425,6 +439,8 @@ async def market_scanner():
                                 "side": side,
                                 "entry": entry,
                                 "tp1": tp1_price,
+                                "new_sl": new_sl,
+                                "sl_mode": _cfg.TP1_SL_MODE,
                             })
                         except Exception as ws_err:
                             logger.warning(f"[WS] broadcast failed: {ws_err}")
@@ -433,7 +449,7 @@ async def market_scanner():
                             await asyncio.to_thread(
                                 _push.send_push,
                                 title=f"🎯 TP1 Hit {ticker} {tf}",
-                                body=f"Close 50%, move SL to breakeven (${round(entry, 2):,.2f})",
+                                body=f"Close 50%, move SL to {sl_label_en}",
                                 data={"type": "tp1_hit", "ticker": ticker, "tf": tf, "track": track},
                             )
                         except Exception as push_err:

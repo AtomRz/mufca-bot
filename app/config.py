@@ -204,6 +204,28 @@ MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
 
 # =====================================================================
+# 🎯  РЕЖИМ ПЕРЕНОСА SL ПОСЛЕ TP1
+# =====================================================================
+# "breakeven" — SL = entry (нулевой риск по остатку, но чаще ловит финальный
+#               откат-выбивание перед продолжением к TP2, особенно на chop-рынке)
+# "half_tp1"  — SL = entry + (TP1 - entry) / 2 (жёстче безубытка — уже в плюсе,
+#               чаще срабатывает на шуме, но каждое срабатывание фиксирует
+#               небольшой гарантированный профит вместо нуля)
+TP1_SL_MODE_FILE = os.path.join(DATA_DIR, "tp1_sl_mode.json")
+
+def load_tp1_sl_mode() -> str:
+    data = safe_json_load(TP1_SL_MODE_FILE, {"tp1_sl_mode": "breakeven"})
+    mode = data.get("tp1_sl_mode", "breakeven")
+    return mode if mode in ("breakeven", "half_tp1") else "breakeven"
+
+def save_tp1_sl_mode(mode: str):
+    if mode not in ("breakeven", "half_tp1"):
+        raise ValueError(f"Unknown TP1_SL_MODE: {mode!r}")
+    safe_json_save(TP1_SL_MODE_FILE, {"tp1_sl_mode": mode})
+
+TP1_SL_MODE = load_tp1_sl_mode()
+
+# =====================================================================
 # 🎨  ЦВЕТА ГРАФИКА (веб-морда + !chart) — настраиваются из Settings
 # =====================================================================
 COLORS_FILE = os.path.join(DATA_DIR, "chart_colors.json")
