@@ -102,7 +102,11 @@ cp .env.example .env
 Edit `.env`:
 
 ```env
+# Optional — Discord is not required to run the bot (see "Running without
+# Discord" below). Leave DISCORD_TOKEN empty to disable it entirely, or set
+# DISCORD_ENABLED=false to keep the token configured but temporarily disabled.
 DISCORD_TOKEN=your_discord_bot_token
+DISCORD_ENABLED=true
 CHANNEL_NAME=general
 
 # Optional — enables the on-chain bias module (confidence/TP/SL/leverage adjustments).
@@ -126,6 +130,28 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Running without Discord
+
+Discord is entirely optional. The scanner, adaptive TP/SL engine, web dashboard,
+WebSocket live feed, and Android push notifications all work identically with
+or without it — only the Discord channel messages and `!commands` depend on it.
+
+To run without Discord:
+- leave `DISCORD_TOKEN` empty in `.env`, **or**
+- keep the token set but add `DISCORD_ENABLED=false`
+
+Either way, no gateway connection is attempted at startup — the container goes
+straight to the scanner + web dashboard. This is a startup-time setting: edit
+`.env` and restart the container to apply it (it isn't a live web toggle,
+since establishing/tearing down the Discord gateway connection isn't something
+that can be safely flipped at runtime without a restart).
+
+If Discord *is* enabled, there's a separate, independent toggle in the web
+dashboard's Settings panel — **"Discord signal notifications"** — that mutes
+just the signal/TP1 channel messages while keeping the gateway connected (so
+`!status` and other commands keep working). That one *is* a live toggle, no
+restart needed.
+
 ---
 
 ## Persistent Data
@@ -135,16 +161,21 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | File | Purpose |
 |---|---|
 | `signals_history.json` | Historical MFE/MAE data for adaptive TP/SL |
+| `bot_state_snapshot.json` | Active position snapshot — survives non-graceful restarts (OOM kill, `docker stop -t 0`) |
 | `mode.json` | Spot / Futures mode |
 | `htf_bias.json` | Active HTF timeframe |
 | `ut_ha.json` | UT Bot Heikin Ashi toggle |
 | `pairs.json` | Scanned pairs list |
 | `chop_threshold.json` | Per-timeframe CHOP thresholds |
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
+| `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven or half-way-to-TP1 (editable from the web dashboard) |
+| `discord_notifications.json` | Discord channel notifications on/off (editable from the web dashboard; independent of `DISCORD_ENABLED` — see "Running without Discord" above) |
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
 | `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
+| `onchain_baseline.json` | Previous-cycle exchange ETH balances, used to compute inflow/outflow delta — survives restarts so a restart doesn't delay flow analysis by a full cycle |
+| `closure_notified.json` | Trade-closure notification dedup set, capped at the last 2000 entries |
 
-Note: on-chain data (Etherscan/CoinGecko) is cached in-memory only (TTL 1h) and is not persisted to disk — it rebuilds automatically after a restart.
+Note: on-chain data other than the baseline balances above (Fear & Greed, BTC dominance, etc.) is cached in-memory only (TTL 1h) and is not persisted to disk — it rebuilds automatically after a restart.
 
 **Docker Compose volume example:**
 ```yaml
@@ -155,6 +186,10 @@ volumes:
 ---
 
 ## Discord Commands
+
+> Everything in this section requires Discord to be enabled (`DISCORD_TOKEN` set and
+> `DISCORD_ENABLED` not `false`) — see "Running without Discord" above. Without it,
+> use the web dashboard instead; it covers the same functionality.
 
 ### 📊 Status & Info
 

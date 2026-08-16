@@ -41,7 +41,7 @@ app = FastAPI(title="MUFCA Web API")
 # bot.py импортирует web_api в самом низу, когда bot/state/config уже готовы.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history
@@ -560,6 +560,7 @@ async def get_config():
         "htf_bias": _cfg.HTF_BIAS,
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
+        "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "chop_threshold": CHOP_THRESHOLD,
         "filter_toggles": {
             "frama": _cfg.ENABLE_FRAMA_FILTER,
@@ -682,6 +683,29 @@ async def set_tp1_sl_mode(body: Tp1SlModeIn):
     save_tp1_sl_mode(_cfg.TP1_SL_MODE)
     await broadcast_event({"type": "config_changed", "key": "tp1_sl_mode", "value": _cfg.TP1_SL_MODE})
     return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": True}
+
+
+class DiscordNotificationsIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/discord-notifications")
+async def set_discord_notifications(body: DiscordNotificationsIn):
+    """Вкл/выкл отправку сигналов/TP1-уведомлений в Discord-канал. Discord
+    gateway остаётся подключён (команды вроде !status продолжают работать) —
+    выключается только сама отправка сообщений в канал. Сканер, веб-дашборд,
+    WebSocket и Android push никак не затрагиваются."""
+    if body.enabled == _cfg.DISCORD_NOTIFICATIONS_ENABLED:
+        return {"discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED, "changed": False}
+
+    _cfg.DISCORD_NOTIFICATIONS_ENABLED = body.enabled
+    save_discord_notifications_enabled(_cfg.DISCORD_NOTIFICATIONS_ENABLED)
+    await broadcast_event({
+        "type": "config_changed",
+        "key": "discord_notifications_enabled",
+        "value": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
+    })
+    return {"discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED, "changed": True}
 
 
 class UthaIn(BaseModel):

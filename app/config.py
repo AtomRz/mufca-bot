@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 # ⚙️  БАЗОВЫЕ НАСТРОЙКИ
 # =====================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+# Discord is entirely optional: with no token, or DISCORD_ENABLED=false, the
+# bot runs scanner + web dashboard only — no gateway connection is attempted,
+# no channel messages, no !commands. See bot.py's ensure_engine_started() /
+# main.py for how startup no longer depends on Discord's on_ready firing.
+DISCORD_ENABLED = bool(DISCORD_TOKEN) and os.getenv("DISCORD_ENABLED", "true").strip().lower() != "false"
 
 # 🆕 Basic Auth для веб-морды. Если оба не заданы — дашборд остаётся открытым
 # (для локальной разработки), но при старте пишется громкий warning в лог.
@@ -224,6 +229,24 @@ def save_tp1_sl_mode(mode: str):
     safe_json_save(TP1_SL_MODE_FILE, {"tp1_sl_mode": mode})
 
 TP1_SL_MODE = load_tp1_sl_mode()
+
+# =====================================================================
+# 🔕  DISCORD NOTIFICATIONS TOGGLE
+# =====================================================================
+# When off, the bot skips sending signal/TP1 messages to the Discord channel —
+# the gateway connection itself stays up, so slash-commands like !status still
+# work. Scanner, web dashboard, WebSocket push, and Android push notifications
+# are completely unaffected — this only gates the app.bot.py channel.send() calls.
+DISCORD_NOTIFICATIONS_FILE = os.path.join(DATA_DIR, "discord_notifications.json")
+
+def load_discord_notifications_enabled() -> bool:
+    data = safe_json_load(DISCORD_NOTIFICATIONS_FILE, {"enabled": True})
+    return bool(data.get("enabled", True))
+
+def save_discord_notifications_enabled(enabled: bool):
+    safe_json_save(DISCORD_NOTIFICATIONS_FILE, {"enabled": bool(enabled)})
+
+DISCORD_NOTIFICATIONS_ENABLED = load_discord_notifications_enabled()
 
 # =====================================================================
 # 🎨  ЦВЕТА ГРАФИКА (веб-морда + !chart) — настраиваются из Settings

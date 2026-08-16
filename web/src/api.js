@@ -78,6 +78,8 @@ export const api = {
     request('/api/config/htf', { method: 'POST', body: JSON.stringify({ htf }) }),
   setTp1SlMode: (tp1SlMode) =>
     request('/api/config/tp1-sl-mode', { method: 'POST', body: JSON.stringify({ tp1_sl_mode: tp1SlMode }) }),
+  setDiscordNotifications: (enabled) =>
+    request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

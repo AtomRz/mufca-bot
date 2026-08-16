@@ -132,6 +132,28 @@ def _save_closure_notified(notified: set):
 # 🚀  ЗАПУСК
 # =====================================================================
 
+# 🆕 FIX: startup (exchange creation + backtest + scanner.start()) used to run
+# ONLY from on_ready — meaning if Discord is disabled/unreachable, on_ready
+# never fires and NOTHING starts (not the scanner, not signal generation),
+# even though scanning has nothing to do with Discord. Split into its own
+# idempotent function so main.py can call it directly when Discord is off,
+# while on_ready still calls it the normal way when Discord is on.
+_engine_started = False
+
+async def ensure_engine_started():
+    global _engine_started, _exchange_ref
+    if _engine_started:
+        return
+    _engine_started = True
+
+    if MARKET_MODE == "futures":
+        exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    else:
+        exchange = ccxt.gate({"enableRateLimit": True})
+    _exchange_ref = exchange
+    asyncio.create_task(startup_sequence(exchange))
+
+
 async def startup_sequence(exchange: ccxt.Exchange):
     global _exchange_ref
     _exchange_ref = exchange
@@ -190,10 +212,14 @@ _onchain_last_fetch: float = 0.0
 @tasks.loop(seconds=60)
 async def market_scanner():
     """Основной цикл сканирования."""
-    channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
-    if channel is None:
-        logger.warning(f"[WARN] Channel '{CHANNEL_NAME}' not found!")
-        return
+    # 🆕 FIX: раньше отсутствие Discord-канала (или сам Discord отключённый —
+    # см. _cfg.DISCORD_ENABLED) обрывало ВЕСЬ цикл сканирования через ранний
+    # return — то есть без Discord не работало вообще ничего, включая веб.
+    # Теперь channel — просто Optional: если недоступен, ниже молча
+    # пропускаются только сами отправки в канал, сканирование идёт как обычно.
+    channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME) if _cfg.DISCORD_ENABLED else None
+    if _cfg.DISCORD_ENABLED and channel is None:
+        logger.warning(f"[WARN] Channel '{CHANNEL_NAME}' not found — scanning continues, Discord messages will be skipped this cycle.")
 
     exchange = _exchange_ref
     if exchange is None:
@@ -272,43 +298,49 @@ async def market_scanner():
                         # узнавал о позиции только зайдя в Status. Теперь каждый канал
                         # уведомления в своём try: падение одного не блокирует остальные.
                         chart_file = None
-                        try:
-                            from chart import generate_chart
-                            is_long = "BUY" in sig_type or "LONG" in sig_type
-                            # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
-                            # который фетчился ЗДЕСЬ (limit=100), а generate_chart
-                            # внутри себя делает свой отдельный fetch (limit≈300+) —
-                            # индексы не совпадали, и стрелка почти всегда улетала
-                            # в начало графика. Сигнал всегда формируется на последнем
-                            # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
-                            # это верно для df ЛЮБОЙ длины — используем offset от конца.
-                            state_snapshot = {
-                                "entry": price,
-                                "tp":    tp,
-                                "tp1":   tp1,
-                                "sl":    sl,
-                                "side":  "long" if is_long else "short",
-                                "signal_bar_offset": -2,
-                            }
-                            chart_buf = await generate_chart(
-                                exchange=exchange,
-                                symbol=ticker,
-                                timeframe=tf,
-                                limit=50,
-                                state_snapshot=state_snapshot,
-                            )
-                            chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
-                        except Exception as chart_err:
-                            logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
+                        # 🆕 Skip the (expensive, matplotlib) chart render entirely when
+                        # nothing will use it — only the Discord embed attaches it.
+                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                            try:
+                                from chart import generate_chart
+                                is_long = "BUY" in sig_type or "LONG" in sig_type
+                                # 🆕 FIX: раньше здесь считался абсолютный индекс от df,
+                                # который фетчился ЗДЕСЬ (limit=100), а generate_chart
+                                # внутри себя делает свой отдельный fetch (limit≈300+) —
+                                # индексы не совпадали, и стрелка почти всегда улетала
+                                # в начало графика. Сигнал всегда формируется на последнем
+                                # подтверждённом закрытом баре (iloc[-2]) по правилам бота,
+                                # это верно для df ЛЮБОЙ длины — используем offset от конца.
+                                state_snapshot = {
+                                    "entry": price,
+                                    "tp":    tp,
+                                    "tp1":   tp1,
+                                    "sl":    sl,
+                                    "side":  "long" if is_long else "short",
+                                    "signal_bar_offset": -2,
+                                }
+                                chart_buf = await generate_chart(
+                                    exchange=exchange,
+                                    symbol=ticker,
+                                    timeframe=tf,
+                                    limit=50,
+                                    state_snapshot=state_snapshot,
+                                )
+                                chart_file = discord.File(chart_buf, filename=f"{ticker.replace('/', '')}_{tf}_signal.png")
+                            except Exception as chart_err:
+                                logger.warning(f"[CHART] Failed to generate signal chart: {chart_err}")
 
-                        try:
-                            if chart_file:
-                                await channel.send(embed=embed, file=chart_file)
-                            else:
-                                await channel.send(embed=embed)
-                            scan_stats["signals_generated"] += 1
-                        except Exception as discord_err:
-                            logger.error(f"[DISCORD] Failed to send signal for {ticker} {tf}: {discord_err}", exc_info=True)
+                        # 🆕 discord_notifications toggle (Settings → web) — gateway stays
+                        # connected either way, this only skips the channel message itself.
+                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                            try:
+                                if chart_file:
+                                    await channel.send(embed=embed, file=chart_file)
+                                else:
+                                    await channel.send(embed=embed)
+                            except Exception as discord_err:
+                                logger.error(f"[DISCORD] Failed to send signal for {ticker} {tf}: {discord_err}", exc_info=True)
+                        scan_stats["signals_generated"] += 1
 
                         # 🆕 веб-морда: пушим сигнал всем подключенным WS-клиентам
                         try:
@@ -365,12 +397,13 @@ async def market_scanner():
                                     # навсегда. Реальная сделка закрылась, а пользователь никогда об этом
                                     # не узнавал. Теперь отправляем в любом случае, помечая опоздание явно.
                                     late_note = "" if age < 35 else " ⏱️ *(delayed notification)*"
-                                    await channel.send(
-                                        f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                        f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
-                                        f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
-                                        f"{late_note}"
-                                    )
+                                    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                                        await channel.send(
+                                            f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                            f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                            f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                                            f"{late_note}"
+                                        )
                                     notified_ids.add(trade_id)
                                     _save_closure_notified(notified_ids)
                                     st[notified_key] = True
@@ -423,11 +456,12 @@ async def market_scanner():
                             sl_label_en = f"breakeven (${round(entry, 2):,.2f})"
                         trade["sl"] = new_sl
                         track_label = "A" if track == "a" else "U"
-                        await channel.send(
-                            f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
-                            f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
-                            f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
-                        )
+                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                            await channel.send(
+                                f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
+                                f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
+                            )
                         logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price} | SL mode={_cfg.TP1_SL_MODE} → {new_sl}")
                         try:
                             from web_api import broadcast_event
@@ -529,16 +563,7 @@ async def on_ready():
     _startup_completed = True
 
     logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {_cfg.HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
-
-    if MARKET_MODE == "futures":
-        exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-    else:
-        exchange = ccxt.gate({"enableRateLimit": True})
-
-    global _exchange_ref
-    _exchange_ref = exchange
-    asyncio.create_task(startup_sequence(exchange))
-    await asyncio.sleep(0)  # satisfy async convention
+    await ensure_engine_started()
 
 # 🆕 FIX: Global command error handler
 @bot.event

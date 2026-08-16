@@ -217,6 +217,24 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
+            <h3 className="panel-title">Notifications</h3>
+            <div className="toggle-row">
+              <span className="row-label" title="Discord gateway stays connected — commands like !status keep working. Only the channel messages (signals, TP1) are suppressed. WebSocket and Android push are unaffected.">
+                Discord signal notifications
+              </span>
+              <Toggle
+                checked={config.discord_notifications_enabled}
+                disabled={busy === 'discord_notifications'}
+                onChange={(v) => run('discord_notifications', () => api.setDiscordNotifications(v))}
+              />
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Off = the bot stops posting signal/TP1 messages to the Discord channel. Scanning, the web
+              dashboard, and Android push all keep working exactly the same either way.
+            </p>
+          </div>
+
+          <div className="panel">
             <h3 className="panel-title">Signal Filters</h3>
             {FILTER_TOGGLES.map(({ key, label }) => (
               <div className="toggle-row" key={key}>
