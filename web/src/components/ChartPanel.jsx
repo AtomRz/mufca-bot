@@ -310,8 +310,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       s.srZones.push(zone)
     }
 
-    data.support?.forEach((level) => srZone(level, 'rgba(69, 208, 165, 0.16)'))
-    data.resistance?.forEach((level) => srZone(level, 'rgba(242, 99, 122, 0.16)'))
+    data.support?.forEach((level) => srZone(level, hexToRgba(C.support, 0.16)))
+    data.resistance?.forEach((level) => srZone(level, hexToRgba(C.resistance, 0.16)))
 
     if (data.active_trade) {
       const t = data.active_trade
