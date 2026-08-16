@@ -108,7 +108,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         horzLines: { color: '#1b222b' },
       },
       rightPriceScale: { borderColor: '#232c3a' },
-      timeScale: { borderColor: '#232c3a', timeVisible: true, rightOffset: 20 },
+      timeScale: { borderColor: '#232c3a', timeVisible: true, rightOffset: 6 },
       crosshair: { mode: 0 },
       height: 640,
     })
@@ -196,7 +196,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     })
     mfi.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 }, visible: true })
 
-    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], tradeLines: [], mfiLines: [] }
+    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [] }
 
     const handleResize = () => {
       if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth })
@@ -278,29 +278,40 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       )
     }
 
-    // S/R уровни и entry/tp/sl — как horizontal price lines на свечной серии
-    ;[...s.srLines, ...s.tradeLines].forEach((line) => {
+    // 🆕 S/R теперь полупрозрачные зоны (как supply/demand на TradingView), а не
+    // тонкие пунктирные линии. Baseline-серия заливает область между value и
+    // baseValue цветом topFillColor — то есть между level±halfWidth получаем
+    // ровную горизонтальную полосу на всю ширину графика.
+    ;[...s.srLines, ...s.srZones, ...s.tradeLines].forEach((line) => {
       try { s.candle.removePriceLine(line) } catch (_) {}
+      try { chartRef.current.removeSeries(line) } catch (_) {}
     })
     s.srLines = []
+    s.srZones = []
     s.tradeLines = []
 
-    data.support?.forEach((level) => {
-      s.srLines.push(
-        s.candle.createPriceLine({
-          price: level, color: C.support, lineWidth: 1,
-          lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'S',
-        }),
-      )
-    })
-    data.resistance?.forEach((level) => {
-      s.srLines.push(
-        s.candle.createPriceLine({
-          price: level, color: C.resistance, lineWidth: 1,
-          lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'R',
-        }),
-      )
-    })
+    const srZone = (level, color) => {
+      const halfWidth = level * 0.0012 // ~0.12% каждая сторона — подстраивается ниже
+      const zone = chartRef.current.addBaselineSeries({
+        baseValue: { type: 'price', price: level - halfWidth },
+        topLineColor: 'transparent',
+        topFillColor1: color,
+        topFillColor2: color,
+        bottomLineColor: 'transparent',
+        bottomFillColor1: 'transparent',
+        bottomFillColor2: 'transparent',
+        lineWidth: 1,
+        priceScaleId: 'right',
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      })
+      zone.setData(times.map((t) => ({ time: t, value: level + halfWidth })))
+      s.srZones.push(zone)
+    }
+
+    data.support?.forEach((level) => srZone(level, 'rgba(69, 208, 165, 0.16)'))
+    data.resistance?.forEach((level) => srZone(level, 'rgba(242, 99, 122, 0.16)'))
 
     if (data.active_trade) {
       const t = data.active_trade
