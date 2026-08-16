@@ -23,8 +23,11 @@ from config import (
     MAX_HOLD_BARS,
     HTF_CACHE_TTL_SECONDS,
     MARKET_MODE,
-    SIGNAL_HISTORY_LIMIT,
 )
+# SIGNAL_HISTORY_LIMIT deliberately NOT bare-imported: it's runtime-mutable via
+# !tpconfig limit / web_api.py (_cfg.SIGNAL_HISTORY_LIMIT = ...). A bare import
+# would bind a stale int copy here that never sees those updates. Same reasoning
+# as the indicator params below — always read via _cfg.SIGNAL_HISTORY_LIMIT.
 # 🆕 Параметры индикаторов (FRAMA/MFI/Andean/UT Bot) теперь редактируются на
 # лету из веб-морды (Settings), поэтому обращаемся к ним как _cfg.FRAMA_LEN и
 # т.д. по месту использования, а не через bare-импорт — иначе после
@@ -1133,7 +1136,7 @@ def backtest_history(
                     "regime": bt_regime,
                     "track": track,
                 })
-                history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
+                history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1
 
         save_signals_history(history)

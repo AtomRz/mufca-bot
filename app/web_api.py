@@ -222,11 +222,14 @@ _ws_clients: Set[WebSocket] = set()
 
 
 async def broadcast_event(event: dict):
-    """Рассылает событие всем подключенным клиентам. Вызывается из bot.py."""
+    """Рассылает событие всем подключенным клиентам. Вызывается из bot.py.
+
+    Each send is bounded by a timeout — a slow/stuck client shouldn't be able
+    to stall delivery to every other connected client."""
     dead = []
     for ws in _ws_clients:
         try:
-            await ws.send_json(event)
+            await asyncio.wait_for(ws.send_json(event), timeout=2.0)
         except Exception:
             dead.append(ws)
     for ws in dead:

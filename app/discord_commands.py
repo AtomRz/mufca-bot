@@ -1194,10 +1194,10 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             await ctx.send(embed=embed)
 
         except Exception as e:
+            # Full traceback goes to the log only — sending it to Discord leaks
+            # absolute container paths (/app/...) and internal function names.
             logger.error(f"Forcerun error: {e}", exc_info=True)
-            await ctx.send(f"❌ Force run failed: {e}")
-            import traceback
-            await ctx.send(f"```\n{traceback.format_exc()[:1000]}\n```")
+            await ctx.send("❌ Force run failed. Check logs for details.")
 
 
 @core.bot.command(name="onchain")

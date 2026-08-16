@@ -128,6 +128,7 @@ def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: floa
     for i, l in enumerate(levels):
         if used[i]:
             continue
+        used[i] = True  # mark the pivot element itself as consumed too, not just its cluster-mates
         cluster = [l]
         for j in range(i + 1, len(levels)):
             if not used[j] and abs(levels[j] - l) / (l + 1e-8) < tol:
@@ -516,7 +517,13 @@ async def generate_chart(
         else:
             signal_bar_offset = state_snapshot.get("signal_bar_offset", -2)
 
-    return build_chart(
+    # 🆕 FIX: build_chart() is a heavy synchronous matplotlib call (CPU-bound
+    # rendering + PNG encode, easily 100-300ms). Calling it directly here would
+    # block the whole asyncio event loop — including the scanner loop and every
+    # other coroutine — for that whole duration on every single signal chart.
+    # Offload to a worker thread so the event loop stays responsive.
+    return await asyncio.to_thread(
+        build_chart,
         df=df,
         symbol=symbol,
         timeframe=timeframe,

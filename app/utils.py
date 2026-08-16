@@ -20,6 +20,10 @@ async def safe_fetch_ohlcv(
     retries: int = 3
 ) -> List[List[float]]:
     """Безопасный fetch с экспоненциальной задержкой при ошибках."""
+    # Guard against an accidentally huge limit (typo, bad param) causing memory
+    # pressure. Largest legitimate caller today is 900 bars; backtest_history()
+    # calls exchange.fetch_ohlcv directly and isn't affected by this bound.
+    limit = max(1, min(limit, 2000))
     for attempt in range(retries):
         try:
             return await asyncio.to_thread(
