@@ -477,14 +477,40 @@ async def market_scanner():
     except Exception as snap_err:
         logger.warning(f"[STATE] snapshot save failed: {snap_err}")
 
+    # 🆕 A scan cycle reached this point without raising — reset the crash
+    # counter so sporadic, unrelated failures spread over days/weeks don't
+    # eventually accumulate past _MAX_SCANNER_RESTARTS and permanently disable
+    # auto-restart (see on_scanner_error below).
+    global _scanner_crash_count
+    _scanner_crash_count = 0
+
 # 🆕 FIX: CRITICAL - Task error handler to prevent silent death
+# 🆕 FIX: unbounded restart loop had no ceiling — a persistent error (corrupted
+# state file, bad API key, etc.) would crash → sleep 10s → restart → crash again,
+# forever, with a fixed 10s delay regardless of how many times it already failed.
+# Now backs off exponentially (capped at 5 min) and gives up after too many
+# crashes in a row instead of spinning forever.
+_scanner_crash_count = 0
+_MAX_SCANNER_RESTARTS = 5
+
 @market_scanner.error
 async def on_scanner_error(error):
-    """Handle scanner loop errors and restart if needed."""
-    logger.exception(f"[CRITICAL] Scanner loop crashed: {error}")
-    await asyncio.sleep(10)
+    """Handle scanner loop errors and restart if needed, with backoff + a ceiling."""
+    global _scanner_crash_count
+    _scanner_crash_count += 1
+    logger.exception(f"[CRITICAL] Scanner loop crashed ({_scanner_crash_count}/{_MAX_SCANNER_RESTARTS}): {error}")
+
+    if _scanner_crash_count > _MAX_SCANNER_RESTARTS:
+        logger.critical(
+            f"[FATAL] Scanner crashed {_scanner_crash_count} times in a row — "
+            "giving up on auto-restart. Fix the underlying issue and restart the container."
+        )
+        return
+
+    wait = min(10 * (2 ** (_scanner_crash_count - 1)), 300)
+    await asyncio.sleep(wait)
     if not market_scanner.is_running():
-        logger.info("[RECOVERY] Restarting scanner loop...")
+        logger.info(f"[RECOVERY] Restarting scanner loop (after {wait}s backoff)...")
         market_scanner.restart()
 
 # =====================================================================

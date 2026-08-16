@@ -9,15 +9,19 @@ onchain.py — On-Chain анализ для MUFCA Bot
 import asyncio
 import aiohttp
 import logging
+import os
 import time
 from typing import Dict, Optional, Any, Tuple
 
 from config import (
+    DATA_DIR,
     ETHERSCAN_API_KEY,
     COINGECKO_API_KEY,
     ONCHAIN_CACHE_TTL,
     ONCHAIN_FLOW_THRESHOLD_ETH,
     ONCHAIN_FLOW_THRESHOLD_LARGE_ETH,
+    safe_json_load,
+    safe_json_save,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +40,14 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
 # 💾  КЭШ
 # =====================================================================
 _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
-_prev_balances: Dict[str, Optional[float]] = {}  # постоянное хранилище предыдущих балансов (без TTL)
+
+# 🆕 FIX: baseline balances used to live in a plain in-memory dict and were lost
+# on every container restart, forcing a fresh "first_run" and delaying flow
+# analysis by a full ONCHAIN_CACHE_TTL cycle (~1h) each time. Persisted to disk
+# so a restart doesn't reset the baseline.
+_ONCHAIN_BASELINE_FILE = os.path.join(DATA_DIR, "onchain_baseline.json")
+_prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FILE, {})
+
 
 def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -63,6 +74,8 @@ def clear_onchain_cache_full():
     """Полный сброс кэша включая baseline балансов (использовать только при !reset_cache)."""
     _cache.clear()
     _prev_balances.clear()
+    # Иначе на следующем скане baseline подхватится обратно из файла на диске.
+    safe_json_save(_ONCHAIN_BASELINE_FILE, {})
     logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
@@ -160,6 +173,7 @@ async def get_eth_flow_delta() -> Dict:
     # При первом запуске — сохраняем как базу и сразу делаем второй запрос через паузу
     if not _prev_balances:
         _prev_balances.update(curr_balances)
+        safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
         logger.info("[ONCHAIN] First run: saved baseline balances, delta will be available on next cycle.")
         return {
             "delta_eth": 0.0,
@@ -183,6 +197,7 @@ async def get_eth_flow_delta() -> Dict:
 
     # Обновляем предыдущие балансы для следующего цикла
     _prev_balances.update(curr_balances)
+    safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
 
     # Классифицируем
     abs_delta = abs(delta_total)

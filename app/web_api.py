@@ -165,8 +165,10 @@ class BasicAuthASGIMiddleware:
         # Защищаем только /api/* и /ws/* — статику фронта (index.html, JS/CSS-бандл)
         # отдаём свободно, иначе браузер покажет СВОЙ нативный Basic Auth попап поверх
         # нашего кастомного логин-экрана ещё до того, как React успеет отрендериться.
+        # /api/health тоже освобождён — это liveness-проба для Docker HEALTHCHECK,
+        # у которой нет и не должно быть кредов, и она не отдаёт ничего чувствительного.
         path = scope.get("path", "")
-        if not (path.startswith("/api/") or path.startswith("/ws/")):
+        if not (path.startswith("/api/") or path.startswith("/ws/")) or path == "/api/health":
             return await self.app(scope, receive, send)
 
         if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
@@ -260,6 +262,18 @@ async def issue_ws_ticket():
     и весь /api/*, так что тикет получит только тот, кто уже прошёл нормальную
     авторизацию по заголовку."""
     return {"ticket": _issue_ws_ticket()}
+
+
+@app.get("/api/health")
+async def health():
+    """Lightweight liveness/readiness probe for Docker/orchestrator healthchecks —
+    intentionally has no auth and does no heavy work (no exchange calls, no file I/O)."""
+    return {
+        "status": "ok",
+        "exchange_connected": core._exchange_ref is not None,
+        "scanner_running": core.market_scanner.is_running(),
+        "last_scan": core.scan_stats.get("last_scan_time"),
+    }
 
 
 @app.get("/api/status")

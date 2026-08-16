@@ -333,32 +333,16 @@ def apply_onchain_with_safety(
         new_tp = entry - reward_before * tp_mult
         new_sl = entry + risk_before * sl_mult
 
-    risk_after = abs(entry - new_sl)
-    reward_after = abs(new_tp - entry)
-    rr_after = reward_after / max(risk_after, 1e-8)
-
-    # 🆕 SAFETY CHECKS
     desc_suffix = ""
 
-    # 1. Если RR упал ниже минимума — откатываем TP к минимально допустимому
-    if rr_after < min_rr:
-        logger.warning(f"[ONCHAIN-SAFETY] RR degraded {rr_before:.2f} -> {rr_after:.2f} (below {min_rr}), using conservative")
-        # Восстанавливаем RR = min_rr, сохраняя направление on-chain если возможно
-        if side == "long":
-            # Минимальный TP = entry + risk_after * min_rr
-            safe_tp = entry + risk_after * min_rr
-            # Но не хуже оригинального TP
-            new_tp = max(safe_tp, tp)
-        else:
-            safe_tp = entry - risk_after * min_rr
-            new_tp = min(safe_tp, tp)
-
-        reward_after = abs(new_tp - entry)
-        rr_after = reward_after / max(risk_after, 1e-8)
-        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [SAFETY: RR capped @ {rr_after:.2f}]"
-        return new_tp, new_sl, desc_suffix, False
-
-    # 2. Если SL расширен слишком сильно — ограничиваем
+    # 🆕 FIX: SL-widen cap moved BEFORE the RR check (was after, with an early
+    # `return` in the RR branch — if on-chain widened SL enough to also drop RR
+    # below min_rr, the function returned from the RR branch first and the SL
+    # cap below was never reached, silently letting SL through wider than
+    # max_sl_widen_pct). Capping first means the RR check afterwards always
+    # operates on the already-capped risk, so neither guarantee can undercut
+    # the other regardless of which condition triggers.
+    risk_after = abs(entry - new_sl)
     sl_widen = (risk_after - risk_before) / risk_before
     if sl_widen > max_sl_widen_pct:
         logger.warning(f"[ONCHAIN-SAFETY] SL widened {sl_widen:.1%} > max {max_sl_widen_pct:.1%}, capping")
@@ -367,12 +351,30 @@ def apply_onchain_with_safety(
         else:
             new_sl = entry + risk_before * (1 + max_sl_widen_pct)
         risk_after = abs(entry - new_sl)
+        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [SL capped +{max_sl_widen_pct:.0%}]"
+
+    reward_after = abs(new_tp - entry)
+    rr_after = reward_after / max(risk_after, 1e-8)
+
+    # Если RR всё ещё ниже минимума (из-за on-chain TP-множителя или пост-капа SL) —
+    # откатываем TP к минимально допустимому, сохраняя направление on-chain где возможно.
+    if rr_after < min_rr:
+        logger.warning(f"[ONCHAIN-SAFETY] RR degraded {rr_before:.2f} -> {rr_after:.2f} (below {min_rr}), using conservative")
+        if side == "long":
+            # Минимальный TP = entry + risk_after * min_rr, но не хуже оригинального TP
+            safe_tp = entry + risk_after * min_rr
+            new_tp = max(safe_tp, tp)
+        else:
+            safe_tp = entry - risk_after * min_rr
+            new_tp = min(safe_tp, tp)
+
         reward_after = abs(new_tp - entry)
         rr_after = reward_after / max(risk_after, 1e-8)
-        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [SL capped +{max_sl_widen_pct:.0%}]"
-        return new_tp, new_sl, desc_suffix, True
+        desc_suffix += f" | OC×TP{tp_mult}/SL{sl_mult} [SAFETY: RR capped @ {rr_after:.2f}]"
+        return new_tp, new_sl, desc_suffix, False
 
-    desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [RR {rr_before:.2f}→{rr_after:.2f}]"
+    if not desc_suffix:
+        desc_suffix = f" | OC×TP{tp_mult}/SL{sl_mult} [RR {rr_before:.2f}→{rr_after:.2f}]"
     return new_tp, new_sl, desc_suffix, True
 
 # =====================================================================
