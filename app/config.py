@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import logging
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -247,6 +247,23 @@ def save_discord_notifications_enabled(enabled: bool):
     safe_json_save(DISCORD_NOTIFICATIONS_FILE, {"enabled": bool(enabled)})
 
 DISCORD_NOTIFICATIONS_ENABLED = load_discord_notifications_enabled()
+
+# =====================================================================
+# ⛓️  ON-CHAIN BIAS CACHE (persisted so a restart doesn't lose it / delay it)
+# =====================================================================
+# The bias itself already has its own TTL logic inside onchain.py (hourly), but
+# it previously lived only in a bot.py module-level variable — reset to None on
+# every restart, so the web dashboard (and Discord embeds) had nothing to show
+# until the next hourly refresh completed. Persisting it means a restart just
+# picks up wherever it left off.
+ONCHAIN_BIAS_CACHE_FILE = os.path.join(DATA_DIR, "onchain_bias_cache.json")
+
+def load_onchain_bias_cache() -> dict:
+    """Returns {"bias": dict|None, "last_fetch": float}."""
+    return safe_json_load(ONCHAIN_BIAS_CACHE_FILE, {"bias": None, "last_fetch": 0.0})
+
+def save_onchain_bias_cache(bias: Optional[dict], last_fetch: float):
+    safe_json_save(ONCHAIN_BIAS_CACHE_FILE, {"bias": bias, "last_fetch": last_fetch})
 
 # =====================================================================
 # 🎨  ЦВЕТА ГРАФИКА (веб-морда + !chart) — настраиваются из Settings

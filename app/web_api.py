@@ -264,6 +264,22 @@ async def issue_ws_ticket():
     return {"ticket": _issue_ws_ticket()}
 
 
+@app.get("/api/onchain")
+async def get_onchain():
+    """On-chain bias snapshot (ETH exchange flow, Fear & Greed, BTC dominance,
+    resulting TP/SL/leverage multipliers) — same data the Discord embeds show,
+    now also available to the web dashboard. Reads bot.py's in-memory cache
+    (refreshed hourly, persisted to disk — see config.load_onchain_bias_cache),
+    doesn't trigger a fetch itself."""
+    if not core.ONCHAIN_ENABLED:
+        return {"enabled": False, "bias": None, "last_fetch": None}
+    return {
+        "enabled": True,
+        "bias": core._onchain_bias_cache,
+        "last_fetch": core._onchain_last_fetch or None,
+    }
+
+
 @app.get("/api/health")
 async def health():
     """Lightweight liveness/readiness probe for Docker/orchestrator healthchecks —

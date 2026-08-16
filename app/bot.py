@@ -206,8 +206,9 @@ async def startup_sequence(exchange: ccxt.Exchange):
 # =====================================================================
 
 # On-chain bias кэш (обновляется раз в час в market_scanner)
-_onchain_bias_cache: Optional[Dict] = None
-_onchain_last_fetch: float = 0.0
+_onchain_cache_loaded = _cfg.load_onchain_bias_cache()
+_onchain_bias_cache: Optional[Dict] = _onchain_cache_loaded.get("bias")
+_onchain_last_fetch: float = _onchain_cache_loaded.get("last_fetch", 0.0)
 
 @tasks.loop(seconds=60)
 async def market_scanner():
@@ -240,6 +241,7 @@ async def market_scanner():
                 logger.info("[ONCHAIN] First run detected — bias cache cleared for next cycle")
             else:
                 logger.info(f"[ONCHAIN] Bias refreshed: long={_onchain_bias_cache.get('bias_long',0):+d} short={_onchain_bias_cache.get('bias_short',0):+d}")
+            _cfg.save_onchain_bias_cache(_onchain_bias_cache, _onchain_last_fetch)
         except Exception as e:
             logger.warning(f"[ONCHAIN] Refresh failed: {e}")
 

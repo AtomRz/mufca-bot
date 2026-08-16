@@ -59,6 +59,7 @@ async function request(path, options = {}) {
 
 export const api = {
   getStatus: () => request('/api/status'),
+  getOnchain: () => request('/api/onchain'),
   getPairs: () => request('/api/pairs'),
   addPair: (ticker) =>
     request('/api/pairs', { method: 'POST', body: JSON.stringify({ ticker }) }),

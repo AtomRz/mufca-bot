@@ -3,6 +3,7 @@ import { api, connectLive, getAuthToken, clearAuthToken } from './api'
 import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
+import OnchainPanel from './components/OnchainPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
@@ -11,6 +12,7 @@ const TABS = [
   { id: 'status', label: 'Status' },
   { id: 'chart', label: 'Chart' },
   { id: 'history', label: 'History' },
+  { id: 'onchain', label: 'Onchain' },
 ]
 
 const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 'var(--text-dim)' }
@@ -180,6 +182,7 @@ export default function App() {
           />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
+        {tab === 'onchain' && <OnchainPanel lastEvent={lastEvent} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}
