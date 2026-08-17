@@ -81,6 +81,8 @@ export const api = {
     request('/api/config/tp1-sl-mode', { method: 'POST', body: JSON.stringify({ tp1_sl_mode: tp1SlMode }) }),
   setDiscordNotifications: (enabled) =>
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setScanInterval: (seconds) =>
+    request('/api/config/scan-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

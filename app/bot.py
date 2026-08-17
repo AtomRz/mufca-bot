@@ -210,7 +210,7 @@ _onchain_cache_loaded = _cfg.load_onchain_bias_cache()
 _onchain_bias_cache: Optional[Dict] = _onchain_cache_loaded.get("bias")
 _onchain_last_fetch: float = _onchain_cache_loaded.get("last_fetch", 0.0)
 
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=_cfg.SCAN_INTERVAL_SECONDS)
 async def market_scanner():
     """Основной цикл сканирования."""
     # 🆕 FIX: раньше отсутствие Discord-канала (или сам Discord отключённый —
@@ -519,6 +519,19 @@ async def market_scanner():
     # auto-restart (see on_scanner_error below).
     global _scanner_crash_count
     _scanner_crash_count = 0
+
+
+def set_scan_interval(seconds: int):
+    """Live-changes the scanner loop interval (Settings → web) — no restart needed.
+    discord.ext.tasks.Loop.change_interval() takes effect after the current
+    iteration finishes; it doesn't interrupt an in-progress scan."""
+    if seconds not in _cfg.SCAN_INTERVAL_OPTIONS:
+        raise ValueError(f"scan interval must be one of {_cfg.SCAN_INTERVAL_OPTIONS}, got {seconds}")
+    market_scanner.change_interval(seconds=seconds)
+    _cfg.SCAN_INTERVAL_SECONDS = seconds
+    _cfg.save_scan_interval(seconds)
+    logger.info(f"[SCAN] Interval changed to {seconds}s")
+
 
 # 🆕 FIX: CRITICAL - Task error handler to prevent silent death
 # 🆕 FIX: unbounded restart loop had no ceiling — a persistent error (corrupted

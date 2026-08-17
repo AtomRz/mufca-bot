@@ -249,6 +249,32 @@ def save_discord_notifications_enabled(enabled: bool):
 DISCORD_NOTIFICATIONS_ENABLED = load_discord_notifications_enabled()
 
 # =====================================================================
+# ⏱️  SCAN INTERVAL
+# =====================================================================
+# Signals only ever form on a closed bar (anti-repainting, idx=-2), so on a 1h
+# timeframe a new signal can't appear more than once an hour no matter how
+# often we poll. Faster polling still helps with two things: catching TP1/SL
+# hits sooner (checked against the forming bar's live high/low) and fresher
+# numbers in the web dashboard's topbar/pulse. 15s floor keeps a full scan
+# cycle (network fetch + indicators + occasional chart render) comfortably
+# inside the interval even for several pairs — benchmarked indicator compute
+# time alone is ~50ms/pair-timeframe, network I/O dominates.
+SCAN_INTERVAL_OPTIONS = (15, 30, 60, 180)  # seconds
+SCAN_INTERVAL_FILE = os.path.join(DATA_DIR, "scan_interval.json")
+
+def load_scan_interval() -> int:
+    data = safe_json_load(SCAN_INTERVAL_FILE, {"seconds": 60})
+    seconds = data.get("seconds", 60)
+    return seconds if seconds in SCAN_INTERVAL_OPTIONS else 60
+
+def save_scan_interval(seconds: int):
+    if seconds not in SCAN_INTERVAL_OPTIONS:
+        raise ValueError(f"scan interval must be one of {SCAN_INTERVAL_OPTIONS}, got {seconds}")
+    safe_json_save(SCAN_INTERVAL_FILE, {"seconds": seconds})
+
+SCAN_INTERVAL_SECONDS = load_scan_interval()
+
+# =====================================================================
 # ⛓️  ON-CHAIN BIAS CACHE (persisted so a restart doesn't lose it / delay it)
 # =====================================================================
 # The bias itself already has its own TTL logic inside onchain.py (hourly), but

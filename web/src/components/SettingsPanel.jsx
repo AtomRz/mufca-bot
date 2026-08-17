@@ -203,6 +203,18 @@ export default function SettingsPanel({ config, onChanged }) {
                 <option value="half_tp1">Half-way to TP1 (SL &gt; entry)</option>
               </select>
             </div>
+            <div className="field">
+              <label title="How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard's live numbers are.">Scan interval</label>
+              <select
+                value={config.scan_interval_seconds}
+                disabled={busy === 'scan_interval'}
+                onChange={(e) => run('scan_interval', () => api.setScanInterval(Number(e.target.value)))}
+              >
+                {(config.scan_interval_options || [15, 30, 60, 180]).map((s) => (
+                  <option key={s} value={s}>{s < 60 ? `${s}s` : `${s / 60}m`}</option>
+                ))}
+              </select>
+            </div>
             <div className="toggle-row">
               <span className="row-label">Heikin Ashi for UT Bot</span>
               <Toggle

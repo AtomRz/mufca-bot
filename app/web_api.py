@@ -577,6 +577,8 @@ async def get_config():
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
+        "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
+        "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
         "filter_toggles": {
             "frama": _cfg.ENABLE_FRAMA_FILTER,
@@ -722,6 +724,24 @@ async def set_discord_notifications(body: DiscordNotificationsIn):
         "value": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
     })
     return {"discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED, "changed": True}
+
+
+class ScanIntervalIn(BaseModel):
+    seconds: int
+
+
+@app.post("/api/config/scan-interval")
+async def set_scan_interval(body: ScanIntervalIn):
+    """Меняет интервал сканера вживую, без рестарта контейнера — см.
+    bot.set_scan_interval() / discord.ext.tasks.Loop.change_interval()."""
+    if body.seconds not in _cfg.SCAN_INTERVAL_OPTIONS:
+        raise HTTPException(400, f"seconds должен быть одним из {_cfg.SCAN_INTERVAL_OPTIONS}")
+    if body.seconds == _cfg.SCAN_INTERVAL_SECONDS:
+        return {"scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS, "changed": False}
+
+    core.set_scan_interval(body.seconds)
+    await broadcast_event({"type": "config_changed", "key": "scan_interval_seconds", "value": _cfg.SCAN_INTERVAL_SECONDS})
+    return {"scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS, "changed": True}
 
 
 class UthaIn(BaseModel):
