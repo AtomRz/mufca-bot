@@ -419,8 +419,38 @@ async def market_scanner():
                     if not trade:
                         continue
                     tp1_price = trade.get("tp1")
-                    if tp1_price is None or trade.get("tp1_hit"):
+                    if tp1_price is None:
                         continue
+
+                    # 🆕 FIX BUG-LO009: once SL has already moved (post-TP1), the
+                    # closed-bar check in check_signals() deliberately ignores bars
+                    # that finished before the move (see check_tp_sl_hit) — otherwise
+                    # a bar printed before price ever touched TP1 could trip the new,
+                    # tighter stop retroactively. That fix means the position has no
+                    # protection at all for the rest of the current forming bar (and
+                    # possibly one bar after) unless we also check it here, against
+                    # the live ticker — which has no such bar-ordering ambiguity: if
+                    # price is really at/through the new SL right now, it's a real hit.
+                    if trade.get("tp1_hit"):
+                        side = trade.get("side")
+                        sl = trade.get("sl")
+                        try:
+                            ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
+                            live_price = ticker_data.get("last")
+                        except Exception:
+                            live_price = None
+                        if live_price is not None and sl is not None:
+                            breached = (
+                                (side == "long" and live_price <= sl) or
+                                (side == "short" and live_price >= sl)
+                            )
+                            if breached:
+                                from signals import close_trade
+                                async with lock:
+                                    close_trade(st, sl, "sl", ticker, tf, track)
+                                logger.info(f"[TP1-SL] {ticker} {tf} {track.upper()}-track | post-TP1 SL hit @ live={live_price} (sl={sl})")
+                        continue
+
                     current_price = None
                     try:
                         ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
@@ -457,6 +487,13 @@ async def market_scanner():
                             sl_label = f"безубыток (${round(entry, 2):,.2f})"
                             sl_label_en = f"breakeven (${round(entry, 2):,.2f})"
                         trade["sl"] = new_sl
+                        # 🆕 FIX BUG-LO009: SL перенесён ВНУТРИ формирующегося бара —
+                        # low/high этого и всех предыдущих баров напечатаны ДО того,
+                        # как цена вообще коснулась TP1, и check_tp_sl_hit() (signals.py)
+                        # больше не сверяет новый стоп против них — только против баров,
+                        # закрывшихся ПОСЛЕ этого момента. bar_time берём из state
+                        # текущего скана (см. check_signals), не из этого тикер-запроса.
+                        trade["sl_moved_after_bar"] = st.get("last_processed_bar_time") or 0
                         track_label = "A" if track == "a" else "U"
                         if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
                             await channel.send(

@@ -381,8 +381,17 @@ def apply_onchain_with_safety(
 # 📊  TP/SL CHECK
 # =====================================================================
 
-def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a") -> Optional[str]:
-    """Проверяет, был ли пробит TP или SL для указанного трека."""
+def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
+                     bar_time: Optional[int] = None) -> Optional[str]:
+    """Проверяет, был ли пробит TP или SL для указанного трека.
+
+    🆕 FIX BUG-LO009 (found by Kimi audit): SL, перенесённый после TP1, раньше
+    проверялся против ЛЮБОГО бара, включая закрывшиеся ДО момента переноса —
+    их low/high напечатаны раньше, чем цена вообще коснулась TP1, и почти
+    гарантированно ниже (для long) нового полу-пути/безубытка. Это давало
+    ложное "sl" на первом же скане после TP1-хита, по цене, которой рынок
+    после переноса не касался. bar_time + trade["sl_moved_after_bar"]
+    (проставляется в bot.py в момент переноса) исключают такие бары."""
     trade = state.get(f"{track}_active_trade")
     if not trade:
         return None
@@ -391,13 +400,16 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a") -> O
     sl = trade["sl"]
     tp = trade["tp"]
 
+    sl_valid_from = trade.get("sl_moved_after_bar")
+    sl_applicable = sl_valid_from is None or (bar_time is not None and bar_time > sl_valid_from)
+
     if side == "long":
-        if low <= sl:
+        if sl_applicable and low <= sl:
             return "sl"
         if high >= tp:
             return "tp"
     else:
-        if high >= sl:
+        if sl_applicable and high >= sl:
             return "sl"
         if low <= tp:
             return "tp"
@@ -693,7 +705,7 @@ async def check_signals(
             trade = state.get(f"{track}_active_trade")
             if trade:
                 update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track)
-                hit = check_tp_sl_hit(state, last_high, last_low, track)
+                hit = check_tp_sl_hit(state, last_high, last_low, track, bar_time=current_bar_time)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
                     close_trade(state, exit_price, hit, ticker, timeframe, track)
