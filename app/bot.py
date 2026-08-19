@@ -493,7 +493,20 @@ async def market_scanner():
                         # больше не сверяет новый стоп против них — только против баров,
                         # закрывшихся ПОСЛЕ этого момента. bar_time берём из state
                         # текущего скана (см. check_signals), не из этого тикер-запроса.
-                        trade["sl_moved_after_bar"] = st.get("last_processed_bar_time") or 0
+                        # 🆕 FIX (Kimi review): изначально ставили ровно на последний
+                        # закрытый бар (X) — но low/high ТЕКУЩЕГО формирующегося бара (Y),
+                        # в котором и произошло касание TP1, тоже мог быть напечатан ДО
+                        # касания (бар открылся ниже полу-пути, потом вырос до TP1) — тот
+                        # же класс ложного срабатывания, просто в более узком окне. Бар Y и так
+                        # покрыт live-проверкой по тикеру ниже (при tp1_hit=True), поэтому
+                        # безопасно исключить его из барной проверки тоже — сдвигаем порог
+                        # на +1 таймфрейм вперёд, так барная проверка начнёт применяться
+                        # только с бара Z (первого, целиком закрывшегося ПОСЛЕ переноса).
+                        try:
+                            tf_ms = int(exchange.parse_timeframe(tf) * 1000)
+                        except Exception:
+                            tf_ms = 3600_000
+                        trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
                         track_label = "A" if track == "a" else "U"
                         if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
                             await channel.send(
