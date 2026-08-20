@@ -48,6 +48,15 @@ _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
 _ONCHAIN_BASELINE_FILE = os.path.join(DATA_DIR, "onchain_baseline.json")
 _prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FILE, {})
 
+# 🆕 Момент последнего снятия baseline — нужен, чтобы нормализовать пороги
+# ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH по фактически прошедшему времени, а не
+# считать их как будто окно всегда 1h. Раньше пороги были абсолютные ETH вне
+# зависимости от длины окна — на 30m/15m интервале это завышало относительный
+# вес разовых internal-транзакций биржи (hot/cold rebalancing) и давало ложные
+# "large" срабатывания. См. get_eth_flow_delta().
+_ONCHAIN_BASELINE_TS_FILE = os.path.join(DATA_DIR, "onchain_baseline_ts.json")
+_prev_balances_ts: float = safe_json_load(_ONCHAIN_BASELINE_TS_FILE, {}).get("ts", 0.0)
+
 
 def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -72,10 +81,13 @@ def clear_onchain_cache():
 
 def clear_onchain_cache_full():
     """Полный сброс кэша включая baseline балансов (использовать только при !reset_cache)."""
+    global _prev_balances_ts
     _cache.clear()
     _prev_balances.clear()
+    _prev_balances_ts = 0.0
     # Иначе на следующем скане baseline подхватится обратно из файла на диске.
     safe_json_save(_ONCHAIN_BASELINE_FILE, {})
+    safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": 0.0})
     logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
@@ -167,13 +179,28 @@ async def get_eth_flow_delta() -> Dict:
       flow:        "inflow" | "outflow" | "neutral"
       strength:    "large" | "normal" | "weak"
       per_exchange: детали по каждой бирже
+
+    🆕 Пороги strength/flow нормализуются по фактически прошедшему времени с
+    прошлого снятия baseline (elapsed), а не берутся как фиксированные ETH
+    вне зависимости от длины окна. ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH
+    заданы из расчёта "за 1 час" — на 30m/15m окне они масштабируются вниз
+    пропорционально, иначе разовая internal-транзакция биржи (hot/cold
+    rebalancing) при коротком окне будет чаще ошибочно читаться как крупный
+    рыночный flow. scale зажат в [0.25, 4.0], чтобы не давать порогам
+    выродиться в ноль при случайном почти-мгновенном повторном вызове
+    (например, ручной !resetcache сразу после обычного скана) и не улетать
+    в 10x+ после долгого простоя контейнера.
     """
+    global _prev_balances_ts
     curr_balances = await get_exchange_balances()
+    now = time.time()
 
     # При первом запуске — сохраняем как базу и сразу делаем второй запрос через паузу
     if not _prev_balances:
         _prev_balances.update(curr_balances)
+        _prev_balances_ts = now
         safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
+        safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
         logger.info("[ONCHAIN] First run: saved baseline balances, delta will be available on next cycle.")
         return {
             "delta_eth": 0.0,
@@ -195,22 +222,35 @@ async def get_eth_flow_delta() -> Dict:
             delta_total += delta
             per_exchange[name] = round(delta, 2)
 
+    # Сколько реально прошло времени с прошлого baseline — на этом масштабируем пороги
+    elapsed_seconds = (now - _prev_balances_ts) if _prev_balances_ts else 3600.0
+    scale = max(0.25, min(4.0, elapsed_seconds / 3600.0))
+
     # Обновляем предыдущие балансы для следующего цикла
     _prev_balances.update(curr_balances)
+    _prev_balances_ts = now
     safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
+    safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
 
-    # Классифицируем
+    # Классифицируем — пороги нормализованы под фактическую длину окна
+    threshold_large = ONCHAIN_FLOW_THRESHOLD_LARGE_ETH * scale
+    threshold_normal = ONCHAIN_FLOW_THRESHOLD_ETH * scale
+    neutral_threshold = max(20.0, 100.0 * scale)
+
     abs_delta = abs(delta_total)
-    if abs_delta >= ONCHAIN_FLOW_THRESHOLD_LARGE_ETH:
+    if abs_delta >= threshold_large:
         strength = "large"
-    elif abs_delta >= ONCHAIN_FLOW_THRESHOLD_ETH:
+    elif abs_delta >= threshold_normal:
         strength = "normal"
     else:
         strength = "weak"
 
-    flow = "inflow" if delta_total > 100 else "outflow" if delta_total < -100 else "neutral"
+    flow = "inflow" if delta_total > neutral_threshold else "outflow" if delta_total < -neutral_threshold else "neutral"
 
-    logger.info(f"[ONCHAIN] ETH flow: {flow} | delta={delta_total:.0f} ETH | strength={strength}")
+    logger.info(
+        f"[ONCHAIN] ETH flow: {flow} | delta={delta_total:.0f} ETH | strength={strength} "
+        f"| window={elapsed_seconds/60:.0f}m (scale={scale:.2f}, thresholds={threshold_normal:.0f}/{threshold_large:.0f})"
+    )
 
     return {
         "delta_eth": round(delta_total, 2),
