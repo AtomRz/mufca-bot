@@ -579,6 +579,8 @@ async def get_config():
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
+        "onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL,
+        "onchain_interval_options": list(_cfg.ONCHAIN_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
         "filter_toggles": {
             "frama": _cfg.ENABLE_FRAMA_FILTER,
@@ -742,6 +744,24 @@ async def set_scan_interval(body: ScanIntervalIn):
     core.set_scan_interval(body.seconds)
     await broadcast_event({"type": "config_changed", "key": "scan_interval_seconds", "value": _cfg.SCAN_INTERVAL_SECONDS})
     return {"scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS, "changed": True}
+
+
+class OnchainIntervalIn(BaseModel):
+    seconds: int
+
+
+@app.post("/api/config/onchain-interval")
+async def set_onchain_interval(body: OnchainIntervalIn):
+    """Меняет частоту обновления on-chain данных (Etherscan/CoinGecko) вживую,
+    без рестарта контейнера — см. bot.set_onchain_interval()."""
+    if body.seconds not in _cfg.ONCHAIN_INTERVAL_OPTIONS:
+        raise HTTPException(400, f"seconds должен быть одним из {_cfg.ONCHAIN_INTERVAL_OPTIONS}")
+    if body.seconds == _cfg.ONCHAIN_CACHE_TTL:
+        return {"onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL, "changed": False}
+
+    core.set_onchain_interval(body.seconds)
+    await broadcast_event({"type": "config_changed", "key": "onchain_interval_seconds", "value": _cfg.ONCHAIN_CACHE_TTL})
+    return {"onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL, "changed": True}
 
 
 class UthaIn(BaseModel):

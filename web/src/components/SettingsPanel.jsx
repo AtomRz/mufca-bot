@@ -215,6 +215,18 @@ export default function SettingsPanel({ config, onChanged }) {
                 ))}
               </select>
             </div>
+            <div className="field">
+              <label title="How often the bot re-fetches on-chain data (Etherscan exchange balances + CoinGecko Fear&Greed/dominance). Lower is fresher but flow deltas over a shorter window tend to be noisier.">On-chain interval</label>
+              <select
+                value={config.onchain_interval_seconds}
+                disabled={busy === 'onchain_interval'}
+                onChange={(e) => run('onchain_interval', () => api.setOnchainInterval(Number(e.target.value)))}
+              >
+                {(config.onchain_interval_options || [900, 1800, 3600]).map((s) => (
+                  <option key={s} value={s}>{s < 3600 ? `${s / 60}m` : `${s / 3600}h`}</option>
+                ))}
+              </select>
+            </div>
             <div className="toggle-row">
               <span className="row-label">Heikin Ashi for UT Bot</span>
               <Toggle

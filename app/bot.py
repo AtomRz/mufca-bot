@@ -226,10 +226,11 @@ async def market_scanner():
     if exchange is None:
         return
 
-    # 🆕 Обновляем on-chain bias раз в час (кэш TTL управляется внутри onchain.py)
+    # 🆕 Обновляем on-chain bias с интервалом _cfg.ONCHAIN_CACHE_TTL (15m/30m/1h,
+    # настраивается из веб-морды — см. set_onchain_interval())
     global _onchain_bias_cache, _onchain_last_fetch
     now_ts = time.time()
-    if ONCHAIN_ENABLED and (now_ts - _onchain_last_fetch) >= 3600:
+    if ONCHAIN_ENABLED and (now_ts - _onchain_last_fetch) >= _cfg.ONCHAIN_CACHE_TTL:
         try:
             _onchain_bias_cache = await get_onchain_bias()
             _onchain_last_fetch = now_ts
@@ -581,6 +582,18 @@ def set_scan_interval(seconds: int):
     _cfg.SCAN_INTERVAL_SECONDS = seconds
     _cfg.save_scan_interval(seconds)
     logger.info(f"[SCAN] Interval changed to {seconds}s")
+
+
+def set_onchain_interval(seconds: int):
+    """Live-changes the on-chain refresh interval (Settings → web) — no restart
+    needed. Unlike the scanner, on-chain refresh isn't its own tasks.loop — it's
+    just a time.time() - _onchain_last_fetch check inside market_scanner each
+    cycle, so changing _cfg.ONCHAIN_CACHE_TTL takes effect on the next check."""
+    if seconds not in _cfg.ONCHAIN_INTERVAL_OPTIONS:
+        raise ValueError(f"onchain interval must be one of {_cfg.ONCHAIN_INTERVAL_OPTIONS}, got {seconds}")
+    _cfg.ONCHAIN_CACHE_TTL = seconds
+    _cfg.save_onchain_interval(seconds)
+    logger.info(f"[ONCHAIN] Interval changed to {seconds}s")
 
 
 # 🆕 FIX: CRITICAL - Task error handler to prevent silent death

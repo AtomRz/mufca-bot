@@ -83,6 +83,8 @@ export const api = {
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setScanInterval: (seconds) =>
     request('/api/config/scan-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
+  setOnchainInterval: (seconds) =>
+    request('/api/config/onchain-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

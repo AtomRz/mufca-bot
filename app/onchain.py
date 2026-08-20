@@ -3,7 +3,7 @@ onchain.py — On-Chain анализ для MUFCA Bot
 Источники:
   - Etherscan API: балансы биржевых ETH-адресов (реальные притоки/оттоки)
   - CoinGecko API: Fear & Greed, BTC dominance, volume change
-Обновление: раз в час (кэш TTL = 3600с)
+Обновление: настраиваемый интервал (15m/30m/1h, дефолт 1h) — см. config.ONCHAIN_CACHE_TTL
 """
 
 import asyncio
@@ -17,12 +17,12 @@ from config import (
     DATA_DIR,
     ETHERSCAN_API_KEY,
     COINGECKO_API_KEY,
-    ONCHAIN_CACHE_TTL,
     ONCHAIN_FLOW_THRESHOLD_ETH,
     ONCHAIN_FLOW_THRESHOLD_LARGE_ETH,
     safe_json_load,
     safe_json_save,
 )
+import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ _prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FI
 
 def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
-    if entry and (time.time() - entry[0]) < ONCHAIN_CACHE_TTL:
+    if entry and (time.time() - entry[0]) < _cfg.ONCHAIN_CACHE_TTL:
         return entry[1]
     return None
 
