@@ -121,7 +121,7 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
                     await asyncio.sleep(wait)
                     continue
                 data = await resp.json()
-                if data.get("status") == "1":
+                if str(data.get("status")) == "1":
                     return int(data["result"]) / 1e18   # Wei → ETH
                 # status == "0" может быть rate limit или другая ошибка
                 if data.get("message") == "NOTOK" and "rate limit" in str(data.get("result", "")).lower():
@@ -167,7 +167,7 @@ async def get_exchange_balances() -> Dict[str, Optional[float]]:
         balances[name] = result if not isinstance(result, Exception) else None
 
     _cache_set("eth_balances", balances)
-    logger.info(f"[ONCHAIN] ETH balances fetched: { {k: f'{v:.0f}' if v else 'N/A' for k, v in balances.items()} }")
+    logger.info(f"[ONCHAIN] ETH balances fetched: { {k: f'{v:.0f}' if v is not None else 'N/A' for k, v in balances.items()} }")
     return balances
 
 
@@ -186,17 +186,25 @@ async def get_eth_flow_delta() -> Dict:
     заданы из расчёта "за 1 час" — на 30m/15m окне они масштабируются вниз
     пропорционально, иначе разовая internal-транзакция биржи (hot/cold
     rebalancing) при коротком окне будет чаще ошибочно читаться как крупный
-    рыночный flow. scale зажат в [0.25, 4.0], чтобы не давать порогам
-    выродиться в ноль при случайном почти-мгновенном повторном вызове
-    (например, ручной !resetcache сразу после обычного скана) и не улетать
-    в 10x+ после долгого простоя контейнера.
+    рыночный flow. scale зажат в [0.25, 4.0] и дополнительно поднят до 1.0
+    при почти нулевом elapsed (два вызова подряд, например ручной !onchain
+    дважды за минуту) — иначе на скейле 0.25 пороги проседают вчетверо от
+    номинала и разовая internal-транзакция биржи может ложно прочитаться
+    как large на коротком окне, которого фактически не было.
     """
     global _prev_balances_ts
     curr_balances = await get_exchange_balances()
     now = time.time()
 
+    # 🆕 FIX: раньше проверялось только "dict пустой?" — если baseline был
+    # загружен с диска, но все значения в нём None (например, container упал
+    # ровно во время единственного successful fetch), не-пустой dict с одними
+    # None молча уходил в ветку расчёта дельты и давал delta=0/note="ok"
+    # вместо честного "нет данных, жди следующий цикл".
+    baseline_is_empty = not _prev_balances or all(v is None for v in _prev_balances.values())
+
     # При первом запуске — сохраняем как базу и сразу делаем второй запрос через паузу
-    if not _prev_balances:
+    if baseline_is_empty:
         _prev_balances.update(curr_balances)
         _prev_balances_ts = now
         safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
@@ -224,10 +232,21 @@ async def get_eth_flow_delta() -> Dict:
 
     # Сколько реально прошло времени с прошлого baseline — на этом масштабируем пороги
     elapsed_seconds = (now - _prev_balances_ts) if _prev_balances_ts else 3600.0
-    scale = max(0.25, min(4.0, elapsed_seconds / 3600.0))
+    if elapsed_seconds < 300:
+        # Два вызова почти подряд (ручной !onchain дважды за пару минут) — не
+        # даём порогам обвалиться до floor 0.25, работаем как на полном часе.
+        scale = 1.0
+    else:
+        scale = max(0.25, min(4.0, elapsed_seconds / 3600.0))
 
-    # Обновляем предыдущие балансы для следующего цикла
-    _prev_balances.update(curr_balances)
+    # 🆕 FIX: раньше _prev_balances.update(curr_balances) затирал валидный
+    # baseline None-ом, если Etherscan упал для одной биржи в ЭТОМ цикле —
+    # эта биржа выпадала из расчёта не только на текущий (ожидаемо), но и на
+    # следующий цикл тоже (baseline уже испорчен). Теперь обновляем baseline
+    # только для бирж, где реально пришло новое значение.
+    for name, curr in curr_balances.items():
+        if curr is not None:
+            _prev_balances[name] = curr
     _prev_balances_ts = now
     safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
     safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
@@ -353,6 +372,11 @@ async def get_coingecko_data() -> Dict:
         {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY.startswith("CG-")
         else {"x-cg-pro-api-key": COINGECKO_API_KEY}
     ) if COINGECKO_API_KEY else {}
+    # 🆕 FIX: _fetch_fear_greed() уже учитывал pro/demo базовый URL, а /global и
+    # /coins/markets были жёстко зашиты на бесплатный api.coingecko.com — с Pro
+    # ключом такие запросы могли отваливаться по rate limit/401, потому что бьют
+    # не в тот хост, для которого ключ выдан.
+    base = "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY and not COINGECKO_API_KEY.startswith("CG-") else "https://api.coingecko.com/api/v3"
     result = {
         "fear_and_greed": 50,
         "fg_label": "Neutral",
@@ -368,20 +392,31 @@ async def get_coingecko_data() -> Dict:
         async with aiohttp.ClientSession(headers=headers) as session:
             # 1. Global market data (dominance)
             async with session.get(
-                "https://api.coingecko.com/api/v3/global",
+                f"{base}/global",
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 data = await resp.json()
-                mcp = data.get("data", {}).get("market_cap_percentage", {})
-                result["btc_dominance"] = round(mcp.get("btc", 50.0), 2)
+                # 🆕 FIX: если CoinGecko вернул ошибку (429/401/502), data может
+                # не быть словарём с ожидаемой структурой — .get() на не-dict упадёт.
+                if resp.status == 200 and isinstance(data, dict):
+                    mcp = data.get("data", {}).get("market_cap_percentage", {})
+                    result["btc_dominance"] = round(mcp.get("btc", 50.0), 2)
+                else:
+                    logger.warning(f"[ONCHAIN] CoinGecko /global status={resp.status}, using default dominance")
 
             # 2. ETH + BTC volume/price change
             async with session.get(
-                "https://api.coingecko.com/api/v3/coins/markets"
+                f"{base}/coins/markets"
                 "?vs_currency=usd&ids=bitcoin,ethereum&order=market_cap_desc",
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 coins = await resp.json()
+                # 🆕 FIX: на ошибке (429/401/502) markets endpoint отдаёт dict с
+                # описанием ошибки, а не list — `for coin in coins: coin["id"]`
+                # падал бы с TypeError. Явно проверяем тип/статус перед итерацией.
+                if resp.status != 200 or not isinstance(coins, list):
+                    logger.warning(f"[ONCHAIN] CoinGecko /coins/markets status={resp.status}, skipping volume data")
+                    coins = []
                 for coin in coins:
                     # 🆕 FIX BUG-LO003: CoinGecko markets endpoint не предоставляет
                     # volume_change_24h. Использование price_change как прокси вводит
@@ -613,6 +648,8 @@ def format_onchain_report(bias: Dict) -> str:
 
     if note == "first_run":
         lines.append("  _(первый запуск — дельта будет на следующем цикле)_")
+    elif note == "error":
+        lines.append("  _(ошибка получения балансов бирж — показан прошлый известный результат)_")
     else:
         lines.append(f"  Суммарная дельта: `{delta:+.0f} ETH`")
         if per_ex:
