@@ -46,25 +46,6 @@ ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — порог "normal" сигна
 ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — порог "large" сигнала
 ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
 
-# 🆕 Интервал обновления on-chain данных (Etherscan/CoinGecko), настраивается
-# из веб-морды по тому же паттерну, что SCAN_INTERVAL_SECONDS — живая смена
-# без рестарта контейнера. Раньше было захардкожено 3600с в двух местах
-# (onchain.py _cache_get + bot.py market_scanner), теперь один источник правды.
-ONCHAIN_INTERVAL_OPTIONS = (900, 1800, 3600)  # 15m / 30m / 1h
-ONCHAIN_INTERVAL_FILE = os.path.join(DATA_DIR, "onchain_interval.json")
-
-def load_onchain_interval() -> int:
-    data = safe_json_load(ONCHAIN_INTERVAL_FILE, {"seconds": 3600})
-    seconds = data.get("seconds", 3600)
-    return seconds if seconds in ONCHAIN_INTERVAL_OPTIONS else 3600
-
-def save_onchain_interval(seconds: int):
-    if seconds not in ONCHAIN_INTERVAL_OPTIONS:
-        raise ValueError(f"onchain interval must be one of {ONCHAIN_INTERVAL_OPTIONS}, got {seconds}")
-    safe_json_save(ONCHAIN_INTERVAL_FILE, {"seconds": seconds})
-
-ONCHAIN_CACHE_TTL = load_onchain_interval()   # секунд — обновление балансов (default 1h)
-
 # =====================================================================
 # 🔒  THREAD-SAFE FILE OPERATIONS
 # =====================================================================
@@ -107,6 +88,27 @@ def safe_json_save(filename: str, data: dict):
             os.replace(temp_file, filename)
         except Exception as e:
             logger.error(f"Failed to save {filename}: {e}")
+
+# 🆕 Интервал обновления on-chain данных (Etherscan/CoinGecko), настраивается
+# из веб-морды по тому же паттерну, что SCAN_INTERVAL_SECONDS — живая смена
+# без рестарта контейнера. Раньше было захардкожено 3600с в двух местах
+# (onchain.py _cache_get + bot.py market_scanner), теперь один источник правды.
+# Живёт здесь (не в блоке ON-CHAIN НАСТРОЙКИ выше), потому что зависит от
+# safe_json_load/safe_json_save, определённых чуть выше.
+ONCHAIN_INTERVAL_OPTIONS = (900, 1800, 3600)  # 15m / 30m / 1h
+ONCHAIN_INTERVAL_FILE = os.path.join(DATA_DIR, "onchain_interval.json")
+
+def load_onchain_interval() -> int:
+    data = safe_json_load(ONCHAIN_INTERVAL_FILE, {"seconds": 3600})
+    seconds = data.get("seconds", 3600)
+    return seconds if seconds in ONCHAIN_INTERVAL_OPTIONS else 3600
+
+def save_onchain_interval(seconds: int):
+    if seconds not in ONCHAIN_INTERVAL_OPTIONS:
+        raise ValueError(f"onchain interval must be one of {ONCHAIN_INTERVAL_OPTIONS}, got {seconds}")
+    safe_json_save(ONCHAIN_INTERVAL_FILE, {"seconds": seconds})
+
+ONCHAIN_CACHE_TTL = load_onchain_interval()   # секунд — обновление балансов (default 1h)
 
 # =====================================================================
 # 📊  ПАРЫ ДЛЯ СКАНИРОВАНИЯ
