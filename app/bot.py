@@ -435,17 +435,35 @@ async def market_scanner():
                     if trade.get("tp1_hit"):
                         side = trade.get("side")
                         sl = trade.get("sl")
+                        tp = trade.get("tp")
                         try:
                             ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
                             live_price = ticker_data.get("last")
                         except Exception:
                             live_price = None
-                        if live_price is not None and sl is not None:
-                            breached = (
+                        if live_price is not None:
+                            # 🆕 FIX: TP2 раньше проверялся только через check_tp_sl_hit()
+                            # по high/low ЗАКРЫТОГО бара (anti-repainting конвеншен) — если
+                            # цена внутри формирующегося бара касалась TP2, а потом
+                            # разворачивалась обратно к SL ДО закрытия бара, бар закрывался
+                            # уже без следа касания TP2, и позиция ошибочно закрывалась как
+                            # SL, хотя на реальной бирже лимитный TP2-ордер исполнился бы в
+                            # момент касания. Проверяем TP2 живым тикером — симметрично тому,
+                            # как уже сделано для SL после TP1 чуть ниже.
+                            tp_breached = tp is not None and (
+                                (side == "long" and live_price >= tp) or
+                                (side == "short" and live_price <= tp)
+                            )
+                            sl_breached = sl is not None and (
                                 (side == "long" and live_price <= sl) or
                                 (side == "short" and live_price >= sl)
                             )
-                            if breached:
+                            if tp_breached:
+                                from signals import close_trade
+                                async with lock:
+                                    close_trade(st, tp, "tp", ticker, tf, track)
+                                logger.info(f"[TP1-TP2] {ticker} {tf} {track.upper()}-track | live TP2 hit @ {live_price} (tp={tp})")
+                            elif sl_breached:
                                 from signals import close_trade
                                 async with lock:
                                     close_trade(st, sl, "sl", ticker, tf, track)
