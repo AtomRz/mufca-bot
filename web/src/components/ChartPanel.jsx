@@ -242,6 +242,20 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     const isNewSelection = lastSelectionKeyRef.current !== selectionKey
     const savedRange = isNewSelection ? null : chartRef.current.timeScale().getVisibleLogicalRange()
 
+    // 🆕 FIX: если пользователь руками потянул/зумил ценовую ось (правую шкалу
+    // цены, объёма или MFI), lightweight-charts переводит эту шкалу в ручной
+    // режим (autoScale: false) и перестаёт подстраивать диапазон под новые
+    // данные. При смене ticker/tf setData() подставляет цены другого
+    // инструмента, но шкала остаётся залипшей на диапазоне предыдущей пары —
+    // например BTC (~$65k) → DOGE (~$0.08), свечи оказываются далеко за
+    // пределами видимой области. fitContent() ниже чинит только временную
+    // ось, не ценовую — поэтому нужно явно вернуть autoScale на новой паре.
+    if (isNewSelection) {
+      s.candle.priceScale().applyOptions({ autoScale: true })
+      s.volume.priceScale().applyOptions({ autoScale: true })
+      s.mfi.priceScale().applyOptions({ autoScale: true })
+    }
+
     s.candle.setData(data.candles)
     s.framaMid.setData(toLineData(times, data.frama))
     s.framaUpper.setData(toLineData(times, data.frama_upper))
