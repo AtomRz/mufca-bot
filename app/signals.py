@@ -120,8 +120,16 @@ def clear_htf_cache():
     _htf_cache.clear()
 
 async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> int:
-    """Возвращает HTF bias с кэшированием."""
-    cache_key = f"{ticker}_{timeframe}"
+    """Возвращает HTF bias с кэшированием.
+
+    🆕 FIX (Kimi review п.9): раньше ключ кэша был f"{ticker}_{timeframe}", где
+    timeframe — торговый TF (1h/4h/...), хотя HTF bias зависит только от
+    ticker и _cfg.HTF_BIAS (обычно 1d) — параметр timeframe тут вообще не
+    участвует в расчёте. При нескольких торговых TF на одном тикере (обычная
+    конфигурация TICKERS × TIMEFRAMES) это давало N идентичных кэш-записей и
+    N избыточных фетчей одного и того же HTF-таймфрейма вместо одного.
+    """
+    cache_key = f"{ticker}_{_cfg.HTF_BIAS}"
     cached = _htf_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -269,11 +277,11 @@ def calculate_adaptive_sl(
         if side == "long":
             sl_adaptive = entry_price * (1 - mae_with_buffer)
             # Не ставим SL выше цены входа
-            sl = min(sl_adaptive, entry_price * 0.999)
+            sl = min(sl_adaptive, entry_price * (1 - _cfg.SL_MIN_DISTANCE_PCT))
         else:
             sl_adaptive = entry_price * (1 + mae_with_buffer)
             # Не ставим SL ниже цены входа
-            sl = max(sl_adaptive, entry_price * 1.001)
+            sl = max(sl_adaptive, entry_price * (1 + _cfg.SL_MIN_DISTANCE_PCT))
 
         desc = (
             f"adaptive MAE p{_cfg.SL_MAE_PERCENTILE*100:.0f} "
@@ -575,12 +583,18 @@ async def open_position(
             tp1 = round(close_v - (close_v - tp1) * ratio, 4)
 
     # 🆕 GUARD: гарантируем что tp1 между entry и tp (не дальше tp, не ближе entry)
+    # 🆕 FIX (Kimi review п.11): раньше нижняя граница была ровно close_v — при
+    # сильном сжатии TP on-chain'ом (tp_mult << 1) пропорциональный пересчёт мог
+    # дать tp1 == close_v, и 50% позиции закрывалось бы на входе с нулевым PnL.
+    # Теперь минимум entry±0.1% (используем тот же SL_MIN_DISTANCE_PCT, что и
+    # для SL — это уже принятый в проекте порог "не ноль"), затем повторно
+    # ограничиваем tp, чтобы порядок операций не мог вытолкнуть tp1 за tp.
     if side == "long":
+        tp1 = max(tp1, close_v * (1 + _cfg.SL_MIN_DISTANCE_PCT))
         tp1 = min(tp1, tp)       # tp1 не дальше tp
-        tp1 = max(tp1, close_v)  # tp1 не ближе entry (или равен entry)
     else:
+        tp1 = min(tp1, close_v * (1 - _cfg.SL_MIN_DISTANCE_PCT))
         tp1 = max(tp1, tp)       # tp1 не дальше tp (для short tp < entry)
-        tp1 = min(tp1, close_v)  # tp1 не ближе entry
 
     if side == "long":
         risk = abs(close_v - sl)
@@ -704,7 +718,8 @@ async def check_signals(
         for track in ("a", "u"):
             trade = state.get(f"{track}_active_trade")
             if trade:
-                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track)
+                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
+                                       high=last_high, low=last_low)
                 hit = check_tp_sl_hit(state, last_high, last_low, track, bar_time=current_bar_time)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
@@ -816,7 +831,7 @@ async def check_signals(
             tf_ms = 3600_000  # fallback: считаем таймфрейм часом, если parse_timeframe недоступен
 
         def cooldown_ok(last_time):
-            return last_time is None or (bar_time - last_time) > COOLDOWN_BARS * tf_ms
+            return last_time is None or (bar_time - last_time) >= COOLDOWN_BARS * tf_ms
 
         a_long_cd_ok = cooldown_ok(state.get("last_a_long_time"))
         a_short_cd_ok = cooldown_ok(state.get("last_a_short_time"))
@@ -826,8 +841,21 @@ async def check_signals(
         a_in_pos = state["a_in_long"] or state["a_in_short"]
         u_in_pos = state["u_in_long"] or state["u_in_short"]
 
-        sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok  and warmed_up
-        sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok and warmed_up
+        # 🆕 FIX (Kimi review п.1): U-track уже гейтится is_new_bar (сигнал
+        # проверяется один раз на новом баре). A-track такой защиты не имел —
+        # confirm_long_a/confirm_short_a остаются True весь закрытый бар, и
+        # если open_position() отклоняет попытку (R:R/extreme_violation), флаг
+        # in_pos сбрасывается обратно в False (см. open_position), а значит на
+        # каждом следующем скане (~15-60с) бот пытался войти заново — спам
+        # [FILTER] skipped в логах и лишние вызовы open_position на одном и том
+        # же баре. last_a_{side}_attempt_bar гарантирует не больше одной
+        # попытки на трек за бар, симметрично тому, как is_new_bar работает
+        # для U-track.
+        a_long_not_attempted  = state.get("last_a_long_attempt_bar")  != bar_time
+        a_short_not_attempted = state.get("last_a_short_attempt_bar") != bar_time
+
+        sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok  and warmed_up and a_long_not_attempted
+        sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok and warmed_up and a_short_not_attempted
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
@@ -887,14 +915,35 @@ async def check_signals(
             score += oc_bias_long if is_long else oc_bias_short
             return max(0, min(100, score))
 
+        async def _safe_open_position(track: str, side: str):
+            """Обёртка над open_position с exception-safety (Kimi review п.2).
+            state["{track}_in_long/short"] уже выставлен True выше, ДО вызова
+            open_position — сам open_position сбрасывает его назад в False при
+            явном отказе (R:R < MIN_RR, extreme_violation), но НЕ при исключении
+            (например, если calculate_combined_tp или apply_onchain_with_safety
+            бросят Exception). Без этой обёртки такое исключение улетало во
+            внешний try/except всей check_signals, флаг оставался True навсегда,
+            и трек молча блокировался до рестарта контейнера."""
+            in_long_key = f"{track}_in_long"
+            in_short_key = f"{track}_in_short"
+            try:
+                return await open_position(state, track, side, close_v, fs, fu, fl, atr14, df, idx,
+                                            ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
+                                            calc_confidence, MIN_RR)
+            except Exception as e:
+                logger.error(f"[OPEN_POSITION] {ticker} {timeframe} {track.upper()}-{side.upper()} failed: {e}", exc_info=True)
+                if not dry_run:
+                    state[in_long_key] = False
+                    state[in_short_key] = False
+                return None
+
         signals = []
         MIN_RR = 1.5
 
         # --- A-track LONG ---
         if sig_a_long:
-            sig = await open_position(state, "a", "long", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                      calc_confidence, MIN_RR)
+            sig = await _safe_open_position("a", "long")
+            state["last_a_long_attempt_bar"] = bar_time
             if sig:
                 signals.append(sig)
             else:
@@ -902,9 +951,7 @@ async def check_signals(
 
         # --- U-track LONG ---
         if sig_u_long:
-            sig = await open_position(state, "u", "long", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                      calc_confidence, MIN_RR)
+            sig = await _safe_open_position("u", "long")
             if sig:
                 signals.append(sig)
             else:
@@ -912,9 +959,8 @@ async def check_signals(
 
         # --- A-track SHORT ---
         if sig_a_short:
-            sig = await open_position(state, "a", "short", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                      calc_confidence, MIN_RR)
+            sig = await _safe_open_position("a", "short")
+            state["last_a_short_attempt_bar"] = bar_time
             if sig:
                 signals.append(sig)
             else:
@@ -922,9 +968,7 @@ async def check_signals(
 
         # --- U-track SHORT ---
         if sig_u_short:
-            sig = await open_position(state, "u", "short", close_v, fs, fu, fl, atr14, df, idx,
-                                      ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                      calc_confidence, MIN_RR)
+            sig = await _safe_open_position("u", "short")
             if sig:
                 signals.append(sig)
             else:
@@ -1179,6 +1223,10 @@ def make_state() -> Dict:
         # оставлены только для отладки/обратной совместимости, кулдаун их не читает.
         "last_a_long_time": None,
         "last_a_short_time": None,
+        # 🆕 Kimi review п.1: не больше одной попытки open_position на A-track
+        # за закрытый бар, даже если её отклонили (см. _safe_open_position).
+        "last_a_long_attempt_bar": None,
+        "last_a_short_attempt_bar": None,
         "u_in_long": False,
         "u_in_short": False,
         "u_long_bar": None,

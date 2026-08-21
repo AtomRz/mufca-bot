@@ -261,17 +261,20 @@ def update_signal_record(
                 f"TP1 hit: {tp1_hit} | Regime: {rec.get('regime', 'unknown')}")
 
 
-def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a"):
+def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a",
+                           high: Optional[float] = None, low: Optional[float] = None):
     """
     Обновляет MFE/MAE для открытого сигнала указанного трека.
 
-    🆕 FIX: раньше сохраняли на диск не чаще чем раз в save_every вызовов через
-    функцию-атрибут-счётчик, общий на ВСЕ пары/tf/сторону сразу. history в памяти
-    кэширован (_history_cache) и не терялся между вызовами, но при неожиданном
-    завершении процесса (crash/OOM/`docker stop` без graceful shutdown, см. main.py)
-    несохранённый прогресс по MFE/MAE между сохранениями пропадал. Вызывается редко
-    (раз в скан на открытую позицию), atomic-write в safe_json_save дешёвый —
-    троттлинг не нужен, сохраняем при каждом реальном изменении.
+    🆕 FIX (Kimi review): раньше принимала только current_price (close бара) —
+    live-статистика считалась по цене закрытия, а backtest_history() в это же
+    время считает MAE/MFE по high/low каждого бара (реальные внутрибаровые
+    экстремумы). Обе выборки пишутся в один signals_history.json и вместе
+    калибруют calculate_adaptive_sl/calculate_combined_tp — расхождение в
+    методике систематически занижало live MAE/MFE относительно backtest.
+    high/low теперь опциональны и обратно совместимы: старые вызовы (например
+    !sim, где current_price — это уже сама целевая TP/SL цена, а не бар) как
+    и раньше используют одну current_price для обеих сторон расчёта.
     """
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
@@ -282,12 +285,15 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 
     if rec is not None:
         entry = rec["entry"]
+        fav_price = (high if high is not None else current_price) if side == "long" else (low if low is not None else current_price)
+        adv_price = (low if low is not None else current_price) if side == "long" else (high if high is not None else current_price)
+
         if side == "long":
-            favorable = (current_price - entry) / entry * 100
-            adverse = (entry - current_price) / entry * 100
+            favorable = (fav_price - entry) / entry * 100
+            adverse = (entry - adv_price) / entry * 100
         else:
-            favorable = (entry - current_price) / entry * 100
-            adverse = (current_price - entry) / entry * 100
+            favorable = (entry - fav_price) / entry * 100
+            adverse = (adv_price - entry) / entry * 100
 
         new_favorable = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
         new_adverse = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
