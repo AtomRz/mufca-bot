@@ -204,8 +204,29 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     window.addEventListener('resize', handleResize)
     handleResize()
 
+    // 🆕 FIX (Android client): в Android-приложении WebView обёрнут в
+    // SwipeRefreshLayout — вертикальный свайп по графику конкурировал с
+    // pull-to-refresh за один и тот же жест (то панит график, то случайно
+    // обновляет страницу). Сообщаем нативной стороне (см. MainActivity.kt,
+    // ChartTouchBridge), когда палец реально на графике, чтобы она на это
+    // время отключала SwipeRefreshLayout. window.AndroidChartBridge существует
+    // только внутри Android WebView — в обычном браузере вызовы no-op.
+    const notifyChartTouch = (active) => {
+      window.AndroidChartBridge?.setChartTouching?.(active)
+    }
+    const el = containerRef.current
+    const onTouchStart = () => notifyChartTouch(true)
+    const onTouchEnd = () => notifyChartTouch(false)
+    el.addEventListener('touchstart', onTouchStart, { passive: true })
+    el.addEventListener('touchend', onTouchEnd, { passive: true })
+    el.addEventListener('touchcancel', onTouchEnd, { passive: true })
+
     return () => {
       window.removeEventListener('resize', handleResize)
+      el.removeEventListener('touchstart', onTouchStart)
+      el.removeEventListener('touchend', onTouchEnd)
+      el.removeEventListener('touchcancel', onTouchEnd)
+      notifyChartTouch(false) // на случай размонтирования прямо посреди жеста
       chart.remove()
       chartRef.current = null
       seriesRef.current = {}
