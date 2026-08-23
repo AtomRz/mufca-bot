@@ -9,6 +9,7 @@ const FILTER_LABELS = {
   htf: 'HTF',
   fake_break: 'BRK',
   liq_sweep: 'SWEEP',
+  rr: 'R:R',
 }
 
 /**
@@ -77,6 +78,18 @@ function FilterDot({ label, filter, candidateDir }) {
 
   if (filter.value !== undefined) {
     title += ` (${filter.value}${filter.threshold !== undefined ? ` / threshold ${filter.threshold}` : ''})`
+  } else if (filter.value_long !== undefined || filter.value_short !== undefined) {
+    // 🆕 R:R лампочка: риск/прибыль разные для long и short, единого value нет —
+    // показываем значение под текущее направление свечей (candidateDir), а если
+    // направления пока нет — оба сразу.
+    const thresholdSuffix = filter.threshold !== undefined ? ` / min ${filter.threshold}` : ''
+    if (candidateDir === 'long') {
+      title += ` (${filter.value_long}${thresholdSuffix})`
+    } else if (candidateDir === 'short') {
+      title += ` (${filter.value_short}${thresholdSuffix})`
+    } else {
+      title += ` (long ${filter.value_long} / short ${filter.value_short}${thresholdSuffix})`
+    }
   }
 
   return (

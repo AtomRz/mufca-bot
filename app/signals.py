@@ -938,7 +938,7 @@ async def check_signals(
                 return None
 
         signals = []
-        MIN_RR = 1.5
+        MIN_RR = _cfg.MIN_RR
 
         # --- A-track LONG ---
         if sig_a_long:

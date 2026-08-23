@@ -454,7 +454,7 @@ async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
         raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
 
     try:
-        return await get_market_pulse(exchange, ticker, tf)
+        return await get_market_pulse(exchange, ticker, tf, onchain_bias=core._onchain_bias_cache)
     except ValueError as e:
         raise HTTPException(422, str(e))
 

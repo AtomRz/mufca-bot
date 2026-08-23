@@ -36,7 +36,10 @@ from signals import (
     bars_since_crossover2,
     bars_since_crossunder2,
     get_htf_bias,
+    calculate_adaptive_sl,
+    apply_onchain_with_safety,
 )
+from state import calculate_combined_tp
 import config
 
 logger = logging.getLogger(__name__)
@@ -153,7 +156,7 @@ async def get_chart_data(
     return result
 
 
-async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
+async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optional[Dict] = None) -> Dict:
     """
     Лёгкая сводка для верхней плашки дашборда: текущий CHOP, направление FRAMA
     (тренд) и грубая informational-оценка leverage — та же формула, что в
@@ -266,6 +269,38 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
     liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
     liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+    # 🆕 R:R ЛАМПОЧКА — часто самый незаметный "тихий" отказ: MFI/Andean дают
+    # confluence, все фильтры зелёные, но open_position() всё равно молча
+    # отклоняет сигнал, потому что reward/risk < MIN_RR (см. [FILTER] skipped
+    # в логах). Считаем R:R ТЕМИ ЖЕ функциями и в том же порядке, что и
+    # open_position() (calculate_adaptive_sl → calculate_combined_tp →
+    # apply_onchain_with_safety), отдельно для long и short — независимо от
+    # того, есть ли сейчас реальный confluence сигнал, чтобы было видно
+    # заранее, не только в момент отклонения.
+    atr_regime_pct = atr_pct_v
+    regime = "CHAOS" if atr_regime_pct > config.ATR_MAX else "TREND" if atr_regime_pct > config.ATR_MIN * 1.5 else "NORMAL"
+
+    def _calc_rr(side: str) -> float:
+        sl, _ = calculate_adaptive_sl(close_v, side, ticker, tf, frama_s, frama_u, frama_l, atr_s, idx)
+        tp1_raw, tp2_raw, _ = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr_s, regime)
+        tp_final, sl_final, _, _ = apply_onchain_with_safety(
+            close_v, sl, tp2_raw, side, onchain_bias, min_rr=config.MIN_RR
+        )
+        if side == "long":
+            risk = abs(close_v - sl_final)
+            reward = abs(tp_final - close_v)
+        else:
+            risk = abs(sl_final - close_v)
+            reward = abs(close_v - tp_final)
+        return reward / max(risk, 1e-8)
+
+    try:
+        rr_long = round(_calc_rr("long"), 2)
+        rr_short = round(_calc_rr("short"), 2)
+    except Exception as e:
+        logger.warning(f"[PULSE] {ticker} {tf} R:R calc failed: {e}")
+        rr_long = rr_short = None
+
     # pass_long/pass_short повторяют ИМЕННО формулы filter_long/filter_short
     # из signals.py — включая то, что там liq_sweep_short блокирует LONG, а
     # liq_sweep_long блокирует SHORT (так в реальной торговой логике, это не
@@ -307,6 +342,14 @@ async def get_market_pulse(exchange, ticker: str, tf: str) -> Dict:
                 "enabled": config.ENABLE_LIQ_SWEEP_FILTER,
                 "pass_long": not liq_sweep_short,
                 "pass_short": not liq_sweep_long,
+            },
+            "rr": {
+                "enabled": True,  # это жёсткий гейт в open_position(), не выключаемый флагом
+                "pass_long": rr_long is not None and rr_long >= config.MIN_RR,
+                "pass_short": rr_short is not None and rr_short >= config.MIN_RR,
+                "value_long": rr_long,
+                "value_short": rr_short,
+                "threshold": config.MIN_RR,
             },
         },
     }
