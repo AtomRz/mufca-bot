@@ -223,6 +223,11 @@ BB_PERIOD = _indicators["BB_PERIOD"]
 BB_STDDEV = _indicators["BB_STDDEV"]
 SR_PIVOT_WINDOW = _indicators["SR_PIVOT_WINDOW"]
 SR_MAX_LEVELS = _indicators["SR_MAX_LEVELS"]
+# 🆕 Минимальная глубина истории для поиска S/R пивотов в get_chart_data() —
+# НЕ зависит от выбранного на UI barsLimit (100/200/300/500 bars). Уровни,
+# сформированные глубже видимого окна, всё равно должны попадать в выборку
+# кандидатов, иначе на маленьком barsLimit они физически не находятся.
+SR_MIN_LOOKBACK = 900
 
 COOLDOWN_BARS = 2
 MAX_ALLOWED_LEV = 10
