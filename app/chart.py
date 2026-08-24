@@ -103,6 +103,18 @@ def calc_support_resistance(
     def near_price(levels, price, pct=0.05):
         return [l for l in levels if abs(l - price) / price < pct]
 
+    # 🆕 FIX: направление (resistance выше цены / support ниже) теперь
+    # фильтруется ДО отбора топ-N ближайших, не после. Раньше _cluster_levels
+    # мог занять все max_levels слотов кандидатами, которые всё равно
+    # отсеются финальным фильтром направления — например, после резкого
+    # пробоя вверх большинство исторических resistance-пивотов оказываются
+    # НИЖЕ текущей цены (уже пробиты), и если они ближе по расстоянию, они
+    # вытесняют немногочисленные оставшиеся уровни ВЫШЕ цены, оставляя
+    # resistance пустым, хотя реальные уровни сопротивления есть — просто
+    # чуть дальше по цене, чем уже пробитые.
+    resistances = [l for l in resistances if l > last_close]
+    supports = [l for l in supports if l < last_close]
+
     # 🆕 FIX: раньше при отборе max_levels из кластеров сортировали по близости к
     # МЕДИАНЕ набора кандидатов, а не к текущей цене — в результате реально близкие
     # к цене (и потому самые торгуемо-релевантные) уровни могли отсеиваться в пользу
@@ -112,8 +124,8 @@ def calc_support_resistance(
     resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels, last_close)
 
     return {
-        "support":    [l for l in supports    if l < last_close],
-        "resistance": [l for l in resistances if l > last_close],
+        "support":    supports,
+        "resistance": resistances,
         "pivot":      [],
     }
 
