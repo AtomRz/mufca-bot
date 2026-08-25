@@ -502,6 +502,18 @@ async def market_scanner():
                         (side == "long"  and current_price >= tp1_price) or
                         (side == "short" and current_price <= tp1_price)
                     )
+                    # 🆕 FIX: исходный SL (до TP1) раньше проверялся только через
+                    # check_tp_sl_hit() по low/high ЗАКРЫТОГО бара — асимметрично с TP1,
+                    # который уже проверяется live чуть выше в этом же блоке. Свеча могла
+                    # проколоть SL внутри бара и вернуться выше к его закрытию — бот видел
+                    # бы это только на следующем скане после закрытия, а не в момент касания.
+                    # Симметрично TP2/SL-после-TP1 (см. блок выше при tp1_hit=True) — теперь
+                    # тем же current_price, без дополнительного похода к бирже.
+                    sl = trade.get("sl")
+                    sl_breached = sl is not None and (
+                        (side == "long" and current_price <= sl) or
+                        (side == "short" and current_price >= sl)
+                    )
                     if tp1_reached:
                         trade["tp1_hit"] = True
                         # 🆕 FIX: раньше SL после TP1 либо не двигался вовсе, либо был
@@ -578,6 +590,11 @@ async def market_scanner():
                             )
                         except Exception as push_err:
                             logger.warning(f"[PUSH] send failed: {push_err}")
+                    elif sl_breached:
+                        from signals import close_trade
+                        async with lock:
+                            close_trade(st, sl, "sl", ticker, tf, track)
+                        logger.info(f"[LIVE-SL] {ticker} {tf} {track.upper()}-track | pre-TP1 SL hit @ live={current_price} (sl={sl})")
 
                 await asyncio.sleep(0.5)
             except Exception as e:
