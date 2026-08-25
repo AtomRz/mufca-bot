@@ -29,6 +29,7 @@ export default function App() {
   const [chartTicker, setChartTicker] = useState(null)
   const [chartTf, setChartTf] = useState('1h')
   const [chartLoading, setChartLoading] = useState(false)
+  const contentRef = useRef(null)
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
@@ -89,6 +90,30 @@ export default function App() {
       if (tf) setChartTf(tf)
     }
     return () => { delete window.mufcaOpenSignal }
+  }, [])
+
+  // 🆕 FIX (Android client): SwipeRefreshLayout решает, разрешать ли
+  // pull-to-refresh, по scrollY самого WebView — но у нас реальный скролл
+  // происходит ВНУТРИ .content (overflow-y: auto), а не на уровне страницы,
+  // так что нативный scrollY всегда остаётся 0, даже когда список
+  // (например History) прокручен вниз. Итог — свайп вверх внутри списка,
+  // возвращающий его к началу, читался нативной стороной как "пользователь
+  // тянет сверху вниз от scrollY=0" и триггерил refresh. В отличие от
+  // графика (там любое касание однозначно принадлежит canvas — своего
+  // нативного скролла у него нет вообще), здесь НАДО учитывать реальную
+  // scrollTop-позицию: блокируем pull-to-refresh, только пока .content
+  // реально прокручен вниз, и сразу отпускаем, как только вернулись к
+  // самому верху — там жест "тянуть вниз" снова легитимен.
+  useEffect(() => {
+    const el = contentRef.current
+    if (!el) return
+    const notify = (active) => window.AndroidChartBridge?.setChartTouching?.(active)
+    const onScroll = () => notify(el.scrollTop > 0)
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      notify(false)
+    }
   }, [])
 
   if (!authenticated) {
@@ -167,7 +192,7 @@ export default function App() {
         </button>
       </nav>
 
-      <main className="content">
+      <main className="content" ref={contentRef}>
         {tab === 'status' && <StatusPanel lastEvent={lastEvent} pairs={config?.pairs} />}
         {tab === 'chart' && (
           <ChartPanel
