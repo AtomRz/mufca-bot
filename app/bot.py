@@ -283,6 +283,25 @@ async def market_scanner():
                         st["last_bar_time"] = bar_time
 
                 # ── лок отпущен — дальше только чтение/уведомления, без критичных мутаций ──
+
+                # 🆕 FIX: раньше save_bot_state() вызывался один раз за ВЕСЬ цикл
+                # сканирования (после всех тикеров/tf, см. конец market_scanner), хотя
+                # открытие/закрытие позиции мутирует state прямо здесь, внутри лока
+                # выше. Если контейнер перезапускался (docker rebuild/restart) в
+                # промежутке между тем как сделка открылась в памяти (и уже попала в
+                # signals_history.json через add_signal_record — та запись синхронна)
+                # и тем как дошла очередь до save_bot_state() в конце цикла — при
+                # рестарте active_trade терялся из bot_state.json, ДАЖЕ с
+                # примонтированной data/ как volume: файл просто физически не успел
+                # записаться. reconcile_orphaned_signals() затем честно, но обидно
+                # помечал такую запись как "cancelled", хотя позиция была реально
+                # открыта. Сохраняем сразу же, как только signals непустой (позиция
+                # открылась или закрылась в этом цикле) — не дожидаясь остальных пар.
+                if signals:
+                    try:
+                        save_bot_state(state)
+                    except Exception as snap_err:
+                        logger.warning(f"[STATE] immediate snapshot save failed: {snap_err}")
                 if is_new_bar and signals:
                     # 🆕 Fetch df for volume info
                     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
