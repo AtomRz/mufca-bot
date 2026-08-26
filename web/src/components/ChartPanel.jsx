@@ -43,7 +43,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const seriesRef = useRef({})
   const lastSelectionKeyRef = useRef(null) // 🆕 меняется только при смене ticker/tf/track
   const [track, setTrack] = useState('a')
-  const [barsLimit, setBarsLimit] = useState(200)
+  const [barsLimit, setBarsLimit] = useState(100)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const requestIdRef = useRef(0) // 🆕 для игнорирования устаревших ответов (race condition fix)
