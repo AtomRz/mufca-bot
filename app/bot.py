@@ -558,12 +558,23 @@ async def market_scanner():
                             tf_ms = 3600_000
                         trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
                         track_label = "A" if track == "a" else "U"
+                        # 🆕 FIX: раньше эта отправка не была обёрнута в try/except —
+                        # единственная из трёх (Discord/WS/push) в этом блоке. Если
+                        # channel.send() кидал исключение (rate limit, отсутствие прав,
+                        # discord.HTTPException), это ронял всю итерацию сканера и молча
+                        # съедало И WS-broadcast, И push для этого же TP1-события — тот же
+                        # класс проблемы, что чинили в BUG-LO007, просто не применённый
+                        # к новому коду. Теперь ошибка Discord-отправки не мешает
+                        # остальным каналам уведомления сработать.
                         if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
-                            await channel.send(
-                                f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
-                                f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
-                            )
+                            try:
+                                await channel.send(
+                                    f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                    f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
+                                    f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
+                                )
+                            except Exception as discord_err:
+                                logger.error(f"[DISCORD] Failed to send TP1 hit for {ticker} {tf}: {discord_err}", exc_info=True)
                         logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price} | SL mode={_cfg.TP1_SL_MODE} → {new_sl}")
                         try:
                             from web_api import broadcast_event
