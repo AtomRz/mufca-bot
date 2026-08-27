@@ -56,7 +56,7 @@ from state import (
     calculate_combined_tp,
     normalize_timestamp,
 )
-from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer
+from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price
 from config import ONCHAIN_ENABLED
 
 logger = logging.getLogger(__name__)
@@ -578,9 +578,9 @@ async def open_position(
     if abs(tp - close_v) > 1e-8 and abs(tp2 - close_v) > 1e-8:
         ratio = abs(tp - close_v) / abs(tp2 - close_v)
         if side == "long":
-            tp1 = round(close_v + (tp1 - close_v) * ratio, 4)
+            tp1 = round_price(close_v + (tp1 - close_v) * ratio)
         else:
-            tp1 = round(close_v - (close_v - tp1) * ratio, 4)
+            tp1 = round_price(close_v - (close_v - tp1) * ratio)
 
     # 🆕 GUARD: гарантируем что tp1 между entry и tp (не дальше tp, не ближе entry)
     # 🆕 FIX (Kimi review п.11): раньше нижняя граница была ровно close_v — при
@@ -1183,8 +1183,8 @@ def backtest_history(
                 moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
 
                 history[ticker][tf][side].append({
-                    "entry": round(close_v, 4),
-                    "exit": round(exit_price, 4),
+                    "entry": round_price(close_v),
+                    "exit": round_price(exit_price),
                     "exit_type": exit_type,
                     "bars_held": bars_held,
                     "moved_pct": round(moved_pct, 4),

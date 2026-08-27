@@ -13,6 +13,7 @@ from config import (
     safe_json_load,
     safe_json_save,
 )
+from utils import round_price
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +176,7 @@ def add_signal_record(
     _ensure_history_slot(history, ticker, tf)
 
     record = {
-        "entry": round(entry, 4),
+        "entry": round_price(entry),
         "exit": None,
         "exit_type": "open",
         "bars_held": 0,
@@ -243,7 +244,7 @@ def update_signal_record(
         logger.warning(f"No open signal found to close for {ticker} {tf} {side} (track={track})")
         return
 
-    rec["exit"] = round(exit_price, 4)
+    rec["exit"] = round_price(exit_price)
     rec["exit_type"] = exit_type
     rec["bars_held"] = bars_held
     rec["tp1_hit"] = bool(tp1_hit)
@@ -540,7 +541,7 @@ def calculate_adaptive_tp(
     fallback_tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
 
     if ticker not in history or tf not in history[ticker]:
-        return round(fallback_tp, 4)
+        return round_price(fallback_tp)
 
     records = history[ticker][tf][side]
     # 🆕 FIX: синтетические записи (!sim) исключаются — см. get_signal_stats.
@@ -548,7 +549,7 @@ def calculate_adaptive_tp(
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
 
     if len(closed) < 3:
-        return round(fallback_tp, 4)
+        return round_price(fallback_tp)
 
     # 🆕 FIX: ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ
     use_records = []
@@ -596,7 +597,7 @@ def calculate_adaptive_tp(
     weighted_mfes = _extract_weighted_mfes(recent)
 
     if not weighted_mfes:
-        return round(fallback_tp, 4)
+        return round_price(fallback_tp)
 
     expanded = _build_weighted_sample(weighted_mfes)
 
@@ -634,7 +635,7 @@ def calculate_adaptive_tp(
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
 
     logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | pct={adjusted_percentile:.0%} (base={base_percentile:.0%}) | {regime_info} | {hit_rate_info} | capture={'full' if regime_discount >= 1.0 else 'soft'}")
-    return round(tp, 4)
+    return round_price(tp)
 
 
 def calculate_combined_tp(
@@ -669,7 +670,7 @@ def calculate_combined_tp(
         tp2 = max(tp1, min_rr_tp)
     else:
         tp2 = min(tp1, min_rr_tp)
-    tp2 = round(tp2, 4)
+    tp2 = round_price(tp2)
 
     if stats["count"] >= 5:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE

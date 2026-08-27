@@ -82,6 +82,25 @@ def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
 # =====================================================================
 # 💵  ФОРМАТИРОВАНИЕ ЦЕНЫ (адаптивная точность)
 # =====================================================================
+def round_price(x: float, sig_figs: int = 6) -> float:
+    """Rounds a price to a fixed number of significant figures instead of a
+    fixed number of decimal places.
+
+    FIX: state.py and signals.py used round(x, 4) everywhere for
+    entry/exit/tp/tp1/tp2 storage and calculation. That's fine for BTC/ETH,
+    but for any pair priced under $0.0001 (SHIB, PEPE, BONK, etc. — the
+    tracked pair list is user-editable via web/Discord, not hardcoded) it
+    collapses the price straight to 0.0, which then causes division-by-zero
+    or garbage percentages in _pct_move() and the whole adaptive TP/SL
+    calibration pipeline. Significant-figure rounding keeps consistent
+    relative precision regardless of price magnitude."""
+    if x == 0:
+        return 0.0
+    from math import log10, floor
+    d = sig_figs - int(floor(log10(abs(x)))) - 1
+    return round(x, d)
+
+
 def format_price(x: float) -> str:
     """Форматирует цену с числом знаков после запятой, зависящим от порядка
     величины, вместо фиксированного round(x, 2), который использовался почти
