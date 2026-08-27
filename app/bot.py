@@ -419,13 +419,27 @@ async def market_scanner():
                                     # навсегда. Реальная сделка закрылась, а пользователь никогда об этом
                                     # не узнавал. Теперь отправляем в любом случае, помечая опоздание явно.
                                     late_note = "" if age < 35 else " ⏱️ *(delayed notification)*"
+                                    # 🆕 FIX: тот же класс проблемы, что чинили для TP1 —
+                                    # channel.send() здесь не был обёрнут в свой try/except,
+                                    # только внешний except ValueError (ловит только
+                                    # datetime.fromisoformat выше, не Discord-исключения).
+                                    # Если отправка падала (rate limit, HTTPException), это
+                                    # уходило в общий except сканера и обрывало остаток
+                                    # обработки этого ticker/tf на цикле — включая TP1/TP2/SL
+                                    # live-проверку ниже. Теперь ошибка Discord-отправки не
+                                    # мешает остальному, а notified_ids/флаг всё равно
+                                    # выставляются (реотправлять сообщение о старом закрытии
+                                    # смысла нет — как и раньше, best-effort уведомление).
                                     if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
-                                        await channel.send(
-                                            f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                            f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
-                                            f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
-                                            f"{late_note}"
-                                        )
+                                        try:
+                                            await channel.send(
+                                                f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
+                                                f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                                f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
+                                                f"{late_note}"
+                                            )
+                                        except Exception as discord_err:
+                                            logger.error(f"[DISCORD] Failed to send trade closed for {ticker} {tf}: {discord_err}", exc_info=True)
                                     notified_ids.add(trade_id)
                                     _save_closure_notified(notified_ids)
                                     st[notified_key] = True
