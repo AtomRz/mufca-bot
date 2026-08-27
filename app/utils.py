@@ -10,7 +10,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 🔄  БЕЗОПАСНЫЙ FETCH С ПОВТОРАМИ
+# 🔄  SAFE FETCH WITH RETRIES
 # =====================================================================
 async def safe_fetch_ohlcv(
     exchange: ccxt.Exchange,
@@ -19,7 +19,7 @@ async def safe_fetch_ohlcv(
     limit: int = 100,
     retries: int = 3
 ) -> List[List[float]]:
-    """Безопасный fetch с экспоненциальной задержкой при ошибках."""
+    """Safe fetch with exponential backoff on errors."""
     # Guard against an accidentally huge limit (typo, bad param) causing memory
     # pressure. Largest legitimate caller today is 900 bars; backtest_history()
     # calls exchange.fetch_ohlcv directly and isn't affected by this bound.
@@ -49,10 +49,10 @@ async def safe_fetch_ohlcv(
     return []
 
 # =====================================================================
-# 📊  ПАРСИНГ OHLCV
+# 📊  OHLCV PARSING
 # =====================================================================
 def parse_ohlcv(bars: List[List[float]]) -> pd.DataFrame:
-    """Конвертирует OHLCV в DataFrame."""
+    """Converts OHLCV bars into a DataFrame."""
     if not bars:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     return pd.DataFrame(
@@ -61,18 +61,18 @@ def parse_ohlcv(bars: List[List[float]]) -> pd.DataFrame:
     )
 
 # =====================================================================
-# 🔍  ВАЛИДАЦИЯ ДАННЫХ
+# 🔍  DATA VALIDATION
 # =====================================================================
 def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
-    """Проверяет, что DataFrame содержит достаточно данных и не содержит NaN
-    в ключевых OHLC-колонках.
+    """Checks that the DataFrame has enough rows and no NaNs in the key OHLC
+    columns.
 
-    🆕 FIX: раньше проверялось только количество строк — если биржа изредка
-    отдавала NaN в отдельных барах (сетевой глюк, неполный последний бар и
-    т.п.), это NaN тихо просачивалось во все индикаторы дальше по цепочке
-    (FRAMA, Andean, Heikin Ashi, volume delta — каждый по-своему ломался бы
-    на NaN). Проверяем один раз здесь, на входе данных, вместо того чтобы
-    защищаться от NaN в каждом индикаторе по отдельности."""
+    🆕 FIX: previously this only checked row count — if the exchange
+    occasionally returned NaN in a bar (network glitch, incomplete last bar,
+    etc.), that NaN would silently leak into every indicator downstream
+    (FRAMA, Andean, Heikin Ashi, volume delta — each would break on NaN in
+    its own way). We validate once here, at the data entry point, instead of
+    guarding against NaN separately in every indicator."""
     if df.empty or len(df) < min_rows:
         return False
     if df[["open", "high", "low", "close"]].isna().any().any():
@@ -80,7 +80,7 @@ def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
     return True
 
 # =====================================================================
-# 💵  ФОРМАТИРОВАНИЕ ЦЕНЫ (адаптивная точность)
+# 💵  PRICE FORMATTING (adaptive precision)
 # =====================================================================
 def round_price(x: float, sig_figs: int = 6) -> float:
     """Rounds a price to a fixed number of significant figures instead of a
@@ -102,17 +102,19 @@ def round_price(x: float, sig_figs: int = 6) -> float:
 
 
 def format_price(x: float) -> str:
-    """Форматирует цену с числом знаков после запятой, зависящим от порядка
-    величины, вместо фиксированного round(x, 2), который использовался почти
-    везде в Discord-сообщениях/push (embeds.py, bot.py, discord_commands.py).
+    """Formats a price with a number of decimal places that scales with its
+    magnitude, instead of a fixed round(x, 2), which used to be used almost
+    everywhere in Discord messages/push notifications (embeds.py, bot.py,
+    discord_commands.py).
 
-    🆕 FIX (TODO): на низкономинальных парах типа DOGE (~$0.08) фикс. 2 знака
-    схлопывали Entry/SL/TP1/TP2 в одно и то же отображаемое число (все — просто
-    "$0.08"), хотя внутри бот оперирует полной точностью и реально разными
-    значениями — вводило в заблуждение при чтении сигнала/уведомления. Дело
-    было не в вычислениях (там точность float всегда сохранялась), а именно в
-    отображении. Всегда используем эту функцию вместо round(x, 2) для любой
-    цены, которую видит пользователь (entry/sl/tp/tp1/tp2/exit)."""
+    🆕 FIX (TODO): on low-nominal pairs like DOGE (~$0.08), a fixed 2 decimal
+    places collapsed Entry/SL/TP1/TP2 into the same displayed number (all of
+    them just showed "$0.08"), even though internally the bot works with
+    full precision and genuinely distinct values — this was misleading when
+    reading a signal/notification. The issue was never in the calculations
+    (float precision was always preserved there), only in the display.
+    Always use this function instead of round(x, 2) for any price shown to
+    the user (entry/sl/tp/tp1/tp2/exit)."""
     ax = abs(x)
     if ax == 0:
         decimals = 2
@@ -127,7 +129,7 @@ def format_price(x: float) -> str:
     return f"{x:,.{decimals}f}"
 
 # =====================================================================
-# ⏱️  ТАЙМЕР ДЛЯ КЭША
+# ⏱️  CACHE TIMER
 # =====================================================================
 class Timer:
     def __init__(self, ttl_seconds: int):

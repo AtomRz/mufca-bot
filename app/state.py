@@ -18,16 +18,16 @@ from utils import round_price
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 💾  СНАПШОТ ЖИВОГО СОСТОЯНИЯ (bot.state) — активные позиции переживают рестарт
+# 💾  LIVE STATE SNAPSHOT (bot.state) — active positions survive a restart
 # =====================================================================
 def save_bot_state(state: Dict[str, Dict[str, dict]]):
-    """Пишет снапшот всего bot.state (ticker -> tf -> state dict) на диск.
-    Вызывается периодически (каждый скан) и на graceful shutdown (SIGTERM/SIGINT,
-    см. main.py), чтобы активные позиции (a_active_trade/u_active_trade — entry,
-    TP1/TP2, SL, tp1_hit) переживали рестарт контейнера, а не терялись как раньше.
-    signals_history.json — это отдельный аудиторский журнал, он и без этого
-    переживал рестарт; данный файл — именно "что бот сейчас реально отслеживает
-    как открытое"."""
+    """Writes a snapshot of the whole bot.state (ticker -> tf -> state dict)
+    to disk. Called periodically (every scan) and on graceful shutdown
+    (SIGTERM/SIGINT, see main.py), so active positions (a_active_trade/
+    u_active_trade — entry, TP1/TP2, SL, tp1_hit) survive a container
+    restart instead of being lost like before. signals_history.json is a
+    separate audit log and already survived restarts on its own; this file
+    is specifically "what the bot currently considers open"."""
     try:
         safe_json_save(BOT_STATE_FILE, state)
     except Exception as e:
@@ -35,9 +35,10 @@ def save_bot_state(state: Dict[str, Dict[str, dict]]):
 
 
 def load_bot_state() -> Dict[str, Dict[str, dict]]:
-    """Читает снапшот с диска. Пустой dict, если файла нет (первый запуск) или
-    он повреждён — в этом случае вызывающий код (bot.py) достроит state заново
-    через make_state() для отсутствующих ticker/tf, как и раньше."""
+    """Reads the snapshot from disk. Returns an empty dict if the file
+    doesn't exist (first run) or is corrupted — in that case the caller
+    (bot.py) rebuilds state from scratch via make_state() for any missing
+    ticker/tf, same as before."""
     try:
         return safe_json_load(BOT_STATE_FILE, {})
     except Exception as e:
@@ -46,18 +47,21 @@ def load_bot_state() -> Dict[str, Dict[str, dict]]:
 
 
 def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
-    """Помечает как 'cancelled' любые exit_type='open' записи в signals_history.json,
-    для которых нет соответствующего active_trade в переданном (восстановленном) state.
+    """Marks any exit_type='open' record in signals_history.json as
+    'cancelled' if there's no corresponding active_trade in the passed-in
+    (restored) state.
 
-    Зачем: до появления save_bot_state()/load_bot_state() каждый рестарт контейнера
-    полностью стирал bot.state (make_state() с нуля), но записи в signals_history.json
-    оставались висеть с exit_type="open" навсегда — бот больше их не отслеживал, TP/SL
-    для них никогда не проверялся, и они просто зависали "открытыми" без надежды на
-    честный exit_type. Тот же сценарий в принципе возможен и сейчас в узком окне (если
-    контейнер упадёт не-gracefully ровно между открытием сигнала и первым сохранением
-    снапшота) — поэтому это не разовая миграция, а постоянная проверка при каждом
-    старте. cancelled — честная маркировка "не знаем как закрылось", а не притворство,
-    что знаем реальный tp/sl-исход."""
+    Why: before save_bot_state()/load_bot_state() existed, every container
+    restart wiped bot.state completely (make_state() from scratch), but
+    records in signals_history.json stayed stuck at exit_type="open"
+    forever — the bot no longer tracked them, TP/SL was never checked for
+    them, and they just hung "open" with no honest exit_type ever recorded.
+    The same scenario is technically still possible today in a narrow
+    window (if the container crashes non-gracefully exactly between opening
+    a signal and the first snapshot save) — so this isn't a one-off
+    migration, it's a standing check on every startup. "cancelled" is an
+    honest label for "we don't know how this closed", not a pretense that
+    we know the real tp/sl outcome."""
     history = load_signals_history()
     changed = False
 
@@ -69,7 +73,7 @@ def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
                         continue
                     track = rec.get("track", "a")
                     if track in ("sim",):
-                        continue  # синтетика !sim к живому bot.state не относится
+                        continue  # !sim synthetic records don't map to live bot.state
 
                     active = state.get(ticker, {}).get(tf, {}).get(f"{track}_active_trade")
                     matches_active = (
@@ -90,31 +94,32 @@ def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
         save_signals_history(history)
 
 # =====================================================================
-# 💾  УПРАВЛЕНИЕ ИСТОРИЕЙ СИГНАЛОВ
+# 💾  SIGNAL HISTORY MANAGEMENT
 # =====================================================================
 
 _history_cache: Optional[Dict] = None
-# 🆕 FIX: backtest_history выполняется в отдельном потоке (через asyncio.to_thread),
-# одновременно с основным event loop (market_scanner). Оба читают/пишут этот же
-# глобальный кэш без синхронизации — threading.Lock (не asyncio.Lock, нужна
-# защита между РЕАЛЬНЫМИ потоками ОС, не только корутинами) закрывает основной
-# риск: неатомарное "проверить-и-создать"/"переприсвоить-и-сохранить".
-# Полностью узкий сценарий (clear_history_cache() ровно во время работающего в
-# фоне backtest) всё ещё возможен, но требует редкого стечения обстоятельств
-# (одновременный !reset и фоновый backtest) — не защищаемся от него отдельно,
-# несоразмерно усложнять ради личного бота с редкими add/reset.
+# 🆕 FIX: backtest_history runs in a separate thread (via asyncio.to_thread),
+# concurrently with the main event loop (market_scanner). Both read/write
+# this same global cache without synchronization — threading.Lock (not
+# asyncio.Lock; we need protection between actual OS threads, not just
+# coroutines) closes the main risk: a non-atomic "check-then-create"/
+# "reassign-and-save". A fully narrow scenario (clear_history_cache() firing
+# exactly while a background backtest is running) is still possible, but
+# needs a rare coincidence (a simultaneous !reset and a background
+# backtest) — not guarding against that separately, disproportionate
+# complexity for a personal bot with infrequent add/reset.
 _history_lock = threading.Lock()
 
 
 def clear_history_cache():
-    """Сбрасывает кэш истории сигналов — вызывать при удалении файла истории."""
+    """Resets the signal history cache — call after deleting the history file."""
     global _history_cache
     with _history_lock:
         _history_cache = None
 
 
 def load_signals_history() -> Dict:
-    """Загружает историю сигналов из файла."""
+    """Loads the signal history from file."""
     global _history_cache
     with _history_lock:
         if _history_cache is not None:
@@ -124,7 +129,7 @@ def load_signals_history() -> Dict:
 
 
 def save_signals_history(history: Dict):
-    """Сохраняет историю сигналов в файл."""
+    """Saves the signal history to file."""
     global _history_cache
     with _history_lock:
         _history_cache = history
@@ -132,7 +137,7 @@ def save_signals_history(history: Dict):
 
 
 def _ensure_history_slot(history: Dict, ticker: str, tf: str):
-    """Создает слот для пары/таймфрейма если его нет."""
+    """Creates a slot for the pair/timeframe if it doesn't exist yet."""
     if ticker not in history:
         history[ticker] = {}
     if tf not in history[ticker]:
@@ -140,7 +145,7 @@ def _ensure_history_slot(history: Dict, ticker: str, tf: str):
 
 
 def normalize_timestamp(timestamp) -> str:
-    """Унифицирует timestamp в ISO формат."""
+    """Normalizes a timestamp into ISO format."""
     if isinstance(timestamp, datetime):
         return timestamp.isoformat()
     if isinstance(timestamp, (int, float)):
@@ -162,15 +167,16 @@ def add_signal_record(
     track: str = "a",
     synthetic: bool = False,
 ):
-    """Добавляет запись о новом сигнале.
+    """Adds a record for a new signal.
 
-    🆕 FIX: записи теперь помечаются `track` ("a" | "u" | "sim" | ...).
-    Раньше история хранилась только по ключу ticker/tf/side, и если A- и U-трек
-    одновременно держали позицию в одну сторону на одном ticker/tf, в истории
-    оказывалось две записи exit_type="open" без возможности их различить —
-    update_signal_record/update_signal_mae_mfe закрывали/обновляли не ту сделку.
-    `synthetic` — метка для записей, созданных не реальным сканером (например !sim),
-    чтобы они не участвовали в калибровке adaptive TP/SL.
+    🆕 FIX: records are now tagged with `track` ("a" | "u" | "sim" | ...).
+    Previously history was keyed only by ticker/tf/side, so if the A-track
+    and U-track simultaneously held a position on the same side for the same
+    ticker/tf, history would end up with two exit_type="open" records with
+    no way to tell them apart — update_signal_record/update_signal_mae_mfe
+    would close/update the wrong trade.
+    `synthetic` marks records created outside the real scanner (e.g. !sim),
+    so they're excluded from adaptive TP/SL calibration.
     """
     history = load_signals_history()
     _ensure_history_slot(history, ticker, tf)
@@ -197,12 +203,12 @@ def add_signal_record(
 
 def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
     """
-    Находит открытую запись для данного трека.
+    Finds the open record for the given track.
 
-    🆕 FIX: сначала ищем запись с точным совпадением track (новые данные).
-    Если не нашли — fallback на запись без поля track вообще (старые данные,
-    записанные до этого фикса), чтобы не ломать существующую историю.
-    Берём самую последнюю подходящую запись (reversed).
+    🆕 FIX: first look for a record with an exact track match (new data).
+    If not found — fall back to a record with no track field at all (old
+    data written before this fix), so we don't break existing history.
+    Takes the most recent matching record (reversed).
     """
     for rec in reversed(records):
         if rec.get("exit_type") == "open" and rec.get("track") == track:
@@ -214,7 +220,7 @@ def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
 
 
 def _pct_move(side: str, entry: float, price: float) -> float:
-    """% движения цены в пользу позиции — общая формула для long/short."""
+    """% price move in favor of the position — shared formula for long/short."""
     return (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
 
 
@@ -222,17 +228,19 @@ def update_signal_record(
     ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int,
     track: str = "a", tp1_hit: bool = False, tp1_price: Optional[float] = None,
 ):
-    """Закрывает открытый сигнал (для указанного трека).
+    """Closes an open signal (for the given track).
 
-    🆕 FIX: раньше PnL всегда считался наивно entry→exit_price по ВСЕЙ позиции.
-    Но если TP1 уже был достигнут, по факту закрыто 50% с прибылью TP1, а SL
-    на оставшиеся 50% Атом переносит в безубыток вручную (бот это делает только
-    как уведомление, реальную позицию на бирже не трогает — см. bot.py). Значит
-    итоговый result "sl" по СТАРОМУ SL для такой сделки в реальности никогда бы
-    не наступил: цена сначала должна была откатиться через безубыток. Поэтому
-    когда tp1_hit=True, PnL считаем как среднее между зафиксированной на TP1
-    половиной и результатом второй половины — это и есть реальная экономика
-    сделки, а не искажённая "закрыли всё по старому SL"."""
+    🆕 FIX: PnL used to always be computed naively as entry→exit_price over
+    the WHOLE position. But if TP1 was already hit, 50% was in fact closed
+    at TP1's profit, and Atom manually moves the SL on the remaining 50% to
+    breakeven (the bot only reflects this as a notification, it doesn't
+    touch the actual exchange position — see bot.py). So the final "sl"
+    result at the OLD SL for such a trade would, in reality, never have
+    happened: price would have had to retrace through breakeven first. So
+    when tp1_hit=True, we compute PnL as the average between the half
+    locked in at TP1 and the result of the second half — that's the real
+    economics of the trade, not a distorted "closed everything at the old
+    SL"."""
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
         logger.warning(f"Cannot update signal: no history for {ticker} {tf}")
@@ -251,8 +259,8 @@ def update_signal_record(
     entry = rec["entry"]
 
     if tp1_hit and tp1_price is not None:
-        tp1_leg_pct = _pct_move(side, entry, tp1_price)      # первые 50%, зафиксировано на TP1
-        remainder_leg_pct = _pct_move(side, entry, exit_price)  # вторые 50%, закрыты позже (обычно безубыток или TP2)
+        tp1_leg_pct = _pct_move(side, entry, tp1_price)      # first 50%, locked in at TP1
+        remainder_leg_pct = _pct_move(side, entry, exit_price)  # second 50%, closed later (usually breakeven or TP2)
         rec["moved_pct"] = round((tp1_leg_pct + remainder_leg_pct) / 2, 4)
     else:
         rec["moved_pct"] = round(_pct_move(side, entry, exit_price), 4)
@@ -265,17 +273,19 @@ def update_signal_record(
 def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a",
                            high: Optional[float] = None, low: Optional[float] = None):
     """
-    Обновляет MFE/MAE для открытого сигнала указанного трека.
+    Updates MFE/MAE for the open signal on the given track.
 
-    🆕 FIX (Kimi review): раньше принимала только current_price (close бара) —
-    live-статистика считалась по цене закрытия, а backtest_history() в это же
-    время считает MAE/MFE по high/low каждого бара (реальные внутрибаровые
-    экстремумы). Обе выборки пишутся в один signals_history.json и вместе
-    калибруют calculate_adaptive_sl/calculate_combined_tp — расхождение в
-    методике систематически занижало live MAE/MFE относительно backtest.
-    high/low теперь опциональны и обратно совместимы: старые вызовы (например
-    !sim, где current_price — это уже сама целевая TP/SL цена, а не бар) как
-    и раньше используют одну current_price для обеих сторон расчёта.
+    🆕 FIX (Kimi review): previously this only accepted current_price (bar
+    close) — live stats were computed from the closing price, while
+    backtest_history() computes MAE/MFE from each bar's high/low (actual
+    intrabar extremes) at the same time. Both samples get written into the
+    same signals_history.json and jointly calibrate
+    calculate_adaptive_sl/calculate_combined_tp — the methodology mismatch
+    systematically understated live MAE/MFE relative to backtest. high/low
+    are now optional and backward compatible: old call sites (e.g. !sim,
+    where current_price is already the target TP/SL price itself, not a
+    bar) still use a single current_price for both sides of the
+    calculation, same as before.
     """
     history = load_signals_history()
     if ticker not in history or tf not in history[ticker]:
@@ -306,11 +316,11 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 
 
 # =====================================================================
-# 📊  СТАТИСТИКА ПО СИГНАЛАМ
+# 📊  SIGNAL STATISTICS
 # =====================================================================
 
 def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None) -> Dict:
-    """Возвращает статистику по сигналам."""
+    """Returns statistics for the given signal."""
     history = load_signals_history()
     empty = {
         "count": 0,
@@ -330,16 +340,16 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         return empty
 
     records = history[ticker][tf][side]
-    # 🆕 FIX: синтетические записи (!sim) исключаются из статистики/калибровки —
-    # они не отражают реальное поведение рынка и искажали перцентили.
-    # 🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 дал прибыль, остаток закрылся по
-    # перенесённому SL) — тоже реальный закрытый исход, должен участвовать
-    # в статистике наравне с "tp"/"sl"/"cancelled", а не выпадать из выборки.
+    # 🆕 FIX: synthetic records (!sim) are excluded from stats/calibration —
+    # they don't reflect real market behavior and were skewing the percentiles.
+    # 🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 gave profit, the remainder closed
+    # at the moved SL) is also a real closed outcome and should count in
+    # stats alongside "tp"/"sl"/"cancelled", not be dropped from the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
     if not closed:
         return empty
 
-    # 🆕 FIX: Фильтрация по режиму, если указан
+    # 🆕 FIX: filter by regime, if given
     regime_used = False
     if regime:
         regime_closed = [r for r in closed if r.get("regime", "unknown") == regime]
@@ -366,11 +376,12 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         elif r["exit_type"] == "sl":
             sl_hits += 1
         elif r["exit_type"] == "sl_after_tp1":
-            # 🆕 FIX BUG-LO008: TP1 уже дал прибыль на 50% позиции, остаток
-            # закрылся по перенесённому SL (breakeven/half_tp1) — это частичный
-            # успех, а не полный провал. Даём половинный вес в обе стороны,
-            # а не считаем чистым "sl" наравне со сделкой, где TP1 вообще
-            # не достигался.
+            # 🆕 FIX BUG-LO008: TP1 already delivered profit on 50% of the
+            # position, and the remainder closed at the moved SL
+            # (breakeven/half_tp1) — that's a partial success, not a full
+            # loss. Give it half weight on both sides instead of counting
+            # it as a plain "sl" alongside a trade that never reached TP1
+            # at all.
             tp_hits += 0.5
             sl_hits += 0.5
 
@@ -401,13 +412,13 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
 
 
 # =====================================================================
-# 🎯  АДАПТИВНЫЙ ТП (ГИБРИДНЫЙ: РЕЖИМ + ВЗВЕШИВАНИЕ + HIT RATE FEEDBACK)
+# 🎯  ADAPTIVE TP (HYBRID: REGIME + WEIGHTING + HIT RATE FEEDBACK)
 # =====================================================================
 
 def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
     """
-    Извлекает MFE с весами по типу выхода.
-    Возвращает список (mfe, weight).
+    Extracts MFE values weighted by exit type.
+    Returns a list of (mfe, weight).
     """
     favorable_pcts = []
 
@@ -421,9 +432,9 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
         if exit_type == "tp":
             weight = 1.0
         elif exit_type == "sl_after_tp1":
-            # 🆕 FIX BUG-LO008: TP1 был реально достигнут (подтверждает, что уровень
-            # был статистически обоснован), остаток просто не дошёл до TP2 —
-            # весомее плана "sl", но менее весомо, чем полный "tp".
+            # 🆕 FIX BUG-LO008: TP1 was actually reached (confirms the level
+            # was statistically justified), the remainder just didn't reach
+            # TP2 — weightier than a plain "sl", but less than a full "tp".
             weight = 0.8
         elif exit_type == "sl":
             weight = 0.6
@@ -439,8 +450,9 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
 
 def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[float]:
     """
-    Строит взвешенную выборку для персентиля.
-    Максимум 2 копии на сигнал (tp=2, всё остальное=1) — не раздувает выборку.
+    Builds a weighted sample for the percentile calculation.
+    Max 2 copies per signal (tp=2, everything else=1) — keeps the sample
+    from ballooning.
     """
     expanded = []
     for mfe, weight in weighted_mfes:
@@ -451,13 +463,14 @@ def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[flo
 
 def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
     """
-    Возвращает (tp_hit_rate, tp_count, total_exits) по записям.
+    Returns (tp_hit_rate, tp_count, total_exits) for the given records.
 
-    🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 дал прибыль на 50%, остаток закрылся
-    по перенесённому SL — breakeven/half_tp1) раньше считался как обычный "sl",
-    хотя итоговый PnL по сделке чаще всего положительный. Теперь даём такому
-    исходу половинный вес и в hit, и в total — частичный успех, а не чистый
-    провал наравне со сделкой, которая вообще не дошла до TP1.
+    🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 gave profit on 50%, the remainder
+    closed at the moved SL — breakeven/half_tp1) used to be counted as a
+    plain "sl", even though the trade's overall PnL is usually positive.
+    Now it gets half weight in both the hit count and the total — a partial
+    success, not a full loss on par with a trade that never even reached
+    TP1.
     """
     tp_hits = sum(1 for r in records if r["exit_type"] == "tp")
     sl_hits = sum(1 for r in records if r["exit_type"] == "sl")
@@ -477,31 +490,32 @@ def _adjust_percentile_by_hit_rate(
     max_pct: float = 0.85,
 ) -> Tuple[float, str]:
     """
-    Автоподстройка перцентиля на основе реального hit rate.
+    Auto-adjusts the percentile based on the real hit rate.
 
-    Если hit rate ниже целевого — снижаем перцентиль (TP ближе, достижимее).
-    Если hit rate выше — можно поднять (TP дальше, больше прибыли).
+    If the hit rate is below target — lower the percentile (TP closer,
+    easier to reach). If it's above target — raise it (TP farther, more
+    profit).
 
     Returns: (adjusted_percentile, reason)
     """
     if tp_hit_rate < target_hit_rate * 0.7:
-        # Слишком мало TP hits — TP слишком агрессивный
+        # Too few TP hits — TP is too aggressive
         adjustment = -0.12
         reason = f"hit_rate={tp_hit_rate:.1%} < target, lowering pct {base_percentile:.0%} → {max(min_pct, base_percentile + adjustment):.0%}"
     elif tp_hit_rate < target_hit_rate * 0.9:
-        # Немного ниже цели — небольшая корректировка
+        # Slightly below target — small adjustment
         adjustment = -0.06
         reason = f"hit_rate={tp_hit_rate:.1%} slightly low, adjusting pct {base_percentile:.0%} → {max(min_pct, base_percentile + adjustment):.0%}"
     elif tp_hit_rate > target_hit_rate * 1.5:
-        # TP достигается слишком часто — можно быть агрессивнее
+        # TP hit too often — can afford to be more aggressive
         adjustment = +0.08
         reason = f"hit_rate={tp_hit_rate:.1%} high, raising pct {base_percentile:.0%} → {min(max_pct, base_percentile + adjustment):.0%}"
     elif tp_hit_rate > target_hit_rate * 1.2:
-        # Немного выше цели — небольшой буст
+        # Slightly above target — small boost
         adjustment = +0.04
         reason = f"hit_rate={tp_hit_rate:.1%} good, slight boost {base_percentile:.0%} → {min(max_pct, base_percentile + adjustment):.0%}"
     else:
-        # В целевом диапазоне — не трогаем
+        # Within target range — leave it alone
         adjustment = 0.0
         reason = f"hit_rate={tp_hit_rate:.1%} in target zone, pct unchanged {base_percentile:.0%}"
 
@@ -511,8 +525,8 @@ def _adjust_percentile_by_hit_rate(
 
 def _apply_realistic_capture(mfe_pct: float, capture_rate: float = 0.70) -> float:
     """
-    Применяет "realistic capture rate" к MFE.
-    Идеальный MFE невозможно поймать — корректируем вниз.
+    Applies a "realistic capture rate" to MFE.
+    The ideal MFE can never actually be captured in practice — adjust it down.
     """
     return mfe_pct * capture_rate
 
@@ -527,14 +541,14 @@ def calculate_adaptive_tp(
     regime: Optional[str] = None
 ) -> float:
     """
-    Адаптивный TP на основе исторических MFE с feedback loop по hit rate.
+    Adaptive TP based on historical MFE with a hit-rate feedback loop.
 
-    Гибридная логика:
-    1. Если по режиму ≥ 10 сигналов — используем только их
-    2. Если 5-9 сигналов — используем режим + общие с дисконтом
-    3. Если < 5 — используем все с взвешиванием по exit_type
-    4. 🆕 Автоподстройка перцентиля на основе реального hit rate
-    5. 🆕 Realistic capture rate (70% от идеального MFE)
+    Hybrid logic:
+    1. If there are ≥ 10 signals for this regime — use only those
+    2. If 5-9 signals — use regime + overall with a discount
+    3. If < 5 — use all signals weighted by exit_type
+    4. 🆕 Auto-adjusts the percentile based on the real hit rate
+    5. 🆕 Realistic capture rate (70% of the ideal MFE)
     """
     history = load_signals_history()
     risk = abs(entry - current_sl)
@@ -544,14 +558,14 @@ def calculate_adaptive_tp(
         return round_price(fallback_tp)
 
     records = history[ticker][tf][side]
-    # 🆕 FIX: синтетические записи (!sim) исключаются — см. get_signal_stats.
-    # 🆕 FIX BUG-LO008: sl_after_tp1 — реальный закрытый исход, участвует в выборке.
+    # 🆕 FIX: synthetic records (!sim) are excluded — see get_signal_stats.
+    # 🆕 FIX BUG-LO008: sl_after_tp1 is a real closed outcome, included in the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
 
     if len(closed) < 3:
         return round_price(fallback_tp)
 
-    # 🆕 FIX: ГИБРИДНАЯ ЛОГИКА ПО РЕЖИМУ
+    # 🆕 FIX: HYBRID LOGIC BY REGIME
     use_records = []
     regime_discount = 1.0
     regime_info = ""
@@ -577,12 +591,12 @@ def calculate_adaptive_tp(
 
     recent = use_records[-SIGNAL_HISTORY_LIMIT:]
 
-    # 🆕 FIX: АВТОПОДСТРОЙКА ПЕРЦЕНТИЛЯ ПО HIT RATE
+    # 🆕 FIX: AUTO-ADJUST PERCENTILE BY HIT RATE
     base_percentile = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
     adjusted_percentile = base_percentile
     hit_rate_info = ""
 
-    # Только если достаточно данных для статистически значимой оценки
+    # Only if there's enough data for a statistically meaningful estimate
     if len(recent) >= 15 and _cfg.TP_AUTO_ADJUST:
         tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent)
         adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
@@ -603,21 +617,23 @@ def calculate_adaptive_tp(
 
     tp_pct = float(np.percentile(expanded, adjusted_percentile * 100))
 
-    # Применяем дисконт режима
+    # Apply the regime discount
     tp_pct *= regime_discount
 
     # 🛡️ Realistic capture rate
-    # Применяем capture rate ТОЛЬКО если regime_discount не срабатывал (нет дисконта)
-    # иначе тройной дисконт (weighted + regime + capture) делает TP слишком близким
+    # Only apply the capture rate if regime_discount didn't kick in (no
+    # discount) — otherwise a triple discount (weighted + regime + capture)
+    # makes TP too close
     if regime_discount >= 1.0:
         tp_pct = _apply_realistic_capture(tp_pct, capture_rate=_cfg.TP_CAPTURE_RATE)
     else:
-        # При наличии regime_discount capture_rate смягчаем до среднего между 1.0 и capture_rate
+        # When regime_discount is active, soften capture_rate to the average
+        # between 1.0 and capture_rate
         soft_capture = (_cfg.TP_CAPTURE_RATE + 1.0) / 2
         tp_pct = _apply_realistic_capture(tp_pct, capture_rate=soft_capture)
         logger.debug(f"[TP] Soft capture {soft_capture:.2f} (regime_discount={regime_discount})")
 
-    # 🛡️ ATR-кап
+    # 🛡️ ATR cap
     if atr14 is not None:
         try:
             atr_val = float(atr14.iloc[-1]) if hasattr(atr14, 'iloc') else float(atr14)
@@ -650,9 +666,9 @@ def calculate_combined_tp(
     regime: Optional[str] = None
 ) -> Tuple[float, float, str]:
     """
-    Комбинированный TP с двумя уровнями:
-      TP1 — статистический (перцентиль MFE без RR cap), цель для 50% позиции
-      TP2 — с RR cap (минимум R:R 1.5), цель для оставшихся 50%
+    Combined TP with two levels:
+      TP1 — statistical (MFE percentile without an R:R cap), target for 50% of the position
+      TP2 — with an R:R cap (minimum R:R 1.5), target for the remaining 50%
 
     Returns: (tp1, tp2, desc)
     """
@@ -661,10 +677,10 @@ def calculate_combined_tp(
     mode_label = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
 
-    # ── TP1: чистый статистический, без RR cap ───────────────────────
+    # ── TP1: purely statistical, no R:R cap ───────────────────────
     tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr14, regime)
 
-    # ── TP2: с RR cap (минимум 1.5) ──────────────────────────────────
+    # ── TP2: with R:R cap (minimum 1.5) ──────────────────────────────────
     min_rr_tp = entry + 1.5 * risk if side == "long" else entry - 1.5 * risk
     if side == "long":
         tp2 = max(tp1, min_rr_tp)

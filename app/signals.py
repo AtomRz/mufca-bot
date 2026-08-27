@@ -28,10 +28,10 @@ from config import (
 # !tpconfig limit / web_api.py (_cfg.SIGNAL_HISTORY_LIMIT = ...). A bare import
 # would bind a stale int copy here that never sees those updates. Same reasoning
 # as the indicator params below — always read via _cfg.SIGNAL_HISTORY_LIMIT.
-# 🆕 Параметры индикаторов (FRAMA/MFI/Andean/UT Bot) теперь редактируются на
-# лету из веб-морды (Settings), поэтому обращаемся к ним как _cfg.FRAMA_LEN и
-# т.д. по месту использования, а не через bare-импорт — иначе после
-# `_cfg.FRAMA_LEN = ...` в web_api.py эта копия имени осталась бы старой.
+# 🆕 Indicator parameters (FRAMA/MFI/Andean/UT Bot) are now editable live from
+# the web UI (Settings), so we access them as _cfg.FRAMA_LEN etc. at the call
+# site instead of a bare import — otherwise this name's copy would go stale
+# after `_cfg.FRAMA_LEN = ...` in web_api.py.
 from indicators import (
     calculate_atr,
     calculate_chop,
@@ -110,24 +110,25 @@ def bars_since_crossunder(s, lvl, cur, lookback):
     return 999
 
 # =====================================================================
-# 🧬  HTF BIAS (С КЭШИРОВАНИЕМ)
+# 🧬  HTF BIAS (WITH CACHING)
 # =====================================================================
 
 _htf_cache = Timer(HTF_CACHE_TTL_SECONDS)
 
 def clear_htf_cache():
-    """Сбрасывает кэш HTF bias — вызывать при изменении !htf."""
+    """Resets the HTF bias cache — call when !htf changes."""
     _htf_cache.clear()
 
 async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> int:
-    """Возвращает HTF bias с кэшированием.
+    """Returns the HTF bias, with caching.
 
-    🆕 FIX (Kimi review п.9): раньше ключ кэша был f"{ticker}_{timeframe}", где
-    timeframe — торговый TF (1h/4h/...), хотя HTF bias зависит только от
-    ticker и _cfg.HTF_BIAS (обычно 1d) — параметр timeframe тут вообще не
-    участвует в расчёте. При нескольких торговых TF на одном тикере (обычная
-    конфигурация TICKERS × TIMEFRAMES) это давало N идентичных кэш-записей и
-    N избыточных фетчей одного и того же HTF-таймфрейма вместо одного.
+    🆕 FIX (Kimi review #9): the cache key used to be f"{ticker}_{timeframe}",
+    where timeframe is the trading TF (1h/4h/...), even though HTF bias only
+    depends on ticker and _cfg.HTF_BIAS (usually 1d) — the timeframe
+    parameter never actually factored into the calculation. With multiple
+    trading TFs on the same ticker (the normal TICKERS × TIMEFRAMES
+    configuration), this produced N identical cache entries and N redundant
+    fetches of the same HTF timeframe instead of one.
     """
     cache_key = f"{ticker}_{_cfg.HTF_BIAS}"
     cached = _htf_cache.get(cache_key)
@@ -169,19 +170,19 @@ def calculate_sl(
     atr14: pd.Series,
     idx: int
 ) -> float:
-    """Рассчитывает Stop Loss с валидацией (SL не пересекает цену входа).
+    """Calculates Stop Loss with validation (SL never crosses the entry price).
 
-    BUGFIX BUG-CR002: FRAMA возвращает NaN для первых ~22 баров (rolling windows
-    не заполнены). max(NaN, x) = NaN в Python (IEEE 754), поэтому SL становился NaN,
-    проверки rr < MIN_RR и bar_low <= sl давали False, позиция открывалась без
-    рабочего стопа и никогда не закрывалась по SL.
-    Исправление: если sl_frama = NaN, используем только sl_atr.
+    BUGFIX BUG-CR002: FRAMA returns NaN for the first ~22 bars (rolling
+    windows not yet filled). max(NaN, x) = NaN in Python (IEEE 754), so SL
+    became NaN, the rr < MIN_RR and bar_low <= sl checks both evaluated to
+    False, and the position opened with no working stop and never closed on SL.
+    Fix: if sl_frama = NaN, use sl_atr alone.
     """
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     if side == "long":
         sl_frama = float(fl.iloc[idx])
         sl_atr = entry_price - 1.5 * atr_v
-        # NaN-защита: если FRAMA не прогрелась — падаем обратно на ATR-стоп
+        # NaN guard: if FRAMA hasn't warmed up — fall back to the ATR stop
         if np.isnan(sl_frama):
             sl = sl_atr
         else:
@@ -190,7 +191,7 @@ def calculate_sl(
     else:
         sl_frama = float(fu.iloc[idx])
         sl_atr = entry_price + 1.5 * atr_v
-        # NaN-защита
+        # NaN guard
         if np.isnan(sl_frama):
             sl = sl_atr
         else:
@@ -198,7 +199,7 @@ def calculate_sl(
         return max(sl, entry_price * 1.005)
 
 # =====================================================================
-# 🛑  АДАПТИВНЫЙ SL (на основе исторического MAE)
+# 🛑  ADAPTIVE SL (based on historical MAE)
 # =====================================================================
 
 def calculate_adaptive_sl(
@@ -213,13 +214,13 @@ def calculate_adaptive_sl(
     idx: int,
 ) -> tuple[float, str]:
     """
-    Адаптивный SL на основе исторического MAE выигрышных сделок.
+    Adaptive SL based on historical MAE of winning trades.
 
-    Логика:
-    - Берём только сделки где цена вернулась (exit_type == "tp" или "cancelled") —
-      истинный MAE: цена уходила против нас, но вернулась и не задела стоп.
-    - Берём перцентиль SL_MAE_PERCENTILE от этих MAE значений + буфер SL_MAE_BUFFER.
-    - Если выигрышных сделок меньше SL_MIN_HISTORY — fallback на фиксированный % или ATR-SL.
+    Logic:
+    - Only use trades where price came back (exit_type == "tp" or "cancelled") —
+      true MAE: price moved against us but came back without touching the stop.
+    - Take the SL_MAE_PERCENTILE percentile of these MAE values + an SL_MAE_BUFFER buffer.
+    - If there are fewer winning trades than SL_MIN_HISTORY — fall back to a fixed % or ATR-based SL.
 
     Returns:
         (sl_price, description)
@@ -233,8 +234,8 @@ def calculate_adaptive_sl(
         history = load_signals_history()
         records = history.get(ticker, {}).get(timeframe, {}).get(side, [])
 
-        # Только выигрышные сделки (цена вернулась, не задев стоп)
-        # 🆕 FIX: исключаем synthetic-записи (!sim) — они не отражают реальные MAE.
+        # Winning trades only (price came back without touching the stop)
+        # 🆕 FIX: exclude synthetic records (!sim) — they don't reflect real MAE.
         winning = [
             r for r in records
             if r.get("exit_type") in ("tp", "cancelled")
@@ -243,16 +244,18 @@ def calculate_adaptive_sl(
         ]
 
         if len(winning) < _cfg.SL_MIN_HISTORY:
-            # 🆕 FIX КРИТИЧНЫЙ БАГ: раньше здесь брали "противоположную" линию
-            # FRAMA — fu (верхнюю) для LONG и fl (нижнюю) для SHORT — в попытке
-            # получить "широкий" стоп. На деле это ставило SL НЕ С ТОЙ стороны
-            # входа: для лонга fu почти всегда лежит ВЫШЕ цены входа, то есть SL
-            # оказывался выше входа и не защищал позицию (срабатывал как "SL" при
-            # росте цены, с положительным PnL — именно то, что видно в !signals
-            # при недостатке истории, < SL_MIN_HISTORY=10 выигрышных сделок).
-            # atr_sl уже посчитан выше через calculate_sl() — гарантированно с
-            # правильной стороны (fl для long, fu для short) плюс защита от NaN
-            # и кламп, чтобы SL не пересекал цену входа. Просто переиспользуем его.
+            # 🆕 FIX CRITICAL BUG: this used to take the "opposite" FRAMA line —
+            # fu (upper) for LONG and fl (lower) for SHORT — trying to get a
+            # "wide" stop. In practice this put the SL on the WRONG side of
+            # entry: for a long, fu is almost always ABOVE the entry price,
+            # meaning SL ended up above entry and didn't protect the position
+            # (it would trigger as an "SL" while price was rising, with a
+            # positive PnL — exactly what was showing up in !signals when
+            # history was thin, < SL_MIN_HISTORY=10 winning trades).
+            # atr_sl is already computed above via calculate_sl() — guaranteed
+            # to be on the correct side (fl for long, fu for short), plus NaN
+            # protection and a clamp so SL never crosses the entry price.
+            # Just reuse it.
             sl = atr_sl
             logger.debug(
                 f"[ADAPTIVE_SL] {ticker} {timeframe} {side}: "
@@ -261,13 +264,13 @@ def calculate_adaptive_sl(
             )
             return sl, f"frama/atr-fallback ({len(winning)}/{_cfg.SL_MIN_HISTORY} wins)"
 
-        mae_values = [r["max_adverse_pct"] / 100 for r in winning]  # переводим % → доли
+        mae_values = [r["max_adverse_pct"] / 100 for r in winning]  # convert % → fraction
         mae_percentile = float(np.percentile(mae_values, _cfg.SL_MAE_PERCENTILE * 100))
         mae_with_buffer = mae_percentile + _cfg.SL_MAE_BUFFER
 
-        # 🆕 FIX: у TP есть ATR-кап (calculate_adaptive_tp), у SL его не было —
-        # перцентиль MAE без ограничения мог дать неадекватно широкий стоп при
-        # выбросах в истории. Ограничиваем максимум SL_MAX_ATR_MULT × ATR.
+        # 🆕 FIX: TP has an ATR cap (calculate_adaptive_tp), SL didn't have one —
+        # an unbounded MAE percentile could give an unreasonably wide stop on
+        # outliers in the history. Cap it at SL_MAX_ATR_MULT × ATR.
         atr_v = max(float(atr14.iloc[idx]), 1e-8)
         max_risk_pct = (_cfg.SL_MAX_ATR_MULT * atr_v) / entry_price
         capped = mae_with_buffer > max_risk_pct
@@ -276,11 +279,11 @@ def calculate_adaptive_sl(
 
         if side == "long":
             sl_adaptive = entry_price * (1 - mae_with_buffer)
-            # Не ставим SL выше цены входа
+            # Never put SL above the entry price
             sl = min(sl_adaptive, entry_price * (1 - _cfg.SL_MIN_DISTANCE_PCT))
         else:
             sl_adaptive = entry_price * (1 + mae_with_buffer)
-            # Не ставим SL ниже цены входа
+            # Never put SL below the entry price
             sl = max(sl_adaptive, entry_price * (1 + _cfg.SL_MIN_DISTANCE_PCT))
 
         desc = (
@@ -307,13 +310,13 @@ def apply_onchain_with_safety(
     side: str,
     onchain_bias: Optional[Dict],
     min_rr: float = 1.0,
-    max_sl_widen_pct: float = 0.15,  # Максимальное расширение SL на 15%
+    max_sl_widen_pct: float = 0.15,  # Maximum SL widening of 15%
 ) -> Tuple[float, float, str, bool]:
     """
-    Применяет on-chain множители к TP/SL с проверкой безопасности.
+    Applies on-chain multipliers to TP/SL with a safety check.
 
     Returns: (new_tp, new_sl, desc_suffix, applied_ok)
-    applied_ok = False если on-chain ухудшил R:R ниже min_rr и был отклонён
+    applied_ok = False if on-chain degraded R:R below min_rr and was rejected
     """
     if not onchain_bias or not ONCHAIN_ENABLED:
         return tp, sl, "", True
@@ -332,10 +335,10 @@ def apply_onchain_with_safety(
     reward_before = abs(tp - entry)
     rr_before = reward_before / max(risk_before, 1e-8)
 
-    # Применяем множители
+    # Apply the multipliers
     if side == "long":
         new_tp = entry + reward_before * tp_mult
-        # SL mult > 1 = SL дальше (шире), < 1 = SL ближе
+        # SL mult > 1 = SL farther (wider), < 1 = SL closer
         new_sl = entry - risk_before * sl_mult
     else:
         new_tp = entry - reward_before * tp_mult
@@ -364,12 +367,13 @@ def apply_onchain_with_safety(
     reward_after = abs(new_tp - entry)
     rr_after = reward_after / max(risk_after, 1e-8)
 
-    # Если RR всё ещё ниже минимума (из-за on-chain TP-множителя или пост-капа SL) —
-    # откатываем TP к минимально допустимому, сохраняя направление on-chain где возможно.
+    # If RR is still below the minimum (due to the on-chain TP multiplier or
+    # the SL cap above) — roll TP back to the minimum allowed, preserving the
+    # on-chain direction where possible.
     if rr_after < min_rr:
         logger.warning(f"[ONCHAIN-SAFETY] RR degraded {rr_before:.2f} -> {rr_after:.2f} (below {min_rr}), using conservative")
         if side == "long":
-            # Минимальный TP = entry + risk_after * min_rr, но не хуже оригинального TP
+            # Minimum TP = entry + risk_after * min_rr, but never worse than the original TP
             safe_tp = entry + risk_after * min_rr
             new_tp = max(safe_tp, tp)
         else:
@@ -391,15 +395,16 @@ def apply_onchain_with_safety(
 
 def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
                      bar_time: Optional[int] = None) -> Optional[str]:
-    """Проверяет, был ли пробит TP или SL для указанного трека.
+    """Checks whether TP or SL was hit for the given track.
 
-    🆕 FIX BUG-LO009 (found by Kimi audit): SL, перенесённый после TP1, раньше
-    проверялся против ЛЮБОГО бара, включая закрывшиеся ДО момента переноса —
-    их low/high напечатаны раньше, чем цена вообще коснулась TP1, и почти
-    гарантированно ниже (для long) нового полу-пути/безубытка. Это давало
-    ложное "sl" на первом же скане после TP1-хита, по цене, которой рынок
-    после переноса не касался. bar_time + trade["sl_moved_after_bar"]
-    (проставляется в bot.py в момент переноса) исключают такие бары."""
+    🆕 FIX BUG-LO009 (found by Kimi audit): the SL moved after TP1 used to be
+    checked against ANY bar, including ones that closed BEFORE the move
+    happened — their low/high were printed before price ever even touched
+    TP1, and are almost guaranteed to be below (for long) the new
+    halfway/breakeven level. This produced a false "sl" on the very first
+    scan after a TP1 hit, at a price the market never actually touched after
+    the move. bar_time + trade["sl_moved_after_bar"] (set in bot.py at the
+    moment of the move) excludes such bars."""
     trade = state.get(f"{track}_active_trade")
     if not trade:
         return None
@@ -424,7 +429,7 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
     return None
 
 def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str, track: str = "a") -> Optional[Dict]:
-    """Закрывает активную позицию указанного трека (a или u)."""
+    """Closes the active position for the given track (a or u)."""
     trade_key = f"{track}_active_trade"
     trade = state.get(trade_key)
     if not trade:
@@ -438,11 +443,11 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     tp1_hit = bool(trade.get("tp1_hit"))
     tp1_price = trade.get("tp1")
 
-    # 🆕 FIX: если TP1 уже был достигнут (50% закрыто по факту вручную на бирже,
-    # SL остальных 50% — в безубытке/half_tp1), реальный PnL — среднее между
-    # зафиксированной на TP1 половиной и результатом второй половины, а не
-    # наивное entry→exit_price по всей позиции (см. подробный комментарий
-    # в state.update_signal_record).
+    # 🆕 FIX: if TP1 was already hit (50% closed in practice manually on the
+    # exchange, SL on the remaining 50% moved to breakeven/half_tp1), the
+    # real PnL is the average between the half locked in at TP1 and the
+    # result of the second half, not a naive entry→exit_price over the whole
+    # position (see the detailed comment in state.update_signal_record).
     if tp1_hit and tp1_price is not None:
         tp1_leg_pct = (tp1_price - entry) / entry * 100 if side == "long" else (entry - tp1_price) / entry * 100
         remainder_leg_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
@@ -450,14 +455,15 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     else:
         pnl_pct = (exit_price - entry) / entry * 100 if side == "long" else (entry - exit_price) / entry * 100
 
-    # 🆕 FIX BUG-LO008: раньше сделка, где TP1 уже дал прибыль, а остаток закрылся
-    # по перенесённому SL (breakeven/half_tp1), помечалась результатом "sl" —
-    # той же меткой, что и полный убыток по исходному SL без единого частичного
-    # закрытия. pnl_pct уже считался корректно (см. выше), но бинарная метка
-    # result/exit_type искажала hit-rate (_calculate_hit_rate в state.py) и
-    # авто-калибровку TP percentile — сделка с итоговым плюсом засчитывалась
-    # как чистый провал наравне с настоящим полным лоссом. Отдельная метка
-    # "sl_after_tp1" позволяет считать её частичным успехом, а не провалом.
+    # 🆕 FIX BUG-LO008: a trade where TP1 already gave profit and the
+    # remainder closed at the moved SL (breakeven/half_tp1) used to be
+    # labeled with result "sl" — the same label as a full loss at the
+    # original SL with no partial close at all. pnl_pct was already computed
+    # correctly (see above), but the binary result/exit_type label distorted
+    # the hit rate (_calculate_hit_rate in state.py) and the TP percentile
+    # auto-calibration — a trade with a net positive outcome was counted as
+    # a plain loss on par with a genuine full loss. A separate
+    # "sl_after_tp1" label lets it count as a partial success instead of a loss.
     result_label = "sl_after_tp1" if (result == "sl" and tp1_hit) else result
 
     closed_trade = {
@@ -482,8 +488,9 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     state["trade_history"].append(closed_trade)
     state["trade_history"] = state["trade_history"][-50:]
 
-    # 🆕 FIX: передаём track, чтобы не закрыть по ошибке запись другого трека
-    # (A и U могут одновременно держать позицию в одну сторону на одном ticker/tf)
+    # 🆕 FIX: pass track through so we don't accidentally close the other
+    # track's record (A and U can simultaneously hold a position on the same
+    # side for the same ticker/tf)
     update_signal_record(ticker, tf, side, exit_price, result_label, bars_held, track=track,
                           tp1_hit=tp1_hit, tp1_price=tp1_price)
 
@@ -542,10 +549,11 @@ async def open_position(
 
     sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx)
 
-    # 🆕 FIX: раньше leverage считался ДО вызова calculate_adaptive_sl, по грубой
-    # оценке ширины канала FRAMA (frama_sl_long/short в check_signals) — то есть
-    # плечо не соответствовало реальному риску, который определял adaptive SL
-    # (перцентиль исторического MAE). Теперь считаем от фактического sl.
+    # 🆕 FIX: leverage used to be computed BEFORE calling calculate_adaptive_sl,
+    # from a rough estimate of the FRAMA channel width (frama_sl_long/short in
+    # check_signals) — i.e. leverage didn't match the real risk that the
+    # adaptive SL (historical MAE percentile) actually determined. Now it's
+    # computed from the actual sl.
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     sl_atr_mult = max(1.0, min(3.5, abs(close_v - sl) / atr_v))
     lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sl_atr_mult, 0.1))))
@@ -557,7 +565,7 @@ async def open_position(
     lev = max(1, min(MAX_ALLOWED_LEV, lev + oc_lev_delta))
 
     tp1, tp2, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
-    tp = tp2  # основной TP для R:R расчётов и фильтров — используем tp2
+    tp = tp2  # primary TP for R:R calculations and filters — we use tp2
     tp_desc = f"SL:{sl_desc} | {tp_desc}"
 
     if side == "long":
@@ -573,8 +581,9 @@ async def open_position(
     )
     tp_desc += oc_desc
 
-    # Пересчитываем TP1 пропорционально если on-chain изменил TP2
-    # Без этого при tp_mult < 1.0 возможна ситуация TP1 > TP2 (для шорта TP1 < TP2)
+    # Recompute TP1 proportionally if on-chain changed TP2.
+    # Without this, when tp_mult < 1.0, TP1 > TP2 becomes possible (for a
+    # short, TP1 < TP2).
     if abs(tp - close_v) > 1e-8 and abs(tp2 - close_v) > 1e-8:
         ratio = abs(tp - close_v) / abs(tp2 - close_v)
         if side == "long":
@@ -582,19 +591,21 @@ async def open_position(
         else:
             tp1 = round_price(close_v - (close_v - tp1) * ratio)
 
-    # 🆕 GUARD: гарантируем что tp1 между entry и tp (не дальше tp, не ближе entry)
-    # 🆕 FIX (Kimi review п.11): раньше нижняя граница была ровно close_v — при
-    # сильном сжатии TP on-chain'ом (tp_mult << 1) пропорциональный пересчёт мог
-    # дать tp1 == close_v, и 50% позиции закрывалось бы на входе с нулевым PnL.
-    # Теперь минимум entry±0.1% (используем тот же SL_MIN_DISTANCE_PCT, что и
-    # для SL — это уже принятый в проекте порог "не ноль"), затем повторно
-    # ограничиваем tp, чтобы порядок операций не мог вытолкнуть tp1 за tp.
+    # 🆕 GUARD: make sure tp1 stays between entry and tp (no farther than tp,
+    # no closer than entry).
+    # 🆕 FIX (Kimi review #11): the lower bound used to be exactly close_v —
+    # under heavy on-chain TP compression (tp_mult << 1) the proportional
+    # recalculation could yield tp1 == close_v, closing 50% of the position
+    # at entry with zero PnL. Now the minimum is entry±0.1% (reusing
+    # SL_MIN_DISTANCE_PCT, the same "not zero" threshold already used for
+    # SL), then we re-clamp against tp so the order of operations can't push
+    # tp1 past tp.
     if side == "long":
         tp1 = max(tp1, close_v * (1 + _cfg.SL_MIN_DISTANCE_PCT))
-        tp1 = min(tp1, tp)       # tp1 не дальше tp
+        tp1 = min(tp1, tp)       # tp1 no farther than tp
     else:
         tp1 = min(tp1, close_v * (1 - _cfg.SL_MIN_DISTANCE_PCT))
-        tp1 = max(tp1, tp)       # tp1 не дальше tp (для short tp < entry)
+        tp1 = max(tp1, tp)       # tp1 no farther than tp (for short, tp < entry)
 
     if side == "long":
         risk = abs(close_v - sl)
@@ -610,19 +621,21 @@ async def open_position(
     rr = reward / max(risk, 1e-8)
 
     track_label = "A" if track == "a" else "U"
-    signal_label = f"{track_label} BUY  (Andean+MFI)" if side == "long" and track == "a" else                    f"{track_label} BUY  (UT Bot)" if side == "long" and track == "u" else                    f"{track_label} SELL (Andean+MFI)" if side == "short" and track == "a" else                    f"{track_label} SELL (UT Bot)"
+    signal_label = f"{track_label} BUY  (Andean+MFI)" if side == "long" and track == "a" else \
+                   f"{track_label} BUY  (UT Bot)" if side == "long" and track == "u" else \
+                   f"{track_label} SELL (Andean+MFI)" if side == "short" and track == "a" else \
+                   f"{track_label} SELL (UT Bot)"
 
     in_long_key = f"{track}_in_long"
     in_short_key = f"{track}_in_short"
     last_bar_key = f"last_{track}_{side}_bar"
     bars_key = f"{track}_bars_in_trade"
 
-    # 🆕 FIX: раньше здесь сбрасывался last_bar_key = None при провале фильтра,
-    # что обнуляло cooldown и заставляло сигнал пытаться открыться заново на
-    # каждом цикле сканирования (каждые ~20с) до прихода нового бара — лишняя
-    # нагрузка и спам в логах. Теперь last_bar_key не трогаем: cooldown
-    # (COOLDOWN_BARS) отрабатывает как задумано, in_long/in_short просто гасим
-    # флаг "в позиции".
+    # 🆕 FIX: this used to reset last_bar_key = None on a filter rejection,
+    # which zeroed the cooldown and made the signal retry opening on every
+    # scan cycle (every ~20s) until a new bar arrived — wasted work and log
+    # spam. Now last_bar_key is left untouched: cooldown (COOLDOWN_BARS)
+    # works as intended, in_long/in_short just clears the "in position" flag.
     if rr < MIN_RR:
         logger.info(f"[FILTER] {ticker} {timeframe} {track_label}-{side.upper()} skipped — R:R={rr:.2f} < {MIN_RR}")
         if not dry_run:
@@ -641,33 +654,34 @@ async def open_position(
         "side": side,
         "entry": close_v,
         "sl": sl,
-        "tp": tp,    # TP2 — цель для 100% позиции
-        "tp1": tp1,  # TP1 — статистический, цель для 50% позиции
+        "tp": tp,    # TP2 — target for 100% of the position
+        "tp1": tp1,  # TP1 — statistical, target for 50% of the position
         "lev": lev,
         "bar_opened": idx,
-        # 🆕 FIX: помимо позиционного idx (валиден только для df, на котором был
-        # посчитан сигнал) сохраняем реальный timestamp бара — по нему !chart может
-        # надёжно найти нужный бар в СВОЁМ, независимо нафетченном df.
+        # 🆕 FIX: besides the positional idx (only valid for the df the
+        # signal was computed on) we also store the real bar timestamp — so
+        # !chart can reliably locate the right bar in its OWN, independently
+        # fetched df.
         "bar_opened_time": int(df["timestamp"].iloc[idx]),
-        "tp1_hit": False,  # флаг: уведомление по TP1 уже отправлено
+        "tp1_hit": False,  # flag: TP1 notification already sent
     }
     state[bars_key] = 0
 
-    # 🆕 FIX BUG-LO006: кулдаун (last_{track}_{side}_time, читается cooldown_ok
-    # в check_signals) раньше взводился в check_signals ДО вызова open_position —
-    # то есть даже отклонённая здесь попытка (R:R < MIN_RR или extreme_violation
-    # чуть выше) уже блокировала следующие COOLDOWN_BARS баров, хотя сделка
-    # по факту не открывалась. Теперь взводим кулдаун только тут, в точке
-    # реального открытия позиции.
+    # 🆕 FIX BUG-LO006: the cooldown (last_{track}_{side}_time, read by
+    # cooldown_ok in check_signals) used to be armed in check_signals BEFORE
+    # open_position was even called — meaning even an attempt rejected here
+    # (R:R < MIN_RR or extreme_violation just above) already blocked the next
+    # COOLDOWN_BARS bars, even though no trade was actually opened. Now the
+    # cooldown is only armed here, at the point of actually opening a position.
     if not dry_run:
         bar_idx_val = idx
         bar_time_val = int(df["timestamp"].iloc[idx])
         state[f"{track}_{side}_bar"] = bar_idx_val
-        state[last_bar_key] = bar_idx_val               # debug/обратная совместимость
+        state[last_bar_key] = bar_idx_val               # debug/backward compatibility
         state[f"last_{track}_{side}_time"] = bar_time_val
 
     if not dry_run:
-        # 🆕 FIX: передаём track, чтобы записи A- и U-трека не путались в истории
+        # 🆕 FIX: pass track through so A- and U-track records don't get mixed up in history
         add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
 
     stats = get_signal_stats(ticker, timeframe, side, regime)
@@ -676,7 +690,7 @@ async def open_position(
     return (signal_label, close_v, regime, lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
 
 # =====================================================================
-# 🧠  CHECK SIGNALS (ОСНОВНАЯ ЛОГИКА)
+# 🧠  CHECK SIGNALS (MAIN LOGIC)
 # =====================================================================
 
 async def check_signals(
@@ -688,10 +702,10 @@ async def check_signals(
     onchain_bias: Optional[Dict] = None,
 ) -> Tuple[List[Tuple], Optional[int], str, int]:
     """
-    Проверяет сигналы для пары/таймфрейма.
-    Возвращает: (signals, bar_time, regime, leverage)
-    dry_run=True       — не записывает сигналы в историю (используется в !scan).
-    onchain_bias=dict  — данные из onchain.get_onchain_bias(), влияют на TP/SL/lev/confidence.
+    Checks signals for a pair/timeframe.
+    Returns: (signals, bar_time, regime, leverage)
+    dry_run=True       — doesn't write signals to history (used by !scan).
+    onchain_bias=dict  — data from onchain.get_onchain_bias(), affects TP/SL/lev/confidence.
     """
     try:
         htf_bias = await get_htf_bias(exchange, ticker, timeframe)
@@ -813,22 +827,24 @@ async def check_signals(
         confirm_long_a = (mfi_bull_sig and bs_and_bull <= _cfg.LOOKBACK) or (and_bull_sig and bs_mfi_bull <= _cfg.LOOKBACK)
         confirm_short_a = (mfi_bear_sig and bs_and_bear <= _cfg.LOOKBACK) or (and_bear_sig and bs_mfi_bear <= _cfg.LOOKBACK)
 
-        # 🆕 FIX BUG-LO005: раньше кулдаун считался через bar_idx = len(df) - 2,
-        # который на КАЖДОМ вызове check_signals пересчитывается заново из
-        # свежепойманных limit=900 баров — то есть это почти всегда одно и то
-        # же число (~898), а НЕ сквозной счётчик прошедших баров (в отличие от
-        # backtest_history, где idx реально растёт в цикле по истории). Из-за
-        # этого (bar_idx - last_bar) сравнивал две почти одинаковые позиции и
-        # кулдаун срабатывал непредсказуемо — иногда блокировал сигнал намного
-        # дольше COOLDOWN_BARS, иногда пропускал раньше срока, в зависимости от
-        # случайных колебаний длины полученного от биржи окна свечей.
-        # Теперь считаем кулдаун по РЕАЛЬНОМУ времени бара (bar_time, ms) —
-        # оно не зависит от того, сколько баров вернула биржа в конкретном
-        # запросе, и корректно отражает прошедшее количество таймфреймов.
+        # 🆕 FIX BUG-LO005: the cooldown used to be computed via
+        # bar_idx = len(df) - 2, which is recomputed on EVERY call to
+        # check_signals from a freshly-fetched limit=900 window of bars —
+        # meaning it's almost always the same number (~898), NOT a
+        # continuously-increasing counter of elapsed bars (unlike
+        # backtest_history, where idx genuinely advances through a loop over
+        # history). As a result, (bar_idx - last_bar) was comparing two
+        # nearly-identical positions and the cooldown fired unpredictably —
+        # sometimes blocking a signal far longer than COOLDOWN_BARS,
+        # sometimes releasing early, depending on random fluctuations in the
+        # length of the candle window the exchange happened to return.
+        # Now the cooldown is computed from the REAL bar time (bar_time, ms)
+        # — independent of how many bars the exchange returned for a given
+        # request, and correctly reflects the number of timeframes elapsed.
         try:
             tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
         except Exception:
-            tf_ms = 3600_000  # fallback: считаем таймфрейм часом, если parse_timeframe недоступен
+            tf_ms = 3600_000  # fallback: assume a 1h timeframe if parse_timeframe isn't available
 
         def cooldown_ok(last_time):
             return last_time is None or (bar_time - last_time) >= COOLDOWN_BARS * tf_ms
@@ -841,16 +857,16 @@ async def check_signals(
         a_in_pos = state["a_in_long"] or state["a_in_short"]
         u_in_pos = state["u_in_long"] or state["u_in_short"]
 
-        # 🆕 FIX (Kimi review п.1): U-track уже гейтится is_new_bar (сигнал
-        # проверяется один раз на новом баре). A-track такой защиты не имел —
-        # confirm_long_a/confirm_short_a остаются True весь закрытый бар, и
-        # если open_position() отклоняет попытку (R:R/extreme_violation), флаг
-        # in_pos сбрасывается обратно в False (см. open_position), а значит на
-        # каждом следующем скане (~15-60с) бот пытался войти заново — спам
-        # [FILTER] skipped в логах и лишние вызовы open_position на одном и том
-        # же баре. last_a_{side}_attempt_bar гарантирует не больше одной
-        # попытки на трек за бар, симметрично тому, как is_new_bar работает
-        # для U-track.
+        # 🆕 FIX (Kimi review #1): U-track was already gated by is_new_bar
+        # (the signal is checked once per new bar). A-track had no such
+        # guard — confirm_long_a/confirm_short_a stay True for the whole
+        # closed bar, and if open_position() rejects the attempt
+        # (R:R/extreme_violation), the in_pos flag resets back to False (see
+        # open_position), so on every subsequent scan (~15-60s) the bot
+        # tried entering again — spamming [FILTER] skipped in the logs and
+        # calling open_position redundantly on the same bar.
+        # last_a_{side}_attempt_bar guarantees at most one attempt per track
+        # per bar, symmetric to how is_new_bar already works for U-track.
         a_long_not_attempted  = state.get("last_a_long_attempt_bar")  != bar_time
         a_short_not_attempted = state.get("last_a_short_attempt_bar") != bar_time
 
@@ -859,13 +875,14 @@ async def check_signals(
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
 
-        # Флаги треков ставятся ТОЛЬКО при реальном открытии (не dry_run)
-        # и ТОЛЬКО вместе с active_trade, чтобы не было рассинхрона.
-        # 🆕 FIX BUG-LO006: last_{track}_{side}_bar/_time (кулдаун) сюда больше
-        # не пишем — раньше они взводились здесь, ДО open_position, поэтому
-        # даже отклонённая там попытка (R:R/extreme_violation) уже блокировала
-        # следующие COOLDOWN_BARS баров. Теперь кулдаун взводится только внутри
-        # open_position, в точке реального открытия сделки.
+        # Track flags are only set on an actual open (not dry_run), and ALWAYS
+        # together with active_trade, so they never get out of sync.
+        # 🆕 FIX BUG-LO006: last_{track}_{side}_bar/_time (cooldown) are no
+        # longer written here — they used to be armed here, BEFORE
+        # open_position, so even an attempt rejected there
+        # (R:R/extreme_violation) already blocked the next COOLDOWN_BARS
+        # bars. Now the cooldown is only armed inside open_position, at the
+        # point of actually opening the trade.
         if not dry_run:
             if sig_a_long:
                 state["a_in_long"] = True
@@ -880,11 +897,12 @@ async def check_signals(
                 state["u_in_short"] = True
                 state["u_in_long"] = False
 
-        # 🆕 NOTE: sugg_lev здесь — грубая информационная оценка (по ширине канала
-        # FRAMA), используется только как fallback-значение при отсутствии сигнала
-        # (возврат из функции) и для регимного логирования. Реальное плечо для
-        # каждой открытой позиции теперь считается ВНУТРИ open_position от
-        # фактического adaptive SL (см. fix там) — эта оценка на него не влияет.
+        # 🆕 NOTE: sugg_lev here is a rough informational estimate (from the
+        # FRAMA channel width), used only as a fallback value when there's no
+        # signal (the function's return) and for regime logging. The real
+        # leverage for each opened position is now computed INSIDE
+        # open_position from the actual adaptive SL (see the fix there) —
+        # this estimate has no effect on it.
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
@@ -916,14 +934,15 @@ async def check_signals(
             return max(0, min(100, score))
 
         async def _safe_open_position(track: str, side: str):
-            """Обёртка над open_position с exception-safety (Kimi review п.2).
-            state["{track}_in_long/short"] уже выставлен True выше, ДО вызова
-            open_position — сам open_position сбрасывает его назад в False при
-            явном отказе (R:R < MIN_RR, extreme_violation), но НЕ при исключении
-            (например, если calculate_combined_tp или apply_onchain_with_safety
-            бросят Exception). Без этой обёртки такое исключение улетало во
-            внешний try/except всей check_signals, флаг оставался True навсегда,
-            и трек молча блокировался до рестарта контейнера."""
+            """Wraps open_position with exception safety (Kimi review #2).
+            state["{track}_in_long/short"] is already set True above, before
+            open_position is called — open_position itself resets it back to
+            False on an explicit rejection (R:R < MIN_RR, extreme_violation),
+            but NOT on an exception (e.g. if calculate_combined_tp or
+            apply_onchain_with_safety raise). Without this wrapper, such an
+            exception would escape to check_signals' outer try/except, the
+            flag would stay True forever, and the track would silently be
+            blocked until the container restarted."""
             in_long_key = f"{track}_in_long"
             in_short_key = f"{track}_in_short"
             try:
@@ -990,7 +1009,7 @@ def backtest_history(
     tf: str,
     num_bars: int = 3000
 ) -> int:
-    """Бэктест для накопления истории сигналов."""
+    """Backtest for accumulating signal history."""
     logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars)...")
 
     try:
@@ -1033,9 +1052,9 @@ def backtest_history(
                         if htf_idx >= _cfg.FRAMA_LEN * 2:
                             htf_close = float(df_htf["close"].iloc[htf_idx])
                             htf_frama_val = float(fs_htf.iloc[htf_idx])
-                            # BUGFIX BUG-ME003: FRAMA может вернуть NaN на первых ~22 барах.
-                            # htf_close > NaN = False (IEEE 754) → bias = -1 (bear) вместо 0 (neutral).
-                            # Это создаёт ложный медвежий bias и искажает backtest статистику.
+                            # BUGFIX BUG-ME003: FRAMA can return NaN for the first ~22 bars.
+                            # htf_close > NaN = False (IEEE 754) → bias = -1 (bear) instead of 0 (neutral).
+                            # This creates a false bearish bias and distorts backtest stats.
                             if np.isnan(htf_frama_val):
                                 htf_bias_arr[i] = 0
                             else:
@@ -1125,12 +1144,14 @@ def backtest_history(
                 sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx)
                 risk_fixed = abs(close_v - sl)
                 tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime)
-                # 🆕 FIX: раньше бэктест проверял tp_hit против tp1 (статистический,
-                # без RR-cap), а live-торговля реально выходит по tp2 (тот же
-                # calculate_combined_tp, но с RR-cap) — см. open_position(), tp = tp2.
-                # Из-за этого статистика (win-rate/MFE/MAE), на которой калибруется
-                # calculate_combined_tp для БУДУЩИХ сигналов, обучалась на другом
-                # критерии выхода, чем реально торгует live. Теперь оба пути совпадают.
+                # 🆕 FIX: the backtest used to check tp_hit against tp1
+                # (statistical, no RR cap), while live trading actually
+                # exits at tp2 (same calculate_combined_tp, but with the RR
+                # cap — see open_position(), tp = tp2). Because of this, the
+                # stats (win-rate/MFE/MAE) that calibrate
+                # calculate_combined_tp for FUTURE signals were trained on a
+                # different exit criterion than live trading actually uses.
+                # Now both paths match.
                 tp = tp2
 
                 tp_hit = sl_hit = False
@@ -1206,11 +1227,11 @@ def backtest_history(
         return 0
 
 # =====================================================================
-# 🔄  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 🔄  HELPER FUNCTIONS
 # =====================================================================
 
 def make_state() -> Dict:
-    """Создает начальное состояние с независимыми A и U треками."""
+    """Creates the initial state with independent A and U tracks."""
     return {
         "a_in_long": False,
         "a_in_short": False,
@@ -1218,13 +1239,14 @@ def make_state() -> Dict:
         "a_short_bar": None,
         "last_a_long_bar": None,
         "last_a_short_bar": None,
-        # 🆕 FIX BUG-LO005: time-based кулдаун вместо позиционного bar_idx (см.
-        # cooldown_ok в check_signals) — last_a_long_bar/last_a_short_bar выше
-        # оставлены только для отладки/обратной совместимости, кулдаун их не читает.
+        # 🆕 FIX BUG-LO005: time-based cooldown instead of positional bar_idx
+        # (see cooldown_ok in check_signals) — last_a_long_bar/last_a_short_bar
+        # above are kept only for debugging/backward compatibility, the
+        # cooldown no longer reads them.
         "last_a_long_time": None,
         "last_a_short_time": None,
-        # 🆕 Kimi review п.1: не больше одной попытки open_position на A-track
-        # за закрытый бар, даже если её отклонили (см. _safe_open_position).
+        # 🆕 Kimi review #1: at most one open_position attempt per A-track
+        # per closed bar, even if it was rejected (see _safe_open_position).
         "last_a_long_attempt_bar": None,
         "last_a_short_attempt_bar": None,
         "u_in_long": False,
@@ -1252,7 +1274,7 @@ def make_state() -> Dict:
     }
 
 def _ensure_history_slot(history: Dict, ticker: str, tf: str):
-    """Создает слот для истории если его нет."""
+    """Creates a history slot if it doesn't exist yet."""
     if ticker not in history:
         history[ticker] = {}
     if tf not in history[ticker]:
