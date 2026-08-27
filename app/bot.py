@@ -20,7 +20,7 @@ from config import (
     MARKET_MODE,
     ONCHAIN_ENABLED,
 )
-from utils import safe_fetch_ohlcv, parse_ohlcv
+from utils import safe_fetch_ohlcv, parse_ohlcv, format_price
 from signals import check_signals, backtest_history, make_state
 from onchain import get_onchain_bias
 from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
@@ -434,7 +434,7 @@ async def market_scanner():
                                         try:
                                             await channel.send(
                                                 f"{emoji} **Trade Closed [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                                f"{last['side'].upper()} | Entry: ${round(last['entry'], 2)} → Exit: ${round(last['exit'], 2)} | "
+                                                f"{last['side'].upper()} | Entry: ${format_price(last['entry'])} → Exit: ${format_price(last['exit'])} | "
                                                 f"PnL: **{last['pnl_pct']:.2f}%** | Result: **{last['result'].upper()}** | Bars: {last['bars_held']}"
                                                 f"{late_note}"
                                             )
@@ -544,12 +544,12 @@ async def market_scanner():
                                 new_sl = entry + (tp1_price - entry) / 2
                             else:
                                 new_sl = entry - (entry - tp1_price) / 2
-                            sl_label = f"половина пути до TP1 (${round(new_sl, 2):,.2f})"
-                            sl_label_en = f"halfway to TP1 (${round(new_sl, 2):,.2f})"
+                            sl_label = f"половина пути до TP1 (${format_price(new_sl)})"
+                            sl_label_en = f"halfway to TP1 (${format_price(new_sl)})"
                         else:
                             new_sl = entry
-                            sl_label = f"безубыток (${round(entry, 2):,.2f})"
-                            sl_label_en = f"breakeven (${round(entry, 2):,.2f})"
+                            sl_label = f"безубыток (${format_price(entry)})"
+                            sl_label_en = f"breakeven (${format_price(entry)})"
                         trade["sl"] = new_sl
                         # 🆕 FIX BUG-LO009: SL перенесён ВНУТРИ формирующегося бара —
                         # low/high этого и всех предыдущих баров напечатаны ДО того,
@@ -584,7 +584,7 @@ async def market_scanner():
                             try:
                                 await channel.send(
                                     f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                    f"{side.upper()} | Entry: ${round(entry, 2):,.2f} → TP1: ${round(tp1_price, 2):,.2f}\n"
+                                    f"{side.upper()} | Entry: ${format_price(entry)} → TP1: ${format_price(tp1_price)}\n"
                                     f"⚠️ **Закрой 50% позиции и перенеси SL в {sl_label}**"
                                 )
                             except Exception as discord_err:

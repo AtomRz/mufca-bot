@@ -15,6 +15,7 @@ import discord
 
 import config as _cfg
 from volume_indicators import volume_flow_signal_v3, volume_score_for_side
+from utils import format_price
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     embed.add_field(name="⏱ TF", value=tf.upper(), inline=True)
     embed.add_field(name=f"{track_emoji} Track", value=signal_type.strip(), inline=True)
     embed.add_field(name="🧬 HTF Bias", value=f"✅ {_cfg.HTF_BIAS.upper()} FRAMA confirmed", inline=True)
-    embed.add_field(name="💵 Entry", value=f"${round(price, 2):,.2f}", inline=True)
-    embed.add_field(name="🛑 Stop Loss", value=f"${round(sl, 2):,.2f}", inline=True)
-    embed.add_field(name="🎯 TP1 (50%)", value=f"${round(tp1, 2):,.2f} (+{tp1_pct:.2f}%)", inline=True)
-    embed.add_field(name="🏁 TP2 (100%)", value=f"${round(tp, 2):,.2f} (+{tp2_pct:.2f}%)", inline=True)
+    embed.add_field(name="💵 Entry", value=f"${format_price(price)}", inline=True)
+    embed.add_field(name="🛑 Stop Loss", value=f"${format_price(sl)}", inline=True)
+    embed.add_field(name="🎯 TP1 (50%)", value=f"${format_price(tp1)} (+{tp1_pct:.2f}%)", inline=True)
+    embed.add_field(name="🏁 TP2 (100%)", value=f"${format_price(tp)} (+{tp2_pct:.2f}%)", inline=True)
     embed.add_field(name="📊 Risk/Reward", value=f"1:{rr}", inline=True)
     embed.add_field(name="⚙️ Regime", value=regime, inline=True)
     embed.add_field(name="⚠️ Leverage", value=f"x{leverage}", inline=True)

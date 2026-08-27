@@ -47,7 +47,7 @@ from config import (
     save_mode,
     ONCHAIN_ENABLED,
 )
-from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
+from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, format_price
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache
@@ -174,9 +174,9 @@ async def status_cmd(ctx):
                     u_pos = u_flag or "—"
             trade_info = ""
             if a_trade:
-                trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${round(a_trade['entry'], 2)}"
+                trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${format_price(a_trade['entry'])}"
             if u_trade:
-                trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${round(u_trade['entry'], 2)}"
+                trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${format_price(u_trade['entry'])}"
 
             # 🆕 Volume info
             vol_info = ""
@@ -813,10 +813,10 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
             tp2_pct = abs(tp2 - last_close) / last_close * 100
 
             lines = [f"**📊 Adaptive TP Preview — `{ticker}` `{tf}` {side.upper()}:**"]
-            lines.append(f"• Current price: **${round(last_close, 2):,.2f}**")
-            lines.append(f"• Stop Loss: **${round(sl, 2):,.2f}** ({sl_desc})")
-            lines.append(f"• 🎯 TP1 (50%): **${round(tp1, 2):,.2f}** (+{tp1_pct:.2f}%)")
-            lines.append(f"• 🏁 TP2 (100%): **${round(tp2, 2):,.2f}** (+{tp2_pct:.2f}%)")
+            lines.append(f"• Current price: **${format_price(last_close)}**")
+            lines.append(f"• Stop Loss: **${format_price(sl)}** ({sl_desc})")
+            lines.append(f"• 🎯 TP1 (50%): **${format_price(tp1)}** (+{tp1_pct:.2f}%)")
+            lines.append(f"• 🏁 TP2 (100%): **${format_price(tp2)}** (+{tp2_pct:.2f}%)")
             lines.append(f"• Risk/Reward: **1:{rr}**")
             if stats["count"] >= 5:
                 lines.append(f"• Based on **{stats['count']}** historical signals")
@@ -893,7 +893,7 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
 
         await msg.delete()
         has_trade = state_snapshot is not None
-        trade_note = f" | 🎯 Active {state_snapshot['side'].upper()} @ ${state_snapshot['entry']:,.2f}" if has_trade else ""
+        trade_note = f" | 🎯 Active {state_snapshot['side'].upper()} @ ${format_price(state_snapshot['entry'])}" if has_trade else ""
         await ctx.send(
             content=f"📊 **{pair}** `{tf}` · {limit} bars{trade_note}",
             file=discord.File(buf, filename=f"{pair.replace('/', '')}_{tf}.png")
@@ -1075,11 +1075,11 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             lines = [f"✅ Simulated {side.upper()} signal recorded!"]
 
-            lines.append(f"• Entry: **${round(last_close, 2):,.2f}**")
+            lines.append(f"• Entry: **${format_price(last_close)}**")
 
-            lines.append(f"• SL: **${round(sl, 2):,.2f}**")
+            lines.append(f"• SL: **${format_price(sl)}**")
 
-            lines.append(f"• TP: **${round(tp, 2):,.2f}**")
+            lines.append(f"• TP: **${format_price(tp)}**")
 
             # 🆕 NOTE: stats['count'] теперь считается только по реальным (не-sim)
             # закрытым сигналам — синтетическая sim-запись в калибровку не входит.
@@ -1157,7 +1157,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             if existing:
                 await ctx.send(
                     f"⚠️ У A-трека уже есть открытая позиция `{existing['side'].upper()}` "
-                    f"по `{ticker}` `{tf}` (entry ${existing['entry']:,.2f}). "
+                    f"по `{ticker}` `{tf}` (entry ${format_price(existing['entry'])}). "
                     f"Сначала дождитесь её закрытия или закройте вручную."
                 )
                 return
@@ -1186,9 +1186,9 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             )
             embed.add_field(name="Pair", value=f"**{ticker}**", inline=True)
             embed.add_field(name="TF", value=tf.upper(), inline=True)
-            embed.add_field(name="Entry", value=f"${round(last_close, 2):,.2f}", inline=True)
-            embed.add_field(name="SL", value=f"${round(sl, 2):,.2f}", inline=True)
-            embed.add_field(name="TP", value=f"${round(tp, 2):,.2f} (+{tp_pct:.2f}%)", inline=True)
+            embed.add_field(name="Entry", value=f"${format_price(last_close)}", inline=True)
+            embed.add_field(name="SL", value=f"${format_price(sl)}", inline=True)
+            embed.add_field(name="TP", value=f"${format_price(tp)} (+{tp_pct:.2f}%)", inline=True)
             embed.add_field(name="R:R", value=f"1:{rr}", inline=True)
             embed.add_field(name="⚠️ WARNING", value="Bypassed all filters — for testing only!", inline=False)
             await ctx.send(embed=embed)
