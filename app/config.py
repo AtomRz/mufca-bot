@@ -10,7 +10,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# ⚙️  БАЗОВЫЕ НАСТРОЙКИ
+# ⚙️  BASIC SETTINGS
 # =====================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 # Discord is entirely optional: with no token, or DISCORD_ENABLED=false, the
@@ -19,31 +19,32 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 # main.py for how startup no longer depends on Discord's on_ready firing.
 DISCORD_ENABLED = bool(DISCORD_TOKEN) and os.getenv("DISCORD_ENABLED", "true").strip().lower() != "false"
 
-# 🆕 Basic Auth для веб-морды. Если оба не заданы — дашборд остаётся открытым
-# (для локальной разработки), но при старте пишется громкий warning в лог.
+# 🆕 Basic Auth for the web UI. If neither is set, the dashboard stays open
+# (for local development), but a loud warning is logged on startup.
 WEB_USERNAME = os.getenv("WEB_USERNAME", "")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "general")
 
-# 🆕 Push-уведомления на Android через Firebase Cloud Messaging.
-# Файл сервисного аккаунта НЕ коммитится в репо (он публичный!) — кладётся
-# вручную на сервер, в тот же персистентный volume, что signals_history.json.
+# 🆕 Push notifications to Android via Firebase Cloud Messaging.
+# The service account file is NOT committed to the repo (it's public!) — it's
+# placed manually on the server, in the same persistent volume as
+# signals_history.json.
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/app/data/firebase-credentials.json")
 
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =====================================================================
-# 🔑  ВНЕШНИЕ API КЛЮЧИ
+# 🔑  EXTERNAL API KEYS
 # =====================================================================
 ETHERSCAN_API_KEY  = os.getenv("ETHERSCAN_API_KEY", "")
-COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")   # Demo key (бесплатный)
+COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")   # Demo key (free)
 
 # =====================================================================
-# 📡  ON-CHAIN НАСТРОЙКИ
+# 📡  ON-CHAIN SETTINGS
 # =====================================================================
-ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — порог "normal" сигнала
-ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — порог "large" сигнала
+ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — threshold for a "normal" signal
+ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — threshold for a "large" signal
 ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
 
 # =====================================================================
@@ -68,13 +69,14 @@ def safe_json_load(filename: str, default: dict = None) -> dict:
             with open(filename, "r") as f:
                 return json.load(f)
         except FileNotFoundError:
-            return default  # нормальный сценарий — первый запуск, файла ещё нет
+            return default  # normal scenario — first run, no file yet
         except Exception as e:
-            # 🆕 FIX: раньше ЛЮБАЯ ошибка (битый JSON, нет прав на чтение, диск
-            # недоступен) молча проглатывалась и возвращала default — то же самое
-            # поведение, что и для честного "файла ещё нет". Разница в том, что
-            # первое — это реальная потеря/недоступность данных, о которой стоит
-            # знать, а не тихо продолжать с пустым конфигом.
+            # 🆕 FIX: previously ANY error (corrupted JSON, no read permission,
+            # disk unavailable) was silently swallowed and returned default —
+            # the same behavior as an honest "file doesn't exist yet". The
+            # difference is that the former is a real data loss/unavailability
+            # worth knowing about, not something to silently continue past
+            # with an empty config.
             logger.error(f"[CONFIG] Failed to load {filename}, using default: {e}")
             return default
 
@@ -89,12 +91,13 @@ def safe_json_save(filename: str, data: dict):
         except Exception as e:
             logger.error(f"Failed to save {filename}: {e}")
 
-# 🆕 Интервал обновления on-chain данных (Etherscan/CoinGecko), настраивается
-# из веб-морды по тому же паттерну, что SCAN_INTERVAL_SECONDS — живая смена
-# без рестарта контейнера. Раньше было захардкожено 3600с в двух местах
-# (onchain.py _cache_get + bot.py market_scanner), теперь один источник правды.
-# Живёт здесь (не в блоке ON-CHAIN НАСТРОЙКИ выше), потому что зависит от
-# safe_json_load/safe_json_save, определённых чуть выше.
+# 🆕 Refresh interval for on-chain data (Etherscan/CoinGecko), configurable
+# from the web UI following the same pattern as SCAN_INTERVAL_SECONDS — live
+# changes without a container restart. Used to be hardcoded to 3600s in two
+# places (onchain.py _cache_get + bot.py market_scanner), now there's a
+# single source of truth.
+# Lives here (not in the ON-CHAIN SETTINGS block above) because it depends on
+# safe_json_load/safe_json_save, defined just above.
 ONCHAIN_INTERVAL_OPTIONS = (900, 1800, 3600)  # 15m / 30m / 1h
 ONCHAIN_INTERVAL_FILE = os.path.join(DATA_DIR, "onchain_interval.json")
 
@@ -108,10 +111,10 @@ def save_onchain_interval(seconds: int):
         raise ValueError(f"onchain interval must be one of {ONCHAIN_INTERVAL_OPTIONS}, got {seconds}")
     safe_json_save(ONCHAIN_INTERVAL_FILE, {"seconds": seconds})
 
-ONCHAIN_CACHE_TTL = load_onchain_interval()   # секунд — обновление балансов (default 1h)
+ONCHAIN_CACHE_TTL = load_onchain_interval()   # seconds — balance refresh interval (default 1h)
 
 # =====================================================================
-# 📊  ПАРЫ ДЛЯ СКАНИРОВАНИЯ
+# 📊  PAIRS TO SCAN
 # =====================================================================
 DEFAULT_TICKERS = ["BTC/USDT", "ETH/USDT"]
 PAIRS_FILE = os.path.join(DATA_DIR, "pairs.json")
@@ -126,17 +129,18 @@ def save_tickers(tickers: List[str]):
 TICKERS: List[str] = load_tickers()
 
 # =====================================================================
-# ⏱️  НАСТРОЙКИ ТАЙМФРЕЙМОВ
+# ⏱️  TIMEFRAME SETTINGS
 # =====================================================================
 TIMEFRAMES = ["1h", "4h"]
 
 # =====================================================================
-# 🔧  FILTER TOGGLES (зеркало Pine Script input.bool)
-# 🆕 Раньше это были просто константы True, зашитые в код — их нельзя было
-# выключить из UI. Теперь, как HTF_BIAS/UT_HEIKIN_ASHI, персистятся в JSON и
-# правятся через _cfg.ENABLE_X (НЕ bare import — иначе после runtime-смены
-# через /api/config/filters старые импортированные копии в signals.py и
-# chart_data.py останутся замороженными на исходном значении).
+# 🔧  FILTER TOGGLES (mirrors Pine Script input.bool)
+# 🆕 These used to be plain True constants hardcoded in the code — they
+# couldn't be turned off from the UI. Now, like HTF_BIAS/UT_HEIKIN_ASHI, they
+# persist to JSON and are read via _cfg.ENABLE_X (NOT a bare import —
+# otherwise, after a runtime change via /api/config/filters, the old imported
+# copies in signals.py and chart_data.py would stay frozen at their original
+# value).
 # =====================================================================
 FILTERS_FILE = os.path.join(DATA_DIR, "filter_toggles.json")
 
@@ -145,13 +149,13 @@ DEFAULT_FILTER_TOGGLES = {
     "chop": True,        # use_chop
     "atr": True,         # use_atr_f
     "htf": True,         # enable_mtf_bias
-    "fake_break": True,  # 🆕 раньше применялся безусловно, без input.bool-аналога
-    "liq_sweep": True,   # 🆕 раньше применялся безусловно, без input.bool-аналога
+    "fake_break": True,  # 🆕 used to always apply unconditionally, no input.bool equivalent
+    "liq_sweep": True,   # 🆕 used to always apply unconditionally, no input.bool equivalent
 }
 
 def load_filter_toggles() -> dict:
     data = safe_json_load(FILTERS_FILE, DEFAULT_FILTER_TOGGLES)
-    # на случай если в файле не все ключи (например после добавления нового фильтра)
+    # in case the file is missing some keys (e.g. after a new filter was added)
     return {**DEFAULT_FILTER_TOGGLES, **data}
 
 def save_filter_toggles(toggles: dict):
@@ -166,7 +170,7 @@ ENABLE_FAKE_BREAK_FILTER = _filter_toggles["fake_break"]
 ENABLE_LIQ_SWEEP_FILTER  = _filter_toggles["liq_sweep"]
 
 # =====================================================================
-# 📈  ПАРАМЕТРЫ ИНДИКАТОРОВ
+# 📈  INDICATOR PARAMETERS
 # =====================================================================
 ATR_PERIOD = 14
 ATR_MIN = 0.3
@@ -202,7 +206,7 @@ _INDICATOR_DEFAULTS = {
 
 def load_indicators() -> dict:
     data = safe_json_load(INDICATOR_FILE, _INDICATOR_DEFAULTS)
-    # на случай если файл со старой версией — подмешиваем недостающие ключи дефолтами
+    # in case the file is from an older version — fill in any missing keys with defaults
     merged = {**_INDICATOR_DEFAULTS, **data}
     return merged
 
@@ -223,28 +227,30 @@ BB_PERIOD = _indicators["BB_PERIOD"]
 BB_STDDEV = _indicators["BB_STDDEV"]
 SR_PIVOT_WINDOW = _indicators["SR_PIVOT_WINDOW"]
 SR_MAX_LEVELS = _indicators["SR_MAX_LEVELS"]
-# 🆕 Минимальная глубина истории для поиска S/R пивотов в get_chart_data() —
-# НЕ зависит от выбранного на UI barsLimit (100/200/300/500 bars). Уровни,
-# сформированные глубже видимого окна, всё равно должны попадать в выборку
-# кандидатов, иначе на маленьком barsLimit они физически не находятся.
+# 🆕 Minimum history depth for finding S/R pivots in get_chart_data() —
+# independent of the UI's selected barsLimit (100/200/300/500 bars). Levels
+# formed deeper than the visible window still need to be included in the
+# candidate sample, otherwise they're physically unreachable at a small
+# barsLimit.
 SR_MIN_LOOKBACK = 900
 
 COOLDOWN_BARS = 2
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
-# 🆕 Минимальный R:R для открытия сделки (было локальной MIN_RR=1.5 внутри
-# check_signals() — вынесено в конфиг, т.к. теперь используется и в
-# get_market_pulse() для R:R-лампочки в топ-баре, единый источник правды.
+# 🆕 Minimum R:R to open a trade (used to be a local MIN_RR=1.5 inside
+# check_signals() — moved into config since it's now also used in
+# get_market_pulse() for the topbar R:R indicator; single source of truth.
 MIN_RR = 1.5
 
 # =====================================================================
-# 🎯  РЕЖИМ ПЕРЕНОСА SL ПОСЛЕ TP1
+# 🎯  SL-MOVE MODE AFTER TP1
 # =====================================================================
-# "breakeven" — SL = entry (нулевой риск по остатку, но чаще ловит финальный
-#               откат-выбивание перед продолжением к TP2, особенно на chop-рынке)
-# "half_tp1"  — SL = entry + (TP1 - entry) / 2 (жёстче безубытка — уже в плюсе,
-#               чаще срабатывает на шуме, но каждое срабатывание фиксирует
-#               небольшой гарантированный профит вместо нуля)
+# "breakeven" — SL = entry (zero risk on the remainder, but more often catches
+#               a final shakeout retrace before continuing to TP2, especially
+#               in a choppy market)
+# "half_tp1"  — SL = entry + (TP1 - entry) / 2 (tighter than breakeven —
+#               already in profit; triggers more often on noise, but every
+#               trigger locks in a small guaranteed profit instead of zero)
 TP1_SL_MODE_FILE = os.path.join(DATA_DIR, "tp1_sl_mode.json")
 
 def load_tp1_sl_mode() -> str:
@@ -321,7 +327,7 @@ def save_onchain_bias_cache(bias: Optional[dict], last_fetch: float):
     safe_json_save(ONCHAIN_BIAS_CACHE_FILE, {"bias": bias, "last_fetch": last_fetch})
 
 # =====================================================================
-# 🎨  ЦВЕТА ГРАФИКА (веб-морда + !chart) — настраиваются из Settings
+# 🎨  CHART COLORS (web UI + !chart) — configurable from Settings
 # =====================================================================
 COLORS_FILE = os.path.join(DATA_DIR, "chart_colors.json")
 _COLOR_DEFAULTS = {
@@ -350,7 +356,7 @@ def save_colors(data: dict):
 CHART_COLORS: dict = load_colors()
 
 # =====================================================================
-# 📱  ЗАРЕГИСТРИРОВАННЫЕ УСТРОЙСТВА (Android push, FCM токены)
+# 📱  REGISTERED DEVICES (Android push, FCM tokens)
 # =====================================================================
 DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
 
@@ -362,7 +368,7 @@ def save_devices(data: dict):
     safe_json_save(DEVICES_FILE, data)
 
 # =====================================================================
-# 🎯  АДАПТИВНЫЙ ТП
+# 🎯  ADAPTIVE TP
 # =====================================================================
 SIGNAL_HISTORY_LIMIT = 25
 TP_PERCENTILE = 0.75
@@ -373,35 +379,35 @@ MAX_TP_PCT = 8.0
 MAX_HOLD_BARS = 20
 
 # =====================================================================
-# 🛑  АДАПТИВНЫЙ SL (на основе исторического MAE)
+# 🛑  ADAPTIVE SL (based on historical MAE)
 # =====================================================================
-SL_ADAPTIVE_ENABLED   = True    # Включить адаптивный SL
-SL_MAE_PERCENTILE     = 0.85    # Перцентиль MAE (85% — покрываем большинство откатов)
-SL_MAE_BUFFER         = 0.002   # Дополнительный отступ за перцентиль (0.2%)
-SL_MIN_HISTORY        = 10      # Минимум выигрышных сделок для активации адаптивного SL
-SL_FALLBACK_PCT       = 0.015   # Fallback SL когда истории недостаточно (1.5% от цены)
-# 🆕 FIX: у TP есть ATR-кап (calculate_adaptive_tp), у адаптивного SL его не было —
-# перцентиль MAE без ограничения мог дать неадекватно широкий стоп при выбросах в истории.
-SL_MAX_ATR_MULT        = 4.0    # Адаптивный SL не может быть дальше 4×ATR от входа
-# 🆕 FIX (Kimi review п.10): раньше было захардкожено entry*0.999/entry*1.001
-# прямо в calculate_adaptive_sl — это МИНИМАЛЬНАЯ дистанция SL от входа (floor,
-# не cap): если adaptive MAE говорит поставить SL на 0.03%, он всё равно
-# сдвигался до 0.1%. На низковолатильных альткоинах может быть неоптимально —
-# вынесено в конфиг, чтобы крутить без правки кода.
-SL_MIN_DISTANCE_PCT    = 0.001   # Минимальная дистанция SL от входа (0.1%)
+SL_ADAPTIVE_ENABLED   = True    # Enable adaptive SL
+SL_MAE_PERCENTILE     = 0.85    # MAE percentile (85% — covers most retraces)
+SL_MAE_BUFFER         = 0.002   # Extra margin added on top of the percentile (0.2%)
+SL_MIN_HISTORY        = 10      # Minimum winning trades to activate adaptive SL
+SL_FALLBACK_PCT       = 0.015   # Fallback SL when there's not enough history (1.5% of price)
+# 🆕 FIX: TP has an ATR cap (calculate_adaptive_tp), the adaptive SL didn't —
+# an unbounded MAE percentile could give an unreasonably wide stop on outliers in the history.
+SL_MAX_ATR_MULT        = 4.0    # Adaptive SL can't be farther than 4×ATR from entry
+# 🆕 FIX (Kimi review #10): this used to be hardcoded as entry*0.999/entry*1.001
+# directly in calculate_adaptive_sl — this is the MINIMUM SL distance from
+# entry (a floor, not a cap): if the adaptive MAE said to put SL at 0.03%, it
+# still got pushed out to 0.1%. That can be suboptimal on low-volatility
+# altcoins — moved into config so it can be tuned without editing code.
+SL_MIN_DISTANCE_PCT    = 0.001   # Minimum SL distance from entry (0.1%)
 
-# 🆕 TP FEEDBACK LOOP — автоподстройка на основе реального hit rate
-TP_HIT_RATE_TARGET = 0.35      # Целевой процент достижения TP (35%)
-TP_AUTO_ADJUST = True          # Включить автоподстройку перцентиля
+# 🆕 TP FEEDBACK LOOP — auto-adjustment based on the real hit rate
+TP_HIT_RATE_TARGET = 0.35      # Target TP hit rate (35%)
+TP_AUTO_ADJUST = True          # Enable percentile auto-adjustment
 TP_CAPTURE_RATE = 0.70         # Realistic MFE capture rate (0.5-0.8)
-TP_ADJUST_MIN_PCT = 0.30       # Минимальный перцентиль после корректировки
-TP_ADJUST_MAX_PCT = 0.85       # Максимальный перцентиль после корректировки
+TP_ADJUST_MIN_PCT = 0.30       # Minimum percentile after adjustment
+TP_ADJUST_MAX_PCT = 0.85       # Maximum percentile after adjustment
 
-# Персистенс TP конфига
+# TP config persistence
 TP_CONFIG_FILE = os.path.join(DATA_DIR, "tp_config.json")
 
 def load_tp_config():
-    """Загружает TP конфиг из файла."""
+    """Loads the TP config from file."""
     global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
     global TP_HIT_RATE_TARGET, TP_AUTO_ADJUST, TP_CAPTURE_RATE
     global TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT
@@ -419,7 +425,7 @@ def load_tp_config():
     TP_ADJUST_MAX_PCT    = data.get("tp_adjust_max_pct",    TP_ADJUST_MAX_PCT)
 
 def save_tp_config():
-    """Сохраняет текущий TP конфиг в файл."""
+    """Saves the current TP config to file."""
     safe_json_save(TP_CONFIG_FILE, {
         "tp_percentile":        TP_PERCENTILE,
         "safe_tp_percentile":   SAFE_TP_PERCENTILE,
@@ -432,11 +438,11 @@ def save_tp_config():
         "tp_adjust_max_pct":    TP_ADJUST_MAX_PCT,
     })
 
-# Загружаем при старте
+# Load on startup
 load_tp_config()
 
 # =====================================================================
-# 🕯️  HEIKIN ASHI ДЛЯ UT BOT
+# 🕯️  HEIKIN ASHI FOR UT BOT
 # =====================================================================
 UT_HA_FILE = os.path.join(DATA_DIR, "ut_ha.json")
 
@@ -465,7 +471,7 @@ def save_htf(htf: str):
 HTF_BIAS = load_htf()
 
 # =====================================================================
-# 📡  РЕЖИМ ТОРГОВЛИ
+# 📡  TRADING MODE
 # =====================================================================
 MODE_FILE = os.path.join(DATA_DIR, "mode.json")
 
@@ -479,12 +485,13 @@ def save_mode(mode: str):
 MARKET_MODE = load_mode()
 
 # =====================================================================
-# 📊  ФАЙЛЫ ИСТОРИИ
+# 📊  HISTORY FILES
 # =====================================================================
 SIGNALS_HISTORY_FILE = os.path.join(DATA_DIR, "signals_history.json")
 
-# 🆕 Снапшот bot.state (активные позиции a_active_trade/u_active_trade и т.п.) —
-# отдельно от signals_history.json. История сигналов и раньше переживала рестарт,
-# а вот сам факт "эта позиция ещё открыта, вот её TP/SL/tp1_hit" жил только в
-# памяти процесса и терялся при каждом перезапуске контейнера. См. state.py.
+# 🆕 Snapshot of bot.state (active positions a_active_trade/u_active_trade,
+# etc.) — separate from signals_history.json. Signal history already survived
+# restarts before; but the fact that "this position is still open, here's its
+# TP/SL/tp1_hit" only lived in the process's memory and was lost on every
+# container restart. See state.py.
 BOT_STATE_FILE = os.path.join(DATA_DIR, "bot_state_snapshot.json")

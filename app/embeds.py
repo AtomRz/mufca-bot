@@ -1,12 +1,13 @@
 """
 embeds.py — Discord embed builders.
 
-🆕 Вынесено из bot.py (было ~1600 строк, всё в одном файле — Discord-команды,
-scanner, embed-билдинг, state). Чистый перенос кода, логика не менялась.
+🆕 Split out of bot.py (which was ~1600 lines, everything in one file —
+Discord commands, scanner, embed building, state). A clean code move, logic
+unchanged.
 
-Ничего не импортирует из bot.py — независимый модуль, поэтому его безопасно
-импортировать и из bot.py (scanner), и из discord_commands.py (команды) без
-риска циклического импорта.
+Doesn't import anything from bot.py — an independent module, so it's safe to
+import from both bot.py (scanner) and discord_commands.py (commands) without
+risk of a circular import.
 """
 
 import logging
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def _flow_label(flow: str) -> str:
-    """Переводит internal flow в читаемый лейбл для Discord."""
+    """Translates the internal flow value into a readable Discord label."""
     return {"inflow": "BUY PRESSURE", "outflow": "SELL PRESSURE"}.get(flow, "NEUTRAL")
 
 
@@ -72,8 +73,8 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             rel_vol = vol_info["rel_vol"]
-            # 🆕 FIX BUG-LO005: Убрано дублирующее присваивание is_long
-            # Переменная is_long уже определена в начале функции
+            # 🆕 FIX BUG-LO005: removed a duplicate is_long assignment here.
+            # The is_long variable is already defined at the top of the function.
             dir_score = volume_score_for_side(vol_info, "long" if is_long else "short")
             lev_adj = "+" if dir_score > 0.3 else "-" if dir_score < -0.3 else "="
             vol_text = f"{_flow_label(vol_flow)} RV:{rel_vol:.1f}x [{lev_adj}lev]"

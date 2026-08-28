@@ -1,25 +1,25 @@
 """
-discord_commands.py — все Discord !команды MUFCA Bot.
+discord_commands.py — all Discord !commands for MUFCA Bot.
 
-🆕 Вынесено из bot.py (было ~1600 строк в одном файле — Discord-команды,
-scanner, embed-билдинг, state вперемешку). Это чистый перенос кода,
-логика ни одной команды не менялась.
+🆕 Split out of bot.py (which was ~1600 lines in one file — Discord
+commands, scanner, embed building, state all mixed together). This is a
+clean code move, no command's logic changed.
 
-ВАЖНО про доступ к общему состоянию бота:
-`_exchange_ref`, `_onchain_bias_cache`, `_onchain_last_fetch` — это модульные
-переменные bot.py, которые команды !mode/!onchain/!reset/!reset_cache
-ПЕРЕПРИСВАИВАЮТ (не просто мутируют). Обычный `from bot import _exchange_ref`
-скопировал бы значение один раз при импорте и не отслеживал бы дальнейшие
-переприсвоения в bot.py — market_scanner продолжал бы видеть старое значение.
-Поэтому здесь используется квалифицированный доступ `core.<имя>` (и на чтение,
-и на запись) вместо `global` + голого имени — присваивание атрибуту модуля
-видно из любого места, которое импортирует этот же модуль.
+IMPORTANT about accessing shared bot state:
+`_exchange_ref`, `_onchain_bias_cache`, `_onchain_last_fetch` are module-level
+variables in bot.py that the !mode/!onchain/!reset/!reset_cache commands
+REASSIGN (not just mutate). A plain `from bot import _exchange_ref` would
+copy the value once at import time and wouldn't track further reassignments
+in bot.py — market_scanner would keep seeing the old value. That's why
+qualified access `core.<name>` is used here (both for reading and writing)
+instead of `global` + a bare name — an attribute assignment on the module is
+visible from anywhere that imports that same module.
 
-Для `state`, `scan_stats`, `_state_locks`, `market_scanner`, `_tickers_lock`
-голый `global` не нужен в принципе — они только мутируются на месте
-(`dict[...] = ...`, `list.append(...)`, вызовы методов), а не переприсваиваются
-целиком, так что ссылка на объект через `core.<имя>` работает и для чтения,
-и для записи одинаково надёжно.
+For `state`, `scan_stats`, `_state_locks`, `market_scanner`, `_tickers_lock`
+a bare `global` isn't needed in principle — they're only ever mutated in
+place (`dict[...] = ...`, `list.append(...)`, method calls), never reassigned
+wholesale, so a reference to the object via `core.<name>` works equally
+reliably for both reading and writing.
 """
 
 import asyncio
@@ -64,60 +64,60 @@ from state import (
 )
 from embeds import build_embed, _flow_label
 
-import bot as core  # 🆕 доступ к общему рантайму bot.py (см. пояснение выше)
+import bot as core  # 🆕 access to bot.py's shared runtime (see explanation above)
 
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 💬  DISCORD КОМАНДЫ
+# 💬  DISCORD COMMANDS
 # =====================================================================
 
 @core.bot.command(name="help", aliases=["?"])
 async def help_cmd(ctx):
-    """Список всех команд MUFCA Bot."""
+    """List of all MUFCA Bot commands."""
     lines = [
-        "**📖 MUFCA v4.0 — Команды**\n",
+        "**📖 MUFCA v4.0 — Commands**\n",
 
-        "**📊 Мониторинг**",
-        "`!status`       — состояние сканера: пары, треки A/U, volume",
-        "`!scan <pair> <tf>` — ручной скан (напр. `!scan BTC/USDT 1h`)",
-        "`!history <pair> <tf>` — история сделок (напр. `!history BTC/USDT 4h`)",
-        "`!signals <pair> <tf>` — статистика сигналов по паре",
-        "`!tp <pair> <tf>` — текущий адаптивный TP",
-        "`!chart <pair> <tf>` — свечной график с индикаторами (напр. `!chart BTC 1h`)",
-        "`!debug`        — расширенная отладочная информация",
-        "`!onchain`      — on-chain анализ (F&G, ETH flows)",
+        "**📊 Monitoring**",
+        "`!status`       — scanner status: pairs, A/U tracks, volume",
+        "`!scan <pair> <tf>` — manual scan (e.g. `!scan BTC/USDT 1h`)",
+        "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
+        "`!signals <pair> <tf>` — signal statistics for a pair",
+        "`!tp <pair> <tf>` — current adaptive TP",
+        "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
+        "`!debug`        — extended debug information",
+        "`!onchain`      — on-chain analysis (F&G, ETH flows)",
         "",
 
-        "**⚙️ Настройки**",
-        "`!mode spot|futures` — переключить режим торговли",
-        "`!htf <tf>`     — HTF Bias таймфрейм (напр. `!htf 4h`)",
-        "`!utha on|off`  — Heikin Ashi для UT Bot",
-        "`!chop <tf> <val>` — порог CHOP (напр. `!chop 1h 55`)",
+        "**⚙️ Settings**",
+        "`!mode spot|futures` — switch trading mode",
+        "`!htf <tf>`     — HTF Bias timeframe (e.g. `!htf 4h`)",
+        "`!utha on|off`  — Heikin Ashi for UT Bot",
+        "`!chop <tf> <val>` — CHOP threshold (e.g. `!chop 1h 55`)",
         "",
 
-        "**📚 Адаптивный TP**",
-        "`!tpconfig`           — показать текущий конфиг TP",
-        "`!tpconfig mode safe` — безопасный режим (50-й %ile)",
-        "`!tpconfig mode aggressive` — агрессивный (75-й %ile)",
-        "`!tpconfig percentile 70` — изменить агрессивный %ile",
-        "`!tpconfig safe 45`   — изменить безопасный %ile",
-        "`!tpconfig limit 30`  — кол-во сигналов для обучения",
+        "**📚 Adaptive TP**",
+        "`!tpconfig`           — show the current TP config",
+        "`!tpconfig mode safe` — safe mode (50th %ile)",
+        "`!tpconfig mode aggressive` — aggressive mode (75th %ile)",
+        "`!tpconfig percentile 70` — change the aggressive %ile",
+        "`!tpconfig safe 45`   — change the safe %ile",
+        "`!tpconfig limit 30`  — number of signals used for training",
         "",
 
-        "**📋 Пары**",
-        "`!pairs`        — список активных пар",
-        "`!add <pair>`   — добавить пару (напр. `!add SOL/USDT`)",
-        "`!remove <pair>` — удалить пару",
-        "`!delsignals <pair> [tf]` — удалить историю сигналов пары",
+        "**📋 Pairs**",
+        "`!pairs`        — list of active pairs",
+        "`!add <pair>`   — add a pair (e.g. `!add SOL/USDT`)",
+        "`!remove <pair>` — remove a pair",
+        "`!delsignals <pair> [tf]` — delete a pair's signal history",
         "",
 
-        "**🛠️ Утилиты**",
-        "`!sim <pair> <tf> <side>` — симуляция сделки",
-        "`!forcerun`     — принудительный запуск сканера",
-        "`!reset`        — сбросить всё состояние и историю",
-        "`!reset_cache`  — сбросить HTF и on-chain кеш",
-        "`!help` / `!?` — эта справка",
+        "**🛠️ Utilities**",
+        "`!sim <pair> <tf> <side>` — simulate a trade",
+        "`!forcerun`     — force-run the scanner",
+        "`!reset`        — reset all state and history",
+        "`!reset_cache`  — reset HTF and on-chain cache",
+        "`!help` / `!?` — this help",
     ]
     await ctx.send("\n".join(lines))
 
@@ -147,29 +147,29 @@ async def status_cmd(ctx):
             a_trade = st.get("a_active_trade")
             u_trade = st.get("u_active_trade")
 
-            # Показываем позицию только если флаг И active_trade оба установлены
-            # Если только флаг без trade — рассинхрон, показываем предупреждение
+            # Only show a position if both the flag AND active_trade are set.
+            # If only the flag is set with no trade — that's a desync, show a warning.
             a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
             u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
 
-            # 🆕 FIX BUG-HI001: Убрано двойное присваивание a_pos
-            # Ранее: a_pos = f"⚠️{a_flag}" → затем a_pos = "—" (перезаписывало!)
-            # Теперь: одно присваивание с информативным сообщением
+            # 🆕 FIX BUG-HI001: removed a double assignment to a_pos.
+            # Before: a_pos = f"⚠️{a_flag}" → then a_pos = "—" (overwriting it!)
+            # Now: a single assignment with an informative message.
             async with core._state_locks[ticker][tf]:
                 if a_flag and not a_trade:
                     logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["a_in_long"] = False   # auto-heal
                     core.state[ticker][tf]["a_in_short"] = False
-                    a_pos = f"⚠️{a_flag} (fixed)"  # ← Одно присваивание, пользователь видит предупреждение
+                    a_pos = f"⚠️{a_flag} (fixed)"  # ← single assignment, user sees the warning
                 else:
                     a_pos = a_flag or "—"
 
-                # 🆕 FIX BUG-HI001: Аналогично для U-трека
+                # 🆕 FIX BUG-HI001: same fix for the U-track
                 if u_flag and not u_trade:
                     logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["u_in_long"] = False   # auto-heal
                     core.state[ticker][tf]["u_in_short"] = False
-                    u_pos = f"⚠️{u_flag} (fixed)"  # ← Аналогично для U-трека
+                    u_pos = f"⚠️{u_flag} (fixed)"  # ← same fix for the U-track
                 else:
                     u_pos = u_flag or "—"
             trade_info = ""
@@ -223,7 +223,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         core._state_locks[ticker][tf] = asyncio.Lock()
 
     async with core._state_locks[ticker][tf]:
-        # ✅ ИСПРАВЛЕНО: используем временный state, чтобы не мутировать основной
+        # ✅ FIXED: use a temporary state so we don't mutate the real one
         temp_state = make_state()
         try:
             signals, bar_time, regime, lev = await check_signals(exchange, ticker, tf, temp_state, dry_run=True)
@@ -299,10 +299,10 @@ async def add_cmd(ctx, ticker: str = ""):
         if tf not in core._state_locks[ticker]:
             core._state_locks[ticker][tf] = asyncio.Lock()
 
-    # ✅ ИСПРАВЛЕНО: сохраняем через функцию config
+    # ✅ FIXED: persist via the config function
     save_tickers(TICKERS)
 
-    # ✅ ИСПРАВЛЕНО: запускаем бэктест для новой пары
+    # ✅ FIXED: run a backtest for the new pair
     await ctx.send(f"🔄 Running backtest for `{ticker}`...")
     total = 0
     for tf in TIMEFRAMES:
@@ -341,24 +341,24 @@ async def remove_cmd(ctx, ticker: str = ""):
 
 @core.bot.command(name="delsignals")
 async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = ""):
-    """Удаляет историю сигналов (signals_history.json) для конкретной пары.
+    """Deletes signal history (signals_history.json) for a specific pair.
 
-    !delsignals SOL/USDT           — предпросмотр (все таймфреймы)
-    !delsignals SOL/USDT yes       — удалить все таймфреймы
-    !delsignals SOL/USDT 1h        — предпросмотр (только 1h)
-    !delsignals SOL/USDT 1h yes    — удалить только 1h
+    !delsignals SOL/USDT           — preview (all timeframes)
+    !delsignals SOL/USDT yes       — delete all timeframes
+    !delsignals SOL/USDT 1h        — preview (1h only)
+    !delsignals SOL/USDT 1h yes    — delete 1h only
 
-    🆕 Команда `!remove` чистит только TICKERS/live-state, но НЕ трогает
-    signals_history.json — после удаления пары из сканирования её адаптивная
-    TP/SL-статистика оставалась висеть в файле истории. Эта команда закрывает
-    тот пробел точечно, без полного !reset.
+    🆕 The `!remove` command only clears TICKERS/live-state, but does NOT
+    touch signals_history.json — after removing a pair from scanning, its
+    adaptive TP/SL statistics kept hanging around in the history file. This
+    command closes that gap on a per-pair basis, without a full !reset.
     """
     if not ticker:
         await ctx.send("❌ Please specify a pair. Example: `!delsignals SOL/USDT` or `!delsignals SOL/USDT 1h`")
         return
     ticker = ticker.upper()
 
-    # Поддержка "!delsignals SOL/USDT yes" (tf пропущен, confirm пришёл вторым аргументом)
+    # Support "!delsignals SOL/USDT yes" (tf omitted, confirm arrives as the second argument)
     if tf.lower() == "yes":
         confirm, tf = tf, ""
 
@@ -399,9 +399,10 @@ async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = "")
 
 @core.bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
-    # 🆕 FIX BUG-LO001: Не используем global MARKET_MODE напрямую
-    # Ранее: global MARKET_MODE — не работает корректно с from config import MARKET_MODE
-    # Теперь: модифицируем _cfg.MARKET_MODE, к которому обращаются все модули
+    # 🆕 FIX BUG-LO001: don't use global MARKET_MODE directly.
+    # Before: global MARKET_MODE — doesn't work correctly with
+    # `from config import MARKET_MODE`.
+    # Now: modify _cfg.MARKET_MODE, which every module reads from.
     if not new_mode:
         label = "🔵 Spot" if _cfg.MARKET_MODE == "spot" else "🟠 Futures"
         await ctx.send(f"Current mode: **{label}**\nTo switch: `!mode spot` or `!mode futures`")
@@ -416,7 +417,7 @@ async def mode_cmd(ctx, new_mode: str = ""):
         await ctx.send(f"⚠️ Already in **{_cfg.MARKET_MODE}** mode.")
         return
 
-    _cfg.MARKET_MODE = new_mode  # ← Меняем через модуль, не через global
+    _cfg.MARKET_MODE = new_mode  # ← change via the module, not `global`
 
     save_mode(_cfg.MARKET_MODE)
 
@@ -665,7 +666,7 @@ async def history_cmd(ctx, ticker: str = "", tf: str = ""):
                                 lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
 
         msg = "\n".join(lines)
-        # ✅ ИСПРАВЛЕНО: разбиваем длинные сообщения
+        # ✅ FIXED: split long messages into chunks
         while msg:
             chunk = msg[:1900]
             if len(msg) > 1900:
@@ -787,19 +788,20 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
                 await ctx.send("❌ Not enough data")
                 return
 
-            # Берём реальную текущую цену через fetch_ticker (не iloc[-2]),
-            # иначе на 1h бот показывает цену до 59 минут устаревшей.
-            # Индикаторы (ATR, FRAMA) считаем по закрытым барам (iloc[-2]) как обычно.
+            # Use the real current price via fetch_ticker (not iloc[-2]),
+            # otherwise on 1h the bot could show a price up to 59 minutes stale.
+            # Indicators (ATR, FRAMA) are still computed from closed bars
+            # (iloc[-2]) as usual.
             try:
                 ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
                 last_close = float(
-                    ticker_data.get("close") or      # ← приоритет close (консистентно с ботом)
+                    ticker_data.get("close") or      # ← prefer close (consistent with the bot)
                     ticker_data.get("last") or
                     ticker_data.get("bid") or
-                    df["close"].iloc[-2]             # fallback на закрытый бар
+                    df["close"].iloc[-2]             # fallback to the closed bar
                 )
             except Exception:
-                last_close = float(df["close"].iloc[-2])  # fallback на закрытый бар
+                last_close = float(df["close"].iloc[-2])  # fallback to the closed bar
 
             atr14 = calculate_atr(df, ATR_PERIOD)
             fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
@@ -833,10 +835,10 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
 async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
     """
     !chart [PAIR] [TIMEFRAME] [LIMIT]
-    Примеры:
-      !chart          → BTC/USDT 1h 50 свечей
-      !chart ETH      → ETH/USDT 1h 50 свечей
-      !chart BTC 4h   → BTC/USDT 4h 50 свечей
+    Examples:
+      !chart          → BTC/USDT 1h 50 candles
+      !chart ETH      → ETH/USDT 1h 50 candles
+      !chart BTC 4h   → BTC/USDT 4h 50 candles
       !chart BTC 1h 100
     """
     pair = pair.upper()
@@ -860,7 +862,7 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
     try:
         from chart import generate_chart
 
-        # Snapshot активной сделки если есть
+        # Snapshot of the active trade, if any
         state_snapshot = None
         pair_state = core.state.get(pair, {})
         for _tf_key, st in pair_state.items():
@@ -869,11 +871,12 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
                 u_trade = st.get("u_active_trade") or st.get("active_trade")
                 active = a_trade or u_trade
                 if active:
-                    # 🆕 FIX: раньше передавался позиционный "bar_opened" индекс,
-                    # посчитанный на df сигнала — но !chart строит свой df отдельным
-                    # fetch'ем (возможно днями позже), и индексы не совпадали, стрелка
-                    # уезжала в произвольное место. Теперь передаём реальный timestamp
-                    # бара входа, и chart.py сам находит нужный бар в своём df.
+                    # 🆕 FIX: used to pass a positional "bar_opened" index computed
+                    # on the signal's df — but !chart builds its own df with a
+                    # separate fetch (possibly days later), and the indices
+                    # didn't line up, so the marker landed on an arbitrary spot.
+                    # Now we pass the entry bar's real timestamp, and chart.py
+                    # locates the right bar in its own df itself.
                     state_snapshot = {
                         "entry": active.get("entry"),
                         "tp":    active.get("tp"),
@@ -951,21 +954,22 @@ async def reset_cmd(ctx, confirm: str = ""):
         )
         return
 
-    # BUGFIX BUG-CR003: останавливаем сканер перед backtest чтобы исключить
-    # race condition — одновременная запись в signals_history.json из двух источников.
+    # BUGFIX BUG-CR003: stop the scanner before the backtest to rule out a race
+    # condition — two sources writing to signals_history.json at the same time.
     scanner_was_running = core.market_scanner.is_running()
     if scanner_was_running:
         core.market_scanner.stop()
-        await asyncio.sleep(1)  # даём текущей итерации завершиться
+        await asyncio.sleep(1)  # let the current iteration finish
 
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)
     clear_history_cache()
 
-    # BUGFIX BUG-HI002: ранее сбрасывались только trade_history/active_trade/bars_in_trade.
-    # Не сбрасывались: a_active_trade, u_active_trade, a_in_long/a_in_short, u_in_long/u_in_short,
-    # a_bars_in_trade, u_bars_in_trade, last_*_bar, *_last_closure_notified.
-    # Треки оставались замороженными после !reset. Теперь полный сброс через make_state().
+    # BUGFIX BUG-HI002: previously only trade_history/active_trade/bars_in_trade
+    # were reset. NOT reset: a_active_trade, u_active_trade, a_in_long/a_in_short,
+    # u_in_long/u_in_short, a_bars_in_trade, u_bars_in_trade, last_*_bar,
+    # *_last_closure_notified.
+    # The tracks stayed frozen after !reset. Now it's a full reset via make_state().
     for ticker in TICKERS:
         for tf in TIMEFRAMES:
             core.state[ticker][tf] = make_state()
@@ -995,7 +999,7 @@ async def reset_cmd(ctx, confirm: str = ""):
                 logger.error(f"Reset backtest error: {e}")
                 await ctx.send(f"❌ `{ticker}` `{tf}` backtest failed: {e}")
 
-    # Перезапускаем сканер после backtest
+    # Restart the scanner after the backtest
     if scanner_was_running and not core.market_scanner.is_running():
         core.market_scanner.start()
 
@@ -1047,24 +1051,25 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
             tp = tp2
 
 
-            # 🆕 FIX BUG-HI005: Рассчитываем реалистичный MFE/MAE перед закрытием
-            # Ранее: update_signal_mae_mfe НЕ вызывался, max_favorable_pct и max_adverse_pct
-            # оставались 0.0, искажая перцентиль TP.
-            # Теперь: вызываем update_signal_mae_mfe для SL и TP, чтобы записать реалистичные
-            # значения MAE/MFE в историю.
+            # 🆕 FIX BUG-HI005: compute a realistic MFE/MAE before closing the record.
+            # Before: update_signal_mae_mfe was NOT called, so max_favorable_pct and
+            # max_adverse_pct stayed at 0.0, skewing the TP percentile.
+            # Now: call update_signal_mae_mfe for both SL and TP, so realistic
+            # MAE/MFE values get written to history.
             #
-            # 🆕 FIX: помечаем track="sim" + synthetic=True — эта запись идеализированная
-            # (полный ход до TP И до SL одновременно) и раньше писалась под тем же track,
-            # что и реальные A/U сделки, искажая calculate_adaptive_sl/tp (в т.ч. раздувая
-            # адаптивный SL, т.к. max_adverse_pct тут равен полной дистанции до SL).
-            # Теперь такие записи исключены из статистики/калибровки (см. state.py).
+            # 🆕 FIX: tag with track="sim" + synthetic=True — this record is
+            # idealized (the full move to TP AND to SL at once) and used to be
+            # written under the same track as real A/U trades, skewing
+            # calculate_adaptive_sl/tp (including inflating the adaptive SL,
+            # since max_adverse_pct here equals the full distance to SL).
+            # Such records are now excluded from stats/calibration (see state.py).
             add_signal_record(
                 ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(),
                 track="sim", synthetic=True,
             )
 
-            # Рассчитываем MFE (максимально благоприятное движение = TP)
-            # и MAE (максимально неблагоприятное = SL) для корректной статистики
+            # Compute MFE (maximum favorable move = TP)
+            # and MAE (maximum adverse move = SL) for correct statistics
             update_signal_mae_mfe(ticker, tf, side, tp, track="sim")   # MFE = (TP - entry)/entry
             update_signal_mae_mfe(ticker, tf, side, sl, track="sim")   # MAE = (entry - SL)/entry
 
@@ -1081,9 +1086,9 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
 
             lines.append(f"• TP: **${format_price(tp)}**")
 
-            # 🆕 NOTE: stats['count'] теперь считается только по реальным (не-sim)
-            # закрытым сигналам — синтетическая sim-запись в калибровку не входит.
-            lines.append(f"• Real closed {side} signals in history: **{stats['count']}** (sim-запись помечена отдельно и не влияет на adaptive TP/SL)")
+            # 🆕 NOTE: stats['count'] now only counts real (non-sim) closed
+            # signals — the synthetic sim record isn't part of the calibration.
+            lines.append(f"• Real closed {side} signals in history: **{stats['count']}** (the sim record is tagged separately and doesn't affect adaptive TP/SL)")
 
             await ctx.send("\n".join(lines))
 
@@ -1124,7 +1129,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
 
-            # BUGFIX BUG-ME001: отсутствовала проверка — IndexError при пустом ответе биржи
+            # BUGFIX BUG-ME001: missing check — IndexError on an empty exchange response
             if not validate_dataframe(df, 50):
                 await ctx.send("❌ Not enough data from exchange")
                 return
@@ -1140,25 +1145,25 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             tp = tp2
             risk = abs(last_close - sl)
 
-            # BUGFIX BUG-HI003: ранее делали core.state[ticker][tf] = make_state() через st,
-            # что безвозвратно уничтожало активные позиции и всю историю сделок.
-            # Теперь обновляем только нужные поля существующего state.
+            # BUGFIX BUG-HI003: this used to do core.state[ticker][tf] = make_state()
+            # via st, which irrecoverably destroyed active positions and the whole
+            # trade history. Now only the needed fields of the existing state are updated.
             if ticker not in core.state or tf not in core.state.get(ticker, {}):
                 state.setdefault(ticker, {})[tf] = make_state()
 
             st = core.state[ticker][tf]
-            track_key = "a_active_trade"  # forcerun всегда на A-треке
+            track_key = "a_active_trade"  # forcerun always operates on the A-track
 
-            # 🆕 FIX: раньше forcerun безусловно перезаписывал a_active_trade —
-            # если A-трек уже держал реальную позицию, она терялась бесследно
-            # (без закрытия и без записи в историю), а её "open"-запись в
-            # signals_history зависала навсегда. Теперь просто отказываем.
+            # 🆕 FIX: forcerun used to unconditionally overwrite a_active_trade —
+            # if the A-track already held a real position, it was lost without a
+            # trace (no close, no history record), and its "open" record in
+            # signals_history hung forever. Now we simply refuse instead.
             existing = st.get(track_key)
             if existing:
                 await ctx.send(
-                    f"⚠️ У A-трека уже есть открытая позиция `{existing['side'].upper()}` "
-                    f"по `{ticker}` `{tf}` (entry ${format_price(existing['entry'])}). "
-                    f"Сначала дождитесь её закрытия или закройте вручную."
+                    f"⚠️ The A-track already has an open position `{existing['side'].upper()}` "
+                    f"on `{ticker}` `{tf}` (entry ${format_price(existing['entry'])}). "
+                    f"Wait for it to close, or close it manually first."
                 )
                 return
 
@@ -1169,11 +1174,11 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             st["a_bars_in_trade"] = 0
             st["a_in_long"] = (side == "long")
             st["a_in_short"] = (side == "short")
-            # Обновляем legacy поле для совместимости
+            # Update the legacy field for backward compatibility
             st["active_trade"] = st[track_key]
             st["bars_in_trade"] = 0
 
-            # 🆕 FIX: явно помечаем track="a", т.к. forcerun открывает именно a_active_trade
+            # 🆕 FIX: explicitly tag track="a", since forcerun specifically opens a_active_trade
             add_signal_record(ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(), track="a")
             stats = get_signal_stats(ticker, tf, side)
 
@@ -1202,26 +1207,28 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
 
 @core.bot.command(name="onchain")
 async def onchain_cmd(ctx):
-    """Показывает текущий on-chain анализ (F&G, ETH flows, влияние на сигналы)."""
+    """Shows the current on-chain analysis (F&G, ETH flows, impact on signals)."""
     if not ONCHAIN_ENABLED:
         await ctx.send(
-            "⚠️ On-Chain анализ отключён.\n"
-            "Добавьте в переменные окружения:\n"
-            "```\nETHERSCAN_API_KEY=ваш_ключ\nCOINGECKO_API_KEY=ваш_ключ\n```"
+            "⚠️ On-Chain analysis is disabled.\n"
+            "Add these to your environment variables:\n"
+            "```\nETHERSCAN_API_KEY=your_key\nCOINGECKO_API_KEY=your_key\n```"
         )
         return
 
-    msg = await ctx.send("⏳ Получаю on-chain данные...")
+    msg = await ctx.send("⏳ Fetching on-chain data...")
     try:
         bias = await get_onchain_bias()
 
-        # BUGFIX BUG-HI004: НЕ вызываем clear_onchain_cache() при first_run —
-        # это сбрасывало _prev_balances и следующий вызов снова давал first_run (infinite loop).
-        # При первом запуске baseline уже сохранён в _prev_balances, следующий hourly
-        # цикл в core.market_scanner сам посчитает реальную дельту. Просто сообщаем об этом.
+        # BUGFIX BUG-HI004: do NOT call clear_onchain_cache() on first_run —
+        # that reset _prev_balances, and the next call would just report
+        # first_run again (infinite loop). On the first run, the baseline is
+        # already saved in _prev_balances, and the next hourly cycle in
+        # core.market_scanner will compute the real delta on its own. Just
+        # report that here.
         if bias.get("flow_data", {}).get("note") == "first_run":
             report = format_onchain_report(bias)
-            await msg.edit(content=report + "\n\n⏳ _ETH flow дельта будет доступна через ~1 час (первый запуск)._")
+            await msg.edit(content=report + "\n\n⏳ _ETH flow delta will be available in ~1 hour (first run)._")
             return
 
         core._onchain_bias_cache = bias
@@ -1229,14 +1236,14 @@ async def onchain_cmd(ctx):
         report = format_onchain_report(bias)
         await msg.edit(content=report)
     except Exception as e:
-        await msg.edit(content=f"❌ Ошибка on-chain: `{e}`")
+        await msg.edit(content=f"❌ On-chain error: `{e}`")
 
 
 @core.bot.command(name="reset_cache")
 async def reset_cache_cmd(ctx):
-    """Сбрасывает HTF bias cache и on-chain cache вручную."""
+    """Manually resets the HTF bias cache and on-chain cache."""
     clear_htf_cache()
-    clear_onchain_cache_full()  # полный сброс включая baseline балансов
+    clear_onchain_cache_full()  # full reset, including the balance baseline
     core._onchain_bias_cache = None
     core._onchain_last_fetch = 0.0
-    await ctx.send("✅ HTF bias cache и On-Chain cache сброшены. Следующий скан обновит данные.")
+    await ctx.send("✅ HTF bias cache and On-Chain cache reset. The next scan will refresh the data.")
