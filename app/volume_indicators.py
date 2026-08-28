@@ -30,15 +30,15 @@ def calculate_volume_delta(df: pd.DataFrame) -> pd.Series:
     Volume Delta — buying/selling pressure via close location in bar.
     close near high = +pressure, close near low = -pressure.
 
-    BUGFIX BUG-ME004: При high == low (doji-свеча) range_ = 0, close_loc ≈ 0,
-    pressure = -1.0 — doji интерпретировалась как максимальное давление продаж.
-    Теперь при doji close_loc = 0.5 (нейтрально).
+    BUGFIX BUG-ME004: at high == low (a doji candle) range_ = 0, close_loc ≈ 0,
+    pressure = -1.0 — a doji was being interpreted as maximum sell pressure.
+    Now a doji gives close_loc = 0.5 (neutral).
     """
     range_ = df["high"] - df["low"]
-    # 🆕 FIX: doji защита — при нулевом или почти нулевом range ставим нейтральное значение
+    # 🆕 FIX: doji protection — at zero or near-zero range, use a neutral value
     close_loc = np.where(
         range_ < 1e-12,
-        0.5,  # Doji = нейтрально
+        0.5,  # Doji = neutral
         (df["close"] - df["low"]) / (range_ + 1e-12)
     )
     pressure = (close_loc - 0.5) * 2.0
@@ -47,7 +47,7 @@ def calculate_volume_delta(df: pd.DataFrame) -> pd.Series:
 
 def volume_flow_signal_v3(df: pd.DataFrame, obv_period: int = 20) -> Dict:
     """
-    Комплексный анализ объёма v3.
+    Comprehensive volume analysis v3.
 
     Returns dict:
         - flow: "inflow" | "outflow" | "neutral"
@@ -138,10 +138,10 @@ def volume_flow_signal_v3(df: pd.DataFrame, obv_period: int = 20) -> Dict:
 
 def volume_score_for_side(info: Dict, side: str) -> float:
     """
-    Преобразует volume score в directional score для стороны сигнала.
+    Converts the volume score into a directional score for the signal's side.
 
-    LONG:  положительный score = хорошо (покупатели)
-    SHORT: отрицательный score = хорошо (продавцы)
+    LONG:  a positive score = good (buyers)
+    SHORT: a negative score = good (sellers)
 
     Returns: -1.0 to +1.0 where +1 = perfect alignment
     """
@@ -154,7 +154,7 @@ def volume_score_for_side(info: Dict, side: str) -> float:
 
 def volume_confidence_adjustment(info: Dict, side: str) -> int:
     """
-    Корректировка confidence на основе объёма.
+    Adjusts confidence based on volume.
 
     Returns: delta to add to confidence score (-15 to +15)
     """
@@ -166,7 +166,7 @@ def volume_confidence_adjustment(info: Dict, side: str) -> int:
 
 def volume_leverage_adjustment_v3(info: Dict, side: str, base_lev: int) -> Tuple[int, str]:
     """
-    Корректировка leverage на основе объёма.
+    Adjusts leverage based on volume.
 
     Returns: (adjusted_lev, reason)
     """
@@ -206,7 +206,7 @@ def volume_filter_v3(df: pd.DataFrame, side: str, regime: str,
     Volume Filter v3 — score-based, almost never rejects.
 
     Returns: (passed, reason, info)
-    passed is almost always True except critical conditions.
+    passed is almost always True except for critical conditions.
     """
     info = volume_flow_signal_v3(df, obv_period)
     rel_vol = info["rel_vol"]
