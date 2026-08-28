@@ -1,9 +1,10 @@
 """
-onchain.py — On-Chain анализ для MUFCA Bot
-Источники:
-  - Etherscan API: балансы биржевых ETH-адресов (реальные притоки/оттоки)
+onchain.py — On-chain analysis for MUFCA Bot.
+
+Sources:
+  - Etherscan API: exchange ETH-address balances (real inflows/outflows)
   - CoinGecko API: Fear & Greed, BTC dominance, volume change
-Обновление: настраиваемый интервал (15m/30m/1h, дефолт 1h) — см. config.ONCHAIN_CACHE_TTL
+Refresh: configurable interval (15m/30m/1h, default 1h) — see config.ONCHAIN_CACHE_TTL
 """
 
 import asyncio
@@ -27,7 +28,7 @@ import config as _cfg
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 🏦  БИРЖЕВЫЕ ETH-АДРЕСА (публично известные hot wallets)
+# 🏦  EXCHANGE ETH ADDRESSES (publicly known hot wallets)
 # =====================================================================
 EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
     "Binance":  "0x28C6c06298d514Db089934071355E5743bf21d60",
@@ -37,7 +38,7 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
 }
 
 # =====================================================================
-# 💾  КЭШ
+# 💾  CACHE
 # =====================================================================
 _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
 
@@ -48,12 +49,13 @@ _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
 _ONCHAIN_BASELINE_FILE = os.path.join(DATA_DIR, "onchain_baseline.json")
 _prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FILE, {})
 
-# 🆕 Момент последнего снятия baseline — нужен, чтобы нормализовать пороги
-# ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH по фактически прошедшему времени, а не
-# считать их как будто окно всегда 1h. Раньше пороги были абсолютные ETH вне
-# зависимости от длины окна — на 30m/15m интервале это завышало относительный
-# вес разовых internal-транзакций биржи (hot/cold rebalancing) и давало ложные
-# "large" срабатывания. См. get_eth_flow_delta().
+# 🆕 Timestamp of the last baseline snapshot — needed to normalize the
+# ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH thresholds against the actually
+# elapsed time, instead of treating the window as always 1h. The thresholds
+# used to be absolute ETH figures regardless of window length — on a 30m/15m
+# interval this overweighted the relative significance of one-off internal
+# exchange transactions (hot/cold rebalancing) and produced false "large"
+# triggers. See get_eth_flow_delta().
 _ONCHAIN_BASELINE_TS_FILE = os.path.join(DATA_DIR, "onchain_baseline_ts.json")
 _prev_balances_ts: float = safe_json_load(_ONCHAIN_BASELINE_TS_FILE, {}).get("ts", 0.0)
 
@@ -68,41 +70,42 @@ def _cache_set(key: str, value: Any):
     _cache[key] = (time.time(), value)
 
 def clear_onchain_cache():
-    """Сбрасывает TTL-кэш on-chain данных.
+    """Clears the TTL cache of on-chain data.
 
-    BUGFIX BUG-HI004: ранее очищала и _prev_balances, из-за чего следующий вызов
-    get_eth_flow_delta() снова попадал в ветку first_run (нет baseline → возвращает
-    note='first_run' → bot.py вызывал clear_onchain_cache() → цикл бесконечно).
-    Теперь _prev_balances НЕ сбрасывается — baseline сохраняется между сбросами кэша.
-    Для полного сброса включая baseline используйте clear_onchain_cache_full().
+    BUGFIX BUG-HI004: this used to also clear _prev_balances, which meant the
+    next call to get_eth_flow_delta() fell into the first_run branch again
+    (no baseline → returns note='first_run' → bot.py called
+    clear_onchain_cache() → infinite loop). Now _prev_balances is NOT
+    cleared — the baseline survives a cache reset. For a full reset including
+    the baseline, use clear_onchain_cache_full().
     """
     _cache.clear()
     logger.info("[ONCHAIN] TTL cache cleared (baseline balances preserved)")
 
 def clear_onchain_cache_full():
-    """Полный сброс кэша включая baseline балансов (использовать только при !reset_cache)."""
+    """Full cache reset, including the balance baseline (only use with !reset_cache)."""
     global _prev_balances_ts
     _cache.clear()
     _prev_balances.clear()
     _prev_balances_ts = 0.0
-    # Иначе на следующем скане baseline подхватится обратно из файла на диске.
+    # Otherwise the baseline would just get pulled back from the on-disk file on the next scan.
     safe_json_save(_ONCHAIN_BASELINE_FILE, {})
     safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": 0.0})
     logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
-# 🔗  ETHERSCAN — балансы бирж
+# 🔗  ETHERSCAN — exchange balances
 # =====================================================================
 
 async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retries: int = 3) -> Optional[float]:
-    """Возвращает ETH баланс адреса (в ETH, не в Wei).
+    """Returns the ETH balance of an address (in ETH, not Wei).
 
-    BUGFIX BUG-ME002: Etherscan имеет rate limit 5 calls/second для бесплатных ключей.
-    4 параллельных запроса через asyncio.gather могут вызвать 429 Too Many Requests.
-    Добавлен retry с exponential backoff.
+    BUGFIX BUG-ME002: Etherscan has a rate limit of 5 calls/second for free
+    keys. 4 parallel requests via asyncio.gather can trigger a 429 Too Many
+    Requests. Added retry with exponential backoff.
     """
-    # 🆕 FIX: Etherscan deprecated V1 endpoint (2025+).
-    # Мигрируем на V2 API: добавляем /v2/ и обязательный chainid=1 (Ethereum mainnet).
+    # 🆕 FIX: Etherscan deprecated the V1 endpoint (2025+).
+    # Migrated to the V2 API: added /v2/ and the required chainid=1 (Ethereum mainnet).
     url = (
         f"https://api.etherscan.io/v2/api"
         f"?chainid=1"
@@ -115,7 +118,7 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 429:
-                    # Rate limit — ждём и повторяем
+                    # Rate limit — wait and retry
                     wait = 2 ** attempt  # 1s, 2s, 4s
                     logger.warning(f"[ONCHAIN] Etherscan 429 for {address[:10]}…, retrying in {wait}s (attempt {attempt+1}/{retries})")
                     await asyncio.sleep(wait)
@@ -123,13 +126,13 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
                 data = await resp.json()
                 if str(data.get("status")) == "1":
                     return int(data["result"]) / 1e18   # Wei → ETH
-                # status == "0" может быть rate limit или другая ошибка
+                # status == "0" could be a rate limit or another error
                 if data.get("message") == "NOTOK" and "rate limit" in str(data.get("result", "")).lower():
                     wait = 2 ** attempt
                     logger.warning(f"[ONCHAIN] Etherscan rate limit (message), retrying in {wait}s")
                     await asyncio.sleep(wait)
                     continue
-                # Ошибка но не rate limit — не retry
+                # An error, but not a rate limit — don't retry
                 logger.warning(f"[ONCHAIN] Etherscan error for {address[:10]}…: {data.get('message')} — {data.get('result')}")
                 return None
         except asyncio.TimeoutError:
@@ -149,8 +152,8 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
 
 async def get_exchange_balances() -> Dict[str, Optional[float]]:
     """
-    Получает балансы всех биржевых адресов параллельно.
-    Возвращает: {exchange_name: balance_eth}
+    Fetches all exchange address balances in parallel.
+    Returns: {exchange_name: balance_eth}
     """
     cached = _cache_get("eth_balances")
     if cached is not None:
@@ -173,37 +176,38 @@ async def get_exchange_balances() -> Dict[str, Optional[float]]:
 
 async def get_eth_flow_delta() -> Dict:
     """
-    Сравнивает текущие балансы с предыдущими.
-    Возвращает:
-      delta_eth:   суммарная дельта по всем биржам (+ = приток на биржу, - = отток с биржи)
-      flow:        "inflow" | "outflow" | "neutral"
-      strength:    "large" | "normal" | "weak"
-      per_exchange: детали по каждой бирже
+    Compares current balances against the previous snapshot.
+    Returns:
+      delta_eth:    total delta across all exchanges (+ = inflow to exchanges, - = outflow from exchanges)
+      flow:         "inflow" | "outflow" | "neutral"
+      strength:     "large" | "normal" | "weak"
+      per_exchange: per-exchange breakdown
 
-    🆕 Пороги strength/flow нормализуются по фактически прошедшему времени с
-    прошлого снятия baseline (elapsed), а не берутся как фиксированные ETH
-    вне зависимости от длины окна. ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH
-    заданы из расчёта "за 1 час" — на 30m/15m окне они масштабируются вниз
-    пропорционально, иначе разовая internal-транзакция биржи (hot/cold
-    rebalancing) при коротком окне будет чаще ошибочно читаться как крупный
-    рыночный flow. scale зажат в [0.25, 4.0] и дополнительно поднят до 1.0
-    при почти нулевом elapsed (два вызова подряд, например ручной !onchain
-    дважды за минуту) — иначе на скейле 0.25 пороги проседают вчетверо от
-    номинала и разовая internal-транзакция биржи может ложно прочитаться
-    как large на коротком окне, которого фактически не было.
+    🆕 The strength/flow thresholds are normalized against the actually
+    elapsed time since the last baseline snapshot (elapsed), instead of being
+    treated as fixed ETH figures regardless of window length.
+    ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH are set for a "1 hour" baseline —
+    on a 30m/15m window they scale down proportionally, otherwise a one-off
+    internal exchange transaction (hot/cold rebalancing) would more often be
+    mistakenly read as a large market flow on a short window. scale is
+    clamped to [0.25, 4.0] and additionally floored at 1.0 when elapsed is
+    close to zero (two calls back to back — e.g. a manual !onchain twice
+    within a minute) — otherwise at a scale of 0.25 the thresholds sag to a
+    quarter of nominal and a one-off internal exchange transaction can be
+    falsely read as "large" on a short window where it actually wasn't.
     """
     global _prev_balances_ts
     curr_balances = await get_exchange_balances()
     now = time.time()
 
-    # 🆕 FIX: раньше проверялось только "dict пустой?" — если baseline был
-    # загружен с диска, но все значения в нём None (например, container упал
-    # ровно во время единственного successful fetch), не-пустой dict с одними
-    # None молча уходил в ветку расчёта дельты и давал delta=0/note="ok"
-    # вместо честного "нет данных, жди следующий цикл".
+    # 🆕 FIX: this used to only check "is the dict empty?" — if the baseline
+    # was loaded from disk but every value in it was None (e.g. the container
+    # crashed exactly during the one successful fetch), a non-empty dict full
+    # of Nones silently fell into the delta-calculation branch and returned
+    # delta=0/note="ok" instead of an honest "no data yet, wait for the next cycle".
     baseline_is_empty = not _prev_balances or all(v is None for v in _prev_balances.values())
 
-    # При первом запуске — сохраняем как базу и сразу делаем второй запрос через паузу
+    # On the first run — save this as the baseline and let the second request happen after a pause
     if baseline_is_empty:
         _prev_balances.update(curr_balances)
         _prev_balances_ts = now
@@ -218,7 +222,7 @@ async def get_eth_flow_delta() -> Dict:
             "note": "first_run",
         }
 
-    # Считаем дельту
+    # Compute the delta
     delta_total = 0.0
     per_exchange = {}
 
@@ -226,24 +230,26 @@ async def get_eth_flow_delta() -> Dict:
         curr = curr_balances.get(name)
         prev = _prev_balances.get(name)
         if curr is not None and prev is not None:
-            delta = curr - prev    # + = приток на биржу, - = отток с биржи
+            delta = curr - prev    # + = inflow to the exchange, - = outflow from the exchange
             delta_total += delta
             per_exchange[name] = round(delta, 2)
 
-    # Сколько реально прошло времени с прошлого baseline — на этом масштабируем пороги
+    # How much time has actually elapsed since the last baseline — thresholds scale off this
     elapsed_seconds = (now - _prev_balances_ts) if _prev_balances_ts else 3600.0
     if elapsed_seconds < 300:
-        # Два вызова почти подряд (ручной !onchain дважды за пару минут) — не
-        # даём порогам обвалиться до floor 0.25, работаем как на полном часе.
+        # Two calls almost back to back (a manual !onchain twice within a
+        # couple minutes) — don't let the thresholds collapse to the 0.25
+        # floor, behave as if it's a full hour.
         scale = 1.0
     else:
         scale = max(0.25, min(4.0, elapsed_seconds / 3600.0))
 
-    # 🆕 FIX: раньше _prev_balances.update(curr_balances) затирал валидный
-    # baseline None-ом, если Etherscan упал для одной биржи в ЭТОМ цикле —
-    # эта биржа выпадала из расчёта не только на текущий (ожидаемо), но и на
-    # следующий цикл тоже (baseline уже испорчен). Теперь обновляем baseline
-    # только для бирж, где реально пришло новое значение.
+    # 🆕 FIX: _prev_balances.update(curr_balances) used to overwrite a valid
+    # baseline with None if Etherscan failed for one exchange THIS cycle —
+    # that exchange dropped out of the calculation not just for the current
+    # cycle (expected), but for the next one too (the baseline was already
+    # corrupted). Now we only update the baseline for exchanges where a real
+    # new value actually came back.
     for name, curr in curr_balances.items():
         if curr is not None:
             _prev_balances[name] = curr
@@ -251,7 +257,7 @@ async def get_eth_flow_delta() -> Dict:
     safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
     safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
 
-    # Классифицируем — пороги нормализованы под фактическую длину окна
+    # Classify — thresholds normalized to the actual window length
     threshold_large = ONCHAIN_FLOW_THRESHOLD_LARGE_ETH * scale
     threshold_normal = ONCHAIN_FLOW_THRESHOLD_ETH * scale
     neutral_threshold = max(20.0, 100.0 * scale)
@@ -284,7 +290,7 @@ async def get_eth_flow_delta() -> Dict:
 # =====================================================================
 
 def _fg_label_from_value(value: int) -> str:
-    """Конвертирует числовое значение F&G в текстовый лейбл."""
+    """Converts a numeric F&G value into a text label."""
     if value <= 20:   return "Extreme Fear"
     if value <= 40:   return "Fear"
     if value <= 60:   return "Neutral"
@@ -294,14 +300,14 @@ def _fg_label_from_value(value: int) -> str:
 
 async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
     """
-    Получает Fear & Greed Index с fallback цепочкой:
-      1. CoinGecko Pro/Demo API (/fear-greed-index) — если есть ключ
-      2. alternative.me/fng — публичный, но нестабильный
-      3. Дефолт 50 (Neutral) — если оба упали
+    Fetches the Fear & Greed Index with a fallback chain:
+      1. CoinGecko Pro/Demo API (/fear-greed-index) — if a key is present
+      2. alternative.me/fng — public, but flaky
+      3. Default 50 (Neutral) — if both fail
 
     Returns: (value: int, label: str)
     """
-    # ── Источник 1: CoinGecko Fear & Greed (платный/demo endpoint) ──
+    # ── Source 1: CoinGecko Fear & Greed (paid/demo endpoint) ──
     if COINGECKO_API_KEY:
         try:
             async with session.get(
@@ -327,7 +333,7 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
         except Exception as e:
             logger.warning(f"[ONCHAIN] CoinGecko F&G failed: {e}, trying fallback")
 
-    # ── Источник 2: alternative.me ──────────────────────────────────
+    # ── Source 2: alternative.me ──────────────────────────────────
     try:
         async with session.get(
             "https://api.alternative.me/fng/?limit=1",
@@ -342,7 +348,7 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
                     logger.info(f"[ONCHAIN] F&G from alternative.me: {val} ({lbl})")
                     return val, lbl
                 else:
-                    # HTML вместо JSON — сервис недоступен
+                    # HTML instead of JSON — service unavailable
                     text = await resp.text()
                     logger.warning(f"[ONCHAIN] alternative.me returned non-JSON ({content_type}): {text[:80]}")
             else:
@@ -350,14 +356,14 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
     except Exception as e:
         logger.warning(f"[ONCHAIN] alternative.me F&G failed: {e}")
 
-    # ── Источник 3: дефолт ──────────────────────────────────────────
+    # ── Source 3: default ──────────────────────────────────────────
     logger.warning("[ONCHAIN] All F&G sources failed, using default 50 (Neutral)")
     return 50, "Neutral"
 
 
 async def get_coingecko_data() -> Dict:
     """
-    Получает с CoinGecko:
+    Fetches from CoinGecko:
       - fear_and_greed (0-100)
       - fg_label: "Extreme Fear" / "Fear" / "Neutral" / "Greed" / "Extreme Greed"
       - btc_dominance (%)
@@ -372,10 +378,10 @@ async def get_coingecko_data() -> Dict:
         {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY.startswith("CG-")
         else {"x-cg-pro-api-key": COINGECKO_API_KEY}
     ) if COINGECKO_API_KEY else {}
-    # 🆕 FIX: _fetch_fear_greed() уже учитывал pro/demo базовый URL, а /global и
-    # /coins/markets были жёстко зашиты на бесплатный api.coingecko.com — с Pro
-    # ключом такие запросы могли отваливаться по rate limit/401, потому что бьют
-    # не в тот хост, для которого ключ выдан.
+    # 🆕 FIX: _fetch_fear_greed() already accounted for the pro/demo base URL,
+    # but /global and /coins/markets were hardcoded to the free
+    # api.coingecko.com — with a Pro key, such requests could fail with a
+    # rate limit/401, since they hit the wrong host for the key they were issued for.
     base = "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY and not COINGECKO_API_KEY.startswith("CG-") else "https://api.coingecko.com/api/v3"
     result = {
         "fear_and_greed": 50,
@@ -383,8 +389,8 @@ async def get_coingecko_data() -> Dict:
         "btc_dominance": 50.0,
         "eth_total_volume_24h": 0.0,
         "btc_total_volume_24h": 0.0,
-        "eth_volume_change_24h": None,  # BUG-LO003: требует отдельного endpoint
-        "btc_volume_change_24h": None,  # BUG-LO003: требует отдельного endpoint
+        "eth_volume_change_24h": None,  # BUG-LO003: requires a separate endpoint
+        "btc_volume_change_24h": None,  # BUG-LO003: requires a separate endpoint
         "error": None,
     }
 
@@ -396,8 +402,9 @@ async def get_coingecko_data() -> Dict:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 data = await resp.json()
-                # 🆕 FIX: если CoinGecko вернул ошибку (429/401/502), data может
-                # не быть словарём с ожидаемой структурой — .get() на не-dict упадёт.
+                # 🆕 FIX: if CoinGecko returned an error (429/401/502), data
+                # might not be a dict with the expected structure — .get() on
+                # a non-dict would raise.
                 if resp.status == 200 and isinstance(data, dict):
                     mcp = data.get("data", {}).get("market_cap_percentage", {})
                     result["btc_dominance"] = round(mcp.get("btc", 50.0), 2)
@@ -411,28 +418,30 @@ async def get_coingecko_data() -> Dict:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 coins = await resp.json()
-                # 🆕 FIX: на ошибке (429/401/502) markets endpoint отдаёт dict с
-                # описанием ошибки, а не list — `for coin in coins: coin["id"]`
-                # падал бы с TypeError. Явно проверяем тип/статус перед итерацией.
+                # 🆕 FIX: on an error (429/401/502) the markets endpoint returns
+                # a dict describing the error, not a list — `for coin in coins:
+                # coin["id"]` would raise TypeError. Explicitly check the
+                # type/status before iterating.
                 if resp.status != 200 or not isinstance(coins, list):
                     logger.warning(f"[ONCHAIN] CoinGecko /coins/markets status={resp.status}, skipping volume data")
                     coins = []
                 for coin in coins:
-                    # 🆕 FIX BUG-LO003: CoinGecko markets endpoint не предоставляет
-                    # volume_change_24h. Использование price_change как прокси вводит
-                    # в заблуждение — изменение цены ≠ изменение объёма.
-                    # Убираем некорректные поля; реальный volume_change доступен только
-                    # через /coins/{id}/market_chart (volume) с ручным расчётом дельты.
-                    # Пока оставляем total_volume для справки, но volume_change = N/A.
+                    # 🆕 FIX BUG-LO003: the CoinGecko markets endpoint doesn't
+                    # provide volume_change_24h. Using price_change as a proxy
+                    # is misleading — a price change ≠ a volume change.
+                    # Removing the incorrect fields; real volume_change is
+                    # only available via /coins/{id}/market_chart (volume)
+                    # with a manual delta computation. Keeping total_volume
+                    # for reference for now, but volume_change = N/A.
                     if coin["id"] == "ethereum":
                         result["eth_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
-                        result["eth_volume_change_24h"] = None  # недоступно без доп. запросов
+                        result["eth_volume_change_24h"] = None  # unavailable without extra requests
                     elif coin["id"] == "bitcoin":
                         result["btc_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
-                        result["btc_volume_change_24h"] = None  # недоступно без доп. запросов
+                        result["btc_volume_change_24h"] = None  # unavailable without extra requests
 
             # 3. Fear & Greed Index
-            # Цепочка источников: CoinGecko → alternative.me → дефолт 50
+            # Source chain: CoinGecko → alternative.me → default 50
             fg_value, fg_label = await _fetch_fear_greed(session)
             result["fear_and_greed"] = fg_value
             result["fg_label"] = fg_label
@@ -446,35 +455,35 @@ async def get_coingecko_data() -> Dict:
     return result
 
 # =====================================================================
-# 🧠  ONCHAIN BIAS — объединённый результат
+# 🧠  ONCHAIN BIAS — combined result
 # =====================================================================
 
 async def get_onchain_bias() -> Dict:
     """
-    Главная функция. Собирает все данные и возвращает:
-      flow_data:      результат get_eth_flow_delta()
-      cg_data:        результат get_coingecko_data()
-      bias_long:      итоговый скор для long  (-15 … +15)
-      bias_short:     итоговый скор для short (-15 … +15)
-      tp_mult_long:   множитель TP для long  (0.85 … 1.15)
-      tp_mult_short:  множитель TP для short (0.85 … 1.15)
-      sl_mult_long:   множитель SL для long  (0.90 … 1.10)
-      sl_mult_short:  множитель SL для short (0.90 … 1.10)
-      lev_delta:      корректировка лева     (-2 … +1)
-      summary:        текстовое описание
+    Main entry point. Gathers all the data and returns:
+      flow_data:      result of get_eth_flow_delta()
+      cg_data:        result of get_coingecko_data()
+      bias_long:      final long score  (-15 … +15)
+      bias_short:     final short score (-15 … +15)
+      tp_mult_long:   TP multiplier for long  (0.85 … 1.15)
+      tp_mult_short:  TP multiplier for short (0.85 … 1.15)
+      sl_mult_long:   SL multiplier for long  (0.90 … 1.10)
+      sl_mult_short:  SL multiplier for short (0.90 … 1.10)
+      lev_delta:      leverage adjustment    (-2 … +1)
+      summary:        text description
     """
     cached = _cache_get("onchain_bias")
     if cached is not None:
         return cached
 
-    # Запускаем параллельно
+    # Run in parallel
     flow_data, cg_data = await asyncio.gather(
         get_eth_flow_delta(),
         get_coingecko_data(),
         return_exceptions=True,
     )
 
-    # Безопасные дефолты при ошибке
+    # Safe defaults on error
     if isinstance(flow_data, Exception):
         flow_data = {"flow": "neutral", "strength": "weak", "delta_eth": 0.0, "per_exchange": {}, "note": "error"}
     if isinstance(cg_data, Exception):
@@ -487,15 +496,15 @@ async def get_onchain_bias() -> Dict:
     btc_dom   = cg_data.get("btc_dominance", 50.0)
 
     # ─────────────────────────────────────────────────────────────────
-    # CONFIDENCE BIAS (±15 баллов)
+    # CONFIDENCE BIAS (±15 points)
     # ─────────────────────────────────────────────────────────────────
     bias_long  = 0
     bias_short = 0
     reasons    = []
 
     # ETH Exchange Flow
-    # Отток с бирж (flow="outflow") = накопление = бычий сигнал для LONG
-    # Приток на биржи (flow="inflow") = давление продаж = медвежий
+    # Outflow from exchanges (flow="outflow") = accumulation = bullish signal for LONG
+    # Inflow to exchanges (flow="inflow") = sell pressure = bearish
     flow_pts = {"large": 10, "normal": 6, "weak": 3}.get(strength, 0)
 
     if flow == "outflow":
@@ -507,10 +516,10 @@ async def get_onchain_bias() -> Dict:
         bias_short += flow_pts
         reasons.append(f"ETH inflow +{flow_data.get('delta_eth', 0):.0f} ETH 🔴")
 
-    # Fear & Greed — контрарный индикатор
-    # Extreme Fear (<20) + long = дно вероятно → +5 к long
-    # Extreme Greed (>80) + short = перегрев → +5 к short
-    # Extreme Greed + long = осторожно → -5 к long
+    # Fear & Greed — a contrarian indicator
+    # Extreme Fear (<20) + long = likely a bottom → +5 to long
+    # Extreme Greed (>80) + short = overheated → +5 to short
+    # Extreme Greed + long = caution → -5 to long
     if fg < 20:
         bias_long  += 5
         reasons.append(f"Extreme Fear F&G={fg} (contrarian long) 😱")
@@ -525,7 +534,7 @@ async def get_onchain_bias() -> Dict:
         bias_short += 2
         reasons.append(f"Greed F&G={fg} (mild short boost) 😏")
 
-    # Клипуем до ±15
+    # Clip to ±15
     bias_long  = max(-15, min(15, bias_long))
     bias_short = max(-15, min(15, bias_short))
 
@@ -536,16 +545,16 @@ async def get_onchain_bias() -> Dict:
     tp_mult_short = 1.0
 
     if flow == "outflow" and strength in ("large", "normal"):
-        tp_mult_long  = 1.10   # держим long дольше — накопление
+        tp_mult_long  = 1.10   # hold longs longer — accumulation
     elif flow == "inflow" and strength in ("large", "normal"):
-        tp_mult_long  = 0.90   # берём прибыль раньше — давление продаж
+        tp_mult_long  = 0.90   # take profit sooner — sell pressure
 
     if flow == "inflow" and strength in ("large", "normal"):
-        tp_mult_short = 1.10   # держим short дольше
+        tp_mult_short = 1.10   # hold shorts longer
     elif flow == "outflow" and strength in ("large", "normal"):
         tp_mult_short = 0.90
 
-    # Extreme Fear — чуть дальше TP для long (дно близко)
+    # Extreme Fear — push TP slightly farther for longs (a bottom is likely close)
     if fg < 20:
         tp_mult_long = min(1.15, tp_mult_long * 1.05)
     if fg > 80:
@@ -553,19 +562,19 @@ async def get_onchain_bias() -> Dict:
 
     # ─────────────────────────────────────────────────────────────────
     # SL MULTIPLIER  (0.90 … 1.10)
-    # Больше 1.0 = SL дальше (защита от шума)
-    # Меньше 1.0 = SL ближе (больше риска — защищаемся)
+    # Above 1.0 = SL farther (protection from noise)
+    # Below 1.0 = SL closer (more risk — tighten protection)
     # ─────────────────────────────────────────────────────────────────
     sl_mult_long  = 1.0
     sl_mult_short = 1.0
 
     if flow == "inflow" and strength == "large":
-        # Большой приток на биржи при long — подтягиваем SL ближе
+        # A large inflow to exchanges while long — pull SL closer
         sl_mult_long  = 0.90
     if flow == "outflow" and strength == "large":
         sl_mult_short = 0.90
 
-    # Extreme Fear — волатильность высокая, SL чуть дальше
+    # Extreme Fear — volatility is high, push SL slightly farther
     if fg < 20:
         sl_mult_long  = min(1.10, sl_mult_long  * 1.10)
         sl_mult_short = min(1.10, sl_mult_short * 1.10)
@@ -583,10 +592,10 @@ async def get_onchain_bias() -> Dict:
         lev_delta = -1
 
     # ─────────────────────────────────────────────────────────────────
-    # ТЕКСТОВЫЙ СОВЕТ
+    # TEXT SUMMARY
     # ─────────────────────────────────────────────────────────────────
     if not reasons:
-        summary = "📊 On-chain нейтрален. Стандартные параметры."
+        summary = "📊 On-chain neutral. Using standard parameters."
     else:
         summary = " | ".join(reasons)
 
@@ -615,11 +624,11 @@ async def get_onchain_bias() -> Dict:
 
 
 # =====================================================================
-# 🖨️  ФОРМАТИРОВАНИЕ ДЛЯ DISCORD
+# 🖨️  DISCORD FORMATTING
 # =====================================================================
 
 def format_onchain_report(bias: Dict) -> str:
-    """Форматирует on-chain данные для вывода в Discord (!onchain)."""
+    """Formats on-chain data for output in Discord (!onchain)."""
     fg     = bias.get("fear_and_greed", 50)
     fglbl  = bias.get("fg_label", "Neutral")
     dom    = bias.get("btc_dominance", 50.0)
@@ -647,11 +656,11 @@ def format_onchain_report(bias: Dict) -> str:
     ]
 
     if note == "first_run":
-        lines.append("  _(первый запуск — дельта будет на следующем цикле)_")
+        lines.append("  _(first run — delta will be available on the next cycle)_")
     elif note == "error":
-        lines.append("  _(ошибка получения балансов бирж — показан прошлый известный результат)_")
+        lines.append("  _(failed to fetch exchange balances — showing the last known result)_")
     else:
-        lines.append(f"  Суммарная дельта: `{delta:+.0f} ETH`")
+        lines.append(f"  Total delta: `{delta:+.0f} ETH`")
         if per_ex:
             for exch, d in per_ex.items():
                 em = "🔴" if d > 0 else "🟢" if d < 0 else "⚪"
@@ -659,10 +668,10 @@ def format_onchain_report(bias: Dict) -> str:
 
     lines += [
         "",
-        f"**Влияние на сигналы:**",
-        f"  Long bias:  `{bl:+d}` pts к confidence",
-        f"  Short bias: `{bs:+d}` pts к confidence",
-        f"  Leverage:   `{lev_str}` к рекомендованному",
+        f"**Impact on signals:**",
+        f"  Long bias:  `{bl:+d}` pts to confidence",
+        f"  Short bias: `{bs:+d}` pts to confidence",
+        f"  Leverage:   `{lev_str}` to the recommended value",
     ]
 
     if bias.get("tp_mult_long", 1.0) != 1.0 or bias.get("tp_mult_short", 1.0) != 1.0:
@@ -670,7 +679,7 @@ def format_onchain_report(bias: Dict) -> str:
     if bias.get("sl_mult_long", 1.0) != 1.0 or bias.get("sl_mult_short", 1.0) != 1.0:
         lines.append(f"  SL mult:  Long `×{bias['sl_mult_long']}` | Short `×{bias['sl_mult_short']}`")
 
-    lines += ["", f"**Вывод:** {bias.get('summary', '—')}"]
+    lines += ["", f"**Summary:** {bias.get('summary', '—')}"]
 
     if cg_err:
         lines.append(f"\n⚠️ CoinGecko error: `{cg_err}`")
