@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Tuple
 
 # =====================================================================
-# 📊  БАЗОВЫЕ ИНДИКАТОРЫ
+# 📊  BASE INDICATORS
 # =====================================================================
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -23,13 +23,14 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     atr_sum = tr.rolling(window=length).sum()
     hh = df["high"].rolling(window=length).max()
     ll = df["low"].rolling(window=length).min()
-    # ✅ FIX BUG-LO004: Защита от деления на ноль (HH == LL) — epsilon только в знаменателе.
-    # При atr_sum → 0 (флэт-рынок) CHOP → -∞, что корректно означает "не choppy" → 0.
-    # Добавление epsilon внутрь log (как было раньше) искусственно завышало CHOP на флэте.
+    # ✅ FIX BUG-LO004: division-by-zero protection (HH == LL) — epsilon only
+    # in the denominator. As atr_sum → 0 (a flat market) CHOP → -∞, which
+    # correctly means "not choppy" → 0. Adding an epsilon inside the log (as
+    # it used to be) artificially inflated CHOP on a flat market.
     range_ = hh - ll
     with np.errstate(divide="ignore", invalid="ignore"):
         chop = 100 * np.log10(atr_sum / (range_ + 1e-12)) / np.log10(length)
-    # При atr_sum == 0 log10(0) = -inf → заменяем на 0 (совсем не choppy)
+    # When atr_sum == 0, log10(0) = -inf → replace with 0 (not choppy at all)
     chop = pd.Series(np.where(np.isfinite(chop), chop, 0.0), index=df.index)
     return chop.clip(0, 100)
 
@@ -70,12 +71,13 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tu
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    # 🆕 FIX: раньше ширина канала FRAMA считалась через простое SMA (tr.rolling().mean()),
-    # а не через Wilder RMA, как в оригинальном Pine (ta.atr(frama_len)) и как уже
-    # реализовано в calculate_atr() этого файла. A/B на живой истории (Pine-индикатор)
-    # показал, что Wilder RMA даёт заметно выше винрейт (A: +2.0 п.п., U: +4.9 п.п.),
-    # поэтому переводим и бота на ту же формулу — это меняет момент переключения
-    # frama_bullish/frama_bearish, то есть влияет на вход всех сигналов.
+    # 🆕 FIX: the FRAMA channel width used to be computed via a simple SMA
+    # (tr.rolling().mean()), rather than the Wilder RMA used in the original
+    # Pine Script (ta.atr(frama_len)) and already implemented in this file's
+    # calculate_atr(). An A/B test against live history (the Pine indicator)
+    # showed Wilder RMA gives a noticeably higher win rate (A: +2.0 pp,
+    # U: +4.9 pp), so the bot was switched to the same formula — this shifts
+    # when frama_bullish/frama_bearish flips, i.e. it affects every signal's entry.
     fatr = tr.ewm(alpha=1.0 / length, adjust=False).mean()
     
     fu = fs + fatr * mult
@@ -136,7 +138,7 @@ def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6) -> Tu
 # =====================================================================
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    """Преобразует обычные свечи в Heikin-Ashi."""
+    """Converts regular candles into Heikin-Ashi."""
     ha = df.copy()
     ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
     ha_open = pd.Series(index=df.index, dtype=float)
@@ -150,7 +152,7 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 # =====================================================================
-# 🤖  UT BOT (ИСПРАВЛЕННЫЙ)
+# 🤖  UT BOT (FIXED)
 # =====================================================================
 
 def calculate_ut_bot(
@@ -162,14 +164,14 @@ def calculate_ut_bot(
     """
     UT Bot by Kivanc Ozbilgic.
     
-    ВАЖНО: ATR всегда рассчитывается от обычных свечей (реальная волатильность),
-    даже когда включен режим Heikin-Ashi для сигналов.
+    IMPORTANT: ATR is always calculated from regular candles (real
+    volatility), even when Heikin-Ashi mode is enabled for signals.
     """
-    # ✅ ATR всегда от обычных свечей
+    # ✅ ATR always from regular candles
     atr_normal = calculate_atr(df, period)
     n_loss = (sensitivity * atr_normal).values
     
-    # Для сигналов используем HA или обычные свечи
+    # Use HA or regular candles for signals
     if use_ha:
         df_ut = heikin_ashi(df)
         src = df_ut["close"].values
@@ -177,7 +179,7 @@ def calculate_ut_bot(
         df_ut = df.copy()
         src = df_ut["close"].values
     
-    # Расчет трейлинг-стопа
+    # Trailing stop calculation
     ts = np.zeros(len(df_ut))
     ts[0] = src[0] - n_loss[0]
     
@@ -203,10 +205,10 @@ def calculate_ut_bot(
 # =====================================================================
 
 def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, float]:
-    """Обучение K-Means для MFI уровней oversold/overbought."""
+    """Trains K-Means for the MFI oversold/overbought levels."""
     vals = mfi.dropna().tail(training_size).values
     
-    # Защита от NaN
+    # NaN protection
     if len(vals) < 2 or np.isnan(vals).any():
         return 20.0, 80.0
     
@@ -216,7 +218,7 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, flo
         d1 = np.abs(vals - c1)
         d2 = np.abs(vals - c2)
         
-        # Защита от пустых кластеров
+        # Empty-cluster protection
         cl1 = vals[d1 <= d2]
         cl2 = vals[d2 < d1]
         
