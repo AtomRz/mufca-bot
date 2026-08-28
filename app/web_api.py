@@ -1,22 +1,22 @@
 """
 MUFCA v4.0 — Web API
-FastAPI-бэкенд для веб-морды. Работает В ТОМ ЖЕ процессе и asyncio-loop,
-что и discord-бот (см. main.py) — переиспользует bot.state, bot._exchange_ref
-и config.py как есть, никакого отдельного пересчёта индикаторов сканером.
+FastAPI backend for the web dashboard. Runs in the SAME process and asyncio
+loop as the Discord bot (see main.py) — reuses bot.state, bot._exchange_ref,
+and config.py as-is, no separate indicator recomputation by a second scanner.
 
-Эндпоинты:
-  GET  /api/status                      — сводка по всем парам/TF (как !status)
-  GET  /api/pairs                       — список тикеров
-  POST /api/pairs                       — добавить тикер {"ticker": "DOGE/USDT"}
-  DELETE /api/pairs/{ticker}            — убрать тикер
-  GET  /api/chart?ticker=...&tf=...     — JSON для графика (свечи+FRAMA+BB+S/R+MFI)
-  GET  /api/config                      — все редактируемые настройки одним объектом
+Endpoints:
+  GET  /api/status                      — summary across all pairs/TFs (like !status)
+  GET  /api/pairs                       — list of tickers
+  POST /api/pairs                       — add a ticker {"ticker": "DOGE/USDT"}
+  DELETE /api/pairs/{ticker}            — remove a ticker
+  GET  /api/chart?ticker=...&tf=...     — JSON for the chart (candles+FRAMA+BB+S/R+MFI)
+  GET  /api/config                      — all editable settings as one object
   POST /api/config/mode                 — {"mode": "spot"|"futures"}
   POST /api/config/htf                  — {"htf": "4h"}
   POST /api/config/utha                 — {"enabled": true}
   POST /api/config/chop                 — {"tf": "1h", "value": 55.0}
   POST /api/config/tpconfig             — {"param": "mode"|"limit"|"percentile"|"safe", "value": ...}
-  WS   /ws/live                         — broadcast новых баров/сигналов/закрытий сделок
+  WS   /ws/live                         — broadcasts new bars/signals/trade closures
 """
 
 import asyncio
@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MUFCA Web API")
 
-# 🆕 Циклический импорт по тому же паттерну, что discord_commands.py:
-# bot.py импортирует web_api в самом низу, когда bot/state/config уже готовы.
+# 🆕 Circular import, same pattern as discord_commands.py: bot.py imports
+# web_api at the very bottom, once bot/state/config are already set up.
 import bot as core
 import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled
@@ -49,36 +49,38 @@ import push as _push
 
 
 # =====================================================================
-# 🔒  HTTP BASIC AUTH — защищает и /api/*, и раздачу статики фронта.
-# Если WEB_USERNAME/WEB_PASSWORD не заданы в .env — дашборд остаётся
-# открытым (для локальной разработки), но громко предупреждаем в логах
-# при каждом старте, чтобы это нельзя было не заметить.
+# 🔒  HTTP BASIC AUTH — protects both /api/* and the frontend's static assets.
+# If WEB_USERNAME/WEB_PASSWORD aren't set in .env, the dashboard stays open
+# (for local development), but we loudly warn in the logs on every startup so
+# this can't go unnoticed.
 # =====================================================================
 if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
     logger.warning(
-        "[AUTH] ⚠️  WEB_USERNAME/WEB_PASSWORD не заданы в .env — веб-дашборд "
-        "ОТКРЫТ БЕЗ АВТОРИЗАЦИИ. Любой с доступом к порту 8585 может менять "
-        "настройки бота. Задай оба значения в .env, чтобы включить защиту."
+        "[AUTH] ⚠️  WEB_USERNAME/WEB_PASSWORD not set in .env — the web dashboard "
+        "IS OPEN WITHOUT AUTHENTICATION. Anyone with access to port 8585 can "
+        "change the bot's settings. Set both values in .env to enable protection."
     )
 
 
 # =====================================================================
-# 🚫  RATE LIMITING — блокировка IP после серии неудачных попыток входа.
-# Без этого Basic Auth, выставленный в интернет, можно долбить паролями
-# неограниченное число раз. In-memory (сбрасывается при рестарте контейнера) —
-# для личного дашборда этого достаточно, распределённый брутфорс не сценарий.
+# 🚫  RATE LIMITING — locks out an IP after a run of failed login attempts.
+# Without this, Basic Auth exposed to the internet can be brute-forced an
+# unlimited number of times. In-memory (resets on container restart) — for a
+# personal dashboard that's enough; a distributed brute-force isn't a
+# realistic scenario here.
 # =====================================================================
-_LOCKOUT_THRESHOLD = 5             # столько неудачных попыток подряд...
-_LOCKOUT_WINDOW_SECONDS = 300      # ...в течение этого окна...
-_LOCKOUT_DURATION_SECONDS = 900    # ...даёт блокировку на 15 минут
+_LOCKOUT_THRESHOLD = 5             # this many failed attempts in a row...
+_LOCKOUT_WINDOW_SECONDS = 300      # ...within this window...
+_LOCKOUT_DURATION_SECONDS = 900    # ...triggers a 15-minute lockout
 
 _failed_attempts: dict = defaultdict(list)
 _locked_until: dict = {}
 
 
 def _get_client_ip(scope) -> str:
-    """Реальный IP клиента из-за Cloudflare Tunnel/reverse proxy — не scope['client'],
-    тот покажет адрес самого туннеля/nginx, а не посетителя."""
+    """The client's real IP behind a Cloudflare Tunnel/reverse proxy — not
+    scope['client'], which would show the tunnel/nginx's own address, not the
+    visitor's."""
     headers = dict(scope.get("headers") or [])
     for header_name in (b"cf-connecting-ip", b"x-forwarded-for"):
         value = headers.get(header_name)
@@ -112,14 +114,14 @@ def _record_success(ip: str):
 
 
 # =====================================================================
-# 🎫  WS TICKETS — короткоживущие одноразовые токены для WebSocket-хендшейка.
-# Браузерный WebSocket API не умеет выставлять кастомные заголовки, значит
-# что-то приходится класть в query-параметр URL — а всё, что в query-параметре,
-# оседает в access-логах (uvicorn/nginx/Cloudflare) открытым текстом. Раньше
-# там был сам base64(login:password) — постоянный, реальный пароль. Теперь —
-# тикет: живёт 30 секунд, одноразовый, бесполезен уже через полминуты и не
-# раскрывает ничего о реальных учётных данных, даже если жаднолистая
-# CI/CD-система или Cloudflare сохранят его в логах навсегда.
+# 🎫  WS TICKETS — short-lived, single-use tokens for the WebSocket handshake.
+# The browser WebSocket API can't set custom headers, so something has to go
+# in a URL query parameter instead — and anything in a query parameter ends
+# up in access logs (uvicorn/nginx/Cloudflare) in plain text. This used to be
+# the raw base64(login:password) — a permanent, real password. Now it's a
+# ticket: lives 30 seconds, single-use, worthless after half a minute, and
+# reveals nothing about the real credentials even if a greedy CI/CD system or
+# Cloudflare keeps it in logs forever.
 # =====================================================================
 _WS_TICKET_TTL_SECONDS = 30
 _ws_tickets: dict = {}
@@ -132,14 +134,14 @@ def _issue_ws_ticket() -> str:
 
 
 def _consume_ws_ticket(ticket: str) -> bool:
-    expiry = _ws_tickets.pop(ticket, None)  # pop — одноразовый, повторно не сработает
+    expiry = _ws_tickets.pop(ticket, None)  # pop — single-use, won't work a second time
     return expiry is not None and time.time() < expiry
 
 
 class BasicAuthASGIMiddleware:
-    """Чистый ASGI middleware (не BaseHTTPMiddleware!) — тот не видит websocket-scope,
-    а /ws/live тоже должен требовать авторизации, иначе фид сигналов остаётся открытым
-    даже когда весь остальной API защищён."""
+    """A pure ASGI middleware (not BaseHTTPMiddleware!) — that one can't see
+    the websocket scope, and /ws/live also needs to require auth, otherwise
+    the signal feed stays open even when the rest of the API is protected."""
 
     def __init__(self, app):
         self.app = app
@@ -152,7 +154,7 @@ class BasicAuthASGIMiddleware:
             user, _, pwd = decoded.partition(":")
         except Exception:
             return False
-        # constant-time сравнение — не даём определить правильность по времени ответа
+        # constant-time comparison — don't let response timing reveal correctness
         return (
             secrets.compare_digest(user, _cfg.WEB_USERNAME)
             and secrets.compare_digest(pwd, _cfg.WEB_PASSWORD)
@@ -162,17 +164,18 @@ class BasicAuthASGIMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
 
-        # Защищаем только /api/* и /ws/* — статику фронта (index.html, JS/CSS-бандл)
-        # отдаём свободно, иначе браузер покажет СВОЙ нативный Basic Auth попап поверх
-        # нашего кастомного логин-экрана ещё до того, как React успеет отрендериться.
-        # /api/health тоже освобождён — это liveness-проба для Docker HEALTHCHECK,
-        # у которой нет и не должно быть кредов, и она не отдаёт ничего чувствительного.
+        # Only protect /api/* and /ws/* — serve the frontend's static assets
+        # (index.html, JS/CSS bundle) freely, otherwise the browser shows ITS
+        # OWN native Basic Auth popup over our custom login screen before
+        # React even gets a chance to render. /api/health is also exempt —
+        # it's the liveness probe for the Docker HEALTHCHECK, which has no
+        # (and shouldn't have) credentials, and it returns nothing sensitive.
         path = scope.get("path", "")
         if not (path.startswith("/api/") or path.startswith("/ws/")) or path == "/api/health":
             return await self.app(scope, receive, send)
 
         if not _cfg.WEB_USERNAME or not _cfg.WEB_PASSWORD:
-            return await self.app(scope, receive, send)  # auth выключен — креды не заданы
+            return await self.app(scope, receive, send)  # auth disabled — no credentials set
 
         ip = _get_client_ip(scope)
         if _is_locked_out(ip):
@@ -224,7 +227,7 @@ _ws_clients: Set[WebSocket] = set()
 
 
 async def broadcast_event(event: dict):
-    """Рассылает событие всем подключенным клиентам. Вызывается из bot.py.
+    """Broadcasts an event to all connected clients. Called from bot.py.
 
     Each send is bounded by a timeout — a slow/stuck client shouldn't be able
     to stall delivery to every other connected client."""
@@ -244,7 +247,7 @@ async def ws_live(websocket: WebSocket):
     _ws_clients.add(websocket)
     try:
         while True:
-            # Клиент ничего не шлёт — просто держим соединение живым
+            # The client doesn't send anything — just keep the connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
@@ -257,10 +260,10 @@ async def ws_live(websocket: WebSocket):
 # =====================================================================
 @app.post("/api/ws-ticket")
 async def issue_ws_ticket():
-    """Короткоживущий (30 сек) одноразовый тикет для WS-хендшейка — см. комментарий
-    у _issue_ws_ticket() выше. Сам вызов защищён тем же Basic Auth middleware, что
-    и весь /api/*, так что тикет получит только тот, кто уже прошёл нормальную
-    авторизацию по заголовку."""
+    """Short-lived (30 sec) single-use ticket for the WS handshake — see the
+    comment on _issue_ws_ticket() above. The call itself is protected by the
+    same Basic Auth middleware as the rest of /api/*, so only someone who
+    already passed normal header-based auth can get a ticket."""
     return {"ticket": _issue_ws_ticket()}
 
 
@@ -313,7 +316,7 @@ async def get_status():
 
 
 # =====================================================================
-# 📱  ANDROID PUSH — регистрация устройств (FCM токены)
+# 📱  ANDROID PUSH — device registration (FCM tokens)
 # =====================================================================
 class DeviceRegisterIn(BaseModel):
     token: str
@@ -323,7 +326,7 @@ class DeviceRegisterIn(BaseModel):
 @app.post("/api/devices/register")
 async def register_device(body: DeviceRegisterIn):
     if not body.token or len(body.token) < 20:
-        raise HTTPException(400, "Некорректный FCM-токен")
+        raise HTTPException(400, "Invalid FCM token")
     info = _push.register_device(body.token, body.device_name)
     return {"registered": True, **info}
 
@@ -332,7 +335,7 @@ async def register_device(body: DeviceRegisterIn):
 async def unregister_device(token: str):
     ok = _push.unregister_device(unquote(token))
     if not ok:
-        raise HTTPException(404, "Устройство не найдено")
+        raise HTTPException(404, "Device not found")
     return {"unregistered": True}
 
 
@@ -343,10 +346,11 @@ async def list_devices():
 
 @app.post("/api/devices/test-push")
 async def test_push():
-    """Шлёт тестовый push всем зарегистрированным устройствам — чтобы проверить
-    всю цепочку (Firebase credentials на сервере → FCM → устройство) без ожидания
-    реального сигнала. Если firebase-credentials.json не настроен на сервере,
-    вернёт skipped='firebase_not_configured', а не молча "успех"."""
+    """Sends a test push to all registered devices — to verify the whole
+    pipeline (Firebase credentials on the server → FCM → device) without
+    waiting for a real signal. If firebase-credentials.json isn't configured
+    on the server, returns skipped='firebase_not_configured' rather than a
+    silent "success"."""
     result = await asyncio.to_thread(
         _push.send_push,
         title="MUFCA test push",
@@ -369,13 +373,13 @@ class PairIn(BaseModel):
 async def add_pair(body: PairIn):
     ticker = body.ticker.upper().strip()
     if "/" not in ticker:
-        raise HTTPException(400, "Формат тикера: BASE/QUOTE, например DOGE/USDT")
+        raise HTTPException(400, "Ticker format: BASE/QUOTE, e.g. DOGE/USDT")
     if ticker in _cfg.TICKERS:
-        raise HTTPException(409, f"{ticker} уже отслеживается")
+        raise HTTPException(409, f"{ticker} is already tracked")
 
     exchange = core._exchange_ref
     if exchange is None:
-        raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
 
     _cfg.TICKERS.append(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
@@ -383,10 +387,11 @@ async def add_pair(body: PairIn):
     async with core._tickers_lock:
         core._ensure_locks()
 
-    # 🆕 FIX: раньше пара, добавленная через веб, оставалась с пустой историей —
-    # в отличие от Discord !add, который сразу гоняет backtest_history. Пустая
-    # история значит calculate_combined_tp работает в fallback-режиме (fixed R:R)
-    # до накопления реальных сигналов, что заметно хуже адаптивного TP/SL.
+    # 🆕 FIX: a pair added via the web used to be left with an empty history —
+    # unlike Discord's !add, which immediately runs backtest_history. An
+    # empty history means calculate_combined_tp runs in fallback mode (fixed
+    # R:R) until real signals accumulate, which is noticeably worse than
+    # adaptive TP/SL.
     from signals import backtest_history
     total = 0
     for tf in TIMEFRAMES:
@@ -401,22 +406,22 @@ async def add_pair(body: PairIn):
 
 @app.delete("/api/pairs/{ticker:path}")
 async def remove_pair(ticker: str, purge_history: bool = False):
-    """purge_history=true — аналог Discord `!delsignals {ticker} yes` (все
-    таймфреймы), выполняется сразу без предпросмотра/подтверждения, так как
-    это уже осознанное действие пользователя из веб-интерфейса (checkbox/confirm
-    делает фронтенд перед вызовом). По умолчанию (false) — прежнее поведение,
-    как у Discord-команды `!remove`: signals_history.json не трогаем, чтобы
-    сохранить накопленную адаптивную TP/SL-статистику на случай, если пара
-    вернётся."""
+    """purge_history=true — equivalent to Discord `!delsignals {ticker} yes`
+    (all timeframes), executed immediately with no preview/confirmation,
+    since this is already a deliberate user action from the web UI (the
+    frontend handles the checkbox/confirm before calling this). Default
+    (false) — the same behavior as the Discord `!remove` command:
+    signals_history.json is left untouched, to preserve the accumulated
+    adaptive TP/SL statistics in case the pair comes back."""
     ticker = unquote(ticker).upper().strip()
     if ticker not in _cfg.TICKERS:
-        raise HTTPException(404, f"{ticker} не отслеживается")
+        raise HTTPException(404, f"{ticker} is not tracked")
     _cfg.TICKERS.remove(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
-    # 🆕 FIX: раньше тикер убирался из _cfg.TICKERS, но оставался в core.state и
-    # core._state_locks — не крашится (сканер итерирует по TICKERS, не по state),
-    # но осиротевшая запись висит в памяти навсегда и раздувает
-    # bot_state_snapshot.json. Чистим сразу.
+    # 🆕 FIX: the ticker used to be removed from _cfg.TICKERS but left in
+    # core.state and core._state_locks — doesn't crash (the scanner iterates
+    # over TICKERS, not over state), but the orphaned entry hangs in memory
+    # forever and bloats bot_state_snapshot.json. Clean it up right away.
     core.state.pop(ticker, None)
     core._state_locks.pop(ticker, None)
 
@@ -439,19 +444,20 @@ async def remove_pair(ticker: str, purge_history: bool = False):
 # =====================================================================
 @app.get("/api/pulse")
 async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
-    """Сводка для верхней плашки: CHOP/тренд/suggested leverage по одной referens-паре
-    (по умолчанию — первая отслеживаемая пара). Не привязан к выбору на вкладке Chart."""
+    """Summary for the top bar: CHOP/trend/suggested leverage for one
+    reference pair (defaults to the first tracked pair). Not tied to the
+    selection on the Chart tab."""
     ticker = unquote(ticker).upper().strip() if ticker else (_cfg.TICKERS[0] if _cfg.TICKERS else None)
     if not ticker:
-        raise HTTPException(404, "Нет отслеживаемых пар")
+        raise HTTPException(404, "No tracked pairs")
     if ticker not in _cfg.TICKERS:
-        raise HTTPException(404, f"{ticker} не отслеживается")
+        raise HTTPException(404, f"{ticker} is not tracked")
     if tf not in TIMEFRAMES:
-        raise HTTPException(400, f"tf должен быть одним из {TIMEFRAMES}")
+        raise HTTPException(400, f"tf must be one of {TIMEFRAMES}")
 
     exchange = core._exchange_ref
     if exchange is None:
-        raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
 
     try:
         return await get_market_pulse(exchange, ticker, tf, onchain_bias=core._onchain_bias_cache)
@@ -463,15 +469,15 @@ async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
 async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
     ticker = unquote(ticker).upper().strip()
     if ticker not in _cfg.TICKERS:
-        raise HTTPException(404, f"{ticker} не отслеживается")
+        raise HTTPException(404, f"{ticker} is not tracked")
     if tf not in TIMEFRAMES:
-        raise HTTPException(400, f"tf должен быть одним из {TIMEFRAMES}")
+        raise HTTPException(400, f"tf must be one of {TIMEFRAMES}")
     if not (20 <= limit <= 1000):
-        raise HTTPException(400, "limit должен быть между 20 и 1000")
+        raise HTTPException(400, "limit must be between 20 and 1000")
 
     exchange = core._exchange_ref
     if exchange is None:
-        raise HTTPException(503, "Бот ещё не подключился к бирже, попробуй через пару секунд")
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
 
     st = core.state.get(ticker, {}).get(tf, {})
     trade_key = "a_active_trade" if track == "a" else "u_active_trade"
@@ -485,18 +491,19 @@ async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
 
 
 # =====================================================================
-# 📚  ИСТОРИЯ СИГНАЛОВ / ВИНРЕЙТ
-# То же, что !signals в Discord, но JSON + разбивка по track (A/U), которую
-# !signals не делает (там a+u+sim смешаны в одну кучу).
+# 📚  SIGNAL HISTORY / WIN RATE
+# Same data as Discord's !signals, but as JSON, with a per-track (A/U)
+# breakdown that !signals doesn't do (there a+u+sim are all mixed together).
 # =====================================================================
 def _aggregate_records(records: list) -> Optional[dict]:
-    """Агрегирует закрытые сигналы: винрейт, средние MFE/MAE/PnL, разбивка TP/SL/cancelled.
-    Синтетические (!sim) записи исключены — как и в get_signal_stats/calculate_adaptive_tp,
-    они не отражают реальное поведение рынка.
-    🆕 FIX BUG-LO008: sl_after_tp1 (TP1 дал прибыль, остаток закрылся по перенесённому
-    SL) — реальный закрытый исход, участвует в выборке и в win_rate (win_rate уже и
-    так считается по знаку moved_pct, а не по exit_type, так что тут просто не терялся
-    из выборки); показываем отдельным счётчиком, а не мешаем с чистым "sl"."""
+    """Aggregates closed signals: win rate, average MFE/MAE/PnL, TP/SL/cancelled
+    breakdown. Synthetic (!sim) records are excluded — same as in
+    get_signal_stats/calculate_adaptive_tp, they don't reflect real market behavior.
+    🆕 FIX BUG-LO008: sl_after_tp1 (TP1 gave profit, the remainder closed at
+    the moved SL) is a real closed outcome and is included in the sample and
+    in win_rate (win_rate is already computed from the sign of moved_pct, not
+    from exit_type, so it was never actually dropped from the sample here);
+    shown as a separate counter instead of being lumped in with plain "sl"."""
     closed = [r for r in records if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
     if not closed:
         return None
@@ -525,8 +532,8 @@ def _aggregate_records(records: list) -> Optional[dict]:
 
 @app.get("/api/history/summary")
 async def history_summary():
-    """Винрейт/статистика по каждой комбинации ticker/tf/side/track, у которой есть закрытые сигналы,
-    плюс итоговая строка по всем вместе."""
+    """Win rate/statistics for every ticker/tf/side/track combination that has
+    closed signals, plus a grand-total row across all of them."""
     history = load_signals_history()
     rows = []
     all_closed_for_total: list = []
@@ -557,17 +564,18 @@ async def history_records(ticker: str, tf: str, side: str, track: str = "a", lim
     ticker = unquote(ticker).upper().strip()
     side = side.lower()
     if side not in ("long", "short"):
-        raise HTTPException(400, "side должен быть 'long' или 'short'")
+        raise HTTPException(400, "side must be 'long' or 'short'")
 
     history = load_signals_history()
     records = history.get(ticker, {}).get(tf, {}).get(side, [])
     closed = [r for r in records if r.get("track") == track and r.get("exit_type") != "open"]
-    closed = list(reversed(closed[-limit:]))  # свежие первыми
+    closed = list(reversed(closed[-limit:]))  # newest first
     return {"ticker": ticker, "tf": tf, "side": side, "track": track, "records": closed}
 
 
 # =====================================================================
-# ⚙️  CONFIG — get всех настроек + set по одной, 1-в-1 логика discord-команд
+# ⚙️  CONFIG — get all settings + set one at a time, logic 1-to-1 with the
+# Discord commands.
 # =====================================================================
 @app.get("/api/config")
 async def get_config():
@@ -621,7 +629,8 @@ async def get_config():
 
 
 async def _reset_states_after_regime_change():
-    """То же, что делают mode_cmd/htf_cmd после смены режима — иначе стейт рассинхронится."""
+    """Same as what mode_cmd/htf_cmd do after a regime change — otherwise
+    state would end up desynced."""
     exchange = core._exchange_ref
     for ticker in _cfg.TICKERS:
         for tf in TIMEFRAMES:
@@ -646,7 +655,7 @@ class ModeIn(BaseModel):
 async def set_mode(body: ModeIn):
     new_mode = body.mode.lower()
     if new_mode not in ("spot", "futures"):
-        raise HTTPException(400, "mode должен быть 'spot' или 'futures'")
+        raise HTTPException(400, "mode must be 'spot' or 'futures'")
     if new_mode == _cfg.MARKET_MODE:
         return {"mode": _cfg.MARKET_MODE, "changed": False}
 
@@ -672,7 +681,7 @@ async def set_htf(body: HtfIn):
     valid_htfs = ("1d", "4h", "2h", "6h", "12h", "1w", "3d")
     new_htf = body.htf.lower()
     if new_htf not in valid_htfs:
-        raise HTTPException(400, f"htf должен быть одним из {valid_htfs}")
+        raise HTTPException(400, f"htf must be one of {valid_htfs}")
     if new_htf == _cfg.HTF_BIAS:
         return {"htf_bias": _cfg.HTF_BIAS, "changed": False}
 
@@ -690,12 +699,12 @@ class Tp1SlModeIn(BaseModel):
 
 @app.post("/api/config/tp1-sl-mode")
 async def set_tp1_sl_mode(body: Tp1SlModeIn):
-    """Режим переноса SL после TP1: 'breakeven' (SL = entry) или 'half_tp1'
-    (SL = entry + половина пути до TP1, строже безубытка). Применяется сразу,
-    без рестарта контейнера — bot.py читает _cfg.TP1_SL_MODE на каждом TP1-хите."""
+    """SL-move mode after TP1: 'breakeven' (SL = entry) or 'half_tp1' (SL =
+    entry + halfway to TP1, tighter than breakeven). Applied immediately, no
+    container restart needed — bot.py reads _cfg.TP1_SL_MODE on every TP1 hit."""
     new_mode = body.tp1_sl_mode.lower()
     if new_mode not in ("breakeven", "half_tp1"):
-        raise HTTPException(400, "tp1_sl_mode должен быть 'breakeven' или 'half_tp1'")
+        raise HTTPException(400, "tp1_sl_mode must be 'breakeven' or 'half_tp1'")
     if new_mode == _cfg.TP1_SL_MODE:
         return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": False}
 
@@ -711,10 +720,10 @@ class DiscordNotificationsIn(BaseModel):
 
 @app.post("/api/config/discord-notifications")
 async def set_discord_notifications(body: DiscordNotificationsIn):
-    """Вкл/выкл отправку сигналов/TP1-уведомлений в Discord-канал. Discord
-    gateway остаётся подключён (команды вроде !status продолжают работать) —
-    выключается только сама отправка сообщений в канал. Сканер, веб-дашборд,
-    WebSocket и Android push никак не затрагиваются."""
+    """Turns sending signal/TP1 notifications to the Discord channel on/off.
+    The Discord gateway stays connected (commands like !status keep working) —
+    only the channel message sends themselves are disabled. The scanner, web
+    dashboard, WebSocket, and Android push are completely unaffected."""
     if body.enabled == _cfg.DISCORD_NOTIFICATIONS_ENABLED:
         return {"discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED, "changed": False}
 
@@ -734,10 +743,10 @@ class ScanIntervalIn(BaseModel):
 
 @app.post("/api/config/scan-interval")
 async def set_scan_interval(body: ScanIntervalIn):
-    """Меняет интервал сканера вживую, без рестарта контейнера — см.
+    """Changes the scanner interval live, without a container restart — see
     bot.set_scan_interval() / discord.ext.tasks.Loop.change_interval()."""
     if body.seconds not in _cfg.SCAN_INTERVAL_OPTIONS:
-        raise HTTPException(400, f"seconds должен быть одним из {_cfg.SCAN_INTERVAL_OPTIONS}")
+        raise HTTPException(400, f"seconds must be one of {_cfg.SCAN_INTERVAL_OPTIONS}")
     if body.seconds == _cfg.SCAN_INTERVAL_SECONDS:
         return {"scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS, "changed": False}
 
@@ -752,10 +761,10 @@ class OnchainIntervalIn(BaseModel):
 
 @app.post("/api/config/onchain-interval")
 async def set_onchain_interval(body: OnchainIntervalIn):
-    """Меняет частоту обновления on-chain данных (Etherscan/CoinGecko) вживую,
-    без рестарта контейнера — см. bot.set_onchain_interval()."""
+    """Changes the on-chain data refresh interval (Etherscan/CoinGecko) live,
+    without a container restart — see bot.set_onchain_interval()."""
     if body.seconds not in _cfg.ONCHAIN_INTERVAL_OPTIONS:
-        raise HTTPException(400, f"seconds должен быть одним из {_cfg.ONCHAIN_INTERVAL_OPTIONS}")
+        raise HTTPException(400, f"seconds must be one of {_cfg.ONCHAIN_INTERVAL_OPTIONS}")
     if body.seconds == _cfg.ONCHAIN_CACHE_TTL:
         return {"onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL, "changed": False}
 
@@ -777,10 +786,11 @@ async def set_utha(body: UthaIn):
     return {"ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI, "changed": True}
 
 
-# 🆕 Ключ в API/UI ("frama"/"chop"/"atr"/"htf"/"fake_break"/"liq_sweep") -> имя
-# атрибута в config.py. Меняем строго через _cfg.X = ..., НЕ через локальную
-# переменную — иначе signals.py и chart_data.py (которые тоже читают именно
-# _cfg.X/config.X) runtime-изменение не увидят и продолжат работать по старому значению.
+# 🆕 API/UI key ("frama"/"chop"/"atr"/"htf"/"fake_break"/"liq_sweep") -> the
+# actual attribute name in config.py. Changed strictly via _cfg.X = ..., NOT
+# via a local variable — otherwise signals.py and chart_data.py (which also
+# specifically read _cfg.X/config.X) wouldn't see the runtime change and
+# would keep running on the old value.
 _FILTER_ATTR = {
     "frama": "ENABLE_FRAMA_FILTER",
     "chop": "ENABLE_CHOP_FILTER",
@@ -800,7 +810,7 @@ class FilterToggleIn(BaseModel):
 async def set_filter_toggle(body: FilterToggleIn):
     key = body.filter.lower()
     if key not in _FILTER_ATTR:
-        raise HTTPException(400, f"filter должен быть одним из {list(_FILTER_ATTR)}")
+        raise HTTPException(400, f"filter must be one of {list(_FILTER_ATTR)}")
 
     attr = _FILTER_ATTR[key]
     if body.enabled == getattr(_cfg, attr):
@@ -832,9 +842,9 @@ class ChopIn(BaseModel):
 async def set_chop(body: ChopIn):
     tf = body.tf.lower()
     if tf not in TIMEFRAMES:
-        raise HTTPException(400, f"tf должен быть одним из {TIMEFRAMES}")
+        raise HTTPException(400, f"tf must be one of {TIMEFRAMES}")
     if not (20.0 <= body.value <= 90.0):
-        raise HTTPException(400, "value должен быть между 20 и 90")
+        raise HTTPException(400, "value must be between 20 and 90")
     CHOP_THRESHOLD[tf] = body.value
     _cfg.save_chop(CHOP_THRESHOLD)
     return {"chop_threshold": CHOP_THRESHOLD}
@@ -854,31 +864,31 @@ async def set_tpconfig(body: TpConfigIn):
         elif body.value.lower() in ("aggressive", "aggr"):
             _cfg.USE_SAFE_TP = False
         else:
-            raise HTTPException(400, "value должен быть 'safe' или 'aggressive'")
+            raise HTTPException(400, "value must be 'safe' or 'aggressive'")
         save_tp_config()
     elif param == "limit":
         try:
             new_limit = int(body.value)
         except ValueError:
-            raise HTTPException(400, "value должен быть числом")
+            raise HTTPException(400, "value must be a number")
         if not (5 <= new_limit <= 200):
-            raise HTTPException(400, "limit должен быть между 5 и 200")
+            raise HTTPException(400, "limit must be between 5 and 200")
         _cfg.SIGNAL_HISTORY_LIMIT = new_limit
         save_tp_config()
     elif param in ("percentile", "safe"):
         try:
             new_pct = float(body.value)
         except ValueError:
-            raise HTTPException(400, "value должен быть числом")
+            raise HTTPException(400, "value must be a number")
         if not (10 <= new_pct <= 99):
-            raise HTTPException(400, "percentile должен быть между 10 и 99")
+            raise HTTPException(400, "percentile must be between 10 and 99")
         if param == "percentile":
             _cfg.TP_PERCENTILE = new_pct / 100
         else:
             _cfg.SAFE_TP_PERCENTILE = new_pct / 100
         save_tp_config()
     else:
-        raise HTTPException(400, "param должен быть mode|limit|percentile|safe")
+        raise HTTPException(400, "param must be mode|limit|percentile|safe")
 
     return {
         "use_safe_tp": _cfg.USE_SAFE_TP,
@@ -889,9 +899,9 @@ async def set_tpconfig(body: TpConfigIn):
 
 
 # =====================================================================
-# 📐  ПАРАМЕТРЫ ИНДИКАТОРОВ (FRAMA / MFI / Andean / UT Bot)
-# Меняют логику сигналов на лету — как и mode/htf, требуют сброса стейта,
-# чтобы warmed_up/bars_since не считались по вперемешку старым/новым окном.
+# 📐  INDICATOR PARAMETERS (FRAMA / MFI / Andean / UT Bot)
+# Change signal logic live — like mode/htf, they require a state reset so
+# warmed_up/bars_since aren't computed against a mixed old/new window.
 # =====================================================================
 _INDICATOR_BOUNDS = {
     "frama_len": ("FRAMA_LEN", int, 5, 100),
@@ -911,7 +921,7 @@ _INDICATOR_BOUNDS = {
 
 
 class IndicatorsIn(BaseModel):
-    # Любое подмножество полей — как partial PATCH. Ключи см. _INDICATOR_BOUNDS.
+    # Any subset of fields — a partial PATCH. See _INDICATOR_BOUNDS for the keys.
     frama_len: Optional[int] = None
     frama_mult: Optional[float] = None
     mfi_len: Optional[int] = None
@@ -931,13 +941,26 @@ class IndicatorsIn(BaseModel):
 async def set_indicators(body: IndicatorsIn):
     updates = body.model_dump(exclude_none=True)
     if not updates:
-        raise HTTPException(400, "Нужно передать хотя бы одно поле")
+        raise HTTPException(400, "At least one field is required")
 
+    # 🆕 FIX: validation and application used to happen in the same loop — if
+    # a PATCH updated several fields and one further down the list failed
+    # bounds validation, the earlier fields had already been applied to
+    # _cfg via setattr() before the exception aborted the request. The
+    # response was an error, but _cfg was left partially mutated (and never
+    # persisted via save_indicators(), which only ran after the loop) —
+    # a silent, inconsistent half-applied state until the next successful
+    # call or a restart. Now every field is validated first; setattr() only
+    # runs once everything has passed.
+    casted = {}
     for key, value in updates.items():
         attr, caster, lo, hi = _INDICATOR_BOUNDS[key]
         if not (lo <= value <= hi):
-            raise HTTPException(400, f"{key} должен быть между {lo} и {hi}")
-        setattr(_cfg, attr, caster(value))
+            raise HTTPException(400, f"{key} must be between {lo} and {hi}")
+        casted[attr] = caster(value)
+
+    for attr, value in casted.items():
+        setattr(_cfg, attr, value)
 
     _cfg.save_indicators({
         "FRAMA_LEN": _cfg.FRAMA_LEN,
@@ -974,7 +997,7 @@ async def set_indicators(body: IndicatorsIn):
 
 
 # =====================================================================
-# 🎨  ЦВЕТА ГРАФИКА — чисто визуальные, стейт сбрасывать не нужно
+# 🎨  CHART COLORS — purely visual, no need to reset state
 # =====================================================================
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -999,20 +1022,29 @@ class ColorsIn(BaseModel):
 async def set_colors(body: ColorsIn):
     updates = body.model_dump(exclude_none=True)
     if not updates:
-        raise HTTPException(400, "Нужно передать хотя бы одно поле")
+        raise HTTPException(400, "At least one field is required")
+
+    # 🆕 FIX: same class of bug as set_indicators() above — validation and
+    # application used to be a single loop, so a later invalid hex color in
+    # a multi-field request left the earlier, already-validated colors
+    # applied to the shared _cfg.CHART_COLORS dict in place, with the request
+    # still failing overall and nothing saved to disk. Validate every color
+    # first, apply only once everything passes.
     for key, value in updates.items():
         if not _HEX_RE.match(value):
-            raise HTTPException(400, f"{key}: цвет должен быть в формате #RRGGBB")
+            raise HTTPException(400, f"{key}: color must be in #RRGGBB format")
+    for key, value in updates.items():
         _cfg.CHART_COLORS[key] = value
+
     _cfg.save_colors(_cfg.CHART_COLORS)
     await broadcast_event({"type": "config_changed", "key": "colors"})
     return _cfg.CHART_COLORS
 
 
 # =====================================================================
-# 🌐  СТАТИКА ФРОНТА (собранный web/dist, см. корневой Dockerfile)
-# Регистрируется ПОСЛЕДНЕЙ: /api/*, /ws/*, /docs и т.д. выше по файлу
-# матчатся первыми, а этот mount ловит всё остальное — index.html и ассеты.
+# 🌐  FRONTEND STATIC ASSETS (built web/dist, see the root Dockerfile)
+# Registered LAST: /api/*, /ws/*, /docs, etc. earlier in the file match
+# first, and this mount catches everything else — index.html and assets.
 # =====================================================================
 import os
 from fastapi.staticfiles import StaticFiles
@@ -1021,5 +1053,5 @@ _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 if os.path.isdir(_STATIC_DIR):
     app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="frontend")
 else:
-    logger.warning(f"[WEB] Static dir not found at {_STATIC_DIR} — фронт не будет отдаваться "
-                    f"(нормально при локальном запуске без сборки web/, посмотри README)")
+    logger.warning(f"[WEB] Static dir not found at {_STATIC_DIR} — the frontend won't be served "
+                    f"(normal for a local run without building web/, see the README)")
