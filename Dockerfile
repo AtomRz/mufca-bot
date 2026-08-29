@@ -1,4 +1,3 @@
-# ── Stage 1: сборка React-фронта ────────────────────────────────────
 FROM node:20-alpine AS frontend
 WORKDIR /web
 COPY web/package.json ./
