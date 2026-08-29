@@ -35,8 +35,8 @@ export default function App() {
     api.getConfig().then(setConfig).catch(() => {})
   }, [])
 
-  // 🆕 CHOP/Trend/Leverage в топ-баре теперь следуют за парой/tf, выбранными на
-  // вкладке Chart, а не за жёстко зашитой "первой парой всегда на 1h"
+  // 🆕 CHOP/Trend/Leverage in the top bar now follow the pair/tf selected on
+  // the Chart tab, instead of a hardcoded "always the first pair on 1h"
   const loadPulse = useCallback(() => {
     if (!chartTicker) return
     api.getPulse(chartTicker, chartTf).then(setPulse).catch(() => {})
@@ -56,9 +56,9 @@ export default function App() {
     loadPulse()
   }, [authenticated, loadPulse])
 
-  // 🆕 loadConfig/loadPulse меняют идентичность при каждом ререндере/смене пары —
-  // держим свежие версии в ref, чтобы WS-эффект ниже не пересоздавал соединение
-  // на каждый клик по паре в Chart, а зависел только от authenticated
+  // 🆕 loadConfig/loadPulse get a new identity on every rerender/pair change —
+  // keep fresh versions in a ref so the WS effect below doesn't recreate the
+  // connection on every pair click in Chart, and only depends on authenticated
   const loadConfigRef = useRef(loadConfig)
   const loadPulseRef = useRef(loadPulse)
   loadConfigRef.current = loadConfig
@@ -78,11 +78,11 @@ export default function App() {
     return disconnect
   }, [authenticated])
 
-  // 🆕 Глобальный хук для Android-приложения (WebView-обёртка): при тапе по
-  // push-уведомлению MainActivity.kt зовёт window.mufcaOpenSignal(ticker, tf, tab)
-  // через evaluateJavascript, чтобы сразу открыть нужный сигнал, а не просто
-  // развернуть дашборд на дефолтной вкладке. В обычном браузере эта функция просто
-  // никогда не вызывается — no-op, безопасно для веб-версии.
+  // 🆕 Global hook for the Android app (WebView wrapper): on tapping a push
+  // notification, MainActivity.kt calls window.mufcaOpenSignal(ticker, tf, tab)
+  // via evaluateJavascript, to open the right signal right away instead of
+  // just expanding the dashboard on the default tab. In a regular browser
+  // this function simply never gets called — a no-op, safe for the web version.
   useEffect(() => {
     window.mufcaOpenSignal = (ticker, tf, tabId) => {
       if (tabId) setTab(tabId)
@@ -92,18 +92,18 @@ export default function App() {
     return () => { delete window.mufcaOpenSignal }
   }, [])
 
-  // 🆕 FIX (Android client): SwipeRefreshLayout решает, разрешать ли
-  // pull-to-refresh, по scrollY самого WebView — но у нас реальный скролл
-  // происходит ВНУТРИ .content (overflow-y: auto), а не на уровне страницы,
-  // так что нативный scrollY всегда остаётся 0, даже когда список
-  // (например History) прокручен вниз. Итог — свайп вверх внутри списка,
-  // возвращающий его к началу, читался нативной стороной как "пользователь
-  // тянет сверху вниз от scrollY=0" и триггерил refresh. В отличие от
-  // графика (там любое касание однозначно принадлежит canvas — своего
-  // нативного скролла у него нет вообще), здесь НАДО учитывать реальную
-  // scrollTop-позицию: блокируем pull-to-refresh, только пока .content
-  // реально прокручен вниз, и сразу отпускаем, как только вернулись к
-  // самому верху — там жест "тянуть вниз" снова легитимен.
+  // 🆕 FIX (Android client): SwipeRefreshLayout decides whether to allow
+  // pull-to-refresh based on the WebView's own scrollY — but our actual
+  // scrolling happens INSIDE .content (overflow-y: auto), not at the page
+  // level, so the native scrollY always stays 0, even when a list (e.g.
+  // History) is scrolled down. The result: swiping up inside the list,
+  // bringing it back to the top, was read by the native side as "the user
+  // is pulling down from scrollY=0" and triggered a refresh. Unlike the
+  // chart (there, any touch unambiguously belongs to the canvas — it has no
+  // native scroll of its own at all), here we DO need to account for the
+  // real scrollTop position: block pull-to-refresh only while .content is
+  // actually scrolled down, and release it as soon as we're back at the
+  // very top — there the "pull down" gesture is legitimate again.
   useEffect(() => {
     const el = contentRef.current
     if (!el) return

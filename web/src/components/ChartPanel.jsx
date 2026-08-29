@@ -41,31 +41,33 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
-  const lastSelectionKeyRef = useRef(null) // 🆕 меняется только при смене ticker/tf/track
+  const lastSelectionKeyRef = useRef(null) // 🆕 only changes on ticker/tf/track change
   const [track, setTrack] = useState('a')
   const [barsLimit, setBarsLimit] = useState(100)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
-  const requestIdRef = useRef(0) // 🆕 для игнорирования устаревших ответов (race condition fix)
+  const requestIdRef = useRef(0) // 🆕 to ignore stale responses (race condition fix)
 
   const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
 
   const load = useCallback(() => {
     if (!ticker) return
-    // 🆕 FIX: при быстром переключении пар (BTC→ETH→SOL) несколько запросов летят
-    // почти одновременно; из-за сетевой изменчивости более РАННИЙ запрос (например
-    // BTC) мог ответить ПОЗЖЕ более позднего (SOL) — .then() из BTC переписал бы
-    // уже показанные корректные данные SOL на устаревшие BTC. Помечаем каждый
-    // запрос номером и применяем только самый свежий.
+    // 🆕 FIX: when quickly switching pairs (BTC→ETH→SOL), several requests
+    // go out almost simultaneously; due to network jitter, the EARLIER
+    // request (e.g. BTC) could respond LATER than a more recent one (SOL) —
+    // BTC's .then() would overwrite the already-shown, correct SOL data with
+    // stale BTC data. Tag each request with a number and only apply the
+    // most recent one.
     const myRequestId = ++requestIdRef.current
-    // 🆕 FIX: индикатор загрузки теперь живёт в топ-баре (рядом с LIVE), а не
-    // отдельным блоком прямо тут — раньше он вставлялся/убирался в потоке
-    // документа над графиком и на каждое обновление сдвигал сам график вверх-вниз.
+    // 🆕 FIX: the loading indicator now lives in the top bar (next to LIVE),
+    // not as a separate block right here — it used to be inserted/removed
+    // in the document flow above the chart and shifted the chart itself up
+    // and down on every update.
     onLoadingChange?.(true)
     api
       .getChart(ticker, tf, track, barsLimit)
       .then((d) => {
-        if (myRequestId !== requestIdRef.current) return // устарел, игнорируем
+        if (myRequestId !== requestIdRef.current) return // stale, ignore
         setData(d)
         setError(null)
       })
@@ -84,16 +86,16 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load])
 
-  // тик сканера / новый сигнал по этой же паре/тф — подтягиваем свежие данные
+  // scanner tick / new signal for this same pair/tf — pull fresh data
   useEffect(() => {
     if (!lastEvent || !ticker) return
     if (lastEvent.type === 'scan_tick') load()
     if (lastEvent.type === 'signal' && lastEvent.ticker === ticker && lastEvent.tf === tf) load()
-    // смена цветов/индикаторов в Settings — перечитать данные (пороги MFI могли измениться)
+    // colors/indicators changed in Settings — reread data (MFI thresholds may have changed)
     if (lastEvent.type === 'config_changed') load()
   }, [lastEvent, ticker, tf, load])
 
-  // init chart один раз
+  // init the chart once
   useEffect(() => {
     if (!containerRef.current || chartRef.current) return
     const chart = createChart(containerRef.current, {
@@ -168,12 +170,12 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       color: '#232c3a',
       priceLineVisible: false,
       lastValueVisible: false,
-      // 🆕 FIX: без этого шкала объёма автомасштабируется по фактическому
-      // мин/макс видимых баров — если в текущем окне зелёного объёма заметно
-      // больше, чем красного (или наоборот), ноль съезжает вверх/вниз внутри
-      // панели вместо того, чтобы оставаться по центру. Форсируем симметричный
-      // диапазон [-maxAbs, +maxAbs], чтобы ноль был зафиксирован по центру
-      // всегда, независимо от перекоса покупок/продаж в видимой области.
+      // 🆕 FIX: without this, the volume scale auto-scales to the actual
+      // min/max of the visible bars — if the current window has noticeably
+      // more green volume than red (or vice versa), zero drifts up/down
+      // within the panel instead of staying centered. Force a symmetric
+      // range [-maxAbs, +maxAbs] so zero is always pinned to the center,
+      // regardless of any buy/sell skew in the visible area.
       autoscaleInfoProvider: (original) => {
         const res = original()
         if (res?.priceRange) {
@@ -183,8 +185,9 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         return res
       },
     })
-    // 🆕 volume и mfi делят одну и ту же зону шкалы (merged pane) — объём фоном,
-    // MFI-линия поверх, вместо двух раздельных полос друг под другом
+    // 🆕 volume and mfi share the same scale zone (merged pane) — volume in
+    // the background, the MFI line on top, instead of two separate strips
+    // stacked under each other
     volume.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 } })
 
     const mfi = chart.addLineSeries({
@@ -204,13 +207,14 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     window.addEventListener('resize', handleResize)
     handleResize()
 
-    // 🆕 FIX (Android client): в Android-приложении WebView обёрнут в
-    // SwipeRefreshLayout — вертикальный свайп по графику конкурировал с
-    // pull-to-refresh за один и тот же жест (то панит график, то случайно
-    // обновляет страницу). Сообщаем нативной стороне (см. MainActivity.kt,
-    // ChartTouchBridge), когда палец реально на графике, чтобы она на это
-    // время отключала SwipeRefreshLayout. window.AndroidChartBridge существует
-    // только внутри Android WebView — в обычном браузере вызовы no-op.
+    // 🆕 FIX (Android client): in the Android app, the WebView is wrapped in
+    // SwipeRefreshLayout — a vertical swipe on the chart competed with
+    // pull-to-refresh for the same gesture (sometimes panning the chart,
+    // sometimes accidentally refreshing the page). We notify the native
+    // side (see MainActivity.kt, ChartTouchBridge) when a finger is
+    // actually on the chart, so it can disable SwipeRefreshLayout for that
+    // duration. window.AndroidChartBridge only exists inside the Android
+    // WebView — in a regular browser these calls are no-ops.
     const notifyChartTouch = (active) => {
       window.AndroidChartBridge?.setChartTouching?.(active)
     }
@@ -226,7 +230,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       el.removeEventListener('touchstart', onTouchStart)
       el.removeEventListener('touchend', onTouchEnd)
       el.removeEventListener('touchcancel', onTouchEnd)
-      notifyChartTouch(false) // на случай размонтирования прямо посреди жеста
+      notifyChartTouch(false) // in case of unmounting right in the middle of a gesture
       chart.remove()
       chartRef.current = null
       seriesRef.current = {}
@@ -234,7 +238,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // цвета поменяли в Settings — перекрашиваем уже созданные серии без пересоздания чарта
+  // colors changed in Settings — recolor already-created series without recreating the chart
   useEffect(() => {
     const s = seriesRef.current
     if (!s.candle) return
@@ -250,27 +254,28 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     s.mfi.applyOptions({ color: C.mfi_line })
   }, [C])
 
-  // заливка данных при их обновлении
+  // populate data when it updates
   useEffect(() => {
     if (!data || !chartRef.current) return
     const s = seriesRef.current
     const times = data.candles.map((c) => c.time)
 
-    // 🆕 запоминаем текущий видимый диапазон ДО обновления данных — иначе
-    // каждый scan_tick/новый сигнал прыгает график к fitContent(), сбивая
-    // скролл/зум, который выставил пользователь
+    // 🆕 remember the current visible range BEFORE updating data — otherwise
+    // every scan_tick/new signal jumps the chart to fitContent(), throwing
+    // off whatever scroll/zoom position the user had set
     const selectionKey = `${ticker}-${tf}-${track}-${barsLimit}`
     const isNewSelection = lastSelectionKeyRef.current !== selectionKey
     const savedRange = isNewSelection ? null : chartRef.current.timeScale().getVisibleLogicalRange()
 
-    // 🆕 FIX: если пользователь руками потянул/зумил ценовую ось (правую шкалу
-    // цены, объёма или MFI), lightweight-charts переводит эту шкалу в ручной
-    // режим (autoScale: false) и перестаёт подстраивать диапазон под новые
-    // данные. При смене ticker/tf setData() подставляет цены другого
-    // инструмента, но шкала остаётся залипшей на диапазоне предыдущей пары —
-    // например BTC (~$65k) → DOGE (~$0.08), свечи оказываются далеко за
-    // пределами видимой области. fitContent() ниже чинит только временную
-    // ось, не ценовую — поэтому нужно явно вернуть autoScale на новой паре.
+    // 🆕 FIX: if the user manually dragged/zoomed a price axis (the right
+    // price scale, volume, or MFI), lightweight-charts switches that scale
+    // into manual mode (autoScale: false) and stops adjusting the range to
+    // new data. On a ticker/tf change, setData() plugs in another
+    // instrument's prices, but the scale stays stuck on the previous pair's
+    // range — e.g. BTC (~$65k) → DOGE (~$0.08), and the candles end up way
+    // outside the visible area. fitContent() below only fixes the time
+    // axis, not the price one — so we need to explicitly restore autoScale
+    // on a new pair.
     if (isNewSelection) {
       s.candle.priceScale().applyOptions({ autoScale: true })
       s.volume.priceScale().applyOptions({ autoScale: true })
@@ -313,10 +318,10 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       )
     }
 
-    // 🆕 S/R теперь полупрозрачные зоны (как supply/demand на TradingView), а не
-    // тонкие пунктирные линии. Baseline-серия заливает область между value и
-    // baseValue цветом topFillColor — то есть между level±halfWidth получаем
-    // ровную горизонтальную полосу на всю ширину графика.
+    // 🆕 S/R are now semi-transparent zones (like supply/demand on
+    // TradingView), not thin dashed lines. A Baseline series fills the area
+    // between value and baseValue with topFillColor — meaning between
+    // level±halfWidth we get an even horizontal band across the full chart width.
     ;[...s.srLines, ...s.srZones, ...s.tradeLines].forEach((line) => {
       try { s.candle.removePriceLine(line) } catch (_) {}
       try { chartRef.current.removeSeries(line) } catch (_) {}
@@ -326,7 +331,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     s.tradeLines = []
 
     const srZone = (level, color) => {
-      const halfWidth = level * 0.0012 // ~0.12% каждая сторона — подстраивается ниже
+      const halfWidth = level * 0.0012 // ~0.12% each side — tuned below
       const zone = chartRef.current.addBaselineSeries({
         baseValue: { type: 'price', price: level - halfWidth },
         topLineColor: 'transparent',
@@ -365,8 +370,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         }))
       }
 
-      // 🆕 маркер сигнала на баре входа — раньше signal_bar_time всегда был null
-      // из-за бага с именем поля в chart_data.py (entry_time_ms vs bar_opened_time)
+      // 🆕 signal marker on the entry bar — signal_bar_time used to always be
+      // null because of a field-name bug in chart_data.py (entry_time_ms vs bar_opened_time)
       if (t.signal_bar_time) {
         const isLong = t.side === 'long'
         s.candle.setMarkers([{
@@ -383,7 +388,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       s.candle.setMarkers([])
     }
 
-    // 🆕 восстанавливаем позицию вместо сброса к fitContent на каждое обновление
+    // 🆕 restore the position instead of resetting to fitContent on every update
     if (isNewSelection || !savedRange) {
       chartRef.current.timeScale().fitContent()
     } else {

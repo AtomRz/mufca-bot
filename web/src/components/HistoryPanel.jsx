@@ -24,11 +24,12 @@ function fmtPct(v) {
 function fmtDate(ts) {
   if (!ts) return '—'
   try {
-    // 🆕 FIX: записи бэктеста до этого фикса хранили timestamp как строку цифр
-    // ("1721260800000" — эпоха в мс), а не ISO. new Date("1721260800000")
-    // парсит СТРОКУ как формат даты (не как число), не распознаёт такой паттерн
-    // и даёт Invalid Date. new Date(1721260800000) с тем же значением как Number
-    // работает правильно — поэтому явно приводим чисто-числовые строки к Number.
+    // 🆕 FIX: backtest records from before this fix stored the timestamp as
+    // a string of digits ("1721260800000" — epoch in ms), not ISO.
+    // new Date("1721260800000") parses the STRING as a date format (not as
+    // a number), doesn't recognize this pattern, and gives Invalid Date.
+    // new Date(1721260800000) with the same value as a Number works
+    // correctly — so explicitly convert purely-numeric strings to Number.
     const value = typeof ts === 'string' && /^\d+$/.test(ts) ? Number(ts) : ts
     const d = new Date(value)
     if (isNaN(d.getTime())) return ts

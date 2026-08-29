@@ -1,13 +1,14 @@
 const BASE = ''
 const AUTH_KEY = 'mufca_auth_token'
 
-// 🆕 localStorage вместо sessionStorage — токен переживает перезапуск WebView-процесса.
-// Это осознанный компромисс ради Android-приложения: WebView не гарантирует, что
-// sessionStorage доживёт до следующего холодного старта (Android может убить процесс
-// в фоне), значит без этого пришлось бы логиниться заново при каждом открытии
-// приложения. Для персонального дашборда за Basic Auth + Cloudflare Tunnel на своём же
-// телефоне это приемлемый риск (тот же trade-off, что у любого обычного мобильного
-// приложения с сохранённой сессией).
+// 🆕 localStorage instead of sessionStorage — the token survives a restart
+// of the WebView process. This is a deliberate trade-off for the Android
+// app: WebView doesn't guarantee sessionStorage survives to the next cold
+// start (Android can kill the process in the background), so without this
+// you'd have to log in again every time the app opens. For a personal
+// dashboard behind Basic Auth + Cloudflare Tunnel on your own phone this is
+// an acceptable risk (the same trade-off any regular mobile app with a
+// saved session makes).
 export function getAuthToken() {
   return localStorage.getItem(AUTH_KEY)
 }
@@ -20,9 +21,10 @@ export function clearAuthToken() {
   localStorage.removeItem(AUTH_KEY)
 }
 
-/** Пробует залогиниться — делает реальный запрос к /api/config с этими кредами.
- * Если WEB_USERNAME/WEB_PASSWORD не заданы на бэкенде, auth там выключен и это
- * всегда успешно независимо от введённых значений — так и задумано. */
+/** Tries to log in — makes a real request to /api/config with these
+ * credentials. If WEB_USERNAME/WEB_PASSWORD aren't set on the backend, auth
+ * is disabled there and this always succeeds regardless of the values
+ * entered — that's intentional. */
 export async function login(username, password) {
   const token = btoa(`${username}:${password}`)
   const res = await fetch(`${BASE}/api/config`, {
@@ -43,7 +45,7 @@ async function request(path, options = {}) {
 
   if (res.status === 401) {
     clearAuthToken()
-    window.location.reload() // покажет форму логина заново
+    window.location.reload() // will show the login form again
     throw new Error('Session expired')
   }
   if (!res.ok) {
@@ -112,24 +114,25 @@ export const api = {
 }
 
 /**
- * Хук-обёртка для /ws/live. Переподключается с бэкоффом,
- * зовёт onEvent для каждого JSON-события от бота (сигнал/тик сканера/смена конфига).
+ * Hook-style wrapper for /ws/live. Reconnects with backoff, calls onEvent
+ * for every JSON event from the bot (signal / scanner tick / config change).
  *
- * 🆕 Раньше в URL WebSocket-подключения шёл сырой base64(login:password) —
- * единственный способ передать креды на WS-хендшейк, так как браузерный
- * WebSocket API не умеет кастомные заголовки. Проблема: всё, что в query-параметре
- * URL, обычно попадает в access-логи сервера (и потенциально Cloudflare) открытым
- * текстом — постоянный пароль, который живёт там вечно. Теперь вместо этого
- * сначала получаем короткоживущий (30 сек) одноразовый тикет через обычный
- * авторизованный fetch (креды — в заголовке, заголовки в access-логи не пишутся),
- * и уже с этим тикетом открываем WS. Даже если тикет попадёт в логи — он
- * бесполезен уже через полминуты или сразу после использования.
+ * 🆕 The WebSocket connection URL used to carry the raw base64(login:password) —
+ * the only way to pass credentials to a WS handshake, since the browser
+ * WebSocket API can't set custom headers. The problem: anything in a URL
+ * query parameter usually ends up in the server's (and potentially
+ * Cloudflare's) access logs in plain text — a permanent password that lives
+ * there forever. Now we instead first get a short-lived (30 sec), single-use
+ * ticket via a normal authorized fetch (credentials go in a header, headers
+ * aren't written to access logs), and open the WS with that ticket. Even if
+ * the ticket ends up in the logs, it's worthless after half a minute, or
+ * immediately after being used.
  */
 export function connectLive(onEvent, onStatusChange) {
   let ws = null
   let closed = false
   let attempt = 0
-  let timeoutId = null // 🆕 отслеживаем, чтобы чистить при повторных onclose/cleanup
+  let timeoutId = null // 🆕 tracked so it can be cleared on a repeated onclose/cleanup
 
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
 
@@ -152,7 +155,7 @@ export function connectLive(onEvent, onStatusChange) {
   async function connect() {
     if (closed) return
     const ticket = await getTicket()
-    if (closed) return // на случай если logout произошёл, пока ждали тикет
+    if (closed) return // in case logout happened while we were waiting for the ticket
     const url = `${proto}://${window.location.host}/ws/live${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`
     ws = new WebSocket(url)
     ws.onopen = () => {

@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react'
 
-// Короткие подписи под лампочками.
+// Short labels shown under the lamps.
 const SIGNAL_LABELS = { mfi: 'MFI', andean: 'AND', ut_bot: 'UT' }
 const FILTER_LABELS = {
   frama: 'FRAMA',
@@ -13,16 +13,17 @@ const FILTER_LABELS = {
 }
 
 /**
- * 🆕 Лампочки сигналов (MFI/Andean/UT Bot) и фильтров в топ-баре.
+ * 🆕 Signal (MFI/Andean/UT Bot) and filter lamps in the top bar.
  *
- * Логика идентична signals.check_signals (см. app/chart_data.py get_market_pulse) —
- * фронт тут только красит то, что уже посчитал бэкенд, никакой своей интерпретации
- * сигналов не добавляет.
+ * The logic is identical to signals.check_signals (see app/chart_data.py's
+ * get_market_pulse) — the frontend here only colors what the backend already
+ * computed, it doesn't add any interpretation of the signals of its own.
  *
- * Направление фильтров ("какой фильтр против сигнала") определяется по большинству
- * голосов среди самих сигнальных лампочек (MFI/Andean/UT Bot), а не по общему тренду
- * FRAMA в топ-баре — если MFI и Andean оба сейчас "бычьи", фильтры красятся по long,
- * даже если общий тренд ещё bearish.
+ * Filter direction ("which filter is against the signal") is determined by a
+ * majority vote among the signal lamps themselves (MFI/Andean/UT Bot), not
+ * by the overall FRAMA trend in the top bar — if MFI and Andean are both
+ * currently "bullish", the filters are colored for long, even if the
+ * overall trend is still bearish.
  */
 export default function SignalLamps({ lamps }) {
   const candidateDir = useMemo(() => {
@@ -79,9 +80,9 @@ function FilterDot({ label, filter, candidateDir }) {
   if (filter.value !== undefined) {
     title += ` (${filter.value}${filter.threshold !== undefined ? ` / threshold ${filter.threshold}` : ''})`
   } else if (filter.value_long !== undefined || filter.value_short !== undefined) {
-    // 🆕 R:R лампочка: риск/прибыль разные для long и short, единого value нет —
-    // показываем значение под текущее направление свечей (candidateDir), а если
-    // направления пока нет — оба сразу.
+    // 🆕 R:R lamp: risk/reward differ for long and short, there's no single
+    // value — show the value for the current candle direction (candidateDir),
+    // and if there's no direction yet, show both at once.
     const thresholdSuffix = filter.threshold !== undefined ? ` / min ${filter.threshold}` : ''
     if (candidateDir === 'long') {
       title += ` (${filter.value_long}${thresholdSuffix})`

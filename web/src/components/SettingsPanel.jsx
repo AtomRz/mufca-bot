@@ -21,8 +21,8 @@ function Toggle({ checked, onChange, disabled }) {
   )
 }
 
-// Проверяет всю цепочку Android push разом: сервер → Firebase → устройство,
-// вместо того чтобы ждать реального сигнала для проверки.
+// Checks the whole Android push pipeline at once: server → Firebase → device,
+// instead of waiting for a real signal to test it.
 function PushPanel({ busy, run }) {
   const [devices, setDevices] = useState(null)
   const [result, setResult] = useState(null)
@@ -90,9 +90,10 @@ function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, on
         onBlur={(e) => {
           const v = step === 1 ? parseInt(e.target.value, 10) : parseFloat(e.target.value)
           if (Number.isNaN(v)) return
-          // 🆕 FIX: клиентская проверка диапазона — сервер валидирует то же самое
-          // (это не единственная защита), но лучше сказать пользователю сразу,
-          // а не заставлять ждать round-trip к серверу ради очевидной ошибки
+          // 🆕 FIX: client-side range check — the server validates the same
+          // thing (this isn't the only protection), but it's better to tell
+          // the user right away instead of making them wait for a round
+          // trip to the server for an obvious mistake
           if (v < min || v > max) {
             setWarn(`Must be between ${min} and ${max}`)
             e.target.value = value
@@ -132,10 +133,10 @@ export default function SettingsPanel({ config, onChanged }) {
   const [newPair, setNewPair] = useState('')
   const [chopDraft, setChopDraft] = useState({})
 
-  // 🆕 FIX: если config обновился ИЗВНЕ (WS-событие config_changed от другого
-  // клиента — например Android-приложение поменяло CHOP, пока открыт веб), любой
-  // несохранённый локальный черновик становится враньём — показывает то, что
-  // пользователь когда-то начал печатать, а не актуальное значение с сервера.
+  // 🆕 FIX: if config was updated FROM OUTSIDE (a WS config_changed event
+  // from another client — e.g. the Android app changed CHOP while the web
+  // was open), any unsaved local draft becomes a lie — it shows whatever
+  // the user once started typing, not the actual current value from the server.
   useEffect(() => {
     setChopDraft({})
   }, [config])
@@ -193,7 +194,7 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="field">
-              <label title="Куда переносить SL после закрытия 50% на TP1">SL after TP1</label>
+              <label title="Where to move SL after closing 50% at TP1">SL after TP1</label>
               <select
                 value={config.tp1_sl_mode}
                 disabled={busy === 'tp1_sl_mode'}
@@ -352,10 +353,10 @@ export default function SettingsPanel({ config, onChanged }) {
                     title="Remove pair"
                     onClick={() => {
                       if (!window.confirm(`Stop tracking ${p}?`)) return
-                      // Аналог Discord !remove vs !delsignals: убрать из
-                      // сканирования можно с сохранением накопленной
-                      // адаптивной TP/SL-статистики (на случай возврата пары)
-                      // или полностью стереть её историю сигналов.
+                      // Equivalent of Discord's !remove vs !delsignals: can
+                      // stop scanning while keeping the accumulated adaptive
+                      // TP/SL statistics (in case the pair comes back), or
+                      // fully wipe its signal history.
                       const purge = window.confirm(
                         `Also delete accumulated signal history for ${p}? This cannot be undone.\n\nOK — delete history\nCancel — keep history (in case you re-add ${p} later)`
                       )
