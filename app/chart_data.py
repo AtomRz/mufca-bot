@@ -1,8 +1,9 @@
 """
 MUFCA v4.0 — Chart Data (JSON)
-То же, что считает chart.py для PNG (!chart в Discord), но без matplotlib —
-отдаёт JSON для веб-морды. Использует ТЕ ЖЕ функции индикаторов, что и
-chart.py/indicators.py, чтобы цифры на сайте 1-в-1 совпадали с картинкой в Discord.
+The same thing chart.py computes for the PNG (Discord's !chart), but without
+matplotlib — returns JSON for the web dashboard. Uses the SAME indicator
+functions as chart.py/indicators.py, so the numbers on the site match the
+Discord image 1-to-1.
 """
 
 import logging
@@ -22,10 +23,10 @@ from indicators import (
     calculate_atr,
 )
 from chart import calc_bollinger_bands, calc_support_resistance
-# 🆕 Лампочки сигналов/фильтров в топ-баре: те же crossover/bars_since хелперы
-# и get_htf_bias, что использует signals.check_signals — переиспользуем 1-в-1,
-# чтобы лампочки на UI ТОЧНО совпадали с логикой, которая реально решает,
-# откроется сделка или нет (никакой отдельной "своей" копии условий).
+# 🆕 Signal/filter lamps in the top bar: reuses the exact same crossover/
+# bars_since helpers and get_htf_bias that signals.check_signals uses, so the
+# UI lamps match EXACTLY the logic that actually decides whether a trade
+# opens or not (no separate "own" copy of the conditions).
 from signals import (
     crossover,
     crossunder,
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 def _series_to_list(s: pd.Series, limit: int) -> List[Optional[float]]:
-    """pandas Series -> список float, NaN -> None (JSON не умеет в NaN)."""
+    """pandas Series -> list of floats, NaN -> None (JSON has no NaN)."""
     tail = s.tail(limit)
     out = []
     for v in tail.values:
@@ -65,29 +66,29 @@ async def get_chart_data(
     state_snapshot: Optional[dict] = None,
 ) -> Dict:
     """
-    Аналог chart.generate_chart(), но возвращает JSON вместо PNG.
+    Equivalent to chart.generate_chart(), but returns JSON instead of a PNG.
 
-    Возвращает свечи + все оверлеи (FRAMA channel, BB, S/R, MFI + kmeans-пороги)
-    ровно за один fetch OHLCV — никакого дублирующего пересчёта.
+    Returns candles + all overlays (FRAMA channel, BB, S/R, MFI + kmeans
+    thresholds) from exactly one OHLCV fetch — no duplicate recomputation.
     """
-    # 🆕 FIX: раньше fetch_limit был max(limit+250, 300) — окно поиска S/R
-    # пивотов масштабировалось вместе с выбранным на UI barsLimit (100/200/
-    # 300/500 bars). calc_support_resistance() ищет локальные экстремумы по
-    # ВСЕМУ полученному df, а не только по отображаемому хвосту — значит на
-    # маленьком barsLimit уровень, сформированный дальше вглубь истории,
-    # физически не попадал в выборку кандидатов и не мог быть найден, а не
-    # просто "не показывался". Теперь окно поиска S/R не зависит от того,
-    # сколько баров пользователь решил показать — FRAMA/MFI/BB не меняются от
-    # более глубокого фетча (каузальные индикаторы, хвост уже сходится и на
-    # старом минимуме), меняется только стабильность найденных уровней.
+    # 🆕 FIX: fetch_limit used to be max(limit+250, 300) — the S/R pivot
+    # search window scaled together with the UI's selected barsLimit (100/
+    # 200/300/500 bars). calc_support_resistance() looks for local extremes
+    # across the WHOLE fetched df, not just the displayed tail — meaning at
+    # a small barsLimit, a level formed deeper in history was physically
+    # unreachable in the candidate sample, not just "not shown". Now the S/R
+    # search window doesn't depend on how many bars the user chose to
+    # display — FRAMA/MFI/BB don't change with a deeper fetch (causal
+    # indicators, the tail already converges even from an older starting
+    # point), only the stability of the found levels changes.
     fetch_limit = max(limit + 250, 300, config.SR_MIN_LOOKBACK)
     bars = await safe_fetch_ohlcv(exchange, symbol, timeframe, limit=fetch_limit)
     df = parse_ohlcv(bars)
 
     if not validate_dataframe(df, min_rows=50):
-        raise ValueError(f"Недостаточно данных для {symbol} {timeframe}")
+        raise ValueError(f"Not enough data for {symbol} {timeframe}")
 
-    # ── Индикаторы — те же вызовы, что в chart.generate_chart() ────────
+    # ── Indicators — the same calls as in chart.generate_chart() ────────
     frama_s, frama_u, frama_l, _ = calculate_frama(
         df, length=config.FRAMA_LEN, mult=config.FRAMA_MULT
     )
@@ -101,7 +102,7 @@ async def get_chart_data(
 
     candles = [
         {
-            "time": int(row.timestamp // 1000),  # unix seconds — под lightweight-charts
+            "time": int(row.timestamp // 1000),  # unix seconds — for lightweight-charts
             "open": round(float(row.open), 8),
             "high": round(float(row.high), 8),
             "low": round(float(row.low), 8),
@@ -128,24 +129,25 @@ async def get_chart_data(
         "resistance": sr["resistance"],
     }
 
-    # ── Активная сделка (если передан state_snapshot из !status/state) ──
+    # ── Active trade (if state_snapshot was passed from !status/state) ──
     if state_snapshot:
-        # 🆕 FIX: ключ в trade dict называется bar_opened_time (см. signals.py),
-        # а не entry_time_ms — из-за этого signal_bar_time всегда был None и
-        # маркер сигнала на графике никогда не мог отрисоваться.
+        # 🆕 FIX: the key in the trade dict is called bar_opened_time (see
+        # signals.py), not entry_time_ms — because of this, signal_bar_time
+        # was always None and the signal marker on the chart could never render.
         bar_opened_time_ms = state_snapshot.get("bar_opened_time")
         signal_bar_time = None
         if bar_opened_time_ms is not None:
             try:
                 ts_arr = df["timestamp"].values
                 closest_i = int(np.argmin(np.abs(ts_arr - float(bar_opened_time_ms))))
-                # 🆕 FIX: если сделка открылась раньше видимого на графике диапазона
-                # (например limit=150 баров, а вход был 300 баров назад), argmin всё
-                # равно найдёт "ближайший" бар — обычно самый первый на графике,
-                # что рисует маркер в заведомо неверном месте. Проверяем реальную
-                # близость по времени (в пределах 1.5 интервала бара); если сделка
-                # реально за пределами видимого окна — не рисуем маркер вообще,
-                # вместо того чтобы врать о его местоположении.
+                # 🆕 FIX: if the trade opened earlier than the chart's
+                # visible range (e.g. limit=150 bars, but the entry was 300
+                # bars ago), argmin will still find the "closest" bar —
+                # usually the chart's very first one — drawing the marker in
+                # a definitely wrong spot. Check the real time proximity
+                # (within 1.5 bar intervals); if the trade is genuinely
+                # outside the visible window, don't draw a marker at all,
+                # instead of lying about its location.
                 bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0
                 actual_diff = abs(ts_arr[closest_i] - float(bar_opened_time_ms))
                 if bar_interval_ms <= 0 or actual_diff <= bar_interval_ms * 1.5:
@@ -168,25 +170,27 @@ async def get_chart_data(
 
 async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optional[Dict] = None) -> Dict:
     """
-    Лёгкая сводка для верхней плашки дашборда: текущий CHOP, направление FRAMA
-    (тренд) и грубая informational-оценка leverage — та же формула, что в
-    signals.py check_signals (frama_sl_long/short + TARGET_RISK_DEP), но это
-    ТОЛЬКО индикативное число для UI, реальный sizing она не определяет
-    (см. комментарий в signals.py рядом с sugg_lev).
+    Lightweight summary for the dashboard's top bar: current CHOP, FRAMA
+    direction (trend), and a rough informational leverage estimate — the
+    same formula as in signals.py's check_signals (frama_sl_long/short +
+    TARGET_RISK_DEP), but this is ONLY an indicative number for the UI, it
+    doesn't determine actual sizing (see the comment in signals.py next to
+    sugg_lev).
     """
-    # 🆕 limit=900 (а не 300) — как в signals.check_signals: run_kmeans_mfi
-    # тренируется на MFI_TRAINING (по умолчанию 800) баров, и уровни
-    # перекупленности/перепроданности на меньшей истории будут другими —
-    # лампочки должны совпадать с реальным ботом, а не быть "похожими".
+    # 🆕 limit=900 (not 300) — same as signals.check_signals: run_kmeans_mfi
+    # trains on MFI_TRAINING (800 by default) bars, and the overbought/
+    # oversold levels on a shorter history would come out different — the
+    # lamps need to match the real bot, not just "look similar".
     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=900)
     df = parse_ohlcv(bars)
-    if not validate_dataframe(df, min_rows=50):
-        raise ValueError(f"Недостаточно данных для {ticker} {tf}")
 
-    # idx как позитивный целочисленный индекс (не -2!) — bars_since_* хелперы
-    # из signals.py делают range(idx, idx-lookback-1, -1), с отрицательным idx
-    # это была бы пустая/сломанная последовательность.
-    idx = len(df) - 2  # последний подтверждённый бар — как везде в сигналах
+    if not validate_dataframe(df, min_rows=50):
+        raise ValueError(f"Not enough data for {ticker} {tf}")
+
+    # idx as a positive integer index (not -2!) — the bars_since_* helpers
+    # from signals.py do range(idx, idx-lookback-1, -1); with a negative idx
+    # that would be an empty/broken sequence.
+    idx = len(df) - 2  # the last confirmed bar — same as everywhere else in signals
     close_v = float(df["close"].iloc[idx])
 
     chop_s = calculate_chop(df, length=config.CHOP_LENGTH)
@@ -218,11 +222,11 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
         atr_pct_v = 0.0
 
     # =====================================================================
-    # 🆕 ЛАМПОЧКИ СИГНАЛОВ И ФИЛЬТРОВ (для топ-бара)
-    # Логика 1-в-1 из signals.check_signals — просто без чтения/записи
-    # торгового state (позиции/кулдауны здесь не учитываются, это только
-    # индикация "что сейчас говорят индикаторы и фильтры", а не "откроется
-    # ли сделка на самом деле").
+    # 🆕 SIGNAL AND FILTER LAMPS (for the top bar)
+    # Logic 1-to-1 from signals.check_signals — just without reading/writing
+    # trading state (positions/cooldowns aren't factored in here, this is
+    # only an indication of "what the indicators and filters are currently
+    # saying", not "will a trade actually open").
     # =====================================================================
     htf_bias = await get_htf_bias(exchange, ticker, tf)
     htf_bull = htf_bias == 1
@@ -250,13 +254,13 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
             return "bear"
         return "neutral"
 
-    # MFI/Andean лампочки "держатся" bars_since <= LOOKBACK — как в самом
-    # confirm_long_a/confirm_short_a, а не только на баре самого пересечения.
+    # MFI/Andean lamps "hold" while bars_since <= LOOKBACK — same as
+    # confirm_long_a/confirm_short_a itself, not just on the crossover bar.
     mfi_lamp = _lamp_state(bs_mfi_bull <= config.LOOKBACK, bs_mfi_bear <= config.LOOKBACK)
     and_lamp = _lamp_state(bs_and_bull <= config.LOOKBACK, bs_and_bear <= config.LOOKBACK)
 
-    # UT Bot реально триггерится только на своём баре (нет "окна" в самой
-    # торговой логике) — лампочка честно гаснет уже на следующем баре.
+    # UT Bot genuinely only triggers on its own bar (no "window" in the
+    # actual trading logic) — the lamp honestly goes out on the very next bar.
     ut_lamp = _lamp_state(bool(ut_buy.iloc[idx]), bool(ut_sell.iloc[idx]))
 
     frama_slope = float(frama_s.iloc[idx]) - float(frama_s.iloc[idx - 1])
@@ -279,14 +283,14 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
     liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
-    # 🆕 R:R ЛАМПОЧКА — часто самый незаметный "тихий" отказ: MFI/Andean дают
-    # confluence, все фильтры зелёные, но open_position() всё равно молча
-    # отклоняет сигнал, потому что reward/risk < MIN_RR (см. [FILTER] skipped
-    # в логах). Считаем R:R ТЕМИ ЖЕ функциями и в том же порядке, что и
-    # open_position() (calculate_adaptive_sl → calculate_combined_tp →
-    # apply_onchain_with_safety), отдельно для long и short — независимо от
-    # того, есть ли сейчас реальный confluence сигнал, чтобы было видно
-    # заранее, не только в момент отклонения.
+    # 🆕 R:R LAMP — often the most invisible "silent" rejection: MFI/Andean
+    # give confluence, every filter is green, but open_position() still
+    # silently rejects the signal because reward/risk < MIN_RR (see [FILTER]
+    # skipped in the logs). We compute R:R with the SAME functions and in the
+    # same order as open_position() (calculate_adaptive_sl →
+    # calculate_combined_tp → apply_onchain_with_safety), separately for long
+    # and short — regardless of whether there's a real confluence signal
+    # right now, so it's visible in advance, not only at the moment of rejection.
     atr_regime_pct = atr_pct_v
     regime = "CHAOS" if atr_regime_pct > config.ATR_MAX else "TREND" if atr_regime_pct > config.ATR_MIN * 1.5 else "NORMAL"
 
@@ -311,10 +315,10 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
         logger.warning(f"[PULSE] {ticker} {tf} R:R calc failed: {e}")
         rr_long = rr_short = None
 
-    # pass_long/pass_short повторяют ИМЕННО формулы filter_long/filter_short
-    # из signals.py — включая то, что там liq_sweep_short блокирует LONG, а
-    # liq_sweep_long блокирует SHORT (так в реальной торговой логике, это не
-    # опечатка контроля качества — лампочка обязана показывать как есть).
+    # pass_long/pass_short mirror EXACTLY the filter_long/filter_short
+    # formulas from signals.py — including the fact that liq_sweep_short
+    # blocks LONG there, and liq_sweep_long blocks SHORT (that's how the
+    # real trading logic works, not a QA typo — the lamp has to show it as-is).
     lamps = {
         "mfi":    {"kind": "signal", "state": mfi_lamp},
         "andean": {"kind": "signal", "state": and_lamp},
@@ -354,7 +358,7 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
                 "pass_short": not liq_sweep_long,
             },
             "rr": {
-                "enabled": True,  # это жёсткий гейт в open_position(), не выключаемый флагом
+                "enabled": True,  # this is a hard gate in open_position(), not toggleable by a flag
                 "pass_long": rr_long is not None and rr_long >= config.MIN_RR,
                 "pass_short": rr_short is not None and rr_short >= config.MIN_RR,
                 "value_long": rr_long,

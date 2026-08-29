@@ -1,7 +1,7 @@
 """
 MUFCA v4.0 — Chart Module
-Генерация свечных графиков с индикаторами для Discord.
-Команда: !chart [PAIR] [TIMEFRAME] [LIMIT]
+Generates candlestick charts with indicators for Discord.
+Command: !chart [PAIR] [TIMEFRAME] [LIMIT]
 """
 
 import io
@@ -17,11 +17,12 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from typing import Optional, Tuple, List, Dict
 import config as _cfg
+from utils import format_price
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────
-# 🎨  ТЕМА
+# 🎨  THEME
 # ─────────────────────────────────────────────────────────────────────
 THEME = {
     "bg":         "#0d1117",
@@ -52,7 +53,7 @@ THEME = {
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# 📐  ИНДИКАТОРЫ ДЛЯ ГРАФИКА
+# 📐  CHART INDICATORS
 # ─────────────────────────────────────────────────────────────────────
 
 def calc_bollinger_bands(
@@ -74,22 +75,22 @@ def calc_support_resistance(
     max_levels: int = 4
 ) -> Dict[str, List[float]]:
     """
-    Уровни поддержки/сопротивления:
-    - Pivot Points (локальные min/max)
-    - Round Numbers (круглые уровни)
+    Support/resistance levels:
+    - Pivot Points (local min/max)
+    - Round Numbers (round-number levels)
 
     Returns dict: {"support": [...], "resistance": [...], "pivot": [...]}
     """
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    last_close = float(close.iloc[-2])  # подтверждённый бар
+    last_close = float(close.iloc[-2])  # confirmed bar
 
     supports: List[float] = []
     resistances: List[float] = []
     pivots: List[float] = []
 
-    # 1. Pivot Points (локальные экстремумы)
+    # 1. Pivot Points (local extremes)
     w = pivot_window
     for i in range(w, len(df) - w):
         hi_window = high.iloc[i - w:i + w + 1]
@@ -99,27 +100,29 @@ def calc_support_resistance(
         if low.iloc[i] == lo_window.min():
             supports.append(float(low.iloc[i]))
 
-    # Фильтруем — оставляем только вблизи текущей цены
+    # Filter — keep only levels near the current price
     def near_price(levels, price, pct=0.05):
         return [l for l in levels if abs(l - price) / price < pct]
 
-    # 🆕 FIX: направление (resistance выше цены / support ниже) теперь
-    # фильтруется ДО отбора топ-N ближайших, не после. Раньше _cluster_levels
-    # мог занять все max_levels слотов кандидатами, которые всё равно
-    # отсеются финальным фильтром направления — например, после резкого
-    # пробоя вверх большинство исторических resistance-пивотов оказываются
-    # НИЖЕ текущей цены (уже пробиты), и если они ближе по расстоянию, они
-    # вытесняют немногочисленные оставшиеся уровни ВЫШЕ цены, оставляя
-    # resistance пустым, хотя реальные уровни сопротивления есть — просто
-    # чуть дальше по цене, чем уже пробитые.
+    # 🆕 FIX: direction filtering (resistance above price / support below
+    # price) now happens BEFORE selecting the top-N nearest, not after.
+    # Before, _cluster_levels could fill all max_levels slots with
+    # candidates that would just get filtered out by the final direction
+    # check anyway — e.g. after a sharp breakout upward, most historical
+    # resistance pivots end up BELOW the current price (already broken
+    # through), and if they're closer by distance, they'd crowd out the few
+    # remaining levels ABOVE the price, leaving resistance empty even though
+    # real resistance levels exist — just a bit farther out in price than
+    # the already-broken ones.
     resistances = [l for l in resistances if l > last_close]
     supports = [l for l in supports if l < last_close]
 
-    # 🆕 FIX: раньше при отборе max_levels из кластеров сортировали по близости к
-    # МЕДИАНЕ набора кандидатов, а не к текущей цене — в результате реально близкие
-    # к цене (и потому самые торгуемо-релевантные) уровни могли отсеиваться в пользу
-    # более "типичных для выборки", но далёких от цены. Теперь сортируем по
-    # близости к last_close — ближайшие уровни всегда в приоритете.
+    # 🆕 FIX: when selecting max_levels from clusters, sorting used to be by
+    # closeness to the MEDIAN of the candidate set, not to the current
+    # price — as a result, levels genuinely close to price (and therefore
+    # the most trading-relevant) could get filtered out in favor of ones
+    # more "typical of the sample" but far from price. Now sorted by
+    # closeness to last_close — the nearest levels are always prioritized.
     supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels, last_close)
     resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels, last_close)
 
@@ -131,7 +134,7 @@ def calc_support_resistance(
 
 
 def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: float = 0.005) -> List[float]:
-    """Кластеризует близкие уровни, оставляет до max_n БЛИЖАЙШИХ к ref_price (текущей цене)."""
+    """Clusters nearby levels, keeps up to max_n CLOSEST to ref_price (the current price)."""
     if not levels:
         return []
     levels = sorted(set(levels))
@@ -154,7 +157,7 @@ def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: floa
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 🏗️  ПОСТРОЕНИЕ ГРАФИКА
+# 🏗️  CHART CONSTRUCTION
 # ─────────────────────────────────────────────────────────────────────
 
 def build_chart(
@@ -172,25 +175,26 @@ def build_chart(
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     signal_side: Optional[str] = None,  # "long" | "short"
-    signal_bar_offset: int = -2,        # смещение бара сигнала ОТ КОНЦА отображаемого df
+    signal_bar_offset: int = -2,        # signal bar offset FROM THE END of the displayed df
     limit: int = 50,
 ) -> io.BytesIO:
     """
-    Строит полный свечной график и возвращает BytesIO PNG.
+    Builds the full candlestick chart and returns a BytesIO PNG.
 
-    Панели:
-      [0] Свечи + FRAMA + BB + S/R + Entry/TP/SL + сигнальные стрелки
-      [1] Объём
-      [2] KMeans MFI (если передан)
+    Panels:
+      [0] Candles + FRAMA + BB + S/R + Entry/TP/SL + signal arrows
+      [1] Volume
+      [2] KMeans MFI (if provided)
 
-    🆕 FIX: signal_bar раньше был "абсолютным индексом в оригинальном df до
-    tail()", который вызывающий код (bot.py) считал от СВОЕГО df (limit=100),
-    а generate_chart внутри делает СВОЙ независимый fetch (limit≈300+). Индексы
-    двух разных серий не совпадали, и стрелка почти всегда улетала в начало
-    графика (clamp в 0). Теперь signal_bar_offset — это смещение ОТ КОНЦА уже
-    отображаемого (tail-нутого) df, не зависящее от того, сколько баров и как
-    было исходно нафетчено. По правилам бота сигнал всегда формируется на
-    последнем подтверждённом закрытом баре (iloc[-2]), поэтому дефолт -2.
+    🆕 FIX: signal_bar used to be an "absolute index into the original df
+    before tail()", which the calling code (bot.py) computed against ITS OWN
+    df (limit=100), while generate_chart internally does its OWN independent
+    fetch (limit≈300+). The indices from the two different series didn't
+    line up, and the arrow almost always ended up flying to the start of the
+    chart (clamped to 0). Now signal_bar_offset is an offset FROM THE END of
+    the already-displayed (tail-ed) df, independent of how many bars were
+    originally fetched or how. Per the bot's rules a signal always forms on
+    the last confirmed closed bar (iloc[-2]), so the default is -2.
     """
     df = df.tail(limit).copy().reset_index(drop=True)
     n = len(df)
@@ -212,8 +216,8 @@ def build_chart(
             hspace=0.04, left=0.06, right=0.95, top=0.93, bottom=0.07
         )
 
-    ax_c = fig.add_subplot(gs[0])  # свечи
-    ax_v = fig.add_subplot(gs[1], sharex=ax_c)  # объём
+    ax_c = fig.add_subplot(gs[0])  # candles
+    ax_v = fig.add_subplot(gs[1], sharex=ax_c)  # volume
     ax_m = fig.add_subplot(gs[2], sharex=ax_c) if has_mfi else None
 
     for ax in ([ax_c, ax_v] + ([ax_m] if ax_m else [])):
@@ -230,9 +234,9 @@ def build_chart(
     tick_positions = x[::step]
     tick_labels = [timestamps.iloc[i].strftime("%d/%m %H:%M") for i in tick_positions]
     ax_c.set_xticks(tick_positions)
-    ax_c.set_xticklabels([""] * len(tick_positions))  # скрываем на верхней панели
+    ax_c.set_xticklabels([""] * len(tick_positions))  # hide on the top panel
 
-    # ── Bollinger Bands — считаем из полного df, берём tail(limit) ──
+    # ── Bollinger Bands — computed from the full df, take tail(limit) ──
     _bb_src = df_full["close"] if df_full is not None and len(df_full) > len(df) else df["close"]
     _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(_bb_src, period=_cfg.BB_PERIOD, std_mult=_cfg.BB_STDDEV)
     bb_u = _bb_u_full.tail(limit).values
@@ -243,7 +247,7 @@ def build_chart(
     ax_c.plot(x, bb_m, color=T["bb_mid"], linewidth=0.8, alpha=0.6, linestyle="--", zorder=2)
     ax_c.plot(x, bb_l, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
 
-    # ── S/R уровни — считаем из полного df (200+ баров) ─────────────
+    # ── S/R levels — computed from the full df (200+ bars) ─────────────
     _sr_df = df_full if df_full is not None and len(df_full) > len(df) else df
     sr = calc_support_resistance(_sr_df, pivot_window=_cfg.SR_PIVOT_WINDOW, max_levels=_cfg.SR_MAX_LEVELS)
     x_start = -0.5
@@ -252,7 +256,11 @@ def build_chart(
     for lvl in sr["support"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["support"],
                     linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        ax_c.text(n - 0.5, lvl, f"S {lvl:,.0f}", color=T["support"],
+        # 🆕 FIX: was f"S {lvl:,.0f}" — ZERO decimal places. For a sub-$1 pair
+        # (DOGE, SHIB, etc.) every S/R label on the chart would render as "S 0",
+        # indistinguishable from every other level. format_price() scales
+        # precision to the price's magnitude instead.
+        ax_c.text(n - 0.5, lvl, f"S {format_price(lvl)}", color=T["support"],
                   fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
@@ -260,7 +268,7 @@ def build_chart(
     for lvl in sr["resistance"]:
         ax_c.hlines(lvl, x_start, x_end, colors=T["resist"],
                     linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        ax_c.text(n - 0.5, lvl, f"R {lvl:,.0f}", color=T["resist"],
+        ax_c.text(n - 0.5, lvl, f"R {format_price(lvl)}", color=T["resist"],
                   fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
@@ -276,7 +284,7 @@ def build_chart(
             ax_c.plot(x, fu, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
             ax_c.plot(x, fl, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
 
-    # ── Свечи ───────────────────────────────────────────────────────
+    # ── Candles ───────────────────────────────────────────────────────
     bar_w = 0.6
     for i in range(n):
         o = df["open"].iloc[i]
@@ -287,9 +295,9 @@ def build_chart(
         color      = T["bull"]      if bull else T["bear"]
         body_color = T["bull_body"] if bull else T["bear_body"]
 
-        # Фитиль
+        # Wick
         ax_c.plot([i, i], [l, h], color=color, linewidth=0.8, zorder=5)
-        # Тело
+        # Body
         body_h = abs(c - o) if abs(c - o) > 0 else (h - l) * 0.01
         rect = Rectangle(
             (i - bar_w / 2, min(o, c)),
@@ -299,10 +307,11 @@ def build_chart(
         )
         ax_c.add_patch(rect)
 
-    # ── Сигнал (стрелка) ────────────────────────────────────────────
+    # ── Signal (arrow) ────────────────────────────────────────────
     if signal_side is not None:
-        # signal_bar_offset — смещение от конца отображаемого df (напр. -2 = последний
-        # подтверждённый закрытый бар). Не зависит от того, каким fetch был построен df.
+        # signal_bar_offset — offset from the end of the displayed df (e.g.
+        # -2 = the last confirmed closed bar). Independent of what fetch
+        # request the df was built from.
         offset = signal_bar_offset if signal_bar_offset is not None else -2
         idx = n + offset if offset < 0 else offset
         idx = max(0, min(idx, n - 1))
@@ -328,38 +337,42 @@ def build_chart(
                 arrowprops=dict(arrowstyle="->", color=T["signal_short"], lw=1.5)
             )
 
-    # ── Entry / TP / SL линии ────────────────────────────────────────
+    # ── Entry / TP / SL lines ────────────────────────────────────────
+    # 🆕 FIX: these three labels used to be f"...{price:,.2f}" — a fixed 2
+    # decimal places, same class of bug as the S/R labels above: on a
+    # sub-$1 pair, Entry/TP/SL could render as visually identical or
+    # collapse toward the same rounded value.
     if entry_price:
         ax_c.hlines(entry_price, x_start, x_end, colors=T["entry"],
                     linewidth=1.2, linestyles="-", zorder=8, alpha=0.9)
-        ax_c.text(0, entry_price, f"ENTRY {entry_price:,.2f}",
+        ax_c.text(0, entry_price, f"ENTRY {format_price(entry_price)}",
                   color=T["entry"], fontsize=8, va="bottom", fontweight="bold")
 
     if tp_price:
         ax_c.hlines(tp_price, x_start, x_end, colors=T["tp"],
                     linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, tp_price, f"TP {tp_price:,.2f}",
+        ax_c.text(0, tp_price, f"TP {format_price(tp_price)}",
                   color=T["tp"], fontsize=8, va="bottom", fontweight="bold")
 
     if sl_price:
         ax_c.hlines(sl_price, x_start, x_end, colors=T["sl"],
                     linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, sl_price, f"SL {sl_price:,.2f}",
+        ax_c.text(0, sl_price, f"SL {format_price(sl_price)}",
                   color=T["sl"], fontsize=8, va="top", fontweight="bold")
 
-    # ── TP/SL зона заливка ──────────────────────────────────────────
+    # ── TP/SL zone fill ──────────────────────────────────────────
     if entry_price and tp_price and sl_price:
         ax_c.fill_between(x, entry_price, tp_price,
                           alpha=0.05, color=T["tp"], zorder=1)
         ax_c.fill_between(x, sl_price, entry_price,
                           alpha=0.05, color=T["sl"], zorder=1)
 
-    # ── Сетка и оформление основной панели ──────────────────────────
+    # ── Grid and styling for the main panel ──────────────────────
     ax_c.grid(True, color=T["grid"], linewidth=0.5, alpha=0.6, zorder=0)
     ax_c.set_xlim(-0.5, n - 0.5)
     ax_c.yaxis.set_label_position("right")
 
-    # Заголовок
+    # Title
     last_close = df["close"].iloc[-1]
     prev_close = df["close"].iloc[-2]
     chg_pct = (last_close - prev_close) / prev_close * 100
@@ -371,13 +384,14 @@ def build_chart(
         f"{symbol}  ·  {timeframe}",
         color=T["text"], fontsize=13, fontweight="bold", va="top"
     )
+    # 🆕 FIX: was f"${last_close:,.2f}  ..." — same fixed-2-decimal issue.
     fig.text(
         0.25, 0.955,
-        f"${last_close:,.2f}  {chg_sign}{chg_pct:.2f}%",
+        f"${format_price(last_close)}  {chg_sign}{chg_pct:.2f}%",
         color=chg_color, fontsize=12, fontweight="bold", va="top"
     )
 
-    # Легенда
+    # Legend
     legend_elements = [
         Line2D([0], [0], color=T["frama"],   linewidth=1.4, label="FRAMA"),
         Line2D([0], [0], color=T["bb_mid"],  linewidth=0.8, linestyle="--", label="BB mid"),
@@ -396,7 +410,7 @@ def build_chart(
         labelcolor=T["text_dim"], framealpha=0.8
     )
 
-    # ── Панель объёма ────────────────────────────────────────────────
+    # ── Volume panel ────────────────────────────────────────────────
     vol_colors = [
         T["bull"] if df["close"].iloc[i] >= df["open"].iloc[i] else T["bear"]
         for i in range(n)
@@ -408,7 +422,7 @@ def build_chart(
         plt.FuncFormatter(lambda val, _: f"{val/1e3:.0f}K" if val >= 1000 else f"{val:.0f}")
     )
 
-    # ── Панель MFI ───────────────────────────────────────────────────
+    # ── MFI panel ───────────────────────────────────────────────────
     if ax_m is not None and mfi is not None:
         mfi_vals = mfi.tail(limit).values
         ax_m.plot(x, mfi_vals, color=T["mfi_line"], linewidth=1.0, zorder=3)
@@ -434,7 +448,7 @@ def build_chart(
     plt.setp(ax_c.get_xticklabels(), visible=False)
     plt.setp(ax_v.get_xticklabels(), visible=False if ax_m else True)
 
-    # ── Сохранение ───────────────────────────────────────────────────
+    # ── Save ───────────────────────────────────────────────────────
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
                 facecolor=T["bg"], edgecolor="none")
@@ -444,7 +458,7 @@ def build_chart(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 🤖  ПУБЛИЧНАЯ ФУНКЦИЯ ДЛЯ БОТА
+# 🤖  PUBLIC FUNCTION FOR THE BOT
 # ─────────────────────────────────────────────────────────────────────
 
 async def generate_chart(
@@ -455,15 +469,16 @@ async def generate_chart(
     state_snapshot: Optional[dict] = None,
 ) -> io.BytesIO:
     """
-    Основная точка входа: скачивает OHLCV, считает индикаторы, строит PNG.
+    Main entry point: downloads OHLCV, computes indicators, builds the PNG.
 
     Args:
         exchange:        ccxt.Exchange instance
         symbol:          "BTC/USDT"
         timeframe:       "1h" | "4h"
-        limit:           количество свечей (default 50)
-        state_snapshot:  dict с полями entry, tp, sl, side, signal_bar_offset (опционально;
-                          смещение от конца df, по умолчанию -2 — последний закрытый бар)
+        limit:           number of candles (default 50)
+        state_snapshot:  dict with entry, tp, sl, side, signal_bar_offset
+                          fields (optional; offset from the end of df,
+                          default -2 — the last closed bar)
 
     Returns:
         BytesIO PNG buffer
@@ -475,15 +490,15 @@ async def generate_chart(
         calculate_atr
     )
 
-    # Грузим больше данных для прогрева индикаторов
+    # Fetch more data to warm up the indicators
     fetch_limit = max(limit + 250, 300)
     bars = await safe_fetch_ohlcv(exchange, symbol, timeframe, limit=fetch_limit)
     df = parse_ohlcv(bars)
 
     if not validate_dataframe(df, min_rows=50):
-        raise ValueError(f"Недостаточно данных для {symbol} {timeframe}")
+        raise ValueError(f"Not enough data for {symbol} {timeframe}")
 
-    # ── Индикаторы (module-level _cfg — видит live-правки из веб-морды) ──
+    # ── Indicators (module-level _cfg — sees live edits from the web UI) ──
     frama_s, frama_u, frama_l, _ = calculate_frama(
         df, length=_cfg.FRAMA_LEN, mult=_cfg.FRAMA_MULT
     )
@@ -491,7 +506,7 @@ async def generate_chart(
     mfi_s = calculate_mfi(df, length=_cfg.MFI_LEN)
     mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=_cfg.MFI_TRAINING)
 
-    # ── Данные активной сделки ────────────────────────────────────
+    # ── Active trade data ────────────────────────────────────
     entry_price       = None
     tp_price          = None
     sl_price          = None
@@ -506,23 +521,25 @@ async def generate_chart(
 
         entry_time_ms = state_snapshot.get("entry_time_ms")
         if entry_time_ms is not None:
-            # 🆕 FIX: сделка могла быть открыта много баров назад, на другом df.
-            # Ищем реальный бар по timestamp в СВОЁМ только что нафетченном df,
-            # вместо того чтобы доверять позиционному индексу из чужого df.
+            # 🆕 FIX: the trade may have been opened many bars ago, on a
+            # different df. We look up the real bar by timestamp in OUR OWN
+            # just-fetched df, instead of trusting a positional index from
+            # someone else's df.
             try:
                 ts_arr = df["timestamp"].values
                 closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
-                # Если реальный вход раньше видимого окна графика (limit баров),
-                # argmin всё равно найдёт "ближайший" — обычно первый бар графика,
-                # рисуя маркер в заведомо неверном месте. Проверяем допуск (1.5
-                # интервала бара); если не попадает — используем дефолтный offset
-                # (-2, последний закрытый бар) вместо ложного местоположения.
+                # If the real entry is earlier than the chart's visible
+                # window (limit bars), argmin will still find the "closest"
+                # one — usually the chart's first bar — drawing the marker
+                # in a definitely wrong spot. Check a tolerance (1.5 bar
+                # intervals); if it doesn't fit, use the default offset (-2,
+                # the last closed bar) instead of a false location.
                 bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0
                 actual_diff = abs(ts_arr[closest_i] - float(entry_time_ms))
                 if bar_interval_ms > 0 and actual_diff > bar_interval_ms * 1.5:
                     signal_bar_offset = -2
                 else:
-                    signal_bar_offset = closest_i - len(df)  # смещение от конца, всегда <= -1
+                    signal_bar_offset = closest_i - len(df)  # offset from the end, always <= -1
             except Exception as e:
                 logger.warning(f"[CHART] Failed to resolve entry_time_ms to bar index: {e}")
                 signal_bar_offset = -2

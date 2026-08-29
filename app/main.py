@@ -1,25 +1,27 @@
 """
 MUFCA v4.0 — Multi-Timeframe Adaptive Trading Bot
-Запуск: python main.py
+Run: python main.py
 
-🆕 Discord-бот и веб-API (web_api.py) теперь работают в ОДНОМ процессе и
-ОДНОМ asyncio event loop — discord.py и uvicorn прекрасно уживаются вместе
-через asyncio.gather(). Это значит: никакого дублирующего fetch/пересчёта
-индикаторов — веб-морда читает те же bot.state и config, что видит сканер.
+🆕 The Discord bot and the web API (web_api.py) now run in ONE process and
+ONE asyncio event loop — discord.py and uvicorn coexist perfectly fine via
+asyncio.gather(). This means: no duplicate fetch/recomputation of
+indicators — the web UI reads the same bot.state and config that the
+scanner sees.
 
-🆕 Discord теперь полностью опционален (config.DISCORD_ENABLED — false, если
-DISCORD_TOKEN не задан, либо явно DISCORD_ENABLED=false в .env). Без Discord
-запускаются только сканер и веб-дашборд: gateway-соединение не поднимается,
-!команды недоступны, но сигналы/TP1/статистика продолжают работать как обычно
-через веб/WS/Android push. Раньше запуск сканера был жёстко завязан на
-Discord'овский on_ready — без него не работало вообще ничего (см.
-bot.ensure_engine_started()).
+🆕 Discord is now fully optional (config.DISCORD_ENABLED is false if
+DISCORD_TOKEN isn't set, or DISCORD_ENABLED=false is explicitly set in
+.env). Without Discord, only the scanner and the web dashboard start: no
+gateway connection comes up, !commands are unavailable, but signals/TP1/
+statistics keep working as usual via the web/WS/Android push. Before, the
+scanner's startup was hard-tied to Discord's on_ready — without it, nothing
+worked at all (see bot.ensure_engine_started()).
 
-🆕 Graceful shutdown: по SIGTERM (`docker stop`) или SIGINT (Ctrl+C) бот
-досохраняет signals_history.json И снапшот активных позиций (bot_state_snapshot.json)
-на диск перед выходом — раньше при любом рестарте (в том числе обычном деплое
-новой версии) bot.state строился с нуля через make_state(), и все активные,
-ещё не закрытые позиции просто исчезали из Status/графика (см. state.save_bot_state).
+🆕 Graceful shutdown: on SIGTERM (`docker stop`) or SIGINT (Ctrl+C), the bot
+flushes signals_history.json AND a snapshot of active positions
+(bot_state_snapshot.json) to disk before exiting — before, on any restart
+(including a routine deploy of a new version), bot.state was rebuilt from
+scratch via make_state(), and every active, not-yet-closed position simply
+vanished from Status/the chart (see state.save_bot_state).
 """
 
 import asyncio
@@ -35,17 +37,17 @@ WEB_API_PORT = 8585
 
 
 async def _run_web_api():
-    """Поднимает FastAPI (web_api.py) через uvicorn в текущем event loop."""
+    """Brings up FastAPI (web_api.py) via uvicorn in the current event loop."""
     import uvicorn
-    from web_api import app as fastapi_app  # импорт здесь: web_api делает `import bot as core`,
-                                             # bot должен быть уже полностью загружен к этому моменту
+    from web_api import app as fastapi_app  # imported here: web_api does `import bot as core`,
+                                             # bot must already be fully loaded by this point
 
     config = uvicorn.Config(
         fastapi_app,
         host="0.0.0.0",
         port=WEB_API_PORT,
         log_level="info",
-        loop="none",  # уже внутри работающего loop — не даём uvicorn создавать свой
+        loop="none",  # already inside a running loop — don't let uvicorn create its own
     )
     server = uvicorn.Server(config)
     logger.info(f"[WEB] Starting web API on 0.0.0.0:{WEB_API_PORT}")
@@ -53,16 +55,17 @@ async def _run_web_api():
 
 
 def _flush_state_to_disk():
-    """Форсит сохранение всего, что накопилось в памяти, но ещё не долетело до диска."""
+    """Forces a save of everything that's accumulated in memory but hasn't
+    made it to disk yet."""
     try:
         from state import load_signals_history, save_signals_history, save_bot_state
         import bot as _bot_module
 
-        history = load_signals_history()  # это тот же закэшированный в памяти dict
-        save_signals_history(history)     # принудительно пишет его на диск
+        history = load_signals_history()  # this is the same dict already cached in memory
+        save_signals_history(history)     # forces it to write to disk
         logger.info("[SHUTDOWN] signals_history.json flushed to disk")
 
-        save_bot_state(_bot_module.state)  # снапшот активных позиций — переживёт рестарт
+        save_bot_state(_bot_module.state)  # snapshot of active positions — survives a restart
         logger.info("[SHUTDOWN] bot_state_snapshot.json flushed to disk")
     except Exception as e:
         logger.error(f"[SHUTDOWN] Failed to flush state: {e}", exc_info=True)
@@ -94,7 +97,7 @@ async def _main():
     web_task = asyncio.create_task(_run_web_api(), name="web-api")
     tasks_to_wait.add(web_task)
 
-    # Ждём либо сигнала остановки, либо (аварийного) завершения одной из задач
+    # Wait for either a stop signal, or (an unexpected) completion of one of the tasks
     done, pending = await asyncio.wait(tasks_to_wait, return_when=asyncio.FIRST_COMPLETED)
 
     _flush_state_to_disk()
