@@ -129,13 +129,12 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     const maxVol = Math.max(...vp.bins.map((b) => b.volume))
     if (maxVol <= 0) return
 
-    const priceScale = s.candle.priceScale()
     const profileWidth = width * 0.14
     const rightEdge = width - 2
     const barHeight = Math.max(2, height / (vp.bins.length * 3))
 
     for (const b of vp.bins) {
-      const y = priceScale.priceToCoordinate(b.price)
+      const y = s.candle.priceToCoordinate(b.price)
       if (y === null || y < 0 || y > height) continue
       const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
       const barWidth = (b.volume / maxVol) * profileWidth
