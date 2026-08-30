@@ -110,6 +110,7 @@ async def help_cmd(ctx):
         "`!add <pair>`   — add a pair (e.g. `!add SOL/USDT`)",
         "`!remove <pair>` — remove a pair",
         "`!delsignals <pair> [tf]` — delete a pair's signal history",
+        "`!cleanup_sim` — remove all synthetic `!sim` records from history",
         "",
 
         "**🛠️ Utilities**",
@@ -396,6 +397,61 @@ async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = "")
 
     save_signals_history(history)
     await ctx.send(f"🗑️ Signal history for {scope} deleted.")
+
+@core.bot.command(name="cleanup_sim")
+async def cleanup_sim_cmd(ctx, confirm: str = ""):
+    """Removes synthetic (!sim) records from signals_history.json across
+    ALL pairs/timeframes/sides, leaving everything else untouched.
+
+    !cleanup_sim       — preview
+    !cleanup_sim yes   — delete
+
+    🆕 !sim records are already excluded from stats (get_signal_stats),
+    adaptive TP/SL calibration (calculate_adaptive_tp/calculate_adaptive_sl),
+    and the web dashboard's History tab (see synthetic in
+    web_api._aggregate_records) — they're harmless to leave in place. This
+    command exists purely for tidiness: !debug and !signals count them as
+    regular closed signals (they don't check the synthetic flag), so their
+    totals can look off by however many !sim runs happened, compared to the
+    web dashboard's History tab.
+    """
+    history = load_signals_history()
+
+    to_remove = []
+    for ticker, tfs in history.items():
+        for tf, sides in tfs.items():
+            for side in ("long", "short"):
+                for rec in sides.get(side, []):
+                    if rec.get("synthetic") or rec.get("track") == "sim":
+                        to_remove.append((ticker, tf, side, rec))
+
+    if not to_remove:
+        await ctx.send("✅ No synthetic (`!sim`) records found — nothing to clean up.")
+        return
+
+    if confirm.lower() != "yes":
+        lines = [f"⚠️ This will DELETE {len(to_remove)} synthetic (`!sim`) record(s):"]
+        for ticker, tf, side, rec in to_remove[:15]:
+            lines.append(f"• `{ticker}` `{tf}` {side.upper()} entry=${rec.get('entry')} exit_type={rec.get('exit_type')}")
+        if len(to_remove) > 15:
+            lines.append(f"… and {len(to_remove) - 15} more")
+        lines.append("\nTo confirm, type: `!cleanup_sim yes`")
+        await ctx.send("\n".join(lines))
+        return
+
+    removed = 0
+    for ticker, tfs in history.items():
+        for tf, sides in tfs.items():
+            for side in ("long", "short"):
+                before = len(sides.get(side, []))
+                sides[side] = [
+                    r for r in sides.get(side, [])
+                    if not (r.get("synthetic") or r.get("track") == "sim")
+                ]
+                removed += before - len(sides[side])
+
+    save_signals_history(history)
+    await ctx.send(f"🗑️ Removed {removed} synthetic (`!sim`) record(s). `!debug`/`!signals` totals will now match the web dashboard's History tab.")
 
 @core.bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
