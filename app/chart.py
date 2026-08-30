@@ -17,7 +17,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from typing import Optional, Tuple, List, Dict
 import config as _cfg
-from utils import format_price
+from utils import format_price, round_price
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ THEME = {
     "bb_fill":    "#388bfd",
     "support":    "#00bcd4",
     "resist":     "#9e9e9e",
+    "poc":        "#e6c619",
     "pivot":      "#d29922",
     "entry":      "#f0883e",
     "tp":         "#26a641",
@@ -156,6 +157,96 @@ def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: floa
     return sorted(clustered[:max_n])
 
 
+def calc_volume_profile(
+    df: pd.DataFrame,
+    bins: int = 50,
+    value_area_pct: float = 0.70,
+) -> Dict:
+    """
+    Volume Profile approximated from OHLCV — there's no tick-level trade
+    data available (Gate.io's public API doesn't provide it, and we don't
+    want to pull the full trade stream just for this), so this is a
+    TPO-style approximation, not a "real" exchange volume profile: each
+    bar's volume is distributed evenly across the price bins its
+    [low, high] range spans, instead of weighting toward where trades
+    actually printed within the bar. This is the standard approach used by
+    most retail tools that only have OHLCV, and gives a statistically
+    reasonable POC/Value Area — just not pixel-identical to what a
+    tick-level profile would show.
+
+    Returns:
+        {
+            "poc": float | None,   # Point of Control — price bin with the most volume
+            "vah": float | None,   # Value Area High
+            "val": float | None,   # Value Area Low
+            "bins": [{"price": float, "volume": float}, ...],  # for histogram rendering, low to high
+        }
+    """
+    empty = {"poc": None, "vah": None, "val": None, "bins": []}
+    if len(df) < 10:
+        return empty
+
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    if price_max <= price_min:
+        return empty
+
+    bin_width = (price_max - price_min) / bins
+    volume_by_bin = np.zeros(bins)
+
+    for row in df.itertuples():
+        low, high, vol = float(row.low), float(row.high), float(row.volume)
+        if vol <= 0:
+            continue
+        if high <= low:
+            # doji / zero-range bar — dump its volume into a single bin
+            idx = min(max(int((low - price_min) / bin_width), 0), bins - 1)
+            volume_by_bin[idx] += vol
+            continue
+        first_bin = min(max(int((low - price_min) / bin_width), 0), bins - 1)
+        last_bin = min(max(int((high - price_min) / bin_width), 0), bins - 1)
+        n_spanned = last_bin - first_bin + 1
+        volume_by_bin[first_bin:last_bin + 1] += vol / n_spanned
+
+    total_volume = float(volume_by_bin.sum())
+    if total_volume <= 0:
+        return empty
+
+    poc_idx = int(np.argmax(volume_by_bin))
+    poc_price = price_min + (poc_idx + 0.5) * bin_width
+
+    # Expand the Value Area outward from the POC bin — at each step, add
+    # whichever neighbor (above or below) has more volume — until we've
+    # covered value_area_pct of the total.
+    target_volume = total_volume * value_area_pct
+    covered_volume = float(volume_by_bin[poc_idx])
+    lo_idx = hi_idx = poc_idx
+    while covered_volume < target_volume and (lo_idx > 0 or hi_idx < bins - 1):
+        vol_below = float(volume_by_bin[lo_idx - 1]) if lo_idx > 0 else -1.0
+        vol_above = float(volume_by_bin[hi_idx + 1]) if hi_idx < bins - 1 else -1.0
+        if vol_above >= vol_below:
+            hi_idx += 1
+            covered_volume += float(volume_by_bin[hi_idx])
+        else:
+            lo_idx -= 1
+            covered_volume += float(volume_by_bin[lo_idx])
+
+    val_price = price_min + lo_idx * bin_width
+    vah_price = price_min + (hi_idx + 1) * bin_width
+
+    bins_out = [
+        {"price": round_price(price_min + (i + 0.5) * bin_width), "volume": round(float(volume_by_bin[i]), 4)}
+        for i in range(bins)
+    ]
+
+    return {
+        "poc": round_price(poc_price),
+        "vah": round_price(vah_price),
+        "val": round_price(val_price),
+        "bins": bins_out,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 🏗️  CHART CONSTRUCTION
 # ─────────────────────────────────────────────────────────────────────
@@ -177,6 +268,7 @@ def build_chart(
     signal_side: Optional[str] = None,  # "long" | "short"
     signal_bar_offset: int = -2,        # signal bar offset FROM THE END of the displayed df
     limit: int = 50,
+    volume_profile: Optional[Dict] = None,  # output of calc_volume_profile(), or None if disabled
 ) -> io.BytesIO:
     """
     Builds the full candlestick chart and returns a BytesIO PNG.
@@ -269,6 +361,23 @@ def build_chart(
         ax_c.hlines(lvl, x_start, x_end, colors=T["resist"],
                     linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
         ax_c.text(n - 0.5, lvl, f"R {format_price(lvl)}", color=T["resist"],
+                  fontsize=8, va="bottom", ha="right", fontweight="bold",
+                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
+                  zorder=8)
+
+    # ── Volume Profile: Value Area band + POC line ───────────────────
+    # Deliberately a distinct gold color (T["poc"]), not a variant of the
+    # pivot S/R colors — POC/Value Area are a different kind of level
+    # (where volume concentrated) from pivot S/R (local price extremes),
+    # and should read as visually separate on the chart, not as "more S/R".
+    if volume_profile and volume_profile.get("poc") is not None:
+        vah = volume_profile.get("vah")
+        val = volume_profile.get("val")
+        poc = volume_profile["poc"]
+        if vah is not None and val is not None:
+            ax_c.fill_between(x, val, vah, alpha=0.06, color=T["poc"], zorder=1)
+        ax_c.hlines(poc, x_start, x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
+        ax_c.text(n - 0.5, poc, f"POC {format_price(poc)}", color=T["poc"],
                   fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
                   zorder=8)
@@ -403,12 +512,59 @@ def build_chart(
         legend_elements.append(
             Line2D([0], [0], color=T["entry"], linewidth=1.2, label="Entry")
         )
+    if volume_profile and volume_profile.get("poc") is not None:
+        legend_elements.append(
+            Line2D([0], [0], color=T["poc"], linewidth=1.6, label="POC / Value Area")
+        )
     ax_c.legend(
         handles=legend_elements,
         loc="upper left", fontsize=7,
         facecolor=T["bg"], edgecolor=T["grid"],
         labelcolor=T["text_dim"], framealpha=0.8
     )
+
+    # ── Volume Profile histogram (narrow inset, right edge of the candle panel) ──
+    # A separate axes sharing ax_c's y-limits (price axis), so each bar lands
+    # at the correct price level regardless of the candle panel's own
+    # autoscale. Positioned just inside ax_c's own right edge rather than as
+    # a separate gridspec column — keeps the existing layout/margins
+    # untouched when volume_profile is None (the common case if the feature
+    # is disabled).
+    if volume_profile and volume_profile.get("bins"):
+        vp_bins = volume_profile["bins"]
+        volumes = [b["volume"] for b in vp_bins]
+        max_vol = max(volumes) if volumes else 0
+        if max_vol > 0:
+            bbox = ax_c.get_position()
+            profile_width = bbox.width * 0.16  # ~16% of the candle panel's width
+            ax_vp = fig.add_axes([bbox.x1 - profile_width, bbox.y0, profile_width, bbox.height])
+            ax_vp.set_ylim(ax_c.get_ylim())
+            ax_vp.axis("off")
+            ax_vp.patch.set_alpha(0)
+
+            vah = volume_profile.get("vah")
+            val = volume_profile.get("val")
+            for b in vp_bins:
+                price = b["price"]
+                vol = b["volume"]
+                # Skip near-empty bins — at ~0 width they still leave a
+                # visible sliver right at the profile's left edge (x=0);
+                # stacked together, many of them read as a stray vertical line.
+                if vol / max_vol < 0.06:
+                    continue
+                y0, y1 = ax_c.get_ylim()
+                if price < y0 or price > y1:
+                    continue  # outside the visible price range — skip
+                in_value_area = val is not None and vah is not None and val <= price <= vah
+                width = (vol / max_vol) * 0.94  # fraction of the inset axes' own width
+                bar_color = T["poc"] if in_value_area else T["text_dim"]
+                bar_alpha = 0.85 if in_value_area else 0.35
+                bin_height = (df_full["high"].max() - df_full["low"].min()) / len(vp_bins) if df_full is not None else (y1 - y0) / len(vp_bins)
+                ax_vp.barh(
+                    price, width, height=bin_height * 0.9,
+                    left=0, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none",
+                )
+            ax_vp.set_xlim(0, 1)
 
     # ── Volume panel ────────────────────────────────────────────────
     vol_colors = [
@@ -506,6 +662,19 @@ async def generate_chart(
     mfi_s = calculate_mfi(df, length=_cfg.MFI_LEN)
     mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=_cfg.MFI_TRAINING)
 
+    # 🆕 Volume Profile (POC / Value Area) — see calc_volume_profile() for
+    # the TPO-style approximation used since only OHLCV is available.
+    # Computed over its own lookback window (config.VP_LOOKBACK, independent
+    # of `limit` — the number of candles actually shown on the chart), so
+    # the profile reflects where volume concentrated over a meaningfully
+    # long history, not just whatever's currently on screen.
+    volume_profile = None
+    if _cfg.VP_ENABLED:
+        vp_window = df.tail(min(_cfg.VP_LOOKBACK, len(df)))
+        volume_profile = calc_volume_profile(vp_window, bins=_cfg.VP_BINS, value_area_pct=_cfg.VP_VALUE_AREA_PCT)
+        if not _cfg.VP_SHOW_HISTOGRAM:
+            volume_profile["bins"] = []  # keep POC/VA lines, drop the histogram bars
+
     # ── Active trade data ────────────────────────────────────
     entry_price       = None
     tp_price          = None
@@ -569,4 +738,5 @@ async def generate_chart(
         signal_side=signal_side,
         signal_bar_offset=signal_bar_offset,
         limit=limit,
+        volume_profile=volume_profile,
     )

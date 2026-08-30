@@ -234,6 +234,35 @@ SR_MAX_LEVELS = _indicators["SR_MAX_LEVELS"]
 # barsLimit.
 SR_MIN_LOOKBACK = 900
 
+# =====================================================================
+# 📊  VOLUME PROFILE (POC / Value Area)
+# =====================================================================
+# Approximated from OHLCV — see chart.calc_volume_profile() for why this is
+# a TPO-style approximation rather than a tick-level "real" volume profile.
+VP_FILE = os.path.join(DATA_DIR, "volume_profile.json")
+_VP_DEFAULTS = {
+    "enabled": True,
+    "bins": 50,               # price buckets across the lookback window's range
+    "lookback": 300,          # bars used to build the profile (independent of chart display limit)
+    "value_area_pct": 0.70,   # fraction of volume that defines the Value Area around POC
+    "show_histogram": True,   # False = keep the POC line + Value Area band, drop the histogram bars
+}
+
+def load_vp_config() -> dict:
+    data = safe_json_load(VP_FILE, _VP_DEFAULTS)
+    # fill in any keys missing from an older config file with defaults
+    return {**_VP_DEFAULTS, **data}
+
+def save_vp_config(data: dict):
+    safe_json_save(VP_FILE, data)
+
+_vp_config = load_vp_config()
+VP_ENABLED = _vp_config["enabled"]
+VP_BINS = _vp_config["bins"]
+VP_LOOKBACK = _vp_config["lookback"]
+VP_VALUE_AREA_PCT = _vp_config["value_area_pct"]
+VP_SHOW_HISTOGRAM = _vp_config["show_histogram"]
+
 COOLDOWN_BARS = 2
 MAX_ALLOWED_LEV = 10
 TARGET_RISK_DEP = 5.0
@@ -335,6 +364,7 @@ _COLOR_DEFAULTS = {
     "bb": "#7c8797",
     "support": "#45d0a5",
     "resistance": "#f2637a",
+    "poc": "#e6c619",
     "mfi_line": "#8b93ff",
     "mfi_overbought": "#f2637a",
     "mfi_oversold": "#45d0a5",

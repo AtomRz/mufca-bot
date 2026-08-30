@@ -162,6 +162,7 @@ export default function SettingsPanel({ config, onChanged }) {
 
   const saveIndicator = (field, value) => run(`ind_${field}`, () => api.setIndicators({ [field]: value }))
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
+  const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
 
   return (
     <div>
@@ -455,11 +456,58 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
+            <h3 className="panel-title">Volume Profile</h3>
+            <div className="toggle-row">
+              <span className="row-label" title="Approximated from OHLCV (no tick data) — see the POC/Value Area overlay on the Chart tab.">
+                Enabled
+              </span>
+              <Toggle
+                checked={config.volume_profile?.enabled ?? true}
+                disabled={busy === 'vp_enabled'}
+                onChange={(v) => saveVp('enabled', v)}
+              />
+            </div>
+            <NumberField
+              label="Bins" hint="10–200, price buckets across the lookback window"
+              value={config.volume_profile?.bins ?? 50}
+              min={10} max={200} busyKey="vp_bins" busy={busy}
+              onSave={(v) => saveVp('bins', v)}
+            />
+            <NumberField
+              label="Lookback" hint="50–2000 bars, independent of the chart's display limit"
+              value={config.volume_profile?.lookback ?? 300}
+              min={50} max={2000} busyKey="vp_lookback" busy={busy}
+              onSave={(v) => saveVp('lookback', v)}
+            />
+            <NumberField
+              label="Value Area %" hint="50–95, share of volume that defines the band around POC"
+              value={Math.round((config.volume_profile?.value_area_pct ?? 0.70) * 100)}
+              min={50} max={95} busyKey="vp_value_area_pct" busy={busy}
+              onSave={(v) => saveVp('value_area_pct', v / 100)}
+            />
+            <div className="toggle-row">
+              <span className="row-label" title="Off keeps the POC line and Value Area band, just drops the horizontal histogram bars.">
+                Show histogram
+              </span>
+              <Toggle
+                checked={config.volume_profile?.show_histogram ?? true}
+                disabled={busy === 'vp_show_histogram'}
+                onChange={(v) => saveVp('show_histogram', v)}
+              />
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              POC (Point of Control) and Value Area are a different kind of level from pivot support/resistance
+              above — they mark where volume actually concentrated, not local price extremes. Complementary, not a replacement.
+            </p>
+          </div>
+
+          <div className="panel">
             <h3 className="panel-title">Chart Colors</h3>
             <ColorField label="FRAMA" value={colors.frama} onSave={(v) => saveColor('frama', v)} />
             <ColorField label="Bollinger Bands" value={colors.bb} onSave={(v) => saveColor('bb', v)} />
             <ColorField label="Support" value={colors.support} onSave={(v) => saveColor('support', v)} />
             <ColorField label="Resistance" value={colors.resistance} onSave={(v) => saveColor('resistance', v)} />
+            <ColorField label="POC / Value Area" value={colors.poc || '#e6c619'} onSave={(v) => saveColor('poc', v)} />
             <ColorField label="Take Profit line" value={colors.tp_line} onSave={(v) => saveColor('tp_line', v)} />
             <ColorField label="Stop Loss line" value={colors.sl_line} onSave={(v) => saveColor('sl_line', v)} />
             <ColorField label="Long signal marker" value={colors.signal_long} onSave={(v) => saveColor('signal_long', v)} />

@@ -102,6 +102,8 @@ export const api = {
     request('/api/config/indicators', { method: 'POST', body: JSON.stringify(patch) }),
   setColors: (patch) =>
     request('/api/config/colors', { method: 'POST', body: JSON.stringify(patch) }),
+  setVolumeProfile: (patch) =>
+    request('/api/config/volume-profile', { method: 'POST', body: JSON.stringify(patch) }),
   getHistorySummary: () => request('/api/history/summary'),
   getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30) =>
     request(

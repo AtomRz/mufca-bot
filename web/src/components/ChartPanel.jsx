@@ -9,6 +9,7 @@ const DEFAULT_COLORS = {
   bb: '#7c8797',
   support: '#45d0a5',
   resistance: '#f2637a',
+  poc: '#e6c619',
   mfi_line: '#8b93ff',
   mfi_overbought: '#f2637a',
   mfi_oversold: '#45d0a5',
@@ -41,6 +42,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
+  const canvasRef = useRef(null) // 🆕 overlay canvas for the volume-profile histogram
+  const vpDataRef = useRef(null) // 🆕 latest { poc, vah, val, bins } for on-demand redraw
   const lastSelectionKeyRef = useRef(null) // 🆕 only changes on ticker/tf/track change
   const [track, setTrack] = useState('a')
   const [barsLimit, setBarsLimit] = useState(100)
@@ -56,7 +59,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // go out almost simultaneously; due to network jitter, the EARLIER
     // request (e.g. BTC) could respond LATER than a more recent one (SOL) —
     // BTC's .then() would overwrite the already-shown, correct SOL data with
-    // stale BTC data. Tag each request with a number and only apply the
+    // stale SOL data. Tag each request with a number and only apply the
     // most recent one.
     const myRequestId = ++requestIdRef.current
     // 🆕 FIX: the loading indicator now lives in the top bar (next to LIVE),
@@ -91,9 +94,63 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     if (!lastEvent || !ticker) return
     if (lastEvent.type === 'scan_tick') load()
     if (lastEvent.type === 'signal' && lastEvent.ticker === ticker && lastEvent.tf === tf) load()
-    // colors/indicators changed in Settings — reread data (MFI thresholds may have changed)
+    // colors/indicators/volume-profile settings changed — reread data (MFI thresholds, VP bins etc. may have changed)
     if (lastEvent.type === 'config_changed') load()
   }, [lastEvent, ticker, tf, load])
+
+  // 🆕 Draws the volume-profile histogram on a canvas overlaid on top of the
+  // chart (lightweight-charts v4 has no plugin/primitive API for custom
+  // horizontal bars along the price axis, unlike v5 — this is the standard
+  // workaround: a transparent <canvas> positioned over the chart container,
+  // redrawn whenever the price axis could have moved). Bars are anchored to
+  // the right edge, semi-transparent, so they read as a backdrop behind the
+  // candles rather than a separate panel — same convention most platforms
+  // use for an overlaid volume profile.
+  const drawVolumeProfile = useCallback(() => {
+    const canvas = canvasRef.current
+    const container = containerRef.current
+    const s = seriesRef.current
+    const vp = vpDataRef.current
+    if (!canvas || !container) return
+    const ctx = canvas.getContext('2d')
+    const dpr = window.devicePixelRatio || 1
+    const width = container.clientWidth
+    const height = container.clientHeight
+    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+      canvas.width = Math.round(width * dpr)
+      canvas.height = Math.round(height * dpr)
+      canvas.style.width = `${width}px`
+      canvas.style.height = `${height}px`
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, width, height)
+
+    if (!vp || !vp.bins?.length || !s.candle) return
+    const maxVol = Math.max(...vp.bins.map((b) => b.volume))
+    if (maxVol <= 0) return
+
+    const priceScale = s.candle.priceScale()
+    const profileWidth = width * 0.14
+    const rightEdge = width - 2
+    const barHeight = Math.max(2, height / (vp.bins.length * 3))
+
+    for (const b of vp.bins) {
+      const y = priceScale.priceToCoordinate(b.price)
+      if (y === null || y < 0 || y > height) continue
+      const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
+      const barWidth = (b.volume / maxVol) * profileWidth
+      ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : 'rgba(110,118,129,0.28)'
+      ctx.fillRect(rightEdge - barWidth, y - barHeight / 2, barWidth, barHeight)
+    }
+  }, [C])
+
+  // Always-fresh ref so mount-once chart subscriptions (below) call the
+  // latest closure without needing to resubscribe on every color/data change —
+  // same pattern already used for loadConfig/loadPulse in App.jsx.
+  const drawVolumeProfileRef = useRef(() => {})
+  useEffect(() => {
+    drawVolumeProfileRef.current = drawVolumeProfile
+  }, [drawVolumeProfile])
 
   // init the chart once
   useEffect(() => {
@@ -199,13 +256,23 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     })
     mfi.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 }, visible: true })
 
-    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [] }
+    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [], vpZone: null, vpLine: null }
 
     const handleResize = () => {
       if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth })
+      drawVolumeProfileRef.current()
     }
     window.addEventListener('resize', handleResize)
     handleResize()
+
+    // 🆕 The price axis can move for reasons that don't fire a resize event
+    // (panning/zooming the time axis reflows candle heights via autoscale,
+    // dragging the price axis itself) — subscribe to the chart's own
+    // range-change and crosshair-move events (the latter also fires while
+    // dragging the price scale) to keep the profile bars aligned.
+    const vpRedraw = () => drawVolumeProfileRef.current()
+    chart.timeScale().subscribeVisibleLogicalRangeChange(vpRedraw)
+    chart.subscribeCrosshairMove(vpRedraw)
 
     // 🆕 FIX (Android client): in the Android app, the WebView is wrapped in
     // SwipeRefreshLayout — a vertical swipe on the chart competed with
@@ -227,6 +294,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
 
     return () => {
       window.removeEventListener('resize', handleResize)
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(vpRedraw)
+      chart.unsubscribeCrosshairMove(vpRedraw)
       el.removeEventListener('touchstart', onTouchStart)
       el.removeEventListener('touchend', onTouchEnd)
       el.removeEventListener('touchcancel', onTouchEnd)
@@ -252,7 +321,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     s.bbUpper.applyOptions({ color: hexToRgba(C.bb, 0.5) })
     s.bbLower.applyOptions({ color: hexToRgba(C.bb, 0.5) })
     s.mfi.applyOptions({ color: C.mfi_line })
-  }, [C])
+    drawVolumeProfile()
+  }, [C, drawVolumeProfile])
 
   // populate data when it updates
   useEffect(() => {
@@ -318,22 +388,26 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       )
     }
 
-    // 🆕 S/R are now semi-transparent zones (like supply/demand on
-    // TradingView), not thin dashed lines. A Baseline series fills the area
-    // between value and baseValue with topFillColor — meaning between
-    // level±halfWidth we get an even horizontal band across the full chart width.
-    ;[...s.srLines, ...s.srZones, ...s.tradeLines].forEach((line) => {
+    // 🆕 S/R are semi-transparent zones (like supply/demand on TradingView),
+    // not thin dashed lines. A Baseline series fills the area between value
+    // and baseValue with topFillColor — meaning between level±halfWidth we
+    // get an even horizontal band across the full chart width.
+    ;[...s.srLines, ...s.srZones, ...s.tradeLines, ...(s.vpZone ? [s.vpZone] : [])].forEach((line) => {
       try { s.candle.removePriceLine(line) } catch (_) {}
       try { chartRef.current.removeSeries(line) } catch (_) {}
     })
+    if (s.vpLine) {
+      try { s.candle.removePriceLine(s.vpLine) } catch (_) {}
+      s.vpLine = null
+    }
     s.srLines = []
     s.srZones = []
     s.tradeLines = []
+    s.vpZone = null
 
-    const srZone = (level, color) => {
-      const halfWidth = level * 0.0012 // ~0.12% each side — tuned below
+    const bandZone = (bottom, top, color) => {
       const zone = chartRef.current.addBaselineSeries({
-        baseValue: { type: 'price', price: level - halfWidth },
+        baseValue: { type: 'price', price: bottom },
         topLineColor: 'transparent',
         topFillColor1: color,
         topFillColor2: color,
@@ -346,12 +420,29 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         lastValueVisible: false,
         crosshairMarkerVisible: false,
       })
-      zone.setData(times.map((t) => ({ time: t, value: level + halfWidth })))
-      s.srZones.push(zone)
+      zone.setData(times.map((t) => ({ time: t, value: top })))
+      return zone
     }
 
-    data.support?.forEach((level) => srZone(level, hexToRgba(C.support, 0.16)))
-    data.resistance?.forEach((level) => srZone(level, hexToRgba(C.resistance, 0.16)))
+    data.support?.forEach((level) => s.srZones.push(bandZone(level - level * 0.0012, level + level * 0.0012, hexToRgba(C.support, 0.16))))
+    data.resistance?.forEach((level) => s.srZones.push(bandZone(level - level * 0.0012, level + level * 0.0012, hexToRgba(C.resistance, 0.16))))
+
+    // 🆕 Volume Profile: Value Area band + POC line. Deliberately drawn with
+    // its own distinct color (C.poc), not reusing the support/resistance
+    // colors — POC/Value Area is a different kind of level (where volume
+    // concentrated) from pivot S/R (local price extremes), and should read
+    // as visually separate, not as "more S/R". See chart.py's build_chart()
+    // for the matching logic in the Discord PNG chart.
+    const vp = data.volume_profile
+    vpDataRef.current = vp
+    if (vp?.poc != null) {
+      if (vp.val != null && vp.vah != null) {
+        s.vpZone = bandZone(vp.val, vp.vah, hexToRgba(C.poc, 0.08))
+      }
+      s.vpLine = s.candle.createPriceLine({
+        price: vp.poc, color: C.poc, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'POC',
+      })
+    }
 
     if (data.active_trade) {
       const t = data.active_trade
@@ -395,6 +486,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       chartRef.current.timeScale().setVisibleLogicalRange(savedRange)
     }
     lastSelectionKeyRef.current = selectionKey
+    drawVolumeProfile()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
 
@@ -438,6 +530,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.bb }} />Bollinger</span>
         <span><span className="legend-dot" style={{ background: C.support }} />Support</span>
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
+        <span><span className="legend-dot" style={{ background: C.poc }} />POC / Value Area</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>
         <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />Delta Volume</span>
@@ -446,8 +539,12 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>
       </div>
 
-      <div className="chart-wrap panel" style={{ padding: 8 }}>
+      <div className="chart-wrap panel" style={{ padding: 8, position: 'relative' }}>
         <div ref={containerRef} style={{ width: '100%' }} />
+        <canvas
+          ref={canvasRef}
+          style={{ position: 'absolute', top: 8, left: 8, pointerEvents: 'none' }}
+        />
       </div>
     </div>
   )

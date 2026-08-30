@@ -622,6 +622,13 @@ async def get_config():
             "sr_pivot_window": _cfg.SR_PIVOT_WINDOW,
             "sr_max_levels": _cfg.SR_MAX_LEVELS,
         },
+        "volume_profile": {
+            "enabled": _cfg.VP_ENABLED,
+            "bins": _cfg.VP_BINS,
+            "lookback": _cfg.VP_LOOKBACK,
+            "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
+            "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+        },
         "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
         "pairs": _cfg.TICKERS,
@@ -996,6 +1003,61 @@ async def set_indicators(body: IndicatorsIn):
     }
 
 
+class VolumeProfileIn(BaseModel):
+    # Any subset of fields — a partial PATCH, same as IndicatorsIn.
+    enabled: Optional[bool] = None
+    bins: Optional[int] = None
+    lookback: Optional[int] = None
+    value_area_pct: Optional[float] = None
+    show_histogram: Optional[bool] = None
+
+
+@app.post("/api/config/volume-profile")
+async def set_volume_profile(body: VolumeProfileIn):
+    """Volume Profile (POC / Value Area) settings. Purely a chart overlay —
+    unlike indicator params, it doesn't affect signal generation, so no
+    state reset is needed here."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+
+    # Validate everything first, apply only once everything passes — same
+    # reasoning as set_indicators()/set_colors() above.
+    if "bins" in updates and not (10 <= updates["bins"] <= 200):
+        raise HTTPException(400, "bins must be between 10 and 200")
+    if "lookback" in updates and not (50 <= updates["lookback"] <= 2000):
+        raise HTTPException(400, "lookback must be between 50 and 2000")
+    if "value_area_pct" in updates and not (0.5 <= updates["value_area_pct"] <= 0.95):
+        raise HTTPException(400, "value_area_pct must be between 0.5 and 0.95")
+
+    if "enabled" in updates:
+        _cfg.VP_ENABLED = updates["enabled"]
+    if "bins" in updates:
+        _cfg.VP_BINS = updates["bins"]
+    if "lookback" in updates:
+        _cfg.VP_LOOKBACK = updates["lookback"]
+    if "value_area_pct" in updates:
+        _cfg.VP_VALUE_AREA_PCT = updates["value_area_pct"]
+    if "show_histogram" in updates:
+        _cfg.VP_SHOW_HISTOGRAM = updates["show_histogram"]
+
+    _cfg.save_vp_config({
+        "enabled": _cfg.VP_ENABLED,
+        "bins": _cfg.VP_BINS,
+        "lookback": _cfg.VP_LOOKBACK,
+        "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
+        "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+    })
+    await broadcast_event({"type": "config_changed", "key": "volume_profile"})
+    return {
+        "enabled": _cfg.VP_ENABLED,
+        "bins": _cfg.VP_BINS,
+        "lookback": _cfg.VP_LOOKBACK,
+        "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
+        "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+    }
+
+
 # =====================================================================
 # 🎨  CHART COLORS — purely visual, no need to reset state
 # =====================================================================
@@ -1007,6 +1069,7 @@ class ColorsIn(BaseModel):
     bb: Optional[str] = None
     support: Optional[str] = None
     resistance: Optional[str] = None
+    poc: Optional[str] = None
     mfi_line: Optional[str] = None
     mfi_overbought: Optional[str] = None
     mfi_oversold: Optional[str] = None

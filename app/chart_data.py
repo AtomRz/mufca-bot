@@ -22,7 +22,7 @@ from indicators import (
     calculate_chop,
     calculate_atr,
 )
-from chart import calc_bollinger_bands, calc_support_resistance
+from chart import calc_bollinger_bands, calc_support_resistance, calc_volume_profile
 # 🆕 Signal/filter lamps in the top bar: reuses the exact same crossover/
 # bars_since helpers and get_htf_bias that signals.check_signals uses, so the
 # UI lamps match EXACTLY the logic that actually decides whether a trade
@@ -98,6 +98,23 @@ async def get_chart_data(
     bb_u, bb_m, bb_l = calc_bollinger_bands(df["close"], period=config.BB_PERIOD, std_mult=config.BB_STDDEV)
     sr = calc_support_resistance(df, pivot_window=config.SR_PIVOT_WINDOW, max_levels=config.SR_MAX_LEVELS)
 
+    # 🆕 Volume Profile (POC / Value Area) — see chart.calc_volume_profile()
+    # for the TPO-style approximation used since only OHLCV is available.
+    vp = None
+    if config.VP_ENABLED:
+        vp_window = df.tail(min(config.VP_LOOKBACK, len(df)))
+        vp = calc_volume_profile(vp_window, bins=config.VP_BINS, value_area_pct=config.VP_VALUE_AREA_PCT)
+        if not config.VP_SHOW_HISTOGRAM:
+            vp["bins"] = []
+        elif vp["bins"]:
+            # Same 6%-of-max threshold as the Discord PNG chart (chart.py) —
+            # below that, bars are visually indistinguishable from noise and
+            # just clutter a densely-packed histogram strip with a "staircase"
+            # of thin low-volume bars near the edges of the price range.
+            max_vol = max(b["volume"] for b in vp["bins"])
+            if max_vol > 0:
+                vp["bins"] = [b for b in vp["bins"] if b["volume"] / max_vol >= 0.06]
+
     df_tail = df.tail(limit).reset_index(drop=True)
 
     candles = [
@@ -127,6 +144,7 @@ async def get_chart_data(
         "mfi_oversold": round(float(mfi_os), 2),
         "support": sr["support"],
         "resistance": sr["resistance"],
+        "volume_profile": vp,
     }
 
     # ── Active trade (if state_snapshot was passed from !status/state) ──
