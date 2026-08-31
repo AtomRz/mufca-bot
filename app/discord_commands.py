@@ -52,6 +52,7 @@ from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
+import derivatives
 from state import (
     load_signals_history,
     save_signals_history,
@@ -87,6 +88,7 @@ async def help_cmd(ctx):
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
+        "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "",
 
         "**⚙️ Settings**",
@@ -1297,9 +1299,39 @@ async def onchain_cmd(ctx):
 
 @core.bot.command(name="reset_cache")
 async def reset_cache_cmd(ctx):
-    """Manually resets the HTF bias cache and on-chain cache."""
+    """Manually resets the HTF bias, on-chain, and derivatives caches."""
     clear_htf_cache()
     clear_onchain_cache_full()  # full reset, including the balance baseline
+    derivatives.clear_derivatives_cache_full()  # full reset, including the OI baseline
     core._onchain_bias_cache = None
     core._onchain_last_fetch = 0.0
-    await ctx.send("✅ HTF bias cache and On-Chain cache reset. The next scan will refresh the data.")
+    await ctx.send("✅ HTF bias, On-Chain, and Derivatives caches reset. The next scan will refresh the data.")
+
+
+@core.bot.command(name="derivatives")
+async def derivatives_cmd(ctx, ticker: str = "BTC/USDT"):
+    """Shows the current derivatives bias (funding rate, open interest) for a pair."""
+    if not _cfg.DERIVATIVES_ENABLED:
+        await ctx.send("⚠️ Derivatives analysis is disabled. Enable it from the web dashboard's Settings panel.")
+        return
+    if _cfg.MARKET_MODE != "futures":
+        await ctx.send("⚠️ Derivatives data (funding rate, open interest) only applies in Futures mode. Currently in Spot mode — see `!mode`.")
+        return
+
+    ticker = ticker.upper()
+    if ticker not in TICKERS:
+        await ctx.send(f"⚠️ `{ticker}` is not a tracked pair. See `!pairs`.")
+        return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Exchange not initialized")
+        return
+
+    msg = await ctx.send(f"⏳ Fetching derivatives data for `{ticker}`...")
+    try:
+        bias = await derivatives.get_derivatives_bias(exchange, ticker)
+        report = derivatives.format_derivatives_report(bias)
+        await msg.edit(content=report)
+    except Exception as e:
+        await msg.edit(content=f"❌ Derivatives error: `{e}`")

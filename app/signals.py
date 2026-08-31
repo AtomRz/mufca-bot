@@ -41,6 +41,7 @@ from indicators import (
     calculate_ut_bot,
     run_kmeans_mfi,
     heikin_ashi,
+    calculate_hurst,
 )
 from volume_indicators import (
     volume_flow_signal_v3,
@@ -753,6 +754,10 @@ async def check_signals(
         level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+        # 🆕 Only computed when the filter is actually on (off by default) —
+        # the rolling R/S calculation is meaningfully more expensive than the
+        # other indicators here, no point paying for it unused.
+        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW) if _cfg.ENABLE_HURST_FILTER else None
 
         idx = len(df) - 2
         bar_idx = idx
@@ -788,6 +793,18 @@ async def check_signals(
         liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
         liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+        # 🆕 Hurst exponent — direction-agnostic "regime clarity" check, a
+        # second opinion alongside CHOP (see indicators.calculate_hurst).
+        # Rejects both long and short signals equally when the market sits
+        # close to a random walk, where neither trending nor mean-reverting
+        # strategies have much statistical edge — not a trend/mean-reversion
+        # split between the A/U tracks (that's a possible future refinement,
+        # not what this first version does).
+        hurst_ok = True
+        if _cfg.ENABLE_HURST_FILTER and hurst is not None:
+            hurst_v = float(hurst.iloc[idx])
+            hurst_ok = not np.isnan(hurst_v) and abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
         vol_info = volume_flow_signal_v3(df)
@@ -803,6 +820,7 @@ async def check_signals(
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
+            and hurst_ok
         )
         filter_short = (
             (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
@@ -812,6 +830,7 @@ async def check_signals(
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
+            and hurst_ok
         )
 
         mfi_bull_sig = crossover(mfi, level_os, idx)
@@ -1030,6 +1049,11 @@ def backtest_history(
         level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+        # 🆕 Always computed here (unlike check_signals, not gated behind the
+        # toggle) — backtest_history is a one-off run, not a per-scan cost
+        # concern, and needs to match live's filter logic for calibration
+        # consistency regardless of whether the toggle happens to be on right now.
+        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW)
 
         htf = _cfg.HTF_BIAS
         htf_bias_arr = np.zeros(len(df))
@@ -1093,6 +1117,9 @@ def backtest_history(
             liq_sweep_long = float(df["low"].iloc[idx]) < ll5_prev and close_v > ll5_prev and close_v > open_v
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
+            hurst_v = float(hurst.iloc[idx])
+            hurst_ok = not np.isnan(hurst_v) and abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = idx >= _cfg.MFI_TRAINING
 
@@ -1103,6 +1130,7 @@ def backtest_history(
                 and slope_long
                 and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
                 and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
+                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
             )
             filter_short = (
                 (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
@@ -1111,6 +1139,7 @@ def backtest_history(
                 and slope_short
                 and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
                 and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
+                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
             )
 
             mfi_bull_sig = crossover(mfi, level_os, idx)

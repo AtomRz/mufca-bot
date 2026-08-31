@@ -87,6 +87,12 @@ export const api = {
     request('/api/config/scan-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
   setOnchainInterval: (seconds) =>
     request('/api/config/onchain-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
+  setDerivativesEnabled: (enabled) =>
+    request('/api/config/derivatives-enabled', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setDerivativesInterval: (seconds) =>
+    request('/api/config/derivatives-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
+  getDerivatives: (ticker) =>
+    request(`/api/derivatives${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

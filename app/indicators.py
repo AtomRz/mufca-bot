@@ -14,6 +14,70 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
+def _hurst_rs(returns: np.ndarray) -> float:
+    """Rescaled-range (R/S) Hurst estimate for one window of log-returns.
+
+    For several chunk sizes k, split the window into non-overlapping chunks
+    of that size, compute each chunk's rescaled range (the range of its
+    mean-adjusted cumulative sum, divided by its standard deviation), and
+    average across chunks. The slope of log(R/S) vs log(k) is the Hurst
+    exponent: ~0.5 = random walk, >0.5 = trending/persistent (a move tends
+    to keep going), <0.5 = mean-reverting/anti-persistent (a move tends to
+    reverse)."""
+    n = len(returns)
+    if n < 16:
+        return 0.5  # not enough data — neutral, not "trending" or "reverting"
+    std = returns.std()
+    if std == 0 or np.isnan(std):
+        return 0.5  # flat/no variance — neutral
+
+    max_k = n // 2
+    sizes = sorted(set(int(s) for s in np.geomspace(8, max_k, num=6) if s >= 8))
+    if len(sizes) < 2:
+        return 0.5
+
+    rs_points = []
+    for k in sizes:
+        n_chunks = n // k
+        if n_chunks < 1:
+            continue
+        rs_per_chunk = []
+        for c in range(n_chunks):
+            chunk = returns[c * k:(c + 1) * k]
+            dev = np.cumsum(chunk - chunk.mean())
+            r = dev.max() - dev.min()
+            s = chunk.std()
+            if s > 0:
+                rs_per_chunk.append(r / s)
+        if rs_per_chunk:
+            rs_points.append((k, float(np.mean(rs_per_chunk))))
+
+    if len(rs_points) < 2:
+        return 0.5
+
+    log_k = np.log([p[0] for p in rs_points])
+    log_rs = np.log([p[1] for p in rs_points])
+    slope, _ = np.polyfit(log_k, log_rs, 1)
+    return float(np.clip(slope, 0.0, 1.0))
+
+
+def calculate_hurst(df: pd.DataFrame, window: int = 100) -> pd.Series:
+    """Rolling Hurst exponent from log-returns over `window` bars.
+
+    A statistically distinct "second opinion" on market regime, alongside
+    CHOP: CHOP reads range vs. trend from price action directly (highs/lows
+    vs a summed true range), Hurst reads persistence/randomness from the
+    structure of returns themselves — a market can be choppy-looking by
+    CHOP's measure while still statistically anti-persistent (mean-reverting)
+    or persistent (trending) by Hurst's, and vice versa.
+
+    >0.5 = trending/persistent, <0.5 = mean-reverting/anti-persistent,
+    ~0.5 = closest to a random walk (hardest regime to trade profitably in
+    either direction). NaN for the first `window` bars while warming up."""
+    log_ret = np.log(df["close"] / df["close"].shift(1))
+    return log_ret.rolling(window=window).apply(_hurst_rs, raw=True)
+
+
 def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """Choppiness Index."""
     hl = df["high"] - df["low"]

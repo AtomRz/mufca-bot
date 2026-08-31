@@ -23,6 +23,7 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, format_price
 from signals import check_signals, backtest_history, make_state
 from onchain import get_onchain_bias
+import derivatives
 from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,22 @@ async def market_scanner():
     notified_ids = _load_closure_notified()
 
     for ticker in list(TICKERS):  # copy the list — guards against mutation via !add/!remove
+        # 🆕 Derivatives bias (funding rate + OI) — per-ticker, unlike
+        # on-chain, which is one global reading shared across every pair.
+        # get_derivatives_bias() does its own TTL caching internally
+        # (config.DERIVATIVES_CACHE_TTL), so calling it once per ticker per
+        # scan cycle is cheap on a cache hit — no separate module-level
+        # cache needed here. combine_biases() merges it with the global
+        # on-chain bias into one dict of the same shape everything
+        # downstream already expects (see derivatives.py for why).
+        derivatives_bias = None
+        if _cfg.DERIVATIVES_ENABLED and _cfg.MARKET_MODE == "futures":
+            try:
+                derivatives_bias = await derivatives.get_derivatives_bias(exchange, ticker)
+            except Exception as e:
+                logger.warning(f"[DERIVATIVES] Failed for {ticker}: {e}")
+        combined_bias = derivatives.combine_biases(_onchain_bias_cache, derivatives_bias)
+
         for tf in TIMEFRAMES:
             try:
                 # 🆕 FIX: Use lock to prevent race with commands
@@ -277,7 +294,7 @@ async def market_scanner():
                     st = state[ticker][tf]
                     signals, bar_time, regime, lev = await check_signals(
                         exchange, ticker, tf, st,
-                        onchain_bias=_onchain_bias_cache,
+                        onchain_bias=combined_bias,
                     )
 
                     scan_stats["total_scans"] += 1

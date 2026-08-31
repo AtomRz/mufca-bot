@@ -21,6 +21,7 @@ from indicators import (
     run_kmeans_mfi,
     calculate_chop,
     calculate_atr,
+    calculate_hurst,
 )
 from chart import calc_bollinger_bands, calc_support_resistance, calc_volume_profile
 # 🆕 Signal/filter lamps in the top bar: reuses the exact same crossover/
@@ -290,6 +291,19 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     chop_ok = chop_v < chop_threshold
     atr_ok = config.ATR_MIN <= atr_pct_v <= config.ATR_MAX
 
+    # 🆕 Hurst — direction-agnostic, same pass/fail for long and short (see
+    # signals.py's filter_long/filter_short for the live-trading logic this
+    # mirrors). Always computed here for display, independent of the
+    # toggle, unlike in check_signals() where it's gated behind
+    # ENABLE_HURST_FILTER to skip the cost when unused — get_market_pulse()
+    # runs far less often (only while the Chart tab is actually open), so
+    # showing the reading before Atom decides to enable the filter is worth
+    # the extra cost here.
+    hurst_s = calculate_hurst(df, window=config.HURST_WINDOW)
+    hurst_v = float(hurst_s.iloc[idx])
+    hurst_valid = not np.isnan(hurst_v)
+    hurst_ok = (not hurst_valid) or abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
+
     hh10_prev = float(df["high"].iloc[max(0, idx - 10):idx].max())
     ll10_prev = float(df["low"].iloc[max(0, idx - 10):idx].min())
     fake_break_long = float(df["high"].iloc[idx]) > hh10_prev and close_v < hh10_prev
@@ -374,6 +388,13 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
                 "enabled": config.ENABLE_LIQ_SWEEP_FILTER,
                 "pass_long": not liq_sweep_short,
                 "pass_short": not liq_sweep_long,
+            },
+            "hurst": {
+                "enabled": config.ENABLE_HURST_FILTER,
+                "pass_long": hurst_ok,   # direction-agnostic — same reading for both sides
+                "pass_short": hurst_ok,
+                "value": round(hurst_v, 3) if hurst_valid else None,
+                "threshold": config.HURST_MIN_DEVIATION,
             },
             "rr": {
                 "enabled": True,  # this is a hard gate in open_position(), not toggleable by a flag

@@ -10,6 +10,11 @@ const FILTER_TOGGLES = [
   { key: 'htf', label: 'HTF bias' },
   { key: 'fake_break', label: 'Fake breakout' },
   { key: 'liq_sweep', label: 'Liquidity sweep' },
+  {
+    key: 'hurst',
+    label: 'Hurst regime clarity',
+    hint: 'Direction-agnostic: rejects both long and short signals when the market is statistically close to a random walk (Hurst exponent near 0.5) — a complement to CHOP, not a replacement. Off by default until validated live.',
+  },
 ]
 
 function Toggle({ checked, onChange, disabled }) {
@@ -230,6 +235,28 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="toggle-row">
+              <span className="row-label" title="Funding rate + open interest bias, per pair — only has any effect in Futures mode. See Signal Filters below for the direction-agnostic Hurst regime filter, a separate feature.">
+                Derivatives bias (funding + OI)
+              </span>
+              <Toggle
+                checked={config.derivatives_enabled ?? true}
+                disabled={busy === 'derivatives_enabled'}
+                onChange={(v) => run('derivatives_enabled', () => api.setDerivativesEnabled(v))}
+              />
+            </div>
+            <div className="field">
+              <label title="How often the bot re-fetches funding rate and open interest. Shorter default than on-chain — both move meaningfully within a single 1h/4h trading timeframe.">Derivatives interval</label>
+              <select
+                value={config.derivatives_interval_seconds}
+                disabled={busy === 'derivatives_interval'}
+                onChange={(e) => run('derivatives_interval', () => api.setDerivativesInterval(Number(e.target.value)))}
+              >
+                {(config.derivatives_interval_options || [900, 1800, 3600]).map((s) => (
+                  <option key={s} value={s}>{s < 3600 ? `${s / 60}m` : `${s / 3600}h`}</option>
+                ))}
+              </select>
+            </div>
+            <div className="toggle-row">
               <span className="row-label">Heikin Ashi for UT Bot</span>
               <Toggle
                 checked={config.ut_heikin_ashi}
@@ -262,9 +289,9 @@ export default function SettingsPanel({ config, onChanged }) {
 
           <div className="panel">
             <h3 className="panel-title">Signal Filters</h3>
-            {FILTER_TOGGLES.map(({ key, label }) => (
+            {FILTER_TOGGLES.map(({ key, label, hint }) => (
               <div className="toggle-row" key={key}>
-                <span className="row-label">{label}</span>
+                <span className="row-label" title={hint}>{label}</span>
                 <Toggle
                   checked={config.filter_toggles?.[key] ?? true}
                   disabled={busy === `filter_${key}`}

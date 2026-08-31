@@ -114,6 +114,55 @@ def save_onchain_interval(seconds: int):
 ONCHAIN_CACHE_TTL = load_onchain_interval()   # seconds — balance refresh interval (default 1h)
 
 # =====================================================================
+# 📉  DERIVATIVES (Funding Rate + Open Interest) — futures-only
+# =====================================================================
+# Only meaningful for perpetual futures (MARKET_MODE == "futures") — funding
+# rate and open interest don't exist for spot trading. Persisted toggle
+# (default ON, unlike the opt-in Hurst filter) — this only ever ADDS a bias
+# adjustment on top of on-chain, the same class of signal Atom is already
+# running, not a new gating mechanism that could block trades outright.
+DERIVATIVES_FILE = os.path.join(DATA_DIR, "derivatives.json")
+
+def load_derivatives_enabled() -> bool:
+    data = safe_json_load(DERIVATIVES_FILE, {"enabled": True})
+    return bool(data.get("enabled", True))
+
+def save_derivatives_enabled(enabled: bool):
+    safe_json_save(DERIVATIVES_FILE, {"enabled": bool(enabled)})
+
+DERIVATIVES_ENABLED = load_derivatives_enabled()
+
+DERIVATIVES_INTERVAL_OPTIONS = (900, 1800, 3600)  # 15m / 30m / 1h — same choices as on-chain
+DERIVATIVES_INTERVAL_FILE = os.path.join(DATA_DIR, "derivatives_interval.json")
+
+def load_derivatives_interval() -> int:
+    data = safe_json_load(DERIVATIVES_INTERVAL_FILE, {"seconds": 900})
+    seconds = data.get("seconds", 900)
+    return seconds if seconds in DERIVATIVES_INTERVAL_OPTIONS else 900
+
+def save_derivatives_interval(seconds: int):
+    if seconds not in DERIVATIVES_INTERVAL_OPTIONS:
+        raise ValueError(f"derivatives interval must be one of {DERIVATIVES_INTERVAL_OPTIONS}, got {seconds}")
+    safe_json_save(DERIVATIVES_INTERVAL_FILE, {"seconds": seconds})
+
+# 🆕 Shorter default than on-chain (15m vs 1h) — funding rate and OI move
+# meaningfully within a single 1h/4h trading timeframe, unlike ETH exchange
+# balances, which only shift enough to matter over longer windows.
+DERIVATIVES_CACHE_TTL = load_derivatives_interval()
+
+# Funding rate beyond this (as a fraction, e.g. 0.0005 = 0.05%) is read as
+# "crowd is one-sided" — contrarian bias against that side. Typical Gate.io
+# perpetual funding sits in a much narrower band most of the time; this
+# threshold marks a genuine outlier, not routine funding noise.
+FUNDING_RATE_EXTREME_THRESHOLD = 0.0005
+
+# Open Interest change (as a fraction of the previous snapshot) beyond this,
+# within one DERIVATIVES_CACHE_TTL window, is read as a meaningful shift in
+# positioning (not just normal noise) — feeds into lev_delta the same way
+# on-chain flow strength does.
+OI_DELTA_THRESHOLD = 0.03
+
+# =====================================================================
 # 📊  PAIRS TO SCAN
 # =====================================================================
 DEFAULT_TICKERS = ["BTC/USDT", "ETH/USDT"]
@@ -151,6 +200,7 @@ DEFAULT_FILTER_TOGGLES = {
     "htf": True,         # enable_mtf_bias
     "fake_break": True,  # 🆕 used to always apply unconditionally, no input.bool equivalent
     "liq_sweep": True,   # 🆕 used to always apply unconditionally, no input.bool equivalent
+    "hurst": False,      # 🆕 off by default — new, unproven filter; opt-in until validated live
 }
 
 def load_filter_toggles() -> dict:
@@ -168,6 +218,25 @@ ENABLE_ATR_FILTER        = _filter_toggles["atr"]         # use_atr_f
 ENABLE_MTF_BIAS          = _filter_toggles["htf"]         # enable_mtf_bias
 ENABLE_FAKE_BREAK_FILTER = _filter_toggles["fake_break"]
 ENABLE_LIQ_SWEEP_FILTER  = _filter_toggles["liq_sweep"]
+ENABLE_HURST_FILTER      = _filter_toggles["hurst"]
+
+# =====================================================================
+# 📈  HURST EXPONENT (regime-clarity filter)
+# =====================================================================
+# A statistically distinct "second opinion" alongside CHOP — see
+# indicators.calculate_hurst() for the full explanation. Direction-agnostic:
+# rejects signals when the market is close to a random walk (neither
+# trending nor mean-reverting in a statistically meaningful way), regardless
+# of which side the signal is on. Not split per-track (A vs U) — that's a
+# further refinement worth trying later once this baseline version has been
+# validated live.
+HURST_WINDOW = 100          # bars used to estimate the rolling Hurst exponent
+# 🆕 R/S Hurst estimation is known to be biased upward on finite samples
+# (a pure random walk tends to measure somewhat above the theoretical 0.5,
+# not near it — confirmed empirically against synthetic random-walk data
+# during testing). MIN_DEVIATION is set conservatively with that bias in
+# mind, not as a naive "0.5 ± X".
+HURST_MIN_DEVIATION = 0.12  # reject if abs(hurst - 0.5) < this
 
 # =====================================================================
 # 📈  INDICATOR PARAMETERS

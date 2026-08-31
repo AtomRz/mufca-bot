@@ -46,6 +46,7 @@ from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history
 import push as _push
+import derivatives
 
 
 # =====================================================================
@@ -283,6 +284,33 @@ async def get_onchain():
     }
 
 
+@app.get("/api/derivatives")
+async def get_derivatives(ticker: Optional[str] = None):
+    """Funding rate / open interest bias for one pair — unlike /api/onchain
+    (one global reading shared by every pair), this is per-ticker, so unlike
+    the on-chain endpoint it actively calls derivatives.get_derivatives_bias()
+    rather than just reading a cache — that function has its own TTL cache
+    (config.DERIVATIVES_CACHE_TTL) internally, so repeated calls within the
+    interval are cheap and don't trigger a real fetch each time."""
+    if not _cfg.DERIVATIVES_ENABLED:
+        return {"enabled": False, "bias": None}
+    if _cfg.MARKET_MODE != "futures":
+        return {"enabled": False, "bias": None, "note": "spot_mode"}
+
+    ticker = unquote(ticker).upper().strip() if ticker else (_cfg.TICKERS[0] if _cfg.TICKERS else None)
+    if not ticker:
+        raise HTTPException(404, "No tracked pairs")
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not tracked")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    bias = await derivatives.get_derivatives_bias(exchange, ticker)
+    return {"enabled": True, "ticker": ticker, "bias": bias}
+
+
 @app.get("/api/health")
 async def health():
     """Lightweight liveness/readiness probe for Docker/orchestrator healthchecks —
@@ -459,8 +487,20 @@ async def pulse(ticker: Optional[str] = None, tf: str = "1h"):
     if exchange is None:
         raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
 
+    # 🆕 Match what the scanner actually uses: bot.py combines on-chain +
+    # derivatives bias before calling check_signals() (see market_scanner) —
+    # without this, the R:R lamp here could disagree with what really
+    # decided whether a trade opened.
+    derivatives_bias = None
+    if _cfg.DERIVATIVES_ENABLED and _cfg.MARKET_MODE == "futures":
+        try:
+            derivatives_bias = await derivatives.get_derivatives_bias(exchange, ticker)
+        except Exception as e:
+            logger.warning(f"[PULSE] derivatives fetch failed for {ticker}: {e}")
+    combined_bias = derivatives.combine_biases(core._onchain_bias_cache, derivatives_bias)
+
     try:
-        return await get_market_pulse(exchange, ticker, tf, onchain_bias=core._onchain_bias_cache)
+        return await get_market_pulse(exchange, ticker, tf, onchain_bias=combined_bias)
     except ValueError as e:
         raise HTTPException(422, str(e))
 
@@ -589,6 +629,9 @@ async def get_config():
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
         "onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL,
         "onchain_interval_options": list(_cfg.ONCHAIN_INTERVAL_OPTIONS),
+        "derivatives_enabled": _cfg.DERIVATIVES_ENABLED,
+        "derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL,
+        "derivatives_interval_options": list(_cfg.DERIVATIVES_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
         "filter_toggles": {
             "frama": _cfg.ENABLE_FRAMA_FILTER,
@@ -597,6 +640,7 @@ async def get_config():
             "htf": _cfg.ENABLE_MTF_BIAS,
             "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
             "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
+            "hurst": _cfg.ENABLE_HURST_FILTER,
         },
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
@@ -780,6 +824,43 @@ async def set_onchain_interval(body: OnchainIntervalIn):
     return {"onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL, "changed": True}
 
 
+class DerivativesEnabledIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/derivatives-enabled")
+async def set_derivatives_enabled(body: DerivativesEnabledIn):
+    """Turns the funding-rate/open-interest bias on or off. Only has any
+    effect in Futures mode — in Spot mode the bot never fetches it
+    regardless of this flag (see derivatives.get_derivatives_bias)."""
+    if body.enabled == _cfg.DERIVATIVES_ENABLED:
+        return {"derivatives_enabled": _cfg.DERIVATIVES_ENABLED, "changed": False}
+
+    _cfg.DERIVATIVES_ENABLED = body.enabled
+    _cfg.save_derivatives_enabled(_cfg.DERIVATIVES_ENABLED)
+    await broadcast_event({"type": "config_changed", "key": "derivatives_enabled", "value": _cfg.DERIVATIVES_ENABLED})
+    return {"derivatives_enabled": _cfg.DERIVATIVES_ENABLED, "changed": True}
+
+
+class DerivativesIntervalIn(BaseModel):
+    seconds: int
+
+
+@app.post("/api/config/derivatives-interval")
+async def set_derivatives_interval(body: DerivativesIntervalIn):
+    """Changes the funding-rate/open-interest refresh interval live, without
+    a container restart — same pattern as scan/on-chain intervals."""
+    if body.seconds not in _cfg.DERIVATIVES_INTERVAL_OPTIONS:
+        raise HTTPException(400, f"seconds must be one of {_cfg.DERIVATIVES_INTERVAL_OPTIONS}")
+    if body.seconds == _cfg.DERIVATIVES_CACHE_TTL:
+        return {"derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL, "changed": False}
+
+    _cfg.DERIVATIVES_CACHE_TTL = body.seconds
+    _cfg.save_derivatives_interval(body.seconds)
+    await broadcast_event({"type": "config_changed", "key": "derivatives_interval_seconds", "value": _cfg.DERIVATIVES_CACHE_TTL})
+    return {"derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL, "changed": True}
+
+
 class UthaIn(BaseModel):
     enabled: bool
 
@@ -805,11 +886,12 @@ _FILTER_ATTR = {
     "htf": "ENABLE_MTF_BIAS",
     "fake_break": "ENABLE_FAKE_BREAK_FILTER",
     "liq_sweep": "ENABLE_LIQ_SWEEP_FILTER",
+    "hurst": "ENABLE_HURST_FILTER",
 }
 
 
 class FilterToggleIn(BaseModel):
-    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep
+    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep | hurst
     enabled: bool
 
 
@@ -837,6 +919,7 @@ def _current_filter_toggles() -> dict:
         "htf": _cfg.ENABLE_MTF_BIAS,
         "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
         "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
+        "hurst": _cfg.ENABLE_HURST_FILTER,
     }
 
 
