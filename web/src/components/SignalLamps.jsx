@@ -9,6 +9,7 @@ const FILTER_LABELS = {
   htf: 'HTF',
   fake_break: 'BRK',
   liq_sweep: 'SWEEP',
+  hurst: 'HURST',
   rr: 'R:R',
 }
 

@@ -51,9 +51,12 @@ function MultRow({ label, long, short }) {
   )
 }
 
-export default function OnchainPanel({ lastEvent }) {
+export default function OnchainPanel({ lastEvent, pairs }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+  const [derivTicker, setDerivTicker] = useState(null)
+  const [deriv, setDeriv] = useState(null)
+  const [derivError, setDerivError] = useState(null)
 
   useEffect(() => {
     const load = () => api.getOnchain().then(setData).catch((e) => setError(e.message))
@@ -62,13 +65,30 @@ export default function OnchainPanel({ lastEvent }) {
     return () => clearInterval(id)
   }, [])
 
+  // Default the derivatives pair selector to the first tracked pair once
+  // the pair list arrives — independent of whatever's selected on the
+  // Chart tab, since Onchain has its own dedicated selector for this
+  // per-ticker section (unlike the rest of this tab, which is global).
+  useEffect(() => {
+    if (!derivTicker && pairs?.length) setDerivTicker(pairs[0])
+  }, [pairs, derivTicker])
+
+  useEffect(() => {
+    if (!derivTicker) return
+    const load = () => api.getDerivatives(derivTicker).then(setDeriv).catch((e) => setDerivError(e.message))
+    load()
+    const id = setInterval(load, 60000)
+    return () => clearInterval(id)
+  }, [derivTicker])
+
   // A fresh hourly refresh on the backend broadcasts an onchain-tagged event —
   // reload right away instead of waiting up to a minute for the poll interval.
   useEffect(() => {
     if (lastEvent?.type === 'scan_tick') {
       api.getOnchain().then(setData).catch(() => {})
+      if (derivTicker) api.getDerivatives(derivTicker).then(setDeriv).catch(() => {})
     }
-  }, [lastEvent])
+  }, [lastEvent, derivTicker])
 
   if (error) {
     return <div className="panel"><p style={{ color: 'var(--short)' }}>Failed to load: {error}</p></div>
@@ -172,6 +192,71 @@ export default function OnchainPanel({ lastEvent }) {
           SL widening is capped regardless of these multipliers.
         </p>
       </div>
+
+      <DerivativesSection pairs={pairs} ticker={derivTicker} onTickerChange={setDerivTicker} deriv={deriv} error={derivError} />
+    </div>
+  )
+}
+
+function DerivativesSection({ pairs, ticker, onTickerChange, deriv, error }) {
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Derivatives (Futures)</h3>
+      {pairs?.length > 1 && (
+        <div className="seg" style={{ marginBottom: 12 }}>
+          {pairs.map((p) => (
+            <button key={p} className={ticker === p ? 'active' : ''} onClick={() => onTickerChange(p)}>
+              {p}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed to load: {error}</p>}
+
+      {!error && !deriv && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Loading…</p>}
+
+      {!error && deriv && !deriv.enabled && (
+        <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>
+          {deriv.note === 'spot_mode'
+            ? 'Only applies in Futures mode — currently in Spot mode.'
+            : 'Disabled — enable it from the Settings panel to see funding rate and open interest bias here.'}
+        </p>
+      )}
+
+      {!error && deriv?.enabled && !deriv.bias && (
+        <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>
+          First refresh not completed yet — this fills in on the next cycle.
+        </p>
+      )}
+
+      {!error && deriv?.enabled && deriv.bias && (
+        <>
+          <div className="row">
+            <span className="row-label">Funding rate</span>
+            <span className="row-value">
+              {deriv.bias.funding_rate != null ? `${(deriv.bias.funding_rate * 100).toFixed(4)}%` : '—'}
+            </span>
+          </div>
+          <div className="row">
+            <span className="row-label">Open interest</span>
+            <span className={`tag ${deriv.bias.oi_direction === 'rising' ? 'long' : deriv.bias.oi_direction === 'falling' ? 'short' : 'flat'}`}>
+              {deriv.bias.oi_direction === 'rising' ? '📈 Rising' : deriv.bias.oi_direction === 'falling' ? '📉 Falling' : '⚪ Flat'}
+              {deriv.bias.oi_delta_pct != null ? ` (${deriv.bias.oi_delta_pct > 0 ? '+' : ''}${(deriv.bias.oi_delta_pct * 100).toFixed(1)}%)` : ''}
+            </span>
+          </div>
+          <BiasBar label="Long bias" value={deriv.bias.bias_long ?? 0} />
+          <BiasBar label="Short bias" value={deriv.bias.bias_short ?? 0} />
+          <div className="row">
+            <span className="row-label">Leverage adjustment</span>
+            <span className="row-value">{deriv.bias.lev_delta > 0 ? `+${deriv.bias.lev_delta}` : deriv.bias.lev_delta}</span>
+          </div>
+          <p style={{ fontSize: 13, color: 'var(--text)', marginTop: 10 }}>{deriv.bias.summary}</p>
+          <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+            Combined with the on-chain bias above before being applied to new positions — see <code>derivatives.combine_biases()</code>.
+          </p>
+        </>
+      )}
     </div>
   )
 }

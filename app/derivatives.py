@@ -56,11 +56,31 @@ def clear_derivatives_cache_full():
 # 📡  FETCH — funding rate & open interest via ccxt
 # =====================================================================
 
+def _to_swap_symbol(ticker: str) -> str:
+    """Converts a spot-format ticker ('BTC/USDT') into ccxt's unified swap
+    symbol format ('BTC/USDT:USDT').
+
+    Gate.io's exchange instance loads both spot and swap markets under one
+    ccxt object, even with options.defaultType='swap' — the plain
+    spot-format symbol stays ambiguous, and fetch_funding_rate/
+    fetch_open_interest_history both raise ("supports swap contracts only")
+    without the explicit :SETTLE suffix that unambiguously points at the
+    swap market. Every pair this bot tracks is USDT-quoted, so the
+    settlement currency is always the quote currency (USDT-margined linear
+    perpetual) — this isn't Gate.io-specific in principle, but Gate.io is
+    the only exchange this bot talks to.
+    """
+    if ":" in ticker:
+        return ticker  # already in swap format
+    base, _, quote = ticker.partition("/")
+    return f"{base}/{quote}:{quote}"
+
+
 async def _fetch_funding_rate(exchange, ticker: str) -> Optional[float]:
     """Returns the current funding rate as a fraction (e.g. 0.0001 = 0.01%),
     or None if unavailable."""
     try:
-        data = await asyncio.to_thread(exchange.fetch_funding_rate, ticker)
+        data = await asyncio.to_thread(exchange.fetch_funding_rate, _to_swap_symbol(ticker))
         rate = data.get("fundingRate")
         return float(rate) if rate is not None else None
     except Exception as e:
@@ -72,10 +92,23 @@ async def _fetch_open_interest(exchange, ticker: str) -> Optional[float]:
     """Returns current open interest (in the exchange's native units for
     this symbol — usually base currency or contracts; we only ever use it
     as a relative delta, never an absolute cross-pair comparison, so the
-    unit doesn't need to be normalized)."""
+    unit doesn't need to be normalized).
+
+    🆕 FIX: Gate.io doesn't implement fetchOpenInterest at all in ccxt
+    (exchange.has['fetchOpenInterest'] is False — calling it raises
+    "is not supported yet", not a symbol-format problem like funding rate
+    above). fetchOpenInterestHistory IS supported, so we pull the shortest
+    available window (5m candles) with limit=1 and read the single most
+    recent point instead — same information, different endpoint.
+    """
     try:
-        data = await asyncio.to_thread(exchange.fetch_open_interest, ticker)
-        oi = data.get("openInterestAmount") or data.get("openInterestValue") or data.get("openInterest")
+        history = await asyncio.to_thread(
+            exchange.fetch_open_interest_history, _to_swap_symbol(ticker), "5m", None, 1
+        )
+        if not history:
+            return None
+        latest = history[-1]
+        oi = latest.get("openInterestAmount") or latest.get("openInterestValue") or latest.get("openInterest")
         return float(oi) if oi is not None else None
     except Exception as e:
         logger.warning(f"[DERIVATIVES] fetch_open_interest failed for {ticker}: {e}")

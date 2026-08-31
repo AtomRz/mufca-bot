@@ -207,7 +207,7 @@ export default function App() {
           />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
-        {tab === 'onchain' && <OnchainPanel lastEvent={lastEvent} />}
+        {tab === 'onchain' && <OnchainPanel lastEvent={lastEvent} pairs={config?.pairs} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}
