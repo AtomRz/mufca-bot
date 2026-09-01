@@ -302,7 +302,12 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     hurst_s = calculate_hurst(df, window=config.HURST_WINDOW)
     hurst_v = float(hurst_s.iloc[idx])
     hurst_valid = not np.isnan(hurst_v)
-    hurst_ok = (not hurst_valid) or abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
+    # NOTE: NaN (still warming up) must read as "fail" here, matching
+    # check_signals()'s hurst_ok logic exactly. Previously NaN read as
+    # "pass" (`(not hurst_valid) or ...`), so the dashboard lamp could show
+    # green while ENABLE_HURST_FILTER was silently blocking the live
+    # signal — same warm-up window, opposite verdict. Keep both in sync.
+    hurst_ok = hurst_valid and abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
 
     hh10_prev = float(df["high"].iloc[max(0, idx - 10):idx].max())
     ll10_prev = float(df["low"].iloc[max(0, idx - 10):idx].min())

@@ -1089,7 +1089,18 @@ def backtest_history(
         signals_found = 0
         history = load_signals_history()
 
-        for idx in range(50, len(df) - 100):
+        # Hurst is always computed above (unlike check_signals, not gated
+        # behind ENABLE_HURST_FILTER) and is NaN for its first HURST_WINDOW
+        # bars while warming up. Starting the loop at a flat idx=50 used to
+        # walk straight into that warm-up window whenever the filter was on,
+        # so every signal in idx 50..HURST_WINDOW-1 was unconditionally
+        # blocked (hurst_ok = False on NaN) and never entered the training
+        # history — silently skewing the adaptive TP/SL calibration toward
+        # later, possibly less volatile data. Start past warm-up so those
+        # bars are eligible on equal footing with the rest of the backtest,
+        # regardless of whether the toggle happens to be on right now.
+        start_idx = max(50, _cfg.HURST_WINDOW + 10)
+        for idx in range(start_idx, len(df) - 100):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)

@@ -67,6 +67,10 @@ def _flush_state_to_disk():
 
         save_bot_state(_bot_module.state)  # snapshot of active positions — survives a restart
         logger.info("[SHUTDOWN] bot_state_snapshot.json flushed to disk")
+
+        import derivatives
+        derivatives.flush_oi_baseline()  # throttled OI baseline writes — force the last one out
+        logger.info("[SHUTDOWN] derivatives OI baseline flushed to disk")
     except Exception as e:
         logger.error(f"[SHUTDOWN] Failed to flush state: {e}", exc_info=True)
 

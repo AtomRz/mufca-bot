@@ -37,6 +37,18 @@ _cache: Dict[str, tuple] = {}  # ticker -> (timestamp, bias_dict)
 _OI_BASELINE_FILE = os.path.join(DATA_DIR, "derivatives_oi_baseline.json")
 _oi_baseline: Dict[str, Dict[str, Any]] = safe_json_load(_OI_BASELINE_FILE, {})
 
+# 🆕 Throttle for the OI baseline disk write. The in-memory dict is updated
+# on every fetch (needed for accurate deltas), but persisting to disk on
+# every single fetch (every DERIVATIVES_CACHE_TTL, per ticker) is disk
+# writes the freshness doesn't need — a restart only loses at most
+# _OI_BASELINE_SAVE_INTERVAL seconds of baseline accuracy either way, same
+# tradeoff as most other periodic snapshots in this project. Graceful
+# shutdown (main.py's _flush_state_to_disk) calls flush_oi_baseline() to
+# persist the final in-memory state regardless of the throttle.
+_OI_BASELINE_SAVE_INTERVAL = 300  # seconds
+_oi_baseline_last_saved = 0.0
+_oi_baseline_dirty = False
+
 
 def clear_derivatives_cache():
     """Clears the TTL cache (does not touch the OI baseline)."""
@@ -50,6 +62,42 @@ def clear_derivatives_cache_full():
     _oi_baseline.clear()
     safe_json_save(_OI_BASELINE_FILE, {})
     logger.info("[DERIVATIVES] Full cache cleared (including OI baseline)")
+
+
+def _save_oi_baseline_throttled():
+    """Marks the baseline dirty and persists it if enough time has passed
+    since the last disk write (see _OI_BASELINE_SAVE_INTERVAL)."""
+    global _oi_baseline_last_saved, _oi_baseline_dirty
+    _oi_baseline_dirty = True
+    now = time.time()
+    if now - _oi_baseline_last_saved >= _OI_BASELINE_SAVE_INTERVAL:
+        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        _oi_baseline_last_saved = now
+        _oi_baseline_dirty = False
+
+
+def flush_oi_baseline():
+    """Forces an immediate save regardless of the throttle interval — call
+    on graceful shutdown so the last in-memory baseline isn't lost."""
+    global _oi_baseline_last_saved, _oi_baseline_dirty
+    if _oi_baseline_dirty:
+        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        _oi_baseline_last_saved = time.time()
+        _oi_baseline_dirty = False
+
+
+def clear_ticker_cache(ticker: str):
+    """Drops one ticker's TTL cache entry and OI baseline (use with !remove).
+
+    Without this, removing and later re-adding a ticker reuses the stale
+    baseline from before removal, so the first post-re-add OI delta is
+    computed against whatever OI happened to be current when the ticker was
+    removed rather than the current run — a misleading first reading."""
+    _cache.pop(ticker, None)
+    had_baseline = _oi_baseline.pop(ticker, None) is not None
+    if had_baseline:
+        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+    logger.info(f"[DERIVATIVES] Cleared cache/baseline for {ticker}")
 
 
 # =====================================================================
@@ -131,14 +179,14 @@ async def _get_oi_delta(exchange, ticker: str) -> Dict:
     baseline = _oi_baseline.get(ticker)
     if baseline is None or baseline.get("oi") is None:
         _oi_baseline[ticker] = {"oi": curr_oi, "ts": now}
-        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        _save_oi_baseline_throttled()
         return {"delta_pct": 0.0, "direction": "neutral", "note": "first_run"}
 
     prev_oi = baseline["oi"]
     delta_pct = (curr_oi - prev_oi) / prev_oi if prev_oi else 0.0
 
     _oi_baseline[ticker] = {"oi": curr_oi, "ts": now}
-    safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+    _save_oi_baseline_throttled()
 
     if delta_pct > _cfg.OI_DELTA_THRESHOLD:
         direction = "rising"
@@ -211,12 +259,23 @@ async def get_derivatives_bias(exchange, ticker: str) -> Optional[Dict]:
     # conviction is building or unwinding). ──
     if oi_delta.get("note") == "ok":
         direction = oi_delta["direction"]
-        if direction == "rising":
-            lev_delta += 1
-            reasons.append(f"OI rising {oi_delta['delta_pct']*100:+.1f}% (new positioning building) 📈")
-        elif direction == "falling":
-            lev_delta -= 1
-            reasons.append(f"OI falling {oi_delta['delta_pct']*100:+.1f}% (positions unwinding) 📉")
+        # 🆕 Scale the lev_delta contribution with how far past the
+        # threshold the OI move actually is — previously a 3% OI change and
+        # a 30% OI change both contributed a flat +/-1, same as funding
+        # rate's own strength_mult treatment above. "rising"/"falling" only
+        # fire past OI_DELTA_THRESHOLD already, so this ratio is always
+        # >= 1.0 here; capped at 2.0 so one input can't dominate lev_delta
+        # on its own (combine_biases() then caps the combined total at +/-2
+        # regardless).
+        if direction in ("rising", "falling"):
+            oi_strength_mult = min(2.0, abs(oi_delta["delta_pct"]) / _cfg.OI_DELTA_THRESHOLD)
+            oi_lev_contribution = max(1, int(round(oi_strength_mult)))
+            if direction == "rising":
+                lev_delta += oi_lev_contribution
+                reasons.append(f"OI rising {oi_delta['delta_pct']*100:+.1f}% (x{oi_strength_mult:.1f}, new positioning building) 📈")
+            else:
+                lev_delta -= oi_lev_contribution
+                reasons.append(f"OI falling {oi_delta['delta_pct']*100:+.1f}% (x{oi_strength_mult:.1f}, positions unwinding) 📉")
 
     bias_long = max(-15, min(15, bias_long))
     bias_short = max(-15, min(15, bias_short))
@@ -243,6 +302,17 @@ async def get_derivatives_bias(exchange, ticker: str) -> Optional[Dict]:
     return result
 
 
+# 🆕 Hard cap for the combined (onchain x derivatives) TP/SL multiplier —
+# see the comment in combine_biases(). Symmetric around 1.0 for the
+# discount side (0.95 * 0.95 ~= 0.9025, clamped up to 1/COMBINED_MULT_CAP).
+COMBINED_MULT_CAP = 1.20
+
+
+def _clamp_mult(mult: float) -> float:
+    lo = 1.0 / COMBINED_MULT_CAP
+    return max(lo, min(COMBINED_MULT_CAP, mult))
+
+
 def combine_biases(onchain_bias: Optional[Dict], derivatives_bias: Optional[Dict]) -> Optional[Dict]:
     """
     Merges the on-chain bias (global, one per scan cycle) with the
@@ -264,10 +334,18 @@ def combine_biases(onchain_bias: Optional[Dict], derivatives_bias: Optional[Dict
     combined = dict(onchain_bias)  # start from onchain_bias's extra fields (fear_and_greed, flow, etc.)
     combined["bias_long"] = max(-20, min(20, onchain_bias.get("bias_long", 0) + derivatives_bias.get("bias_long", 0)))
     combined["bias_short"] = max(-20, min(20, onchain_bias.get("bias_short", 0) + derivatives_bias.get("bias_short", 0)))
-    combined["tp_mult_long"] = round(onchain_bias.get("tp_mult_long", 1.0) * derivatives_bias.get("tp_mult_long", 1.0), 3)
-    combined["tp_mult_short"] = round(onchain_bias.get("tp_mult_short", 1.0) * derivatives_bias.get("tp_mult_short", 1.0), 3)
-    combined["sl_mult_long"] = round(onchain_bias.get("sl_mult_long", 1.0) * derivatives_bias.get("sl_mult_long", 1.0), 3)
-    combined["sl_mult_short"] = round(onchain_bias.get("sl_mult_short", 1.0) * derivatives_bias.get("sl_mult_short", 1.0), 3)
+    # 🆕 On-chain and derivatives TP/SL multipliers are two independent
+    # sources multiplied together, so they can compound past what either
+    # one alone was calibrated for (e.g. 1.10 x 1.05 = 1.155, 15.5% beyond
+    # the base TP). apply_onchain_with_safety() still checks R:R downstream,
+    # but capping the combined multiplier here keeps a single "everything
+    # agrees" scenario from pushing TP/SL to an extreme no individual
+    # source would produce on its own — same reasoning as lev_delta's cap
+    # just below.
+    combined["tp_mult_long"] = round(_clamp_mult(onchain_bias.get("tp_mult_long", 1.0) * derivatives_bias.get("tp_mult_long", 1.0)), 3)
+    combined["tp_mult_short"] = round(_clamp_mult(onchain_bias.get("tp_mult_short", 1.0) * derivatives_bias.get("tp_mult_short", 1.0)), 3)
+    combined["sl_mult_long"] = round(_clamp_mult(onchain_bias.get("sl_mult_long", 1.0) * derivatives_bias.get("sl_mult_long", 1.0)), 3)
+    combined["sl_mult_short"] = round(_clamp_mult(onchain_bias.get("sl_mult_short", 1.0) * derivatives_bias.get("sl_mult_short", 1.0)), 3)
     combined["lev_delta"] = max(-2, min(2, onchain_bias.get("lev_delta", 0) + derivatives_bias.get("lev_delta", 0)))
     onchain_summary = onchain_bias.get("summary", "")
     derivatives_summary = derivatives_bias.get("summary", "")

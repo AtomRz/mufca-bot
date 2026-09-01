@@ -340,6 +340,12 @@ async def remove_cmd(ctx, ticker: str = ""):
 
     save_tickers(TICKERS)
 
+    # Drop the ticker's derivatives TTL cache + OI baseline too, otherwise a
+    # later !add re-add reuses the stale pre-removal baseline and the first
+    # OI-delta reading after re-adding is computed against the wrong point
+    # in time.
+    derivatives.clear_ticker_cache(ticker)
+
     await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}")
 
 @core.bot.command(name="delsignals")
