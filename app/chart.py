@@ -53,6 +53,12 @@ THEME = {
     "mfi_os":     "#26a641",
 }
 
+# Fraction of the candle panel's width the volume-profile histogram strip
+# occupies (right-anchored). Shared between where the Value Area band/POC
+# line stop (see build_chart) and where the histogram bars themselves are
+# drawn, so the two can't drift out of sync.
+_VP_STRIP_FRAC = 0.16
+
 # ─────────────────────────────────────────────────────────────────────
 # 📐  CHART INDICATORS
 # ─────────────────────────────────────────────────────────────────────
@@ -370,13 +376,23 @@ def build_chart(
     # pivot S/R colors — POC/Value Area are a different kind of level
     # (where volume concentrated) from pivot S/R (local price extremes),
     # and should read as visually separate on the chart, not as "more S/R".
+    #
+    # 🆕 FIX: both used to span the full chart width (x_start to x_end),
+    # including the rightmost strip where the histogram bars render (see
+    # _VP_STRIP_FRAC below) — the translucent band and the individual bars
+    # overlapped there, both in gold tones, blending into a single solid
+    # block with no visible bar boundaries. Stopping the band/line at the
+    # same boundary the histogram strip starts from keeps the two visually
+    # separate: a clean band+line across the candles, distinct bars in
+    # their own strip.
+    vp_x_end = x_end - (x_end - x_start) * _VP_STRIP_FRAC
     if volume_profile and volume_profile.get("poc") is not None:
         vah = volume_profile.get("vah")
         val = volume_profile.get("val")
         poc = volume_profile["poc"]
         if vah is not None and val is not None:
-            ax_c.fill_between(x, val, vah, alpha=0.06, color=T["poc"], zorder=1)
-        ax_c.hlines(poc, x_start, x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
+            ax_c.fill_between([x_start, vp_x_end], val, vah, alpha=0.06, color=T["poc"], zorder=1)
+        ax_c.hlines(poc, x_start, vp_x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
         ax_c.text(n - 0.5, poc, f"POC {format_price(poc)}", color=T["poc"],
                   fontsize=8, va="bottom", ha="right", fontweight="bold",
                   bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
@@ -536,7 +552,7 @@ def build_chart(
         max_vol = max(volumes) if volumes else 0
         if max_vol > 0:
             bbox = ax_c.get_position()
-            profile_width = bbox.width * 0.16  # ~16% of the candle panel's width
+            profile_width = bbox.width * _VP_STRIP_FRAC
             ax_vp = fig.add_axes([bbox.x1 - profile_width, bbox.y0, profile_width, bbox.height])
             ax_vp.set_ylim(ax_c.get_ylim())
             ax_vp.axis("off")
@@ -557,8 +573,13 @@ def build_chart(
                     continue  # outside the visible price range — skip
                 in_value_area = val is not None and vah is not None and val <= price <= vah
                 width = (vol / max_vol) * 0.94  # fraction of the inset axes' own width
+                # 🆕 FIX: raised transparency (0.85→0.55, 0.35→0.18) and
+                # widened the gap between bars (height factor 0.9→0.6) — at
+                # the old, denser settings the bars packed too tightly and
+                # read as a solid block rather than a legible histogram
+                # shape, especially once dozens of bins were visible at once.
                 bar_color = T["poc"] if in_value_area else T["text_dim"]
-                bar_alpha = 0.85 if in_value_area else 0.35
+                bar_alpha = 0.55 if in_value_area else 0.18
                 bin_height = (df_full["high"].max() - df_full["low"].min()) / len(vp_bins) if df_full is not None else (y1 - y0) / len(vp_bins)
                 # 🆕 FIX: bars used to be anchored at left=0 (the axes' left
                 # edge, overlapping the candles) and grow rightward — meaning
@@ -569,7 +590,7 @@ def build_chart(
                 # dashboard's convention: bars reach toward the candles,
                 # with the tallest (POC-area) bars closest to the price.
                 ax_vp.barh(
-                    price, width, height=bin_height * 0.9,
+                    price, width, height=bin_height * 0.6,
                     left=1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none",
                 )
             ax_vp.set_xlim(0, 1)
