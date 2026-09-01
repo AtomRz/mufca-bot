@@ -548,7 +548,7 @@ def build_chart(
                 price = b["price"]
                 vol = b["volume"]
                 # Skip near-empty bins — at ~0 width they still leave a
-                # visible sliver right at the profile's left edge (x=0);
+                # visible sliver right at the profile's right edge (x=1);
                 # stacked together, many of them read as a stray vertical line.
                 if vol / max_vol < 0.06:
                     continue
@@ -560,9 +560,17 @@ def build_chart(
                 bar_color = T["poc"] if in_value_area else T["text_dim"]
                 bar_alpha = 0.85 if in_value_area else 0.35
                 bin_height = (df_full["high"].max() - df_full["low"].min()) / len(vp_bins) if df_full is not None else (y1 - y0) / len(vp_bins)
+                # 🆕 FIX: bars used to be anchored at left=0 (the axes' left
+                # edge, overlapping the candles) and grow rightward — meaning
+                # the highest-volume bars stuck out farthest AWAY from the
+                # price action, toward the outer margin, instead of toward
+                # it. Anchoring at the right edge (x=1, the chart's actual
+                # outer boundary) and growing leftward matches the web
+                # dashboard's convention: bars reach toward the candles,
+                # with the tallest (POC-area) bars closest to the price.
                 ax_vp.barh(
                     price, width, height=bin_height * 0.9,
-                    left=0, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none",
+                    left=1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none",
                 )
             ax_vp.set_xlim(0, 1)
 
