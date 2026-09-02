@@ -25,6 +25,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - **On-chain module** — Etherscan (exchange ETH wallet in/outflows) + CoinGecko (Fear & Greed, BTC dominance), refresh interval configurable (15m/30m/1h, default 1h) from the web dashboard; adjusts confidence score, TP/SL multipliers and leverage. Fully optional — disabled automatically if API keys aren't set
 - **Derivatives module (futures only)** — funding rate + open interest bias from Gate.io itself (no external API), refresh interval configurable (15m/30m/1h, default 15m — funding/OI move faster than on-chain within a single trading timeframe); extreme funding rate is read as a contrarian signal (crowd one-sided), rising/falling OI as new positioning building/unwinding, scaled by how far OI moved past `OI_DELTA_THRESHOLD`. Combines with on-chain bias with a hard cap on the resulting TP/SL multiplier so the two sources can't compound into an extreme neither would produce alone. On by default; toggle from the web dashboard or `!derivatives`/`!reset_cache`
 - **Hurst regime filter** — rolling Hurst exponent (numba-JIT accelerated) as a statistically distinct "second opinion" alongside CHOP: rejects signals when the market is close to a random walk (neither trending nor mean-reverting) regardless of side. **Off by default** — new, opt-in until validated live from the web dashboard's filter toggles
+- **Order book spread filter** — live-only gate (order book depth isn't in OHLCV, so unlike every other filter here it can't be backtested — see `spread.py`) against Gate.io's own top-of-book, on both spot and futures. Two relative conditions, not a flat percent-of-price cutoff: spread eating more than `SPREAD_SL_EAT_MAX_PCT` of *this signal's own SL distance*, or spread reading anomalously wide vs. *this pair's own recent rolling median*. **Off by default, but always collecting** — the bot fetches and records the order book every scan tick regardless of the toggle, so the per-pair baseline is already warmed up whenever you decide to switch it on. Preview live with `!spread [pair]` before enabling
 - **Volume flow score** — OBV-based, score-based confidence/leverage adjustment
 - **Candlestick chart generation (`!chart`)** — dark-themed PNG with FRAMA bands, Bollinger Bands, support/resistance levels, signal arrows, volume panel and K-means MFI panel, attached directly to Discord signal embeds
 - **Volume Profile (POC / Value Area)** — TPO-style approximation from OHLCV (see `chart.calc_volume_profile()` for why it's an approximation rather than tick-level "real" volume), rendered as a POC line + Value Area band (+ optional histogram) on both the Discord PNG chart and the web dashboard's canvas chart overlay. On by default, configurable bin count/lookback/Value Area % from the web dashboard
@@ -38,7 +39,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - **Retry fetch** — exponential backoff on Gate.io rate limits
 - **Graceful shutdown** — on `SIGTERM`/`SIGINT` the bot flushes all in-memory signal history and active-position state to disk and closes the Discord connection cleanly before exiting
 - **Full data persistence** — all settings and history survive container restarts
-- **Multi-module architecture** — `config`, `indicators`, `volume_indicators`, `signals`, `state`, `onchain`, `derivatives`, `push`, `bot`, `discord_commands`, `chart`, `chart_data`, `web_api`, `embeds`, `utils`
+- **Multi-module architecture** — `config`, `indicators`, `volume_indicators`, `signals`, `state`, `onchain`, `derivatives`, `spread`, `push`, `bot`, `discord_commands`, `chart`, `chart_data`, `web_api`, `embeds`, `utils`
 
 ---
 
@@ -77,6 +78,7 @@ mufca-bot/
 │   ├── state.py              # Signal history, MFE/MAE tracking, TP1/TP2 adaptive TP
 │   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
 │   ├── derivatives.py         # Gate.io funding rate + open interest bias (futures only)
+│   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
 │   ├── push.py               # Android push notifications (Firebase Cloud Messaging)
 │   ├── chart.py              # Candlestick chart (PNG) generation for Discord `!chart`
 │   ├── chart_data.py         # Same indicator data as chart.py, as JSON for the web dashboard
@@ -182,7 +184,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `ut_ha.json` | UT Bot Heikin Ashi toggle |
 | `pairs.json` | Scanned pairs list |
 | `chop_threshold.json` | Per-timeframe CHOP thresholds |
-| `filter_toggles.json` | Per-filter on/off state — FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst (editable from the web dashboard) |
+| `filter_toggles.json` | Per-filter on/off state — FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst, order book spread (editable from the web dashboard) |
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
 | `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven or half-way-to-TP1 (editable from the web dashboard) |
 | `discord_notifications.json` | Discord channel notifications on/off (editable from the web dashboard; independent of `DISCORD_ENABLED` — see "Running without Discord" above) |
@@ -192,6 +194,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `derivatives_interval.json` | Derivatives data refresh interval — 15m/30m/1h (editable from the web dashboard) |
 | `derivatives_oi_baseline.json` | Previous-cycle open interest per ticker, used to compute the OI delta; written on a throttled interval (not on every fetch) and flushed immediately on graceful shutdown |
 | `volume_profile.json` | Volume Profile on/off, bin count, lookback bars, Value Area %, histogram visibility (editable from the web dashboard) |
+| `spread_history.json` | Rolling per-pair order book spread samples (up to `SPREAD_HISTORY_MAX_SAMPLES`), used for the spread filter's own-history anomaly check; written on a throttled interval and flushed immediately on graceful shutdown — collected regardless of whether the filter is switched on |
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
 | `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
 | `onchain_baseline.json` / `onchain_baseline_ts.json` | Previous-cycle exchange ETH balances + timestamp, used to compute inflow/outflow delta — survives restarts so a restart doesn't delay flow analysis by a full cycle |
@@ -228,7 +231,7 @@ volumes:
 |---|---|
 | `!scan [TICKER] [TF]` | Manual scan. Example: `!scan ETH/USDT 4h` |
 | `!add SOL/USDT` | Add pair to scanner (auto-runs backtest) |
-| `!remove SOL/USDT` | Remove pair from scanner (also clears its derivatives cache/OI baseline) |
+| `!remove SOL/USDT` | Remove pair from scanner (also clears its derivatives cache/OI baseline and spread history) |
 | `!delsignals SOL/USDT [TF] [yes]` | Delete accumulated signal history for a pair (optionally one timeframe only). Preview first, then confirm with `yes` |
 | `!cleanup_sim [yes]` | Remove all synthetic `!sim` records from signal history across every pair/timeframe/side. Preview first, then confirm with `yes` |
 
@@ -262,7 +265,9 @@ volumes:
 | `!chart [PAIR] [TF] [LIMIT]` | Candlestick PNG with FRAMA, BB, S/R, volume & MFI panels. Example: `!chart ETH 4h 100` |
 | `!onchain` | Show current on-chain bias (exchange flows, Fear & Greed, BTC dominance) |
 | `!derivatives [PAIR]` | Show current derivatives bias — funding rate + open interest (futures mode only). Example: `!derivatives ETH/USDT` |
-| `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch |
+| `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
+| `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`) |
+| `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch (deliberately does not touch spread history — see `!spread reset`) |
 
 ### 📚 History & Stats
 
@@ -299,7 +304,7 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
   - Discord signal notifications on/off
   - Scanner poll interval (15/30/60/180s), on-chain refresh interval (15m/30m/1h), and derivatives refresh interval (15m/30m/1h)
   - Derivatives module on/off (futures only — funding rate + open interest bias)
-  - Signal filter toggles (FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst regime filter — off by default)
+  - Signal filter toggles (FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst regime filter, order book spread filter — Hurst and spread off by default)
   - Per-timeframe CHOP threshold
   - Adaptive TP mode/percentiles/history limit
   - Tracked pairs (add/remove, with an option to also purge accumulated signal history)
@@ -312,7 +317,7 @@ Changing market mode, HTF bias, or any indicator parameter resets active positio
 
 **Top bar:** live connection status, market mode, HTF bias, CHOP/trend/suggested-leverage pulse for the pair selected on the Chart tab, and a row of signal/filter lamps (MFI, Andean, UT Bot, plus every filter's pass/block state — including R:R) computed with the exact same logic the scanner uses to decide whether a trade actually opens.
 
-**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`volume-profile`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
+**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`volume-profile`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
 
 ---
 
@@ -352,6 +357,9 @@ Defaults below (all editable at runtime from the **web dashboard → Settings**,
 | Funding Rate Threshold | 0.05% | Funding rate beyond this (either direction) reads as "crowd one-sided" — contrarian bias against that side |
 | OI Delta Threshold | 3% | Open interest change beyond this within one derivatives refresh window reads as a meaningful positioning shift, not routine noise |
 | Combined Mult Cap | 1.20 | Hard cap on the on-chain × derivatives combined TP/SL multiplier, so the two independent sources can't compound past what either was calibrated for on its own |
+| Spread SL-Eat Max | 15% | Order book spread filter: block if spread exceeds this fraction of the signal's own SL distance (live scan only, off by default) |
+| Spread Anomaly Mult | 3.0x | Order book spread filter: block if spread exceeds this multiple of the pair's own rolling median spread (needs `Spread Min Samples` warm-up) |
+| Spread Min Samples | 30 | Minimum warm-up samples per pair before the anomaly condition activates; the SL-eat condition needs no warm-up |
 | Scan Interval | 60s | Scanner poll interval — 15/30/60/180s |
 | On-chain Interval | 1h | On-chain data refresh interval — 15m/30m/1h |
 | Derivatives Interval | 15m | Derivatives (funding/OI) data refresh interval — 15m/30m/1h |
@@ -404,8 +412,9 @@ All signals fire on the **last confirmed closed bar** (`iloc[-2]`) — no repain
 8. R:R ≥ 1.5 (`MIN_RR`)
 9. Bar low above SL
 10. *(off by default)* Hurst regime filter — direction-agnostic, rejects when the market reads as statistically close to a random walk
+11. *(off by default; live scan path only, not backtestable)* Order book spread filter — rejects when the current spread eats too much of this signal's own SL distance, or reads anomalously wide vs. the pair's recent history
 
-Each of steps 1–2, 3, 4, 5, 6, 7, 10 can be individually toggled on/off from the web dashboard's Settings panel (Signal Filters) — the top-bar filter lamps reflect these toggles live.
+Each of steps 1–2, 3, 4, 5, 6, 7, 10, 11 can be individually toggled on/off from the web dashboard's Settings panel (Signal Filters) — the top-bar filter lamps reflect these toggles live.
 
 **A-track** — MFI crosses oversold AND Andean crosses signal line within `LOOKBACK=3` bars.
 

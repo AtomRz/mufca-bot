@@ -59,6 +59,7 @@ from state import (
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price
 from config import ONCHAIN_ENABLED
+import spread
 
 logger = logging.getLogger(__name__)
 
@@ -539,6 +540,7 @@ async def open_position(
     dry_run: bool,
     calc_confidence,
     MIN_RR: float,
+    spread_info: Optional[Dict] = None,
 ) -> Optional[Tuple]:
     """
     Unified position opening logic for any track (a/u) and side (long/short).
@@ -651,6 +653,25 @@ async def open_position(
             state[in_short_key] = False
         return None
 
+    # 🆕 Order book spread gate — live-only (see spread.py's module
+    # docstring: spread_info is always None during backtest_history(), so
+    # this is a structural no-op there, not a bug). Uses this specific
+    # signal's own SL distance (risk/close_v), not a flat percent — see the
+    # SPREAD section in config.py for why.
+    if _cfg.ENABLE_SPREAD_FILTER and spread_info is not None:
+        sl_distance_pct = risk / max(close_v, 1e-8)
+        gate = spread.evaluate_spread_gate(spread_info, sl_distance_pct)
+        if gate["blocked"]:
+            logger.info(
+                f"[FILTER] {ticker} {timeframe} {track_label}-{side.upper()} skipped — "
+                f"spread too wide (reason={gate['reason']}, spread={gate.get('spread_pct', 0)*100:.3f}%, "
+                f"eats_sl={gate.get('eats_sl_pct', 0)*100:.0f}%)"
+            )
+            if not dry_run:
+                state[in_long_key] = False
+                state[in_short_key] = False
+            return None
+
     state[trade_key] = {
         "side": side,
         "entry": close_v,
@@ -701,12 +722,18 @@ async def check_signals(
     state: Dict[str, Any],
     dry_run: bool = False,
     onchain_bias: Optional[Dict] = None,
+    spread_info: Optional[Dict] = None,
 ) -> Tuple[List[Tuple], Optional[int], str, int]:
     """
     Checks signals for a pair/timeframe.
     Returns: (signals, bar_time, regime, leverage)
     dry_run=True       — doesn't write signals to history (used by !scan).
     onchain_bias=dict  — data from onchain.get_onchain_bias(), affects TP/SL/lev/confidence.
+    spread_info=dict   — one already-fetched order book snapshot from
+                         spread.get_spread_snapshot(), evaluated against
+                         this signal's own SL distance. Live-only (see
+                         spread.py's module docstring) — None during
+                         backtest_history(), where this gate is a no-op.
     """
     try:
         htf_bias = await get_htf_bias(exchange, ticker, timeframe)
@@ -967,7 +994,7 @@ async def check_signals(
             try:
                 return await open_position(state, track, side, close_v, fs, fu, fl, atr14, df, idx,
                                             ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                            calc_confidence, MIN_RR)
+                                            calc_confidence, MIN_RR, spread_info=spread_info)
             except Exception as e:
                 logger.error(f"[OPEN_POSITION] {ticker} {timeframe} {track.upper()}-{side.upper()} failed: {e}", exc_info=True)
                 if not dry_run:

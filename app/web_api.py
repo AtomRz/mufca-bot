@@ -47,6 +47,7 @@ from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history
 import push as _push
 import derivatives
+import spread
 
 
 # =====================================================================
@@ -309,6 +310,37 @@ async def get_derivatives(ticker: Optional[str] = None):
 
     bias = await derivatives.get_derivatives_bias(exchange, ticker)
     return {"enabled": True, "ticker": ticker, "bias": bias}
+
+
+@app.get("/api/spread")
+async def get_spread(ticker: Optional[str] = None):
+    """Order book spread snapshot + filter status for one pair. Unlike
+    /api/derivatives this always returns a snapshot (there's no separate
+    "disabled" state to short-circuit on) — the spread is collected
+    regardless of ENABLE_SPREAD_FILTER, that's the whole point of the
+    warm-up design (see spread.py's module docstring). `filter_enabled`
+    tells the frontend whether the gate is actually live right now."""
+    ticker = unquote(ticker).upper().strip() if ticker else (_cfg.TICKERS[0] if _cfg.TICKERS else None)
+    if not ticker:
+        raise HTTPException(404, "No tracked pairs")
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not tracked")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    snapshot = await spread.get_spread_snapshot(exchange, ticker)
+    if snapshot is None:
+        raise HTTPException(502, f"Could not fetch order book for {ticker}")
+
+    return {
+        "filter_enabled": _cfg.ENABLE_SPREAD_FILTER,
+        "ticker": ticker,
+        "snapshot": snapshot,
+        "warmed_up": snapshot["sample_count"] >= _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
+        "min_samples_for_anomaly": _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
+    }
 
 
 @app.get("/api/health")
@@ -887,11 +919,12 @@ _FILTER_ATTR = {
     "fake_break": "ENABLE_FAKE_BREAK_FILTER",
     "liq_sweep": "ENABLE_LIQ_SWEEP_FILTER",
     "hurst": "ENABLE_HURST_FILTER",
+    "spread": "ENABLE_SPREAD_FILTER",
 }
 
 
 class FilterToggleIn(BaseModel):
-    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep | hurst
+    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep | hurst | spread
     enabled: bool
 
 
@@ -920,6 +953,7 @@ def _current_filter_toggles() -> dict:
         "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
         "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
         "hurst": _cfg.ENABLE_HURST_FILTER,
+        "spread": _cfg.ENABLE_SPREAD_FILTER,
     }
 
 

@@ -201,6 +201,7 @@ DEFAULT_FILTER_TOGGLES = {
     "fake_break": True,  # 🆕 used to always apply unconditionally, no input.bool equivalent
     "liq_sweep": True,   # 🆕 used to always apply unconditionally, no input.bool equivalent
     "hurst": False,      # 🆕 off by default — new, unproven filter; opt-in until validated live
+    "spread": False,     # 🆕 off by default — starts in warm-up/logging-only mode, see SPREAD section below
 }
 
 def load_filter_toggles() -> dict:
@@ -219,6 +220,7 @@ ENABLE_MTF_BIAS          = _filter_toggles["htf"]         # enable_mtf_bias
 ENABLE_FAKE_BREAK_FILTER = _filter_toggles["fake_break"]
 ENABLE_LIQ_SWEEP_FILTER  = _filter_toggles["liq_sweep"]
 ENABLE_HURST_FILTER      = _filter_toggles["hurst"]
+ENABLE_SPREAD_FILTER     = _filter_toggles["spread"]
 
 # =====================================================================
 # 📈  HURST EXPONENT (regime-clarity filter)
@@ -237,6 +239,43 @@ HURST_WINDOW = 100          # bars used to estimate the rolling Hurst exponent
 # during testing). MIN_DEVIATION is set conservatively with that bias in
 # mind, not as a naive "0.5 ± X".
 HURST_MIN_DEVIATION = 0.12  # reject if abs(hurst - 0.5) < this
+
+# =====================================================================
+# 📏  ORDER BOOK SPREAD (live liquidity gate) — futures & spot
+# =====================================================================
+# Order book depth isn't part of OHLCV, so unlike Hurst/CHOP/FRAMA this
+# can't be backtested against history — the bot only ever sees the spread
+# at the moment it fetches the book, not what it was on some past bar. That
+# means this filter can only gate the LIVE scan path (bot.py -> check_signals'
+# spread_info param), never backtest_history(): there, spread_info is always
+# None and this gate is a structural no-op — not a bug, just the nature of
+# the data.
+#
+# Two independent conditions, either one can trip the gate once enabled:
+#   1) "eats too much of this signal's own SL risk" — needs no warm-up,
+#      computable from the very first reading (spread_pct vs this signal's
+#      sl_distance_pct).
+#   2) "anomalously wide vs this pair's own recent history" — needs
+#      SPREAD_MIN_SAMPLES_FOR_ANOMALY samples before it's meaningful; until
+#      then it's simply skipped (treated as "not an anomaly"), not blocked
+#      outright and not treated as a NaN-style failure. This is the
+#      "warm-up" period Atom asked for: with the toggle OFF, bot.py still
+#      fetches + records the order book every scan tick (see spread.py), so
+#      by the time the toggle is flipped ON, the rolling-median baseline
+#      per pair is already populated instead of starting cold.
+#
+# A flat percent-of-price threshold was deliberately NOT used (see chat
+# discussion) — a major like BTC and a thin alt don't share a normal spread
+# range, so a single absolute cutoff would be miscalibrated for one side of
+# that split no matter where it's set. Both conditions below are relative
+# instead: relative to this signal's own risk, and relative to this pair's
+# own recent behavior.
+SPREAD_HISTORY_FILE = os.path.join(DATA_DIR, "spread_history.json")
+SPREAD_HISTORY_MAX_SAMPLES = 500          # rolling samples kept per ticker
+SPREAD_MIN_SAMPLES_FOR_ANOMALY = 30       # below this, condition 2) is skipped (still warming up)
+SPREAD_ANOMALY_MULT = 3.0                 # condition 2): current spread > this x rolling median
+SPREAD_SL_EAT_MAX_PCT = 0.15              # condition 1): spread_pct > this x sl_distance_pct
+SPREAD_HISTORY_SAVE_INTERVAL = 300        # seconds — throttled disk write, same pattern as OI baseline
 
 # =====================================================================
 # 📈  INDICATOR PARAMETERS

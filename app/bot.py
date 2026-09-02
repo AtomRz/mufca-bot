@@ -24,6 +24,7 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, format_price
 from signals import check_signals, backtest_history, make_state
 from onchain import get_onchain_bias
 import derivatives
+import spread
 from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,14 @@ async def market_scanner():
                 logger.warning(f"[DERIVATIVES] Failed for {ticker}: {e}")
         combined_bias = derivatives.combine_biases(_onchain_bias_cache, derivatives_bias)
 
+        # 🆕 Order book spread — fetched every cycle regardless of
+        # ENABLE_SPREAD_FILTER (see spread.py's module docstring): this is
+        # the "warm-up" collection Atom asked for, so the rolling per-pair
+        # median is already populated by the time the toggle gets switched
+        # on, instead of starting cold. spread_ok gating itself only takes
+        # effect inside check_signals() when the toggle is actually on.
+        spread_snapshot = await spread.get_spread_snapshot(exchange, ticker)
+
         for tf in TIMEFRAMES:
             try:
                 # 🆕 FIX: Use lock to prevent race with commands
@@ -295,6 +304,7 @@ async def market_scanner():
                     signals, bar_time, regime, lev = await check_signals(
                         exchange, ticker, tf, st,
                         onchain_bias=combined_bias,
+                        spread_info=spread_snapshot,
                     )
 
                     scan_stats["total_scans"] += 1

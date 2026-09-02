@@ -53,6 +53,7 @@ from volume_indicators import volume_flow_signal_v3
 from signals import check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
 import derivatives
+import spread
 from state import (
     load_signals_history,
     save_signals_history,
@@ -89,6 +90,7 @@ async def help_cmd(ctx):
         "`!debug`        — extended debug information",
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
+        "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
         "",
 
         "**⚙️ Settings**",
@@ -345,6 +347,7 @@ async def remove_cmd(ctx, ticker: str = ""):
     # OI-delta reading after re-adding is computed against the wrong point
     # in time.
     derivatives.clear_ticker_cache(ticker)
+    spread.clear_ticker_cache(ticker)
 
     await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}")
 
@@ -1305,7 +1308,14 @@ async def onchain_cmd(ctx):
 
 @core.bot.command(name="reset_cache")
 async def reset_cache_cmd(ctx):
-    """Manually resets the HTF bias, on-chain, and derivatives caches."""
+    """Manually resets the HTF bias, on-chain, and derivatives caches.
+
+    Deliberately does NOT touch the spread history — that's a slowly-built
+    per-pair statistical baseline (up to SPREAD_HISTORY_MAX_SAMPLES readings
+    accumulated over potentially days), not a short-TTL cache; wiping it on
+    every routine !reset_cache would throw away warm-up progress for no
+    reason. Use !spread reset if you specifically want to restart it.
+    """
     clear_htf_cache()
     clear_onchain_cache_full()  # full reset, including the balance baseline
     derivatives.clear_derivatives_cache_full()  # full reset, including the OI baseline
@@ -1341,3 +1351,63 @@ async def derivatives_cmd(ctx, ticker: str = "BTC/USDT"):
         await msg.edit(content=report)
     except Exception as e:
         await msg.edit(content=f"❌ Derivatives error: `{e}`")
+
+
+@core.bot.command(name="spread")
+async def spread_cmd(ctx, ticker: str = "BTC/USDT", action: str = "", confirm: str = ""):
+    """Shows the current order book spread for a pair, plus a live preview of
+    whether the spread filter would block a signal right now — even while
+    ENABLE_SPREAD_FILTER is off (warm-up mode), so you can see how it's
+    tracking before switching it on.
+
+    !spread SOL/USDT              — preview
+    !spread SOL/USDT reset        — preview a per-pair history reset
+    !spread SOL/USDT reset yes    — confirm the reset (warm-up starts over for this pair)
+    """
+    ticker = ticker.upper()
+    if ticker not in TICKERS:
+        await ctx.send(f"⚠️ `{ticker}` is not a tracked pair. See `!pairs`.")
+        return
+
+    if action.lower() == "reset":
+        if confirm.lower() != "yes":
+            sample_count = spread.get_sample_count(ticker)
+            await ctx.send(
+                f"⚠️ This clears {sample_count} accumulated spread sample(s) for `{ticker}` — warm-up starts over.\n"
+                f"To confirm, type: `!spread {ticker} reset yes`"
+            )
+            return
+        spread.clear_ticker_cache(ticker)
+        await ctx.send(f"✅ Spread history reset for `{ticker}`.")
+        return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Exchange not initialized")
+        return
+
+    msg = await ctx.send(f"⏳ Fetching order book for `{ticker}`...")
+    try:
+        snapshot = await spread.get_spread_snapshot(exchange, ticker)
+        if snapshot is None:
+            await msg.edit(content=f"❌ Could not fetch order book for `{ticker}`.")
+            return
+
+        filter_state = "🟢 ON" if _cfg.ENABLE_SPREAD_FILTER else "⚪ OFF (warm-up/logging only)"
+        median = snapshot["rolling_median"]
+        median_str = f"{median*100:.3f}%" if median is not None else "n/a (warming up)"
+        warmed_up = snapshot["sample_count"] >= _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY
+
+        report = (
+            f"📏 **Spread — {ticker}**\n"
+            f"Filter: {filter_state}\n"
+            f"Bid: `{snapshot['bid']}` | Ask: `{snapshot['ask']}`\n"
+            f"Spread: `{snapshot['spread_pct']*100:.3f}%`\n"
+            f"Rolling median: `{median_str}` ({snapshot['sample_count']}/{_cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY} samples"
+            f"{', warmed up' if warmed_up else ', still warming up'})\n"
+            f"_Blocking preview depends on each signal's own SL distance, computed at signal time — "
+            f"not shown here since no signal is being evaluated right now._"
+        )
+        await msg.edit(content=report)
+    except Exception as e:
+        await msg.edit(content=f"❌ Spread error: `{e}`")
