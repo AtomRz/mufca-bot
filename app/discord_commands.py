@@ -119,7 +119,7 @@ async def help_cmd(ctx):
         "`!sim <pair> <tf> <side>` — simulate a trade",
         "`!forcerun`     — force-run the scanner",
         "`!reset`        — reset all state and history",
-        "`!reset_cache`  — reset HTF and on-chain cache",
+        "`!reset_cache`  — reset HTF, on-chain, and derivatives cache",
         "`!help` / `!?` — this help",
     ]
     await ctx.send("\n".join(lines))
