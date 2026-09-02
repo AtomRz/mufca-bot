@@ -4,6 +4,7 @@ import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
 import OnchainPanel from './components/OnchainPanel'
+import SpreadPanel from './components/SpreadPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
@@ -13,6 +14,7 @@ const TABS = [
   { id: 'chart', label: 'Chart' },
   { id: 'history', label: 'History' },
   { id: 'onchain', label: 'Onchain' },
+  { id: 'spread', label: 'Spread' },
 ]
 
 const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 'var(--text-dim)' }
@@ -208,6 +210,7 @@ export default function App() {
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'onchain' && <OnchainPanel lastEvent={lastEvent} pairs={config?.pairs} />}
+        {tab === 'spread' && <SpreadPanel lastEvent={lastEvent} pairs={config?.pairs} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}
