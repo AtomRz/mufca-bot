@@ -93,6 +93,8 @@ export const api = {
     request('/api/config/derivatives-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
   getDerivatives: (ticker) =>
     request(`/api/derivatives${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
+  getSpread: (ticker) =>
+    request(`/api/spread${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

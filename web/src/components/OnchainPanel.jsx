@@ -57,6 +57,8 @@ export default function OnchainPanel({ lastEvent, pairs }) {
   const [derivTicker, setDerivTicker] = useState(null)
   const [deriv, setDeriv] = useState(null)
   const [derivError, setDerivError] = useState(null)
+  const [spread, setSpread] = useState(null)
+  const [spreadError, setSpreadError] = useState(null)
 
   useEffect(() => {
     const load = () => api.getOnchain().then(setData).catch((e) => setError(e.message))
@@ -81,12 +83,26 @@ export default function OnchainPanel({ lastEvent, pairs }) {
     return () => clearInterval(id)
   }, [derivTicker])
 
+  // Spread moves faster than funding/OI/on-chain data, so it's polled on a
+  // shorter interval — same shared per-pair ticker selector as Derivatives
+  // below, since both sections are keyed off the same pair.
+  useEffect(() => {
+    if (!derivTicker) return
+    const load = () => api.getSpread(derivTicker).then(setSpread).catch((e) => setSpreadError(e.message))
+    load()
+    const id = setInterval(load, 20000)
+    return () => clearInterval(id)
+  }, [derivTicker])
+
   // A fresh hourly refresh on the backend broadcasts an onchain-tagged event —
   // reload right away instead of waiting up to a minute for the poll interval.
   useEffect(() => {
     if (lastEvent?.type === 'scan_tick') {
       api.getOnchain().then(setData).catch(() => {})
-      if (derivTicker) api.getDerivatives(derivTicker).then(setDeriv).catch(() => {})
+      if (derivTicker) {
+        api.getDerivatives(derivTicker).then(setDeriv).catch(() => {})
+        api.getSpread(derivTicker).then(setSpread).catch(() => {})
+      }
     }
   }, [lastEvent, derivTicker])
 
@@ -194,6 +210,65 @@ export default function OnchainPanel({ lastEvent, pairs }) {
       </div>
 
       <DerivativesSection pairs={pairs} ticker={derivTicker} onTickerChange={setDerivTicker} deriv={deriv} error={derivError} />
+
+      <SpreadSection ticker={derivTicker} spread={spread} error={spreadError} />
+    </div>
+  )
+}
+
+function SpreadSection({ ticker, spread, error }) {
+  const filterOn = spread?.filter_enabled
+  const snap = spread?.snapshot
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Order book spread</h3>
+
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed to load: {error}</p>}
+
+      {!error && !spread && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Loading…</p>}
+
+      {!error && spread && (
+        <>
+          <div className="row">
+            <span className="row-label">Filter</span>
+            <span className={`tag ${filterOn ? 'long' : 'flat'}`}>
+              {filterOn ? '🟢 ON' : '⚪ OFF (warm-up/logging only)'}
+            </span>
+          </div>
+          {snap && (
+            <>
+              <div className="row">
+                <span className="row-label">Bid / Ask</span>
+                <span className="row-value">{snap.bid} / {snap.ask}</span>
+              </div>
+              <div className="row">
+                <span className="row-label">Current spread</span>
+                <span className="row-value">{(snap.spread_pct * 100).toFixed(3)}%</span>
+              </div>
+              <div className="row">
+                <span className="row-label">Rolling median</span>
+                <span className="row-value">
+                  {snap.rolling_median != null ? `${(snap.rolling_median * 100).toFixed(3)}%` : 'n/a'}
+                </span>
+              </div>
+              <div className="row">
+                <span className="row-label">Warm-up</span>
+                <span className={`tag ${spread.warmed_up ? 'long' : 'flat'}`}>
+                  {snap.sample_count}/{spread.min_samples_for_anomaly} samples
+                  {spread.warmed_up ? ' — warmed up' : ''}
+                </span>
+              </div>
+            </>
+          )}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+            Not backtestable — order book depth isn't part of OHLCV history, so this only ever gates the
+            live scan path. Blocking depends on each signal's own SL distance at signal time, so it can't
+            be previewed here directly. Collection runs every scan tick for {ticker || 'this pair'}{' '}
+            regardless of the toggle above — see the Signal Filters panel in Settings to turn it on.
+          </p>
+        </>
+      )}
     </div>
   )
 }

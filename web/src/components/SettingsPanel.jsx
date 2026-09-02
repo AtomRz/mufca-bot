@@ -15,6 +15,11 @@ const FILTER_TOGGLES = [
     label: 'Hurst regime clarity',
     hint: 'Direction-agnostic: rejects both long and short signals when the market is statistically close to a random walk (Hurst exponent near 0.5) — a complement to CHOP, not a replacement. Off by default until validated live.',
   },
+  {
+    key: 'spread',
+    label: 'Order book spread',
+    hint: 'Live-only, not backtestable (order book depth isn\'t part of OHLCV history). Rejects a signal if the current spread eats too much of that signal\'s own SL distance, or reads anomalously wide vs. this pair\'s recent history. Collection runs in the background regardless of this toggle — preview any pair\'s warm-up progress with !spread [pair] in Discord before switching on.',
+  },
 ]
 
 function Toggle({ checked, onChange, disabled }) {
