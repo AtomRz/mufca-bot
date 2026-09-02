@@ -484,6 +484,14 @@ async def remove_pair(ticker: str, purge_history: bool = False):
     # forever and bloats bot_state_snapshot.json. Clean it up right away.
     core.state.pop(ticker, None)
     core._state_locks.pop(ticker, None)
+    # 🆕 FIX: this REST endpoint never cleared the derivatives OI baseline
+    # or spread history for the removed ticker — only the Discord !remove
+    # command did. Re-adding the same ticker (via !add or POST /api/pairs)
+    # after removing it through the web UI would silently reuse the stale
+    # pre-removal baseline/warm-up instead of starting clean, same class of
+    # bug in both places.
+    derivatives.clear_ticker_cache(ticker)
+    spread.clear_ticker_cache(ticker)
 
     purged = 0
     if purge_history:

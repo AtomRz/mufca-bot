@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 
 import config as _cfg
 from config import DATA_DIR, safe_json_load, safe_json_save
+from derivatives import _to_swap_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -114,20 +115,43 @@ async def get_spread_snapshot(exchange, ticker: str) -> Optional[Dict]:
     Returns None on fetch failure (network hiccup, symbol not listed, etc.)
     — the caller should treat that the same as "no data", not as a hard
     stop; a single bad book fetch shouldn't block a whole scan cycle."""
+    # 🆕 FIX: Gate.io's ccxt instance loads spot and swap markets together
+    # even with options.defaultType='swap' — market(symbol) resolves the
+    # plain spot-format "BTC/USDT" as a literal dict key hit against the
+    # *spot* market (that lookup succeeds unconditionally and doesn't even
+    # consult defaultType; the type-disambiguation path only runs for
+    # exchange-native IDs, not already-unified symbols). Silently fetching
+    # the spot order book while MARKET_MODE == "futures" doesn't raise —
+    # it just feeds the futures signal gate numbers from the wrong market.
+    # Same swap-symbol requirement as derivatives.py's funding rate/OI
+    # fetches; reuse the same conversion for consistency.
+    fetch_ticker = _to_swap_symbol(ticker) if _cfg.MARKET_MODE == "futures" else ticker
     try:
-        book = await asyncio.to_thread(exchange.fetch_order_book, ticker, 5)
+        book = await asyncio.to_thread(exchange.fetch_order_book, fetch_ticker, 5)
     except Exception as e:
         logger.warning(f"[SPREAD] fetch_order_book failed for {ticker}: {e}")
         return None
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
-    if not bids or not asks:
+    # 🆕 FIX: `not bids`/`not asks` only guards against an empty outer list.
+    # An inner empty entry (bids == [[]]) passes that check but then
+    # bids[0][0] raises IndexError, which was uncaught here and would have
+    # taken down the whole scan cycle for this ticker.
+    if not bids or not asks or not bids[0] or not asks[0]:
         return None
 
-    best_bid = bids[0][0]
-    best_ask = asks[0][0]
-    if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+    # 🆕 FIX: ccxt's own parsing normally already returns floats, but this
+    # value flows straight into JSON (safe_json_save) and arithmetic below —
+    # an explicit cast is cheap insurance against Decimal/numpy/str leaking
+    # through from an exchange response and blowing up json.dump or silently
+    # string-concatenating instead of adding.
+    try:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+    except (TypeError, ValueError):
+        return None
+    if best_bid <= 0 or best_ask <= 0:
         return None
 
     mid = (best_bid + best_ask) / 2.0
