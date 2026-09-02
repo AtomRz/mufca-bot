@@ -665,15 +665,7 @@ async def get_config():
         "derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL,
         "derivatives_interval_options": list(_cfg.DERIVATIVES_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
-        "filter_toggles": {
-            "frama": _cfg.ENABLE_FRAMA_FILTER,
-            "chop": _cfg.ENABLE_CHOP_FILTER,
-            "atr": _cfg.ENABLE_ATR_FILTER,
-            "htf": _cfg.ENABLE_MTF_BIAS,
-            "fake_break": _cfg.ENABLE_FAKE_BREAK_FILTER,
-            "liq_sweep": _cfg.ENABLE_LIQ_SWEEP_FILTER,
-            "hurst": _cfg.ENABLE_HURST_FILTER,
-        },
+        "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
             "tp_percentile": _cfg.TP_PERCENTILE,
