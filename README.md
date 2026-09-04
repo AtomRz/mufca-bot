@@ -6,7 +6,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 
 ## Features
 
-- **Dual-track signals** — A-track (Andean Oscillator + MFI K-means) and U-track (UT Bot)
+- **Triple-track signals** — A-track (Andean Oscillator + MFI K-means), U-track (UT Bot), and B-track (volatility-squeeze breakout — see below)
 - **HTF Bias filter** — longs only in daily bull market, shorts only in daily bear market (cached 5 min)
 - **FRAMA channel** — fractal adaptive MA for trend direction and SL reference
 - **Per-timeframe CHOP filter** — 1h: 55, 4h: 61.8 (configurable via `!chop` or the web dashboard)
@@ -26,6 +26,13 @@ A Discord trading signal bot for Gate.io (Spot & Futures) that replicates the **
 - **Derivatives module (futures only)** — funding rate + open interest bias from Gate.io itself (no external API), refresh interval configurable (15m/30m/1h, default 15m — funding/OI move faster than on-chain within a single trading timeframe); extreme funding rate is read as a contrarian signal (crowd one-sided), rising/falling OI as new positioning building/unwinding, scaled by how far OI moved past `OI_DELTA_THRESHOLD`. Combines with on-chain bias with a hard cap on the resulting TP/SL multiplier so the two sources can't compound into an extreme neither would produce alone. On by default; toggle from the web dashboard or `!derivatives`/`!reset_cache`
 - **Hurst regime filter** — rolling Hurst exponent (numba-JIT accelerated) as a statistically distinct "second opinion" alongside CHOP: rejects signals when the market is close to a random walk (neither trending nor mean-reverting) regardless of side. **Off by default** — new, opt-in until validated live from the web dashboard's filter toggles
 - **Order book spread filter** — live-only gate (order book depth isn't in OHLCV, so unlike every other filter here it can't be backtested — see `spread.py`) against Gate.io's own top-of-book, on both spot and futures. Two relative conditions, not a flat percent-of-price cutoff: spread eating more than `SPREAD_SL_EAT_MAX_PCT` of *this signal's own SL distance*, or spread reading anomalously wide vs. *this pair's own recent rolling median*. **Off by default, but always collecting** — the bot fetches and records the order book every scan tick regardless of the toggle, so the per-pair baseline is already warmed up whenever you decide to switch it on. Preview live with `!spread [pair]` before enabling
+- **B-track: volatility-squeeze breakout** — a third, independent signal source alongside A/U, purpose-built to catch what they structurally lag on: a long low-volatility consolidation followed by a sudden, volume-backed directional break, where by the time FRAMA's slope turns or MFI/Andean confluence lines up several bars of the move are often already gone. Draws on a handful of classic volume/breakout methodologies (see `config.py`'s BREAKOUT section for the full reasoning) rather than inventing one from scratch:
+  - **Wyckoff (Sign of Strength / Effort vs Result)** — a wide-spread, high-volume bar closing near its own extreme is the tell, not volume in isolation
+  - **VSA (Volume Spread Analysis)** — volume and bar range must expand *together*; big volume on a narrow range can mean absorption, not genuine strength
+  - **NR7 / volatility squeeze** — requires a genuine compression *before* the breakout bar (ATR% in the bottom quartile of its own recent history), not just any big candle in the middle of an already-volatile stretch
+  - **Darvas box** — the breakout must clear the actual high/low of the pre-squeeze range, not just look big relative to ATR
+
+  Deliberately skips the CHOP and FRAMA-direction filters (both would still read the tail end of the just-ended squeeze as "unfavorable" right as the breakout starts — gating on either would defeat the track's purpose); ATR bounds, HTF bias, fake-break/liquidity-sweep, Hurst, and spread filters still apply. All six thresholds (squeeze lookback/window/percentile, volume spike multiplier, range/ATR multiplier, close-location minimum) are live-tunable from the web dashboard's Settings panel. Has its own independent trade history/win-rate — see History tab or `!history`
 - **Volume flow score** — OBV-based, score-based confidence/leverage adjustment
 - **Candlestick chart generation (`!chart`)** — dark-themed PNG with FRAMA bands, Bollinger Bands, support/resistance levels, signal arrows, volume panel and K-means MFI panel, attached directly to Discord signal embeds
 - **Volume Profile (POC / Value Area)** — TPO-style approximation from OHLCV (see `chart.calc_volume_profile()` for why it's an approximation rather than tick-level "real" volume), rendered as a POC line + Value Area band (+ optional histogram) on both the Discord PNG chart and the web dashboard's canvas chart overlay. On by default, configurable bin count/lookback/Value Area % from the web dashboard
@@ -72,7 +79,7 @@ mufca-bot/
 ├── app/
 │   ├── main.py               # Entry point — runs Discord bot + web API together, graceful shutdown
 │   ├── config.py             # Settings, file I/O helpers, thread locks
-│   ├── indicators.py         # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means
+│   ├── indicators.py         # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means, Breakout (squeeze detector)
 │   ├── volume_indicators.py  # OBV-based volume flow score (confidence & leverage)
 │   ├── signals.py            # Signal logic, filters, backtest, HTF bias, adaptive TP/SL
 │   ├── state.py              # Signal history, MFE/MAE tracking, TP1/TP2 adaptive TP
@@ -196,6 +203,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `volume_profile.json` | Volume Profile on/off, bin count, lookback bars, Value Area %, histogram visibility (editable from the web dashboard) |
 | `spread_history.json` | Rolling per-pair order book spread samples (up to `SPREAD_HISTORY_MAX_SAMPLES`), used for the spread filter's own-history anomaly check; written on a throttled interval and flushed immediately on graceful shutdown — collected regardless of whether the filter is switched on |
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
+| `breakout_config.json` | B-track squeeze/volume/range/close-location thresholds (editable from the web dashboard) |
 | `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
 | `onchain_baseline.json` / `onchain_baseline_ts.json` | Previous-cycle exchange ETH balances + timestamp, used to compute inflow/outflow delta — survives restarts so a restart doesn't delay flow analysis by a full cycle |
 | `closure_notified.json` | Trade-closure notification dedup set, capped at the last 2000 entries |
@@ -284,7 +292,7 @@ volumes:
 | Command | Description |
 |---|---|
 | `!sim long ETH/USDT 4h` | Simulate signal entry+exit (adds to TP training history) |
-| `!forcerun long ETH/USDT 4h` | Force-fire signal bypassing all filters |
+| `!forcerun long ETH/USDT 4h` | Force-fire signal bypassing all filters (always opens on the A-track, by design — see `discord_commands.py`) |
 | `!reset yes` | Clear all signal history and re-run backtest |
 
 ---
@@ -294,7 +302,7 @@ volumes:
 FastAPI + React, served from the same container as the bot on port **`8585`** — no separate deployment, no duplicate exchange fetches (the dashboard reads the same `bot.state` and `config` the scanner already computed each scan cycle).
 
 **Tabs:**
-- **Status** — scanner stats, active A-track/U-track trades per pair/timeframe, live-updated over WebSocket
+- **Status** — scanner stats, active A-track/U-track/B-track trades per pair/timeframe, live-updated over WebSocket
 - **Chart** — candlestick chart (FRAMA channel, Bollinger Bands, support/resistance, volume, MFI with K-means overbought/oversold bands), per pair/timeframe/track, auto-refreshes on each scan tick and new signal
 - **History** — win-rate/PnL/MFE/MAE summary per pair/timeframe/side/track, plus a grand-total row and a drill-down into individual closed trades
 - **Onchain** — current on-chain bias snapshot: ETH exchange flow, Fear & Greed, BTC dominance, and the resulting TP/SL/leverage multipliers
@@ -309,6 +317,7 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
   - Adaptive TP mode/percentiles/history limit
   - Tracked pairs (add/remove, with an option to also purge accumulated signal history)
   - All indicator parameters — FRAMA length/multiplier, MFI length/K-means training size, Andean length/signal smoothing/confirmation window, UT Bot sensitivity/ATR period, Bollinger Bands length/StdDev, S/R pivot window/max levels shown
+  - B-track (Breakout) thresholds — squeeze lookback/window/percentile, volume spike multiplier, range/ATR multiplier, close-location minimum
   - Chart colors (FRAMA, Bollinger, support, resistance, MFI line, MFI overbought/oversold, candle up/down, TP/SL lines, long/short signal markers)
   - Volume Profile — on/off, bin count, lookback bars, Value Area %, histogram visibility
   - Android push — registered device count/names, send a test push
@@ -317,7 +326,7 @@ Changing market mode, HTF bias, or any indicator parameter resets active positio
 
 **Top bar:** live connection status, market mode, HTF bias, CHOP/trend/suggested-leverage pulse for the pair selected on the Chart tab, and a row of signal/filter lamps (MFI, Andean, UT Bot, plus every filter's pass/block state — including R:R) computed with the exact same logic the scanner uses to decide whether a trade actually opens.
 
-**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`volume-profile`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
+**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`breakout`/`volume-profile`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
 
 ---
 
@@ -360,6 +369,12 @@ Defaults below (all editable at runtime from the **web dashboard → Settings**,
 | Spread SL-Eat Max | 15% | Order book spread filter: block if spread exceeds this fraction of the signal's own SL distance (live scan only, off by default) |
 | Spread Anomaly Mult | 3.0x | Order book spread filter: block if spread exceeds this multiple of the pair's own rolling median spread (needs `Spread Min Samples` warm-up) |
 | Spread Min Samples | 30 | Minimum warm-up samples per pair before the anomaly condition activates; the SL-eat condition needs no warm-up |
+| Breakout Squeeze Lookback | 20 bars | Pre-breakout range window — the breakout must clear this window's actual high/low (Darvas box), editable from the web dashboard |
+| Breakout Squeeze Window | 60 bars | Longer trailing window the ATR% percentile is measured against; must stay greater than Squeeze Lookback, editable from the web dashboard |
+| Breakout Squeeze Percentile | 0.25 | ATR% just before the breakout bar must sit in the bottom 25% of the Squeeze Window, editable from the web dashboard |
+| Breakout Volume Spike Mult | 2.5x | Breakout bar's volume vs. its own 20-bar average (relative volume), editable from the web dashboard |
+| Breakout Range/ATR Mult | 1.5x | Breakout bar's (high-low) vs. ATR14 — the "Result" side of Wyckoff's effort-vs-result, editable from the web dashboard |
+| Breakout Close Location Min | 0.70 | Close must sit in the top/bottom 30% of the breakout bar's own range, editable from the web dashboard |
 | Scan Interval | 60s | Scanner poll interval — 15/30/60/180s |
 | On-chain Interval | 1h | On-chain data refresh interval — 15m/30m/1h |
 | Derivatives Interval | 15m | Derivatives (funding/OI) data refresh interval — 15m/30m/1h |
@@ -419,6 +434,8 @@ Each of steps 1–2, 3, 4, 5, 6, 7, 10, 11 can be individually toggled on/off fr
 **A-track** — MFI crosses oversold AND Andean crosses signal line within `LOOKBACK=3` bars.
 
 **U-track** — UT Bot trailing stop crossover, only on new bar.
+
+**B-track (Breakout)** — squeeze + volume/range expansion out of a compression, only on new bar (see Features above for the full methodology). All four conditions required: ATR% the bar before was in the bottom quartile of its own trailing window (squeeze); this bar's relative volume and (high-low)/ATR both past their thresholds together (VSA-style, not volume alone); close in the top/bottom 30% of this bar's own range (not a rejection wick); close clears the actual high/low of the pre-squeeze window (Darvas box, not just "big relative to ATR"). Unlike A/U, deliberately does not require CHOP or FRAMA-direction confirmation.
 
 **UT Bot fix** — ATR always calculated from regular candles even in Heikin Ashi mode.
 
