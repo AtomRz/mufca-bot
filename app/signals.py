@@ -1119,10 +1119,20 @@ def backtest_history(
     exchange: ccxt.Exchange,
     ticker: str,
     tf: str,
-    num_bars: int = 3000
+    num_bars: int = 3000,
+    tracks: tuple = _cfg.TRACKS,
 ) -> int:
-    """Backtest for accumulating signal history."""
-    logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars)...")
+    """Backtest for accumulating signal history.
+
+    tracks — restrict which track(s) get simulated (default: all of them).
+    Use this to backfill just one track (e.g. tracks=("b",)) on a
+    ticker/tf that already has history for the others — running the full,
+    unrestricted backtest again on an already-populated ticker/tf would
+    duplicate every existing A/U record (see startup_sequence's comment on
+    this in bot.py), so this is the safe way to add coverage for a track
+    added after the others already had months of accumulated history.
+    """
+    logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars, tracks={tracks})...")
 
     try:
         bars = exchange.fetch_ohlcv(ticker, tf, limit=num_bars)
@@ -1305,6 +1315,8 @@ def backtest_history(
                 ("u", "long", sig_u_long), ("u", "short", sig_u_short),
                 ("b", "long", sig_b_long), ("b", "short", sig_b_short),
             ]:
+                if track not in tracks:
+                    continue
                 if not sig_ok:
                     continue
 

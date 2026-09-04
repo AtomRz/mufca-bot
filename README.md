@@ -276,6 +276,7 @@ volumes:
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
 | `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`) |
 | `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch (deliberately does not touch spread history — see `!spread reset`) |
+| `!backfill_breakout [PAIR]` | Backtest ONLY the B-track (Breakout) and add its signals to history, without touching existing A/U records — use this once after adding the B-track to a bot that's already been running for a while (the normal startup backtest skips any ticker/tf whose history is already non-empty) |
 
 ### 📚 History & Stats
 

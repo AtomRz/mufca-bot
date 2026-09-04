@@ -91,6 +91,7 @@ async def help_cmd(ctx):
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
+        "`!backfill_breakout [pair]` — backtest ONLY the B-track (Breakout) and add to history, without touching A/U",
         "",
 
         "**⚙️ Settings**",
@@ -1318,6 +1319,46 @@ async def onchain_cmd(ctx):
         await msg.edit(content=report)
     except Exception as e:
         await msg.edit(content=f"❌ On-chain error: `{e}`")
+
+
+@core.bot.command(name="backfill_breakout")
+async def backfill_breakout_cmd(ctx, ticker: str = ""):
+    """Backtests ONLY the B-track (Breakout) and appends its signals to
+    history — safe to run on pairs that already have A/U history, unlike
+    !reset (which deletes and rebuilds everything, A/U included). Useful
+    right after adding a new track to a bot that's already been running for
+    a while: the normal startup backtest skips any ticker/tf whose history
+    is already non-empty (see startup_sequence in bot.py), so B never gets
+    its own backtest pass on existing pairs — only live signals from here
+    on, which can take a long time to accumulate given how selective the
+    squeeze+volume conditions are by design.
+
+    !backfill_breakout            — all tracked pairs
+    !backfill_breakout ETH/USDT   — one pair only
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Exchange not initialized")
+        return
+
+    targets = [ticker.upper()] if ticker else list(TICKERS)
+    for t in targets:
+        if t not in TICKERS:
+            await ctx.send(f"⚠️ `{t}` is not a tracked pair. See `!pairs`.")
+            return
+
+    await ctx.send(f"🔄 Backfilling B-track history for {', '.join(targets)}...")
+    total = 0
+    for t in targets:
+        for tf in TIMEFRAMES:
+            try:
+                count = await asyncio.to_thread(backtest_history, exchange, t, tf, 3000, ("b",))
+                total += count
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"B-track backfill error for {t} {tf}: {e}")
+
+    await ctx.send(f"✅ B-track backfill done: {total} signals added. A/U history untouched.")
 
 
 @core.bot.command(name="reset_cache")
