@@ -507,9 +507,9 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
           ))}
         </div>
         <div className="seg">
-          {['a', 'u'].map((t) => (
+          {['a', 'u', 'b'].map((t) => (
             <button key={t} className={track === t ? 'active' : ''} onClick={() => setTrack(t)}>
-              {t === 'a' ? 'Andean' : 'UT Bot'}
+              {t === 'a' ? 'Andean' : t === 'u' ? 'UT Bot' : 'Breakout'}
             </button>
           ))}
         </div>

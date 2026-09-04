@@ -77,7 +77,7 @@ export default function StatusPanel({ lastEvent }) {
           <h3 className="panel-title" style={{ color: 'var(--accent)' }}>🎯 TP1 Hit</h3>
           <div className="row">
             <span className="row-label">
-              {tp1Banner.ticker} · {tp1Banner.tf} · {tp1Banner.track === 'a' ? 'Andean' : 'UT Bot'}
+              {tp1Banner.ticker} · {tp1Banner.tf} · {tp1Banner.track === 'a' ? 'Andean' : tp1Banner.track === 'u' ? 'UT Bot' : 'Breakout'}
             </span>
             <span className={`tag ${tp1Banner.side}`}>{tp1Banner.side}</span>
           </div>
@@ -120,6 +120,7 @@ export default function StatusPanel({ lastEvent }) {
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>{tf}</div>
               <TradeCard trade={data.a_active_trade} label="Andean (A)" />
               <TradeCard trade={data.u_active_trade} label="UT Bot (U)" />
+              <TradeCard trade={data.b_active_trade} label="Breakout (B)" />
             </div>
           ))}
         </div>

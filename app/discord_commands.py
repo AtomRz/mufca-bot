@@ -81,7 +81,7 @@ async def help_cmd(ctx):
         "**📖 MUFCA v4.0 — Commands**\n",
 
         "**📊 Monitoring**",
-        "`!status`       — scanner status: pairs, A/U tracks, volume",
+        "`!status`       — scanner status: pairs, A/U/B tracks, volume",
         "`!scan <pair> <tf>` — manual scan (e.g. `!scan BTC/USDT 1h`)",
         "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — signal statistics for a pair",
@@ -151,11 +151,13 @@ async def status_cmd(ctx):
                     ts = str(last)
             a_trade = st.get("a_active_trade")
             u_trade = st.get("u_active_trade")
+            b_trade = st.get("b_active_trade")
 
             # Only show a position if both the flag AND active_trade are set.
             # If only the flag is set with no trade — that's a desync, show a warning.
             a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
             u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
+            b_flag = "LONG" if st["b_in_long"] else "SHORT" if st["b_in_short"] else None
 
             # 🆕 FIX BUG-HI001: removed a double assignment to a_pos.
             # Before: a_pos = f"⚠️{a_flag}" → then a_pos = "—" (overwriting it!)
@@ -177,11 +179,22 @@ async def status_cmd(ctx):
                     u_pos = f"⚠️{u_flag} (fixed)"  # ← same fix for the U-track
                 else:
                     u_pos = u_flag or "—"
+
+                # 🆕 Same fix for the B-track (Breakout)
+                if b_flag and not b_trade:
+                    logger.warning(f"[STATE] B-track desync fixed for {ticker} {tf}")
+                    core.state[ticker][tf]["b_in_long"] = False   # auto-heal
+                    core.state[ticker][tf]["b_in_short"] = False
+                    b_pos = f"⚠️{b_flag} (fixed)"
+                else:
+                    b_pos = b_flag or "—"
             trade_info = ""
             if a_trade:
                 trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${format_price(a_trade['entry'])}"
             if u_trade:
                 trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${format_price(u_trade['entry'])}"
+            if b_trade:
+                trade_info += f" | 🎯[B] {b_trade['side'].upper()} @ ${format_price(b_trade['entry'])}"
 
             # 🆕 Volume info
             vol_info = ""
@@ -197,7 +210,7 @@ async def status_cmd(ctx):
                 except Exception:
                     pass
 
-            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}{vol_info}")
+            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}** | B: **{b_pos}**{trade_info}{vol_info}")
 
     msg = "\n".join(lines)
     if len(msg) > 1900:
@@ -935,8 +948,9 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
         for _tf_key, st in pair_state.items():
             if _tf_key == tf:
                 a_trade = st.get("a_active_trade")
-                u_trade = st.get("u_active_trade") or st.get("active_trade")
-                active = a_trade or u_trade
+                u_trade = st.get("u_active_trade")
+                b_trade = st.get("b_active_trade")
+                active = a_trade or u_trade or b_trade or st.get("active_trade")
                 if active:
                     # 🆕 FIX: used to pass a positional "bar_opened" index computed
                     # on the signal's df — but !chart builds its own df with a

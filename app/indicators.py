@@ -8,6 +8,8 @@ try:
 except ImportError:
     _HAS_NUMBA = False
 
+from volume_indicators import calculate_relative_volume
+
 # =====================================================================
 # 📊  BASE INDICATORS
 # =====================================================================
@@ -472,3 +474,101 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, flo
             c2 = float(np.nanmean(cl2))
     
     return min(c1, c2), max(c1, c2)
+
+
+# =====================================================================
+# 🚀  BREAKOUT SIGNAL (track "b") — squeeze + volume/range expansion
+# =====================================================================
+def calculate_breakout_signal(
+    df: pd.DataFrame,
+    atr14: pd.Series,
+    atr_pct: pd.Series,
+    lookback: int = 20,
+    squeeze_window: int = 60,
+    squeeze_percentile: float = 0.25,
+    vol_spike_mult: float = 2.5,
+    range_atr_mult: float = 1.5,
+    close_loc_min: float = 0.70,
+) -> Tuple[pd.Series, pd.Series]:
+    """Volume/range breakout-out-of-squeeze detector. See config.py's
+    BREAKOUT section for the methodology this draws on (Wyckoff SOS, VSA,
+    NR7/squeeze, Darvas box) and why this exists as a separate track rather
+    than a filter on A/U.
+
+    Four conditions, ALL required, evaluated per-bar at index i (mirrors
+    the rest of this file's style: full-series vectorized, indexed by the
+    caller — not a rolling().apply(), since every piece here is either
+    already a Series the caller has (atr14/atr_pct) or a cheap rolling op):
+
+      1. Squeeze precondition — atr_pct the bar BEFORE i (not at i — i is
+         the expansion bar itself) sits in the bottom `squeeze_percentile`
+         of its own trailing `squeeze_window`. This is what makes it a
+         breakout-from-compression rather than just any big candle in the
+         middle of an already-volatile stretch.
+      2. Volume AND range expand together at i — relative volume (vs its
+         own 20-bar SMA) past `vol_spike_mult`, AND bar range past
+         `range_atr_mult` x ATR14. VSA's point: high volume alone can mean
+         absorption (someone big quietly filling into the move, capping
+         it), not confirmation — the bar's range has to expand too, in the
+         same conviction the volume implies.
+      3. Close near the bar's own extreme — top/bottom `close_loc_min`
+         share of its (high, low) range. A wide, loud bar that closes back
+         near the open/opposite extreme is a rejection wick, not strength.
+      4. Genuine breakout — close at i clears the actual high/low of the
+         preceding `lookback` bars (the pre-squeeze range), not just "big
+         relative to ATR". Without this, a big-range bar in the middle of
+         a range would qualify; this is what makes it a breakout of
+         something specific.
+
+    Returns (breakout_long, breakout_short) — boolean Series, same index as
+    df. NaN-safe: any bar where an input is still NaN (warm-up) reads False,
+    never raises.
+    """
+    n = len(df)
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    volume = df["volume"]
+
+    rel_vol = calculate_relative_volume(df, period=20)
+
+    bar_range = high - low
+    range_ok = bar_range > (range_atr_mult * atr14)
+    vol_ok = rel_vol > vol_spike_mult
+
+    close_loc = np.where(bar_range > 1e-12, (close - low) / bar_range.replace(0, np.nan), 0.5)
+    close_loc = pd.Series(close_loc, index=df.index).fillna(0.5)
+    close_loc_long_ok = close_loc >= close_loc_min
+    close_loc_short_ok = close_loc <= (1.0 - close_loc_min)
+
+    # Squeeze: atr_pct as of the PRIOR bar vs. its own trailing history —
+    # shift(1) so bar i's own (already-expanded) atr_pct doesn't leak into
+    # its own squeeze check.
+    atr_pct_prev = atr_pct.shift(1)
+    squeeze_threshold = atr_pct_prev.rolling(window=squeeze_window, min_periods=squeeze_window // 2).quantile(squeeze_percentile)
+    squeeze_ok = atr_pct_prev < squeeze_threshold
+
+    # Darvas-box breakout level: the high/low of the `lookback` bars BEFORE
+    # i (shift(1) so the window is [i-lookback, i-1], excluding i itself).
+    box_high = high.shift(1).rolling(window=lookback, min_periods=lookback // 2).max()
+    box_low = low.shift(1).rolling(window=lookback, min_periods=lookback // 2).min()
+    breakout_level_long_ok = close > box_high
+    breakout_level_short_ok = close < box_low
+
+    breakout_long = (
+        squeeze_ok
+        & vol_ok
+        & range_ok
+        & close_loc_long_ok
+        & breakout_level_long_ok
+    ).fillna(False)
+
+    breakout_short = (
+        squeeze_ok
+        & vol_ok
+        & range_ok
+        & close_loc_short_ok
+        & breakout_level_short_ok
+    ).fillna(False)
+
+    return breakout_long, breakout_short

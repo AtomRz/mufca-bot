@@ -370,6 +370,7 @@ async def get_status():
             result["pairs"][ticker][tf] = {
                 "a_active_trade": st.get("a_active_trade"),
                 "u_active_trade": st.get("u_active_trade"),
+                "b_active_trade": st.get("b_active_trade"),
                 "last_bar_time": st.get("last_bar_time"),
             }
     return result
@@ -560,8 +561,14 @@ async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
         raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
 
     st = core.state.get(ticker, {}).get(tf, {})
-    trade_key = "a_active_trade" if track == "a" else "u_active_trade"
+    if track not in _cfg.TRACKS:
+        raise HTTPException(400, f"track must be one of {_cfg.TRACKS}")
+    trade_key = f"{track}_active_trade"
     active_trade = st.get(trade_key)
+    # 🆕 DIAGNOSTIC: see the matching note in chart_data.get_chart_data() —
+    # logs what core.state actually had for this ticker/tf/track at request
+    # time, so a future recurrence can be traced end-to-end through the logs.
+    logger.info(f"[API_CHART] {ticker} {tf} track={track} ({trade_key}): active_trade={'present' if active_trade else 'None'}")
 
     try:
         data = await get_chart_data(exchange, ticker, tf, limit=limit, state_snapshot=active_trade)

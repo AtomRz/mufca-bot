@@ -437,8 +437,8 @@ async def market_scanner():
                             logger.warning(f"[PUSH] send failed: {push_err}")
                         logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
 
-                # 🆕 FIX: Check BOTH tracks for closures independently
-                for track in ("a", "u"):
+                # 🆕 FIX: Check ALL tracks for closures independently
+                for track in _cfg.TRACKS:
                     trade_key = f"{track}_active_trade"
                     history_key = f"{track}_trade_history"
                     notified_key = f"{track}_last_closure_notified"
@@ -454,7 +454,7 @@ async def market_scanner():
                                     exit_dt = datetime.fromisoformat(last["exit_time"])
                                     age = (datetime.now(timezone.utc) - exit_dt).total_seconds()
                                     emoji = "🟢" if last["pnl_pct"] > 0 else "🔴"
-                                    track_label = "A" if track == "a" else "U"
+                                    track_label = _cfg.TRACK_LABELS[track]
                                     # 🆕 FIX: st[notified_key] = True used to be
                                     # set unconditionally AFTER the if age < 35
                                     # block — if the bot only discovered the
@@ -500,7 +500,7 @@ async def market_scanner():
                                     logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
 
                 # ── TP1 hit check ─────────────────────────────────────────
-                for track in ("a", "u"):
+                for track in _cfg.TRACKS:
                     trade_key = f"{track}_active_trade"
                     trade = st.get(trade_key)
                     if not trade:
@@ -636,7 +636,7 @@ async def market_scanner():
                         except Exception:
                             tf_ms = 3600_000
                         trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
-                        track_label = "A" if track == "a" else "U"
+                        track_label = _cfg.TRACK_LABELS[track]
                         # 🆕 FIX: this send used to not be wrapped in
                         # try/except at all — the only one of the three
                         # (Discord/WS/push) in this block. If channel.send()

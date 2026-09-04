@@ -278,6 +278,58 @@ SPREAD_SL_EAT_MAX_PCT = 0.15              # condition 1): spread_pct > this x sl
 SPREAD_HISTORY_SAVE_INTERVAL = 300        # seconds — throttled disk write, same pattern as OI baseline
 
 # =====================================================================
+# 🎯  SIGNAL TRACKS
+# =====================================================================
+# Single source of truth for the set of signal tracks — previously "a"/"u"
+# were hardcoded as a literal 2-tuple in ~10 places across signals.py,
+# bot.py, discord_commands.py, etc. Adding "b" (Breakout) here and nowhere
+# else would have meant hunting down every one of those spots by hand and
+# risking missing one (exactly the class of bug already caught twice this
+# session with !remove not clearing derivatives/spread caches). New code
+# should iterate TRACKS / look up TRACK_LABELS instead of hardcoding.
+TRACKS = ("a", "u", "b")
+TRACK_LABELS = {"a": "A", "u": "U", "b": "B"}                     # single-letter, used in "A BUY", "U SELL", etc.
+TRACK_NAMES = {"a": "Andean+MFI", "u": "UT Bot", "b": "Breakout"}  # descriptive, used in "(Andean+MFI)", etc.
+TRACK_FULL_NAMES = {"a": "Andean", "u": "UT Bot", "b": "Breakout"} # used in Discord/web track selectors
+
+# =====================================================================
+# 🚀  BREAKOUT TRACK (track "b") — volatility-squeeze + volume/range expansion
+# =====================================================================
+# Catches the pattern A/U structurally lag on: a long low-volatility
+# consolidation followed by a sudden, volume-backed directional break — by
+# the time FRAMA's slope turns or MFI/Andean confluence lines up, several
+# bars of the move are often already gone (see chat: Atom's screenshot of
+# exactly this pattern). Draws on a few classic volume/breakout
+# methodologies rather than inventing one from scratch:
+#   - Wyckoff (Sign of Strength / Effort vs Result): wide-spread, high-volume
+#     bar closing near its extreme is the tell, not volume in isolation.
+#   - VSA (Volume Spread Analysis, Tom Williams): explicitly pairs volume
+#     WITH bar range — big volume on a narrow range can mean absorption
+#     (bearish/bullish trap), not genuine strength, so both must expand
+#     together.
+#   - NR7 / volatility squeeze (Crabel, and the common Bollinger/Keltner
+#     "squeeze" variant): requires a genuine compression BEFORE the breakout
+#     bar, not just any big candle — otherwise this would just re-detect
+#     ordinary volatility in the middle of an existing trend.
+#   - Darvas box: the breakout must clear the actual high/low of the
+#     pre-squeeze range, not just look big relative to ATR.
+#
+# Deliberately bypasses the CHOP and FRAMA-direction filters for this track
+# specifically (see the filter_long_b/filter_short_b comment in signals.py)
+# — CHOP would still read "choppy" from the tail of the just-ended squeeze
+# right as the breakout starts, and FRAMA's slope is exactly what's lagging
+# in this pattern; gating on either would defeat the track's purpose. ATR
+# bounds, HTF bias, fake-break/liquidity-sweep, Hurst, and spread filters
+# still apply — those catch different failure modes (manipulation wicks,
+# thin-book execution risk) that a strong squeeze breakout is not immune to.
+BREAKOUT_LOOKBACK = 20             # bars defining the pre-breakout range (Darvas box high/low)
+BREAKOUT_SQUEEZE_WINDOW = 60       # longer window the ATR% percentile is measured against
+BREAKOUT_SQUEEZE_PERCENTILE = 0.25 # ATR% just before the breakout bar must be in the bottom 25% of BREAKOUT_SQUEEZE_WINDOW
+BREAKOUT_VOL_SPIKE_MULT = 2.5      # breakout bar's volume vs its own 20-bar SMA (relative volume)
+BREAKOUT_RANGE_ATR_MULT = 1.5      # breakout bar's (high-low) vs ATR14 — "Result" side of Wyckoff's effort-vs-result
+BREAKOUT_CLOSE_LOC_MIN = 0.70      # close must sit in the top/bottom 30% of the breakout bar's own range
+
+# =====================================================================
 # 📈  INDICATOR PARAMETERS
 # =====================================================================
 ATR_PERIOD = 14

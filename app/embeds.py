@@ -29,14 +29,19 @@ def _flow_label(flow: str) -> str:
 def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
                 sl, tp, tp1, risk, stats, tp_desc: str = "", df=None) -> discord.Embed:
     is_long = "BUY" in signal_type or "LONG" in signal_type
-    is_a_track = "Andean" in signal_type or "A " in signal_type
-    is_u_track = "UT Bot" in signal_type or "U " in signal_type
+    # 🆕 signal_type is always "{TRACK_LABEL} BUY/SELL (...)" (see
+    # signals.py's signal_label) — read the track off its actual leading
+    # letter instead of ad-hoc substring checks like "Andean" in
+    # signal_type, which silently fell through to a generic "⚪" for any
+    # track that isn't A or U (as B now is) rather than genuinely detecting it.
+    track_letter = signal_type.strip()[:1]
+    _TRACK_EMOJI = {"A": "🔵", "U": "🟢", "B": "🟠"}
     _COIN_EMOJI = {
         "BTC": "🟡", "ETH": "🔷", "SOL": "🟢", "XRP": "⚪",
         "DOGE": "🐕", "BNB": "🟨", "ADA": "🔵", "AVAX": "🔺",
     }
     coin_emoji = next((e for sym, e in _COIN_EMOJI.items() if sym in ticker), "🟣")
-    track_emoji = "🔵" if is_a_track else "🟢" if is_u_track else "⚪"
+    track_emoji = _TRACK_EMOJI.get(track_letter, "⚪")
     conf_color = "🟢" if confidence >= 80 else "🟡" if confidence >= 60 else "🔴"
     mode_label = "Spot" if _cfg.MARKET_MODE == "spot" else "Futures"
     ha_label = "HA" if _cfg.UT_HEIKIN_ASHI else "Normal"
