@@ -322,12 +322,31 @@ TRACK_FULL_NAMES = {"a": "Andean", "u": "UT Bot", "b": "Breakout"} # used in Dis
 # bounds, HTF bias, fake-break/liquidity-sweep, Hurst, and spread filters
 # still apply — those catch different failure modes (manipulation wicks,
 # thin-book execution risk) that a strong squeeze breakout is not immune to.
-BREAKOUT_LOOKBACK = 20             # bars defining the pre-breakout range (Darvas box high/low)
-BREAKOUT_SQUEEZE_WINDOW = 60       # longer window the ATR% percentile is measured against
-BREAKOUT_SQUEEZE_PERCENTILE = 0.25 # ATR% just before the breakout bar must be in the bottom 25% of BREAKOUT_SQUEEZE_WINDOW
-BREAKOUT_VOL_SPIKE_MULT = 2.5      # breakout bar's volume vs its own 20-bar SMA (relative volume)
-BREAKOUT_RANGE_ATR_MULT = 1.5      # breakout bar's (high-low) vs ATR14 — "Result" side of Wyckoff's effort-vs-result
-BREAKOUT_CLOSE_LOC_MIN = 0.70      # close must sit in the top/bottom 30% of the breakout bar's own range
+BREAKOUT_FILE = os.path.join(DATA_DIR, "breakout_config.json")
+_BREAKOUT_DEFAULTS = {
+    "BREAKOUT_LOOKBACK": 20,             # bars defining the pre-breakout range (Darvas box high/low)
+    "BREAKOUT_SQUEEZE_WINDOW": 60,       # longer window the ATR% percentile is measured against
+    "BREAKOUT_SQUEEZE_PERCENTILE": 0.25, # ATR% just before the breakout bar must be in the bottom 25% of BREAKOUT_SQUEEZE_WINDOW
+    "BREAKOUT_VOL_SPIKE_MULT": 2.5,      # breakout bar's volume vs its own 20-bar SMA (relative volume)
+    "BREAKOUT_RANGE_ATR_MULT": 1.5,      # breakout bar's (high-low) vs ATR14 — "Result" side of Wyckoff's effort-vs-result
+    "BREAKOUT_CLOSE_LOC_MIN": 0.70,      # close must sit in the top/bottom 30% of the breakout bar's own range
+}
+
+def load_breakout_config() -> dict:
+    data = safe_json_load(BREAKOUT_FILE, _BREAKOUT_DEFAULTS)
+    # in case the file is from before this was persisted — fill in any missing keys with defaults
+    return {**_BREAKOUT_DEFAULTS, **data}
+
+def save_breakout_config(data: dict):
+    safe_json_save(BREAKOUT_FILE, data)
+
+_breakout = load_breakout_config()
+BREAKOUT_LOOKBACK = _breakout["BREAKOUT_LOOKBACK"]
+BREAKOUT_SQUEEZE_WINDOW = _breakout["BREAKOUT_SQUEEZE_WINDOW"]
+BREAKOUT_SQUEEZE_PERCENTILE = _breakout["BREAKOUT_SQUEEZE_PERCENTILE"]
+BREAKOUT_VOL_SPIKE_MULT = _breakout["BREAKOUT_VOL_SPIKE_MULT"]
+BREAKOUT_RANGE_ATR_MULT = _breakout["BREAKOUT_RANGE_ATR_MULT"]
+BREAKOUT_CLOSE_LOC_MIN = _breakout["BREAKOUT_CLOSE_LOC_MIN"]
 
 # =====================================================================
 # 📈  INDICATOR PARAMETERS

@@ -59,7 +59,19 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 _saved_state = load_bot_state()
 state = {
     ticker: {
-        tf: _saved_state.get(ticker, {}).get(tf) or make_state()
+        # 🆕 FIX: used to be `_saved_state.get(ticker, {}).get(tf) or
+        # make_state()` — a saved dict from BEFORE a new field was added to
+        # make_state() (e.g. today's b_in_long/b_active_trade/etc. for the
+        # breakout track) got restored as-is, permanently missing that key —
+        # not just a KeyError waiting to happen (as seen with !status and
+        # b_in_long), but silently wrong for anything that used .get() too,
+        # since a missing b_active_trade is indistinguishable from "no
+        # position". Merge onto a fresh make_state() instead: new keys get
+        # their default, every key that was actually saved still overrides
+        # it — same restore behavior as before for everything that already
+        # existed, plus forward-compatible with the next field this pattern
+        # eventually needs too.
+        tf: {**make_state(), **(_saved_state.get(ticker, {}).get(tf) or {})}
         for tf in TIMEFRAMES
     }
     for ticker in TICKERS
@@ -81,6 +93,10 @@ def _heal_state():
                 st["u_in_long"] = False
                 st["u_in_short"] = False
                 logger.warning(f"[HEAL] U-track desync fixed at startup: {ticker} {tf}")
+            if (st.get("b_in_long") or st.get("b_in_short")) and not st.get("b_active_trade"):
+                st["b_in_long"] = False
+                st["b_in_short"] = False
+                logger.warning(f"[HEAL] B-track desync fixed at startup: {ticker} {tf}")
 
 _heal_state()
 reconcile_orphaned_signals(state)
