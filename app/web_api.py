@@ -726,6 +726,30 @@ async def get_config():
     }
 
 
+def _any_active_trades() -> bool:
+    """True if any ticker/tf/track currently has an open position.
+
+    🆕 FIX (external review, P2): _reset_states_after_regime_change() used
+    to unconditionally replace every ticker/tf's state with a fresh
+    make_state() — including a_active_trade/u_active_trade/b_active_trade —
+    with no check for whether a position was actually open. Switching
+    market mode, HTF timeframe, or indicator parameters while a trade was
+    open would silently make the bot "forget" it: no more TP1/moved-SL
+    tracking, no proper close_trade() call, and the persistent snapshot
+    would get overwritten with the blank state on the next save. The
+    position itself doesn't disappear (this is a signal bot, not an
+    execution bot — nothing on the exchange changes), but the bot's own
+    tracking of it does, which corrupts training history for that trade
+    and stops it from ever being reported as closed.
+    """
+    for ticker in _cfg.TICKERS:
+        for tf in TIMEFRAMES:
+            st = core.state.get(ticker, {}).get(tf, {})
+            if st.get("a_active_trade") or st.get("u_active_trade") or st.get("b_active_trade"):
+                return True
+    return False
+
+
 async def _reset_states_after_regime_change():
     """Same as what mode_cmd/htf_cmd do after a regime change — otherwise
     state would end up desynced."""
@@ -756,14 +780,32 @@ async def set_mode(body: ModeIn):
         raise HTTPException(400, "mode must be 'spot' or 'futures'")
     if new_mode == _cfg.MARKET_MODE:
         return {"mode": _cfg.MARKET_MODE, "changed": False}
+    # 🆕 FIX (external review, P2): see _any_active_trades' docstring —
+    # switching mode used to silently wipe any open position's tracking
+    # state. Reject instead; the person can close/wait out the trade first.
+    if _any_active_trades():
+        raise HTTPException(409, "Cannot switch market mode while a trade is open on any pair/timeframe/track. Wait for it to close first.")
 
     _cfg.MARKET_MODE = new_mode
     save_mode(_cfg.MARKET_MODE)
 
+    # 🆕 FIX (external review, P2/P3): the old exchange object was never
+    # closed here — just replaced — leaking its underlying HTTP
+    # session/connection pool. ccxt's sync client's close() is itself
+    # synchronous; run it off the event loop for consistency with every
+    # other exchange call in this codebase (asyncio.to_thread(...)), and
+    # don't let a close failure (e.g. already-closed session) block the
+    # actual mode switch.
+    old_exchange = core._exchange_ref
     if _cfg.MARKET_MODE == "futures":
         core._exchange_ref = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     else:
         core._exchange_ref = ccxt.gate({"enableRateLimit": True})
+    if old_exchange is not None:
+        try:
+            await asyncio.to_thread(old_exchange.close)
+        except Exception as e:
+            logger.warning(f"[MODE] Failed to close old exchange session: {e}")
 
     await _reset_states_after_regime_change()
     await broadcast_event({"type": "config_changed", "key": "mode", "value": _cfg.MARKET_MODE})
@@ -782,6 +824,8 @@ async def set_htf(body: HtfIn):
         raise HTTPException(400, f"htf must be one of {valid_htfs}")
     if new_htf == _cfg.HTF_BIAS:
         return {"htf_bias": _cfg.HTF_BIAS, "changed": False}
+    if _any_active_trades():
+        raise HTTPException(409, "Cannot change HTF timeframe while a trade is open on any pair/timeframe/track. Wait for it to close first.")
 
     _cfg.HTF_BIAS = new_htf
     save_htf(_cfg.HTF_BIAS)
@@ -1097,6 +1141,9 @@ async def set_indicators(body: IndicatorsIn):
         if not (lo <= value <= hi):
             raise HTTPException(400, f"{key} must be between {lo} and {hi}")
         casted[attr] = caster(value)
+
+    if _any_active_trades():
+        raise HTTPException(409, "Cannot change indicator parameters while a trade is open on any pair/timeframe/track. Wait for it to close first.")
 
     for attr, value in casted.items():
         setattr(_cfg, attr, value)

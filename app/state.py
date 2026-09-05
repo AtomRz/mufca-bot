@@ -318,8 +318,20 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 # 📊  SIGNAL STATISTICS
 # =====================================================================
 
-def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None) -> Dict:
-    """Returns statistics for the given signal."""
+def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None, as_of: Optional[str] = None) -> Dict:
+    """Returns statistics for the given signal.
+
+    as_of — ISO timestamp string; if given, only records strictly before
+    this point are used. 🆕 FIX (external review, P0): without this,
+    backtest_history() simulating an OLD historical bar could have its
+    adaptive TP/SL calibrated using records from LATER in the same
+    signals_history.json (either later in the same backtest run, or from
+    real live trades that happened after that historical bar in wall-clock
+    time but were already saved before this backtest/backfill ran) — a
+    classic look-ahead bias: the "historical" TP would reflect information
+    that didn't actually exist yet at that point in time. Live callers pass
+    as_of=None (the default) — there's no look-ahead concern live, "right
+    now" is genuinely the latest information available."""
     history = load_signals_history()
     empty = {
         "count": 0,
@@ -345,6 +357,10 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
     # at the moved SL) is also a real closed outcome and should count in
     # stats alongside "tp"/"sl"/"cancelled", not be dropped from the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
+    if as_of is not None:
+        # ISO8601 timestamps compare correctly as plain strings as long as
+        # they're all the same format (they are — see normalize_timestamp).
+        closed = [r for r in closed if r.get("timestamp", "") < as_of]
     if not closed:
         return empty
 
@@ -585,7 +601,8 @@ def calculate_adaptive_tp(
     entry: float,
     current_sl: float,
     atr14: Optional[float] = None,
-    regime: Optional[str] = None
+    regime: Optional[str] = None,
+    as_of: Optional[str] = None,
 ) -> float:
     """
     Adaptive TP based on historical MFE with a hit-rate feedback loop.
@@ -596,6 +613,10 @@ def calculate_adaptive_tp(
     3. If < 5 — use all signals weighted by exit_type
     4. 🆕 Auto-adjusts the percentile based on the real hit rate
     5. 🆕 Realistic capture rate (70% of the ideal MFE)
+
+    as_of — see get_signal_stats' docstring; same look-ahead-prevention
+    purpose, independent filter since this pulls its own records directly
+    rather than through get_signal_stats.
     """
     history = load_signals_history()
     risk = abs(entry - current_sl)
@@ -608,6 +629,8 @@ def calculate_adaptive_tp(
     # 🆕 FIX: synthetic records (!sim) are excluded — see get_signal_stats.
     # 🆕 FIX BUG-LO008: sl_after_tp1 is a real closed outcome, included in the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
+    if as_of is not None:
+        closed = [r for r in closed if r.get("timestamp", "") < as_of]
 
     if len(closed) < 3:
         return round_price(fallback_tp)
@@ -710,22 +733,41 @@ def calculate_combined_tp(
     df,
     idx: int,
     atr14,
-    regime: Optional[str] = None
+    regime: Optional[str] = None,
+    as_of: Optional[str] = None,
 ) -> Tuple[float, float, str]:
     """
     Combined TP with two levels:
       TP1 — statistical (MFE percentile without an R:R cap), target for 50% of the position
       TP2 — with an R:R cap (minimum R:R 1.5), target for the remaining 50%
 
+    as_of — see get_signal_stats' docstring (look-ahead prevention for
+    backtest_history()); threaded through to both stats calls below. None
+    (the default) for live callers.
+
     Returns: (tp1, tp2, desc)
     """
-    stats = get_signal_stats(ticker, tf, side, regime)
+    stats = get_signal_stats(ticker, tf, side, regime, as_of=as_of)
     risk = abs(entry - sl)
     mode_label = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
 
+    # 🆕 FIX (external review): idx was accepted but never used — atr14 (a
+    # full Series) was passed straight through to calculate_adaptive_tp(),
+    # which falls back to `.iloc[-1]` for anything with an .iloc attribute.
+    # `.iloc[-1]` is the LAST bar of whatever df this was computed from —
+    # correct-ish in live (idx is close to the end anyway, though off by
+    # one: idx is the closed signal bar, -1 is the still-forming one), but
+    # wrong in backtest, where idx can be an arbitrary historical bar far
+    # from the end of the full fetched series. A backtest signal from a
+    # low-volatility historical stretch would get its TP capped using
+    # today's (possibly very different) volatility instead of its own.
+    # Extract the bar-specific ATR explicitly instead of relying on that
+    # fallback.
+    atr_at_idx = float(atr14.iloc[idx]) if hasattr(atr14, "iloc") else (float(atr14) if atr14 is not None else None)
+
     # ── TP1: purely statistical, no R:R cap ───────────────────────
-    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr14, regime)
+    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr_at_idx, regime, as_of=as_of)
 
     # ── TP2: with R:R cap (minimum 1.5) ──────────────────────────────────
     min_rr_tp = entry + 1.5 * risk if side == "long" else entry - 1.5 * risk

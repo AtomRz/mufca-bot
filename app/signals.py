@@ -215,6 +215,7 @@ def calculate_adaptive_sl(
     fl: pd.Series,
     atr14: pd.Series,
     idx: int,
+    as_of: Optional[str] = None,
 ) -> tuple[float, str]:
     """
     Adaptive SL based on historical MAE of winning trades.
@@ -224,6 +225,12 @@ def calculate_adaptive_sl(
       true MAE: price moved against us but came back without touching the stop.
     - Take the SL_MAE_PERCENTILE percentile of these MAE values + an SL_MAE_BUFFER buffer.
     - If there are fewer winning trades than SL_MIN_HISTORY — fall back to a fixed % or ATR-based SL.
+
+    as_of — ISO timestamp string; same look-ahead-prevention purpose as
+    calculate_adaptive_tp's as_of (see state.get_signal_stats' docstring) —
+    this pulls its own records independently rather than through
+    get_signal_stats/calculate_adaptive_tp, so it needed the same fix
+    applied separately. None (the default) for live callers.
 
     Returns:
         (sl_price, description)
@@ -245,6 +252,8 @@ def calculate_adaptive_sl(
             and r.get("max_adverse_pct", 0) > 0
             and not r.get("synthetic", False)
         ]
+        if as_of is not None:
+            winning = [r for r in winning if r.get("timestamp", "") < as_of]
 
         if len(winning) < _cfg.SL_MIN_HISTORY:
             # 🆕 FIX CRITICAL BUG: this used to take the "opposite" FRAMA line —
@@ -485,6 +494,15 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
         "exit_time": datetime.now(timezone.utc).isoformat(),
         "result": result_label,
         "pnl_pct": round(pnl_pct, 4),
+        # 🆕 (external review, P3): this is a signal bot, not an execution
+        # bot (see the TP1 comment above) — it never places a real order on
+        # the exchange for the 50% partial close. pnl_pct after a TP1 hit is
+        # therefore a MODELLED figure that assumes the person actually
+        # closed half the position manually at TP1, not a verified fill.
+        # Flagged explicitly here so any downstream consumer (Discord
+        # embeds, the web History panel, !history) can label it as such
+        # instead of presenting it as equivalent to a single-exit PnL.
+        "pnl_is_modelled": tp1_hit,
         "bars_held": bars_held,
         "lev": trade.get("lev", 1),
         "track": track,
@@ -1230,7 +1248,37 @@ def backtest_history(
         # bars are eligible on equal footing with the rest of the backtest,
         # regardless of whether the toggle happens to be on right now.
         start_idx = max(50, _cfg.HURST_WINDOW + 10)
-        for idx in range(start_idx, len(df) - 100):
+
+        # 🆕 FIX (external review, P0): the loop below used to have no
+        # concept of a track already being "in a position" — every idx
+        # where a signal condition was true immediately got its own
+        # independent future_idx simulation, with no cooldown either. Since
+        # live only ever allows ONE open position per track (a_in_long/
+        # a_in_short etc. block re-entry until close_trade() runs, then
+        # cooldown_ok() gates the next attempt), the backtest could and did
+        # record multiple overlapping "trades" for the same track — e.g. a
+        # signal at bar 100 simulated through bar 150, while a second signal
+        # at bar 110 (still technically "inside" the first one, if this were
+        # live) got its own separate, overlapping simulation. That directly
+        # corrupts the MFE/MAE/win-rate distributions used to calibrate
+        # adaptive TP/SL, since the training data represents a trading
+        # pattern (parallel overlapping entries per track) the live bot
+        # never actually executes.
+        #
+        # next_available_idx[track] mirrors live's in_position + cooldown
+        # combined into one bar index: a track's signal conditions are only
+        # even evaluated once idx reaches that value, and it's pushed
+        # forward to (exit_idx + COOLDOWN_BARS) every time a simulated trade
+        # for that track closes — one position at a time, with the same
+        # cooldown gap live enforces, matching the real trading model.
+        next_available_idx = {t: -1 for t in _cfg.TRACKS}
+
+        # 🆕 FIX (external review, P1): was a flat `len(df) - 100`, decoupled
+        # from _cfg.MAX_HOLD_BARS (default 20) — see the future_idx loop
+        # below for why that matters. Reserve exactly enough trailing bars
+        # for the longest simulation the hold period actually needs, not a
+        # number that happened to match an old hardcoded default.
+        for idx in range(start_idx, len(df) - _cfg.MAX_HOLD_BARS):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
@@ -1338,12 +1386,25 @@ def backtest_history(
             ]:
                 if track not in tracks:
                     continue
+                if idx < next_available_idx[track]:
+                    continue
                 if not sig_ok:
                     continue
 
-                sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx)
+                # 🆕 FIX (external review, P0): as_of prevents adaptive
+                # TP/SL for this historical bar from seeing records that,
+                # chronologically, didn't exist yet at this point — either
+                # later records from THIS SAME backtest run (idx increases
+                # monotonically, but signals_history.json accumulates as we
+                # go) or real live trades saved before this backtest/backfill
+                # happened to run. Without this, a backtest signal from
+                # e.g. 2025 could get calibrated partly from 2026 live
+                # trades — pure look-ahead bias.
+                as_of_ts = normalize_timestamp(int(df["timestamp"].iloc[idx]))
+
+                sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx, as_of=as_of_ts)
                 risk_fixed = abs(close_v - sl)
-                tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime)
+                tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime, as_of=as_of_ts)
                 # 🆕 FIX: the backtest used to check tp_hit against tp1
                 # (statistical, no RR cap), while live trading actually
                 # exits at tp2 (same calculate_combined_tp, but with the RR
@@ -1365,7 +1426,15 @@ def backtest_history(
                 # which was actually touched first if both fall within its
                 # range; this keeps backtest and live agreeing on the same
                 # conservative resolution).
-                for future_idx in range(idx + 1, min(idx + 101, len(df))):
+                # 🆕 FIX (external review, P1): was hardcoded to a flat 100
+                # bars, independent of _cfg.MAX_HOLD_BARS (live force-closes
+                # at 20 by default) — the backtest was simulating "cancelled"
+                # outcomes on a 5x-longer holding period than live actually
+                # allows, so its MFE/MAE/win-rate stats for cancelled trades
+                # (and how often a trade even reaches "cancelled" vs. TP/SL
+                # within the real hold window) didn't represent what live
+                # trading actually does.
+                for future_idx in range(idx + 1, min(idx + _cfg.MAX_HOLD_BARS + 1, len(df))):
                     fh = float(df["high"].iloc[future_idx])
                     fl_ = float(df["low"].iloc[future_idx])
                     fc = float(df["close"].iloc[future_idx])
@@ -1404,6 +1473,13 @@ def backtest_history(
 
                 if not tp_hit and not sl_hit and bars_held > 0:
                     exit_price = float(df["close"].iloc[min(idx + bars_held, len(df) - 1)])
+
+                # 🆕 See the next_available_idx comment above the outer loop —
+                # this is where the "position" for this track actually
+                # closes in the simulation; block re-entry for this track
+                # until COOLDOWN_BARS past that point, same as live.
+                exit_idx = idx + bars_held
+                next_available_idx[track] = exit_idx + _cfg.COOLDOWN_BARS
 
                 _ensure_history_slot(history, ticker, tf)
                 exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
