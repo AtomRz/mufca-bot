@@ -274,6 +274,17 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """Fractal Adaptive Moving Average."""
+    # 🆕 FIX (external review): FRAMA's fractal-dimension calc splits `length`
+    # into two equal halves (n1, n2, each of width length//2) plus a full-width
+    # reference window (n3, width length) — a construction that only makes
+    # sense symmetrically. The web config's bound for this (5-100) never
+    # enforced evenness, so e.g. length=15 gave n=7 (7+7=14, not 15) — a
+    # silently mismatched window rather than a crash. Normalize here, at the
+    # source, rather than only in the API validator, since Discord commands
+    # and other callers read _cfg.FRAMA_LEN directly and would bypass a
+    # UI-only check.
+    if length % 2 != 0:
+        length += 1
     n = int(length / 2)
     
     hh1 = df["high"].rolling(window=n).max()
@@ -289,22 +300,38 @@ def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tu
     n3 = (hh3 - ll3) / length
     
     with np.errstate(divide="ignore", invalid="ignore"):
+        valid_dimen = (n1 > 0) & (n2 > 0) & (n3 > 0)
         dimen = np.where(
-            (n1 > 0) & (n2 > 0) & (n3 > 0),
+            valid_dimen,
             (np.log(n1 + n2 + 1e-8) - np.log(n3 + 1e-8)) / np.log(2.0),
             0.0,
         )
-    
+
     alpha = np.clip(np.exp(-4.6 * (dimen - 1.0)), 0.01, 1.0)
-    
+
     close = df["close"].values
     frama_ma = np.zeros(len(df))
     frama_ma[0] = close[0]
     for i in range(1, len(df)):
         frama_ma[i] = alpha[i] * close[i] + (1.0 - alpha[i]) * frama_ma[i - 1]
-    
+
+    # 🆕 FIX (external review): before n1/n2/n3 are all valid (the rolling
+    # windows haven't filled yet), `dimen` fell back to 0.0, which makes
+    # `alpha = clip(exp(4.6), ...) = 1.0` — not a warm-up placeholder, a
+    # perfectly valid-looking alpha that makes frama_ma[i] == close[i]
+    # exactly. Downstream code (fu/fl/fdir, and the A/U-track FRAMA
+    # direction filter) had no way to tell that from a genuine "price is
+    # right at its own FRAMA" reading, and could pick up a fdir bias before
+    # the indicator had enough history to mean anything. Masking the
+    # RECURSIVE computation itself to NaN here would be wrong — frama_ma[i]
+    # depends on frama_ma[i-1], so one NaN would poison every bar after it
+    # forever. Instead, let the recursion bootstrap normally using the
+    # alpha=1.0 fallback internally (needed for the running EMA-style
+    # accumulator to work at all), then mask the OUTPUT for the genuinely
+    # invalid bars only, after the fact.
     fs = pd.Series(frama_ma, index=df.index)
-    
+    fs[~valid_dimen] = np.nan
+
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
@@ -340,8 +367,26 @@ def calculate_mfi(df: pd.DataFrame, length: int = 8) -> pd.Series:
     neg = np.where(hlc3 < hlc3.shift(1), mf, 0.0)
     pos_s = pd.Series(pos, index=df.index).rolling(window=length).sum()
     neg_s = pd.Series(neg, index=df.index).rolling(window=length).sum()
-    ratio = pos_s / (neg_s + 1e-8)
-    return 100.0 - (100.0 / (1.0 + ratio))
+
+    # 🆕 FIX (external review): the old `ratio = pos_s / (neg_s + 1e-8)` collapses
+    # the genuinely neutral case (pos_s == 0 AND neg_s == 0 — no directional flow
+    # at all, e.g. hlc3 dead flat for the whole window) into MFI == 0, i.e.
+    # maximally oversold — the opposite of what "no flow either way" should mean.
+    # It also nudges the "no negative flow at all" case to just under 100 rather
+    # than exactly 100. Handle the three edge cases explicitly; only fall back
+    # to the ratio formula when there's an actual mix of both.
+    mfi = pd.Series(np.nan, index=df.index)
+    both_zero = (pos_s == 0) & (neg_s == 0)
+    only_pos = (neg_s == 0) & (pos_s > 0)
+    only_neg = (pos_s == 0) & (neg_s > 0)
+    mixed = ~(both_zero | only_pos | only_neg)
+
+    mfi[both_zero] = 50.0
+    mfi[only_pos] = 100.0
+    mfi[only_neg] = 0.0
+    ratio = pos_s / neg_s.replace(0, np.nan)
+    mfi[mixed] = 100.0 - (100.0 / (1.0 + ratio[mixed]))
+    return mfi
 
 def calculate_andean(df: pd.DataFrame, length: int = 23, sig_len: int = 6) -> Tuple[pd.Series, pd.Series]:
     """Andean Oscillator."""
@@ -544,14 +589,34 @@ def calculate_breakout_signal(
     # Squeeze: atr_pct as of the PRIOR bar vs. its own trailing history —
     # shift(1) so bar i's own (already-expanded) atr_pct doesn't leak into
     # its own squeeze check.
+    #
+    # 🆕 FIX (external review): the threshold used to be computed as
+    # `atr_pct_prev.rolling(window=squeeze_window).quantile(...)` — but that
+    # rolling window, by construction, includes atr_pct_prev's OWN value at
+    # row i (bar i-1's ATR%) as part of the very distribution it's being
+    # measured against. A second shift(1) here excludes the point being
+    # tested from its own comparison baseline: bar i's squeeze check now
+    # reads "is ATR%(i-1) below the Nth percentile of ATR%(i-2 ... i-1-window),
+    # a window that does NOT include ATR%(i-1) itself" — a cleaner,
+    # self-consistent statistical comparison.
+    #
+    # 🆕 FIX (external review): min_periods was squeeze_window // 2 (and
+    # lookback // 2 below) — meaning a "genuine squeeze vs. its own recent
+    # history" claim could fire on half a window's worth of actual history.
+    # README/docstring both describe this as "bottom quartile of its own
+    # RECENT HISTORY" — a half-populated window undersells that claim, so
+    # this now requires the FULL window before it's willing to call
+    # anything a squeeze. b_warmed_up/b_warmed_up_bt in signals.py already
+    # gate on the full squeeze_window + lookback sum, so this doesn't
+    # introduce any additional warm-up delay beyond what was already there.
     atr_pct_prev = atr_pct.shift(1)
-    squeeze_threshold = atr_pct_prev.rolling(window=squeeze_window, min_periods=squeeze_window // 2).quantile(squeeze_percentile)
+    squeeze_threshold = atr_pct_prev.shift(1).rolling(window=squeeze_window, min_periods=squeeze_window).quantile(squeeze_percentile)
     squeeze_ok = atr_pct_prev < squeeze_threshold
 
     # Darvas-box breakout level: the high/low of the `lookback` bars BEFORE
     # i (shift(1) so the window is [i-lookback, i-1], excluding i itself).
-    box_high = high.shift(1).rolling(window=lookback, min_periods=lookback // 2).max()
-    box_low = low.shift(1).rolling(window=lookback, min_periods=lookback // 2).min()
+    box_high = high.shift(1).rolling(window=lookback, min_periods=lookback).max()
+    box_low = low.shift(1).rolling(window=lookback, min_periods=lookback).min()
     breakout_level_long_ok = close > box_high
     breakout_level_short_ok = close < box_low
 

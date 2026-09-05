@@ -1142,6 +1142,13 @@ async def set_indicators(body: IndicatorsIn):
             raise HTTPException(400, f"{key} must be between {lo} and {hi}")
         casted[attr] = caster(value)
 
+    # 🆕 FIX (external review): FRAMA's fractal-dimension calc needs an even
+    # length (splits into two equal halves) — reject an odd value explicitly
+    # here rather than letting calculate_frama() silently round it up, so
+    # the person setting it knows their input didn't take effect as typed.
+    if "frama_len" in updates and casted["FRAMA_LEN"] % 2 != 0:
+        raise HTTPException(400, "frama_len must be even (FRAMA splits its window into two equal halves)")
+
     if _any_active_trades():
         raise HTTPException(409, "Cannot change indicator parameters while a trade is open on any pair/timeframe/track. Wait for it to close first.")
 

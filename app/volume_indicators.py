@@ -20,15 +20,40 @@ def calculate_obv_ema(obv: pd.Series, period: int = 20) -> pd.Series:
 
 
 def calculate_relative_volume(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Relative Volume = current / SMA(volume, period)."""
-    vol_sma = df["volume"].rolling(window=period).mean()
+    """Relative Volume = current / SMA(volume, period) of the PRIOR `period` bars.
+
+    🆕 FIX (external review): `rolling(window=period).mean()` on the same
+    (unshifted) series includes the current bar's own volume as the last
+    element of its own baseline — a genuine spike bar dilutes the very
+    average it's being compared against, systematically understating how
+    unusual it actually is (e.g. 20x normal volume on top of 19 normal bars
+    reads as ~4.17x instead of the true ~5x vs. the *prior* baseline).
+    Shifted by 1 so "how much bigger is this bar than the recent normal
+    volume" doesn't have the bar answering that question baked into the
+    question itself. Matters most for the B-track breakout detector, which
+    thresholds directly on this value (BREAKOUT_VOL_SPIKE_MULT) — the old
+    self-inclusive version made genuine spikes read as systematically
+    smaller than they were, requiring an even bigger real spike to clear
+    the same nominal threshold."""
+    vol_sma = df["volume"].shift(1).rolling(window=period).mean()
     return df["volume"] / (vol_sma + 1e-12)
 
 
-def calculate_volume_delta(df: pd.DataFrame) -> pd.Series:
+def calculate_volume_pressure(df: pd.DataFrame) -> pd.Series:
     """
-    Volume Delta — buying/selling pressure via close location in bar.
-    close near high = +pressure, close near low = -pressure.
+    Volume pressure — an ESTIMATED buying/selling pressure proxy via close
+    location in the bar (close near high = +pressure, close near low =
+    -pressure), multiplied by volume.
+
+    🆕 RENAMED (external review) from calculate_volume_delta: this is not
+    real Volume Delta / CVD (buy-volume minus sell-volume from trade-level
+    tape data) — Gate.io's OHLCV doesn't carry that, so this proxies it from
+    candle shape instead. The old name invited exactly the confusion this
+    docstring already warned about — a future reader skimming just the
+    function name could easily assume it's the real thing and, if Gate.io
+    trade-level data is ever wired in, silently keep using this proxy
+    alongside/instead of it. Renamed rather than reimplemented — same
+    formula, clearer name for what it actually measures.
 
     BUGFIX BUG-ME004: at high == low (a doji candle) range_ = 0, close_loc ≈ 0,
     pressure = -1.0 — a doji was being interpreted as maximum sell pressure.
@@ -75,22 +100,45 @@ def volume_flow_signal_v3(df: pd.DataFrame, obv_period: int = 20) -> Dict:
     current_ema = obv_ema.iloc[-1]
 
     obv_score = 0.0
-    if not (pd.isna(current_obv) or pd.isna(current_ema) or current_ema == 0):
-        obv_ratio = current_obv / current_ema
-        if obv_ratio > 1.02:
-            obv_score = min(1.0, (obv_ratio - 1.02) / 0.08)
-        elif obv_ratio < 0.98:
-            obv_score = max(-1.0, (obv_ratio - 0.98) / 0.08)
+    if not (pd.isna(current_obv) or pd.isna(current_ema)):
+        # 🆕 FIX (external review): only guarded against current_ema == 0
+        # exactly — but OBV crossing (or nearly crossing) zero can leave
+        # current_ema merely TINY rather than exactly zero, which still
+        # blows the ratio up to an extreme value that then maxes out
+        # obv_score at +/-1.0 for what's often a practically insignificant
+        # OBV move. Floor the "is there a meaningful EMA level to compare
+        # against" check using a small fraction of recent total traded
+        # volume — a scale reference that doesn't itself depend on OBV's
+        # own (potentially degenerate) value. Doesn't change anything for
+        # the ordinary case (current_ema is virtually always far larger
+        # than 1% of the period's total volume once trading has been
+        # ongoing) — only prevents the near-zero-crossing blowup.
+        obv_scale_floor = df["volume"].iloc[-obv_period:].sum() * 0.01
+        if abs(current_ema) >= obv_scale_floor:
+            obv_ratio = current_obv / current_ema
+            if obv_ratio > 1.02:
+                obv_score = min(1.0, (obv_ratio - 1.02) / 0.08)
+            elif obv_ratio < 0.98:
+                obv_score = max(-1.0, (obv_ratio - 0.98) / 0.08)
 
     # 2. OBV Momentum (5 bars)
-    obv_mom = (obv.iloc[-1] - obv.iloc[-6]) / (abs(obv.iloc[-6]) + 1e-12) * 100
+    # 🆕 FIX (external review): same near-zero-crossing issue as obv_ratio
+    # above — abs(obv.iloc[-6]) can be tiny even when not exactly zero,
+    # making obv_mom spike to an enormous (if later clipped) percentage for
+    # a practically insignificant absolute OBV change. Floor the
+    # denominator's magnitude the same way, using recent total volume as a
+    # scale reference — unchanged for the ordinary case, only kicks in when
+    # obv.iloc[-6] happens to sit near a zero-crossing.
+    mom_scale_floor = df["volume"].iloc[-20:].sum() * 0.01
+    obv_mom_denom = max(abs(obv.iloc[-6]), mom_scale_floor)
+    obv_mom = (obv.iloc[-1] - obv.iloc[-6]) / obv_mom_denom * 100
     mom_score = np.clip(obv_mom / 10, -0.5, 0.5)
 
     # 3. Relative Volume
     rel_vol = float(calculate_relative_volume(df, obv_period).iloc[-1])
 
     # 4. Volume Delta Trend
-    delta = calculate_volume_delta(df)
+    delta = calculate_volume_pressure(df)
     delta_ema = delta.ewm(span=obv_period, adjust=False).mean()
     current_delta = delta.iloc[-1]
     current_delta_ema = delta_ema.iloc[-1]
