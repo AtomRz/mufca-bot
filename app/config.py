@@ -450,6 +450,19 @@ TARGET_RISK_DEP = 5.0
 # get_market_pulse() for the topbar R:R indicator; single source of truth.
 MIN_RR = 1.5
 
+# 🆕 A single OHLC bar can't tell you whether price touched SL or TP first
+# intrabar — only that both happened to be crossed somewhere within that
+# bar's high/low range. This was always resolved by checking SL first (see
+# check_tp_sl_hit in signals.py and the equivalent block in
+# backtest_history()), in both live and backtest, but that ordering was
+# implicit rather than a named, intentional choice. Made explicit here per
+# an external code review's suggestion — "sl_first" is the conservative
+# choice (assumes the worse outcome on ambiguous bars, rather than crediting
+# a TP that may not have actually printed before the SL did). Changing this
+# would need updating both of those call sites; it isn't currently read as
+# a live branch, it's documentation of the policy already in effect.
+SAME_BAR_EXIT_POLICY = "sl_first"  # the only implemented option currently
+
 # =====================================================================
 # 🎯  SL-MOVE MODE AFTER TP1
 # =====================================================================

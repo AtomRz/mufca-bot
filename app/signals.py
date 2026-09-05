@@ -400,6 +400,13 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
                      bar_time: Optional[int] = None) -> Optional[str]:
     """Checks whether TP or SL was hit for the given track.
 
+    🆕 A single bar's high/low can't tell you which was actually touched
+    first intrabar if both SL and TP fall within its range — see
+    config.SAME_BAR_EXIT_POLICY ("sl_first", the only option implemented):
+    SL is checked before TP below, consistently with backtest_history()'s
+    equivalent block, so live and backtest agree on the same conservative
+    resolution of that ambiguity.
+
     🆕 FIX BUG-LO009 (found by Kimi audit): the SL moved after TP1 used to be
     checked against ANY bar, including ones that closed BEFORE the move
     happened — their low/high were printed before price ever even touched
@@ -850,6 +857,14 @@ async def check_signals(
         vol_lev_reason = "no signal"
 
         warmed_up = len(df) >= _cfg.MFI_TRAINING
+        # 🆕 FIX: B-track doesn't use MFI/Andean at all, so gating it on
+        # MFI_TRAINING (default 800 bars) was borrowed from A-track without
+        # actually applying to B — if MFI_TRAINING is ever raised above the
+        # fetched 900-bar window, B would silently stop firing for a reason
+        # that has nothing to do with what it actually needs. B's own
+        # requirement is just enough bars for its squeeze window + box
+        # lookback to have real (non-truncated) history.
+        b_warmed_up = len(df) >= (_cfg.BREAKOUT_SQUEEZE_WINDOW + _cfg.BREAKOUT_LOOKBACK)
 
         filter_long = (
             (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
@@ -962,8 +977,8 @@ async def check_signals(
         # 🆕 Track "b" — like UT Bot, this is a one-shot "this bar IS the
         # breakout bar" condition (not a lingering confluence state like
         # Andean/MFI), so it's gated by is_new_bar the same way U-track is.
-        sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and not b_in_pos and b_long_cd_ok  and is_new_bar and warmed_up
-        sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and not b_in_pos and b_short_cd_ok and is_new_bar and warmed_up
+        sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and not b_in_pos and b_long_cd_ok  and is_new_bar and b_warmed_up
+        sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and not b_in_pos and b_short_cd_ok and is_new_bar and b_warmed_up
 
         # Track flags are only set on an actual open (not dry_run), and ALWAYS
         # together with active_trade, so they never get out of sync.
@@ -1248,6 +1263,12 @@ def backtest_history(
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = idx >= _cfg.MFI_TRAINING
+            # 🆕 FIX: same reasoning as live's b_warmed_up — B doesn't use
+            # MFI, so it shouldn't be gated on MFI_TRAINING (previously it
+            # had NO warmup gate at all in the backtest, the opposite
+            # problem: too permissive, could fire on bars where the squeeze
+            # window's rolling percentile is only partially populated).
+            b_warmed_up_bt = idx >= (_cfg.BREAKOUT_SQUEEZE_WINDOW + _cfg.BREAKOUT_LOOKBACK)
 
             filter_long = (
                 (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
@@ -1307,8 +1328,8 @@ def backtest_history(
             # 🆕 Track "b" — HTF applied here (not inside filter_long_b/short_b,
             # which are defined before htf_bull_bt/htf_bear_bt exist), same
             # place A-track's HTF check happens.
-            sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
-            sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
+            sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt) and b_warmed_up_bt
+            sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt) and b_warmed_up_bt
 
             for track, side, sig_ok in [
                 ("a", "long", sig_a_long), ("a", "short", sig_a_short),
@@ -1338,6 +1359,12 @@ def backtest_history(
                 exit_price = close_v
                 bars_held = 0
 
+                # 🆕 SL checked before TP on each bar below — see
+                # config.SAME_BAR_EXIT_POLICY and check_tp_sl_hit()'s
+                # docstring for why (a single bar's high/low can't tell you
+                # which was actually touched first if both fall within its
+                # range; this keeps backtest and live agreeing on the same
+                # conservative resolution).
                 for future_idx in range(idx + 1, min(idx + 101, len(df))):
                     fh = float(df["high"].iloc[future_idx])
                     fl_ = float(df["low"].iloc[future_idx])

@@ -8,7 +8,6 @@ import logging
 import config as _cfg
 from config import (
     SIGNALS_HISTORY_FILE,
-    SIGNAL_HISTORY_LIMIT,
     BOT_STATE_FILE,
     safe_json_load,
     safe_json_save,
@@ -196,7 +195,7 @@ def add_signal_record(
     }
 
     history[ticker][tf][side].append(record)
-    history[ticker][tf][side] = history[ticker][tf][side][-(SIGNAL_HISTORY_LIMIT * 3):]
+    history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
     save_signals_history(history)
     logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Track: {track} | Regime: {regime}")
 
@@ -359,7 +358,7 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         else:
             logger.debug(f"[STATS] Only {len(regime_closed)} {regime} signals for {ticker} {tf} {side}, falling back to all {len(closed)} signals")
 
-    recent = closed[-SIGNAL_HISTORY_LIMIT:]
+    recent = closed[-_cfg.SIGNAL_HISTORY_LIMIT:]
     favorable_pcts = []
     tp_hits = 0
     sl_hits = 0
@@ -448,17 +447,65 @@ def _extract_weighted_mfes(records: List[Dict]) -> List[Tuple[float, float]]:
     return favorable_pcts
 
 
-def _build_weighted_sample(weighted_mfes: List[Tuple[float, float]]) -> List[float]:
+def _weighted_percentile(values: List[float], weights: List[float], percentile: float) -> float:
     """
-    Builds a weighted sample for the percentile calculation.
-    Max 2 copies per signal (tp=2, everything else=1) — keeps the sample
-    from ballooning.
+    Weighted percentile via linear interpolation of the weighted empirical
+    CDF — the mathematically correct way to apply the exit-type weights from
+    _extract_weighted_mfes (tp=1.0, sl_after_tp1=0.8, sl=0.6, cancelled=0.4).
+
+    🆕 FIX (external review): replaces the old duplication-based
+    approximation, which capped every signal at 1 or 2 copies
+    (`copies = 2 if weight >= 1.0 else 1`) — that collapsed all three
+    non-tp weight tiers (0.8/0.6/0.4) into an identical single copy each,
+    so the actual distinction the weights were supposed to encode
+    (sl_after_tp1 more representative than plain sl, plain sl more than
+    cancelled) never materialized in the percentile calculation; only a
+    binary tp-vs-everything-else split did. This computes the percentile
+    directly from the real weight values instead of approximating them
+    through repetition count.
+
+    Uses the standard "midpoint" weighted-percentile convention (each point
+    sits at the midpoint of its own cumulative-weight slot): a well-defined,
+    widely used generalization of percentile to weighted samples. It
+    converges to the ordinary percentile as sample size grows and weights
+    even out, but is not bit-identical to numpy's default unweighted
+    percentile method for small uniform-weight samples — a minor
+    convention difference, not a correctness issue, and irrelevant here
+    since weights are never actually uniform in practice (see
+    _extract_weighted_mfes).
+
+    percentile is in [0, 1].
     """
-    expanded = []
-    for mfe, weight in weighted_mfes:
-        copies = 2 if weight >= 1.0 else 1
-        expanded.extend([mfe] * copies)
-    return expanded
+    if not values:
+        return 0.0
+    pairs = sorted(zip(values, weights), key=lambda p: p[0])
+    sorted_values = [p[0] for p in pairs]
+    sorted_weights = [p[1] for p in pairs]
+    total_weight = sum(sorted_weights)
+    if total_weight <= 0:
+        return float(np.median(sorted_values))
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+
+    # Midpoint of each point's cumulative-weight slot, normalized to [0, 1].
+    midpoints = []
+    running = 0.0
+    for w in sorted_weights:
+        midpoints.append((running + w / 2.0) / total_weight)
+        running += w
+
+    target = percentile
+    if target <= midpoints[0]:
+        return sorted_values[0]
+    if target >= midpoints[-1]:
+        return sorted_values[-1]
+
+    for i in range(1, len(midpoints)):
+        if midpoints[i] >= target:
+            span = midpoints[i] - midpoints[i - 1]
+            frac = (target - midpoints[i - 1]) / span if span > 0 else 0.0
+            return sorted_values[i - 1] + frac * (sorted_values[i] - sorted_values[i - 1])
+    return sorted_values[-1]
 
 
 def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
@@ -589,7 +636,7 @@ def calculate_adaptive_tp(
         use_records = closed
         regime_info = "no regime filter"
 
-    recent = use_records[-SIGNAL_HISTORY_LIMIT:]
+    recent = use_records[-_cfg.SIGNAL_HISTORY_LIMIT:]
 
     # 🆕 FIX: AUTO-ADJUST PERCENTILE BY HIT RATE
     base_percentile = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
@@ -613,9 +660,9 @@ def calculate_adaptive_tp(
     if not weighted_mfes:
         return round_price(fallback_tp)
 
-    expanded = _build_weighted_sample(weighted_mfes)
-
-    tp_pct = float(np.percentile(expanded, adjusted_percentile * 100))
+    mfe_values = [m for m, _w in weighted_mfes]
+    mfe_weights = [w for _m, w in weighted_mfes]
+    tp_pct = _weighted_percentile(mfe_values, mfe_weights, adjusted_percentile)
 
     # Apply the regime discount
     tp_pct *= regime_discount
