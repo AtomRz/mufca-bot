@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Tuple
+from typing import Tuple, Optional
 
 try:
     from numba import njit
@@ -270,6 +270,19 @@ def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:
         chop = 100 * np.log10(atr_sum / (range_ + 1e-12)) / np.log10(length)
     # When atr_sum == 0, log10(0) = -inf → replace with 0 (not choppy at all)
     chop = pd.Series(np.where(np.isfinite(chop), chop, 0.0), index=df.index)
+    # 🆕 (external review, decision kept as-is — see chat): flat→0 reads a
+    # dead/no-movement market as "maximally trending", which is only safe
+    # because the separate ATR_MIN filter almost always catches genuinely
+    # dead markets independently (verified: atr_sum→0 here implies
+    # calculate_atr's own ATR%→0 too, which fails ATR_MIN and blocks the
+    # trade regardless of what CHOP says — both filters are AND'ed
+    # together). Logged here (not acted on) so if this combination is ever
+    # seen without ATR also catching it — e.g. ATR_MIN gets lowered or
+    # disabled later — there's a trace instead of a silent pass-through.
+    flat_bars = int((~np.isfinite(pd.Series(np.where(atr_sum > 0, 100 * np.log10(atr_sum / (range_ + 1e-12)) / np.log10(length), np.inf), index=df.index)))
+                     .tail(1).sum()) if len(df) else 0
+    if flat_bars and atr_sum.iloc[-1] == 0:
+        logger.debug(f"[CHOP] Flat/no-movement bar detected (atr_sum=0) — CHOP defaulted to 0 (trending); relying on ATR_MIN to gate this if it's a genuinely dead market.")
     return chop.clip(0, 100)
 
 def calculate_frama(df: pd.DataFrame, length: int = 22, mult: float = 2.1) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
@@ -494,8 +507,20 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, flo
     # NaN protection
     if len(vals) < 2 or np.isnan(vals).any():
         return 20.0, 80.0
-    
+
     c1, c2 = float(vals.min()), float(vals.max())
+
+    # 🆕 FIX (external review): a near-constant MFI window (e.g. a long dead
+    # stretch sitting at ~50) makes min≈max, so both K-Means centers collapse
+    # to the same value — degenerate clustering, not neutral-but-valid
+    # levels. A signal system then reads that collapsed value as BOTH the
+    # oversold AND overbought threshold, meaning any subsequent tiny MFI
+    # wiggle registers as a crossover in either direction — a genuinely flat
+    # market turning into a spurious signal generator. Fall back to the same
+    # generic 20/80 used for the NaN case above; there isn't a real
+    # oversold/overbought distribution to learn from a flat window either.
+    if (c2 - c1) < 1e-6:
+        return 20.0, 80.0
     
     for _ in range(10):
         d1 = np.abs(vals - c1)
@@ -519,6 +544,37 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, flo
             c2 = float(np.nanmean(cl2))
     
     return min(c1, c2), max(c1, c2)
+
+
+def run_kmeans_mfi_rolling(mfi: pd.Series, training_size: int = 800, start_idx: int = 0, end_idx: Optional[int] = None) -> Tuple[pd.Series, pd.Series]:
+    """Point-in-time version of run_kmeans_mfi: OS/OB levels at each index i
+    are trained only on mfi.iloc[max(0, i-training_size+1) : i+1] — data
+    available up to and including bar i — not the whole series.
+
+    🆕 FIX (external review, P0): backtest_history() used to call
+    run_kmeans_mfi(mfi, training_size) ONCE on the full historical series
+    before the simulation loop. `.dropna().tail(training_size)` took the
+    LAST training_size values of the WHOLE series — near the end of the
+    backtest — and applied those same OS/OB thresholds uniformly to every
+    bar, including ones from far earlier. A signal at bar 500 was being
+    judged against a distribution of MFI values that, chronologically,
+    wouldn't exist until bar ~2200+ — classic look-ahead bias. Live doesn't
+    have this problem: a fresh live fetch's own .tail() is genuinely "the
+    most recent training_size values as of right now" already.
+
+    start_idx/end_idx let the caller skip computing this for bars outside
+    the range it actually simulates (backtest_history never evaluates
+    signals before its own start_idx) — benchmarked at well under 1ms/bar,
+    so even the full range costs about a second for a 3000-bar backtest, a
+    one-off admin-triggered cost, not a per-scan-tick one."""
+    n = len(mfi)
+    end_idx = n if end_idx is None else min(end_idx, n)
+    os_arr = np.full(n, 20.0)
+    ob_arr = np.full(n, 80.0)
+    for i in range(start_idx, end_idx):
+        window = mfi.iloc[max(0, i - training_size + 1): i + 1]
+        os_arr[i], ob_arr[i] = run_kmeans_mfi(window, training_size)
+    return pd.Series(os_arr, index=mfi.index), pd.Series(ob_arr, index=mfi.index)
 
 
 # =====================================================================

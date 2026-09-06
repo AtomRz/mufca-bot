@@ -40,6 +40,7 @@ from indicators import (
     calculate_andean,
     calculate_ut_bot,
     run_kmeans_mfi,
+    run_kmeans_mfi_rolling,
     heikin_ashi,
     calculate_hurst,
     calculate_breakout_signal,
@@ -68,15 +69,23 @@ logger = logging.getLogger(__name__)
 # 🔄  CROSSOVER HELPERS (module level for reuse)
 # =====================================================================
 
+def _lvl_at(lvl, k):
+    """Reads a threshold value at index k — works whether `lvl` is a plain
+    scalar (the live path's single current-bar level) or a pandas Series
+    (the backtest path's point-in-time-correct rolling level, one value per
+    bar — see run_kmeans_mfi_rolling)."""
+    return float(lvl.iloc[k]) if hasattr(lvl, "iloc") else lvl
+
+
 def crossover(s, lvl, i):
     if i < 1:
         return False
-    return float(s.iloc[i]) > lvl and float(s.iloc[i-1]) <= lvl
+    return float(s.iloc[i]) > _lvl_at(lvl, i) and float(s.iloc[i-1]) <= _lvl_at(lvl, i-1)
 
 def crossunder(s, lvl, i):
     if i < 1:
         return False
-    return float(s.iloc[i]) < lvl and float(s.iloc[i-1]) >= lvl
+    return float(s.iloc[i]) < _lvl_at(lvl, i) and float(s.iloc[i-1]) >= _lvl_at(lvl, i-1)
 
 def crossover2(s1, s2, i):
     if i < 1:
@@ -102,13 +111,13 @@ def bars_since_crossunder2(s1, s2, cur, lookback):
 
 def bars_since_crossover(s, lvl, cur, lookback):
     for k in range(cur, max(cur - lookback - 1, 1), -1):
-        if float(s.iloc[k]) > lvl and float(s.iloc[k-1]) <= lvl:
+        if float(s.iloc[k]) > _lvl_at(lvl, k) and float(s.iloc[k-1]) <= _lvl_at(lvl, k-1):
             return cur - k
     return 999
 
 def bars_since_crossunder(s, lvl, cur, lookback):
     for k in range(cur, max(cur - lookback - 1, 1), -1):
-        if float(s.iloc[k]) < lvl and float(s.iloc[k-1]) >= lvl:
+        if float(s.iloc[k]) < _lvl_at(lvl, k) and float(s.iloc[k-1]) >= _lvl_at(lvl, k-1):
             return cur - k
     return 999
 
@@ -1182,7 +1191,15 @@ def backtest_history(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
         mfi = calculate_mfi(df, _cfg.MFI_LEN)
-        level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
+        # 🆕 FIX (external review, P0): rolling/point-in-time version, not
+        # the plain run_kmeans_mfi() live uses — see
+        # run_kmeans_mfi_rolling's docstring. A single upfront call here
+        # used to train OS/OB on the LAST training_size bars of the whole
+        # backtest and apply that to every historical bar, including ones
+        # from long before that training window existed — level_os/level_ob
+        # are now per-bar Series instead of fixed scalars; crossover() and
+        # friends already handle either.
+        level_os, level_ob = run_kmeans_mfi_rolling(mfi, _cfg.MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
         # 🆕 Always computed here (unlike check_signals, not gated behind the
@@ -1214,12 +1231,28 @@ def backtest_history(
                     fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
                     ltf_times = df["timestamp"].values
                     htf_times = df_htf["timestamp"].values
+                    # 🆕 FIX (external review, P0): OHLCV timestamps mark a
+                    # candle's OPEN, not its close. The old condition
+                    # (`htf_times[htf_idx+1] <= ltf_times[i]`) only checked
+                    # that the HTF candle had STARTED by the ltf bar's time —
+                    # not that it had CLOSED. For ltf=13:00 with htf=4h, the
+                    # 12:00-16:00 HTF candle's open (12:00) satisfies that
+                    # check, but its close price reflects the market at
+                    # 16:00 — three hours in this historical bar's future.
+                    # Live's get_htf_bias() doesn't have this problem (it
+                    # always reads .iloc[-2], the last candle a fresh fetch
+                    # confirms is actually closed) — this brings backtest in
+                    # line with that by requiring the HTF candle's open +
+                    # its own duration (observed directly from the fetched
+                    # data, not assumed from the timeframe string) to be
+                    # <= the ltf bar's time before using it.
+                    htf_duration_ms = (htf_times[1] - htf_times[0]) if len(htf_times) > 1 else 0
                     htf_idx = 0
                     for i in range(len(df)):
-                        if htf_times[0] > ltf_times[i]:
+                        if htf_times[0] + htf_duration_ms > ltf_times[i]:
                             htf_bias_arr[i] = 0
                             continue
-                        while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] <= ltf_times[i]:
+                        while htf_idx + 1 < len(htf_times) and htf_times[htf_idx + 1] + htf_duration_ms <= ltf_times[i]:
                             htf_idx += 1
                         if htf_idx >= _cfg.FRAMA_LEN * 2:
                             htf_close = float(df_htf["close"].iloc[htf_idx])
@@ -1245,9 +1278,14 @@ def backtest_history(
         # blocked (hurst_ok = False on NaN) and never entered the training
         # history — silently skewing the adaptive TP/SL calibration toward
         # later, possibly less volatile data. Start past warm-up so those
-        # bars are eligible on equal footing with the rest of the backtest,
-        # regardless of whether the toggle happens to be on right now.
-        start_idx = max(50, _cfg.HURST_WINDOW + 10)
+        # bars are eligible on equal footing with the rest of the backtest.
+        #
+        # 🆕 FIX (external review, P1): only reserve those extra bars when
+        # the filter is actually on. It was unconditional before — with
+        # ENABLE_HURST_FILTER off (the default), that discarded ~110 bars
+        # of otherwise-usable training data for a filter that isn't even
+        # active, shrinking the calibration sample for no reason.
+        start_idx = max(50, _cfg.HURST_WINDOW + 10) if _cfg.ENABLE_HURST_FILTER else 50
 
         # 🆕 FIX (external review, P0): the loop below used to have no
         # concept of a track already being "in a position" — every idx
