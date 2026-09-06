@@ -64,18 +64,43 @@ def parse_ohlcv(bars: List[List[float]]) -> pd.DataFrame:
 # 🔍  DATA VALIDATION
 # =====================================================================
 def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
-    """Checks that the DataFrame has enough rows and no NaNs in the key OHLC
-    columns.
+    """Checks that the DataFrame has enough rows, no NaNs in the key OHLC
+    columns, and is internally consistent (sorted/unique timestamps,
+    high/low actually bracket open/close, non-negative volume).
 
     🆕 FIX: previously this only checked row count — if the exchange
     occasionally returned NaN in a bar (network glitch, incomplete last bar,
     etc.), that NaN would silently leak into every indicator downstream
     (FRAMA, Andean, Heikin Ashi, volume delta — each would break on NaN in
     its own way). We validate once here, at the data entry point, instead of
-    guarding against NaN separately in every indicator."""
+    guarding against NaN separately in every indicator.
+
+    🆕 FIX (external review, P2): the above only ever checked "is there a
+    NaN", not "does this data make structural sense". A duplicated or
+    out-of-order timestamp doesn't produce a NaN anywhere, but every rolling
+    indicator (ATR, FRAMA, Andean, MFI, the B-track squeeze/breakout logic,
+    cooldown bar-counting, the whole backtest) implicitly assumes strictly
+    increasing, one-row-per-bar timestamps — silently treating a duplicate
+    as if it were four separate consecutive bars, or a resorted-in-place gap
+    as a real price jump. Same reasoning for high < max(open,close) or
+    low > min(open,close): not NaN, but not a physically possible candle
+    either, and every indicator here trusts high/low as the bar's true
+    extremes. Reject rather than silently compute on data that doesn't
+    represent what it claims to."""
     if df.empty or len(df) < min_rows:
         return False
     if df[["open", "high", "low", "close"]].isna().any().any():
+        return False
+    ts = df["timestamp"]
+    if not ts.is_monotonic_increasing:
+        return False
+    if ts.duplicated().any():
+        return False
+    if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+        return False
+    if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+        return False
+    if "volume" in df.columns and (df["volume"] < 0).any():
         return False
     return True
 

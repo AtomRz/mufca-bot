@@ -812,7 +812,16 @@ async def check_signals(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
         mfi = calculate_mfi(df, _cfg.MFI_LEN)
-        level_os, level_ob = run_kmeans_mfi(mfi, _cfg.MFI_TRAINING)
+        # 🆕 FIX (external review, P1): mfi here is computed on the FULL
+        # fetched df, which includes the still-forming last bar — but the
+        # signal itself is evaluated at idx = len(df)-2 (the last CLOSED
+        # bar, defined a few lines below). Training K-Means on one bar MORE
+        # than what the signal is actually based on is a small but real
+        # point-in-time mismatch, and it's exactly what made live diverge
+        # from backtest_history()'s now-strictly-point-in-time
+        # run_kmeans_mfi_rolling() (mfi.iloc[:idx+1] there vs the full
+        # series here). Truncate the same way live's own signal already is.
+        level_os, level_ob = run_kmeans_mfi(mfi.iloc[:len(df) - 1], _cfg.MFI_TRAINING)
         and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
         ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
         # 🆕 Only computed when the filter is actually on (off by default) —
@@ -1458,6 +1467,22 @@ def backtest_history(
                 exit_price = close_v
                 bars_held = 0
 
+                # 🆕 FIX (external review, P0): backtest used to check only
+                # the ORIGINAL sl/tp2 on every future bar, with no concept
+                # of TP1 at all — live's real mechanics are two-stage (TP1
+                # hit -> 50% closed -> SL moves to breakeven/half_tp1 ->
+                # remainder rides to TP2 or the moved SL). A backtest trade
+                # that would have banked TP1 and then given back the
+                # remainder at breakeven was recorded as a plain full "sl"
+                # loss — same label and PnL as a trade that never worked at
+                # all — systematically pessimistic training data for
+                # adaptive TP/SL, hit-rate, and regime stats. tp1_reached
+                # tracks whether TP1 was crossed at any point (for PnL/label
+                # purposes) even on the branch where price ran straight
+                # through TP1 and TP2 in the same continuous move.
+                current_sl = sl
+                tp1_reached = False
+
                 # 🆕 SL checked before TP on each bar below — see
                 # config.SAME_BAR_EXIT_POLICY and check_tp_sl_hit()'s
                 # docstring for why (a single bar's high/low can't tell you
@@ -1476,38 +1501,85 @@ def backtest_history(
                     fh = float(df["high"].iloc[future_idx])
                     fl_ = float(df["low"].iloc[future_idx])
                     fc = float(df["close"].iloc[future_idx])
+                    bars_held = future_idx - idx
 
                     if side == "long":
                         favorable = (fh - close_v) / close_v * 100
                         adverse = (close_v - fl_) / close_v * 100
                         max_favorable = max(max_favorable, favorable)
                         max_adverse = max(max_adverse, adverse)
-                        if fl_ <= sl:
-                            sl_hit = True
-                            exit_price = sl
-                            bars_held = future_idx - idx
-                            break
-                        if fh >= tp:
-                            tp_hit = True
-                            exit_price = tp
-                            bars_held = future_idx - idx
-                            break
+
+                        if not tp1_reached:
+                            if fl_ <= current_sl:
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
+                            if fh >= tp:
+                                # Reached TP2 directly — since tp1 < tp2 on
+                                # the same side, this necessarily passed
+                                # through TP1 in the same continuous move
+                                # (unlike SL vs TP, these aren't ambiguous
+                                # relative to each other). Live's own
+                                # continuous ticker check would register
+                                # both essentially at once — same result
+                                # here: a full win, both legs positive.
+                                tp1_reached = True
+                                tp_hit = True
+                                exit_price = tp
+                                break
+                            if fh >= tp1:
+                                # 🆕 Mirrors live's sl_moved_after_bar: don't
+                                # also check the moved SL / TP2 on THIS same
+                                # bar — only from the next one onward, since
+                                # we can't know whether the touch happened
+                                # at the start or end of this bar's range.
+                                tp1_reached = True
+                                if _cfg.TP1_SL_MODE == "half_tp1":
+                                    current_sl = close_v + (tp1 - close_v) / 2
+                                else:
+                                    current_sl = close_v
+                                continue
+                        else:
+                            if fl_ <= current_sl:
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
+                            if fh >= tp:
+                                tp_hit = True
+                                exit_price = tp
+                                break
                     else:
                         favorable = (close_v - fl_) / close_v * 100
                         adverse = (fh - close_v) / close_v * 100
                         max_favorable = max(max_favorable, favorable)
                         max_adverse = max(max_adverse, adverse)
-                        if fh >= sl:
-                            sl_hit = True
-                            exit_price = sl
-                            bars_held = future_idx - idx
-                            break
-                        if fl_ <= tp:
-                            tp_hit = True
-                            exit_price = tp
-                            bars_held = future_idx - idx
-                            break
-                    bars_held = future_idx - idx
+
+                        if not tp1_reached:
+                            if fh >= current_sl:
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
+                            if fl_ <= tp:
+                                tp1_reached = True
+                                tp_hit = True
+                                exit_price = tp
+                                break
+                            if fl_ <= tp1:
+                                tp1_reached = True
+                                if _cfg.TP1_SL_MODE == "half_tp1":
+                                    current_sl = close_v - (close_v - tp1) / 2
+                                else:
+                                    current_sl = close_v
+                                continue
+                        else:
+                            if fh >= current_sl:
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
+                            if fl_ <= tp:
+                                tp_hit = True
+                                exit_price = tp
+                                break
 
                 if not tp_hit and not sl_hit and bars_held > 0:
                     exit_price = float(df["close"].iloc[min(idx + bars_held, len(df) - 1)])
@@ -1520,8 +1592,28 @@ def backtest_history(
                 next_available_idx[track] = exit_idx + _cfg.COOLDOWN_BARS
 
                 _ensure_history_slot(history, ticker, tf)
-                exit_type = "tp" if tp_hit else "sl" if sl_hit else "cancelled"
-                moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
+                # 🆕 FIX BUG-LO008 (backtest side of it): a trade where TP1
+                # already banked profit and the remainder gave it back at
+                # the moved SL gets its own "sl_after_tp1" label — same
+                # convention close_trade() already uses live — instead of
+                # being indistinguishable from a full loss at the original
+                # SL. tp_hit==True already implies a full win regardless of
+                # whether TP1 was crossed on the way (see the "reached TP2
+                # directly" branch above), so only the sl_hit branch needs
+                # to check tp1_reached.
+                exit_type = "tp" if tp_hit else ("sl_after_tp1" if (sl_hit and tp1_reached) else "sl" if sl_hit else "cancelled")
+
+                # 🆕 Real two-leg economics once TP1 was crossed — same
+                # formula as state.update_signal_record()/signals.close_trade()
+                # for the live path: half the position's outcome is locked
+                # in at TP1, the other half at wherever it actually closed
+                # (moved SL, TP2, or a force-close price if never resolved).
+                if tp1_reached:
+                    tp1_leg_pct = (tp1 - close_v) / close_v * 100 if side == "long" else (close_v - tp1) / close_v * 100
+                    remainder_leg_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
+                    moved_pct = (tp1_leg_pct + remainder_leg_pct) / 2
+                else:
+                    moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
 
                 history[ticker][tf][side].append({
                     "entry": round_price(close_v),
