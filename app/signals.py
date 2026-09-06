@@ -892,7 +892,15 @@ async def check_signals(
         vol_info = volume_flow_signal_v3(df)
         vol_lev_reason = "no signal"
 
-        warmed_up = len(df) >= _cfg.MFI_TRAINING
+        # 🆕 FIX (external review, P1 — same reasoning as the backtest
+        # fix): len(df) counts fetched bars, not valid MFI values —
+        # calculate_mfi() has its own ~MFI_LEN-bar NaN warm-up before its
+        # first valid value. Inert in practice today (limit=900 fetch vs.
+        # MFI_TRAINING=800 leaves a comfortable margin), but the accurate
+        # check costs nothing and keeps live and backtest defining "warmed
+        # up" the same way instead of one being exact and the other an
+        # approximation that happens to not matter yet.
+        warmed_up = mfi.notna().sum() >= _cfg.MFI_TRAINING
         # 🆕 FIX: B-track doesn't use MFI/Andean at all, so gating it on
         # MFI_TRAINING (default 800 bars) was borrowed from A-track without
         # actually applying to B — if MFI_TRAINING is ever raised above the
@@ -1200,6 +1208,17 @@ def backtest_history(
         chop = calculate_chop(df, CHOP_LENGTH)
         fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
         mfi = calculate_mfi(df, _cfg.MFI_LEN)
+        # 🆕 FIX (external review, P1): warmed_up_bt below used to compare
+        # `idx` directly against MFI_TRAINING, but calculate_mfi() itself
+        # has its own NaN warm-up (MFI_LEN bars, ~7-8 by default) before its
+        # first valid value — so at idx == MFI_TRAINING there are actually
+        # only MFI_TRAINING - MFI_LEN(-ish) valid MFI values, not
+        # MFI_TRAINING of them. A-track was becoming eligible a handful of
+        # bars (empirically ~6 with the default MFI_LEN=8) before
+        # run_kmeans_mfi_rolling actually had a full training window to
+        # draw from. Track the real cumulative count of valid MFI values
+        # instead of assuming idx itself is that count.
+        mfi_valid_cumcount = mfi.notna().cumsum()
         # 🆕 FIX (external review, P0): rolling/point-in-time version, not
         # the plain run_kmeans_mfi() live uses — see
         # run_kmeans_mfi_rolling's docstring. A single upfront call here
@@ -1357,7 +1376,7 @@ def backtest_history(
             hurst_ok = not np.isnan(hurst_v) and abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
-            warmed_up_bt = idx >= _cfg.MFI_TRAINING
+            warmed_up_bt = mfi_valid_cumcount.iloc[idx] >= _cfg.MFI_TRAINING
             # 🆕 FIX: same reasoning as live's b_warmed_up — B doesn't use
             # MFI, so it shouldn't be gated on MFI_TRAINING (previously it
             # had NO warmup gate at all in the backtest, the opposite
