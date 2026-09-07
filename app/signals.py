@@ -58,6 +58,7 @@ from state import (
     get_signal_stats,
     calculate_combined_tp,
     normalize_timestamp,
+    is_before_ts,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price
 from config import ONCHAIN_ENABLED
@@ -262,7 +263,7 @@ def calculate_adaptive_sl(
             and not r.get("synthetic", False)
         ]
         if as_of is not None:
-            winning = [r for r in winning if r.get("timestamp", "") < as_of]
+            winning = [r for r in winning if is_before_ts(r.get("timestamp"), as_of)]
 
         if len(winning) < _cfg.SL_MIN_HISTORY:
             # 🆕 FIX CRITICAL BUG: this used to take the "opposite" FRAMA line —

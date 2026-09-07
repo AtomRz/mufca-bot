@@ -143,6 +143,51 @@ def _ensure_history_slot(history: Dict, ticker: str, tf: str):
         history[ticker][tf] = {"long": [], "short": []}
 
 
+def _parse_ts(ts) -> Optional[datetime]:
+    """Parses an ISO8601 timestamp (any timezone offset, including a bare
+    'Z') into a timezone-aware UTC datetime, so two timestamps with
+    different offsets compare correctly by actual moment in time.
+
+    🆕 FIX (external review, P1/P2): as_of filtering (get_signal_stats,
+    calculate_adaptive_tp, calculate_adaptive_sl) used to do
+    `record["timestamp"] < as_of` as a raw STRING comparison.
+    normalize_timestamp() leaves an already-ISO string exactly as it found
+    it — it does not normalize timezone offsets to a common one — so e.g.
+    "2026-01-01T11:00:00+02:00" (09:00 UTC) and "2026-01-01T10:00:00+00:00"
+    (10:00 UTC) compare as "11:00..." > "10:00..." lexicographically, even
+    though 09:00 UTC is chronologically BEFORE 10:00 UTC. A record that
+    legitimately happened before the as_of cutoff could be wrongly excluded
+    from training (or, the reverse direction, wrongly included) whenever
+    timestamps in history mix timezone offsets — old records, a manual
+    import/migration, or data from a different source than the rest.
+    Returns None if the string can't be parsed (caller decides how to treat
+    that — see _is_before)."""
+    if not ts:
+        return None
+    try:
+        ts_norm = ts.replace("Z", "+00:00") if isinstance(ts, str) else ts
+        dt = datetime.fromisoformat(ts_norm) if isinstance(ts_norm, str) else ts_norm
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def is_before_ts(record_ts, as_of) -> bool:
+    """True if record_ts is chronologically before as_of — compares actual
+    parsed moments in time (see _parse_ts), not raw strings. If either
+    can't be parsed, excludes the record rather than risk a look-ahead
+    leak through a comparison that couldn't actually be verified."""
+    rt = _parse_ts(record_ts)
+    at = _parse_ts(as_of)
+    if rt is None or at is None:
+        return False
+    return rt < at
+
+
 def normalize_timestamp(timestamp) -> str:
     """Normalizes a timestamp into ISO format."""
     if isinstance(timestamp, datetime):
@@ -360,7 +405,7 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
     if as_of is not None:
         # ISO8601 timestamps compare correctly as plain strings as long as
         # they're all the same format (they are — see normalize_timestamp).
-        closed = [r for r in closed if r.get("timestamp", "") < as_of]
+        closed = [r for r in closed if is_before_ts(r.get("timestamp"), as_of)]
     if not closed:
         return empty
 
@@ -630,7 +675,7 @@ def calculate_adaptive_tp(
     # 🆕 FIX BUG-LO008: sl_after_tp1 is a real closed outcome, included in the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
     if as_of is not None:
-        closed = [r for r in closed if r.get("timestamp", "") < as_of]
+        closed = [r for r in closed if is_before_ts(r.get("timestamp"), as_of)]
 
     if len(closed) < 3:
         return round_price(fallback_tp)
@@ -648,7 +693,21 @@ def calculate_adaptive_tp(
             regime_info = f"regime={regime} ({len(regime_records)} signals)"
         elif len(regime_records) >= 5:
             non_regime = [r for r in closed if r.get("regime", "unknown") != regime]
-            use_records = regime_records + non_regime
+            # 🆕 FIX (external review, P1): concatenating regime_records +
+            # non_regime and then slicing use_records[-SIGNAL_HISTORY_LIMIT:]
+            # treated "recent" as "the last N elements of this particular
+            # concatenation order", not "the actual most recent N in time" —
+            # regime_records sat first in the list, so a large enough
+            # non_regime tail could push every regime-specific record out of
+            # the slice entirely (e.g. 7 regime + 143 non_regime at limit=25
+            # keeps zero regime records, even though blending in some
+            # regime-specific signal is the entire point of this branch).
+            # Sort the combined pool back into chronological order first, so
+            # the trailing slice is genuinely "the most recent N" regardless
+            # of which sub-list a record happened to come from.
+            combined = regime_records + non_regime
+            combined.sort(key=lambda r: _parse_ts(r.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc))
+            use_records = combined
             regime_discount = 0.85
             regime_info = f"regime={regime} (mixed, {len(regime_records)} regime + {len(non_regime)} other)"
         else:
