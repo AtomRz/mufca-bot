@@ -299,7 +299,7 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     # runs far less often (only while the Chart tab is actually open), so
     # showing the reading before Atom decides to enable the filter is worth
     # the extra cost here.
-    hurst_s = calculate_hurst(df, window=config.HURST_WINDOW)
+    hurst_s = calculate_hurst(df, window=config.HURST_WINDOW.get(tf, 100))
     hurst_v = float(hurst_s.iloc[idx])
     hurst_valid = not np.isnan(hurst_v)
     # NOTE: NaN (still warming up) must read as "fail" here, matching
@@ -307,7 +307,17 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     # "pass" (`(not hurst_valid) or ...`), so the dashboard lamp could show
     # green while ENABLE_HURST_FILTER was silently blocking the live
     # signal — same warm-up window, opposite verdict. Keep both in sync.
-    hurst_ok = hurst_valid and abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
+    #
+    # 🆕 Mode-aware, mirrors signals.py's hurst_ok exactly (trending_only
+    # rejects mean-reverting H < 0.5 too, not just the near-0.5 random-walk
+    # band) — this lamp must agree with what the live filter actually
+    # decides, or it becomes actively misleading rather than just unhelpful.
+    if not hurst_valid:
+        hurst_ok = False
+    elif config.HURST_MODE == "trending_only":
+        hurst_ok = (hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
+    else:
+        hurst_ok = abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
 
     hh10_prev = float(df["high"].iloc[max(0, idx - 10):idx].max())
     ll10_prev = float(df["low"].iloc[max(0, idx - 10):idx].min())
