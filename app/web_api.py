@@ -41,7 +41,7 @@ app = FastAPI(title="MUFCA Web API")
 # web_api at the very bottom, once bot/state/config are already set up.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history
@@ -680,6 +680,9 @@ async def get_config():
         "derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL,
         "derivatives_interval_options": list(_cfg.DERIVATIVES_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
+        "hurst_window": _cfg.HURST_WINDOW,
+        "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
+        "hurst_mode": _cfg.HURST_MODE,
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
@@ -1031,6 +1034,51 @@ async def set_chop(body: ChopIn):
     CHOP_THRESHOLD[tf] = body.value
     _cfg.save_chop(CHOP_THRESHOLD)
     return {"chop_threshold": CHOP_THRESHOLD}
+
+
+class HurstWindowIn(BaseModel):
+    tf: str
+    value: int
+
+
+@app.post("/api/config/hurst_window")
+async def set_hurst_window(body: HurstWindowIn):
+    tf = body.tf.lower()
+    if tf not in TIMEFRAMES:
+        raise HTTPException(400, f"tf must be one of {TIMEFRAMES}")
+    if not (16 <= body.value <= 300):
+        raise HTTPException(400, "value must be between 16 and 300 (below ~16-20 the R/S estimate degrades to a meaningless neutral 0.5)")
+    _cfg.HURST_WINDOW[tf] = body.value
+    _cfg.save_hurst_window(_cfg.HURST_WINDOW)
+    return {"hurst_window": _cfg.HURST_WINDOW}
+
+
+class HurstConfigIn(BaseModel):
+    hurst_min_deviation: Optional[float] = None
+    hurst_mode: Optional[str] = None
+
+
+@app.post("/api/config/hurst_config")
+async def set_hurst_config(body: HurstConfigIn):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+    if "hurst_min_deviation" in updates and not (0.0 <= updates["hurst_min_deviation"] <= 0.5):
+        raise HTTPException(400, "hurst_min_deviation must be between 0.0 and 0.5")
+    if "hurst_mode" in updates and updates["hurst_mode"] not in ("trending_only", "symmetric"):
+        raise HTTPException(400, "hurst_mode must be 'trending_only' or 'symmetric'")
+
+    if "hurst_min_deviation" in updates:
+        _cfg.HURST_MIN_DEVIATION = updates["hurst_min_deviation"]
+    if "hurst_mode" in updates:
+        _cfg.HURST_MODE = updates["hurst_mode"]
+
+    _cfg.save_hurst_config({
+        "HURST_MIN_DEVIATION": _cfg.HURST_MIN_DEVIATION,
+        "HURST_MODE": _cfg.HURST_MODE,
+    })
+    await broadcast_event({"type": "config_changed", "key": "hurst_config"})
+    return {"hurst_min_deviation": _cfg.HURST_MIN_DEVIATION, "hurst_mode": _cfg.HURST_MODE}
 
 
 class TpConfigIn(BaseModel):

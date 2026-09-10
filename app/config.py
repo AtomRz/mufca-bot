@@ -232,13 +232,58 @@ ENABLE_SPREAD_FILTER     = _filter_toggles["spread"]
 # of which side the signal is on. Not split per-track (A vs U) — that's a
 # further refinement worth trying later once this baseline version has been
 # validated live.
-HURST_WINDOW = 100          # bars used to estimate the rolling Hurst exponent
+#
+# 🆕 HURST_WINDOW is per-timeframe (like CHOP_THRESHOLD), not a single global
+# constant — live comparison on ETHUSDT.P/BTCUSDT.P showed the optimal
+# window differs meaningfully by pair AND timeframe (23 on ETH 4h, 21 on BTC
+# 4h, 29 on ETH 1h). It does not scale linearly with the timeframe's bar
+# duration the way a fixed multiplier would suggest — it's tied to how fast
+# THIS instrument/TF's trends actually confirm, not calendar time. Defaults
+# below are a reasonable starting point (from that testing), not a tuned
+# value for every pair — adjust per pair/TF via the web Settings panel.
+HURST_WINDOW_FILE = os.path.join(DATA_DIR, "hurst_window.json")
+
+def load_hurst_window() -> dict:
+    data = safe_json_load(HURST_WINDOW_FILE, {"1h": 29, "4h": 23})
+    return data
+
+def save_hurst_window(data: dict):
+    safe_json_save(HURST_WINDOW_FILE, data)
+
+HURST_WINDOW: dict = load_hurst_window()
+
 # 🆕 R/S Hurst estimation is known to be biased upward on finite samples
 # (a pure random walk tends to measure somewhat above the theoretical 0.5,
 # not near it — confirmed empirically against synthetic random-walk data
 # during testing). MIN_DEVIATION is set conservatively with that bias in
 # mind, not as a naive "0.5 ± X".
-HURST_MIN_DEVIATION = 0.12  # reject if abs(hurst - 0.5) < this
+#
+# 🆕 HURST_MODE controls which side of 0.5 counts as "clear enough":
+#   "trending_only" (default) — only H > 0.5 + deviation passes. A/U tracks
+#     are trend-following/breakout entries (Andean+MFI crossover, UT Bot),
+#     which lose more often in mean-reverting regimes (H < 0.5) than in
+#     genuinely random ones — live comparison on ETHUSDT.P 4h showed
+#     symmetric mode measurably dragging win rate down vs. no filter at all,
+#     while trending_only measurably raised it.
+#   "symmetric" — the original behavior, H > 0.5+dev OR H < 0.5-dev both
+#     pass. Only appropriate if paired with a genuinely mean-reversion-style
+#     entry, which neither A nor U track is.
+HURST_FILE = os.path.join(DATA_DIR, "hurst_config.json")
+_HURST_DEFAULTS = {
+    "HURST_MIN_DEVIATION": 0.12,
+    "HURST_MODE": "trending_only",   # "trending_only" | "symmetric"
+}
+
+def load_hurst_config() -> dict:
+    data = safe_json_load(HURST_FILE, _HURST_DEFAULTS)
+    return {**_HURST_DEFAULTS, **data}
+
+def save_hurst_config(data: dict):
+    safe_json_save(HURST_FILE, data)
+
+_hurst_cfg = load_hurst_config()
+HURST_MIN_DEVIATION = _hurst_cfg["HURST_MIN_DEVIATION"]
+HURST_MODE = _hurst_cfg["HURST_MODE"]
 
 # =====================================================================
 # 📏  ORDER BOOK SPREAD (live liquidity gate) — futures & spot

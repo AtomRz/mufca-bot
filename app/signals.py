@@ -828,7 +828,7 @@ async def check_signals(
         # 🆕 Only computed when the filter is actually on (off by default) —
         # the rolling R/S calculation is meaningfully more expensive than the
         # other indicators here, no point paying for it unused.
-        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW) if _cfg.ENABLE_HURST_FILTER else None
+        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(timeframe, 100)) if _cfg.ENABLE_HURST_FILTER else None
         # 🆕 Track "b" (Breakout) — see config.py's BREAKOUT section for the
         # methodology. Always computed (unlike Hurst, this isn't behind a
         # toggle — it IS the B-track's entry logic, not an optional filter).
@@ -886,7 +886,12 @@ async def check_signals(
         hurst_ok = True
         if _cfg.ENABLE_HURST_FILTER and hurst is not None:
             hurst_v = float(hurst.iloc[idx])
-            hurst_ok = not np.isnan(hurst_v) and abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            if np.isnan(hurst_v):
+                hurst_ok = False
+            elif _cfg.HURST_MODE == "trending_only":
+                hurst_ok = (hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            else:
+                hurst_ok = abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
 
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
@@ -1235,7 +1240,7 @@ def backtest_history(
         # toggle) — backtest_history is a one-off run, not a per-scan cost
         # concern, and needs to match live's filter logic for calibration
         # consistency regardless of whether the toggle happens to be on right now.
-        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW)
+        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(tf, 100))
         # 🆕 Track "b" (Breakout) — same detector as the live path, computed
         # once as a full series here too (see calculate_breakout_signal's
         # docstring / config.py's BREAKOUT section for the methodology).
@@ -1314,7 +1319,7 @@ def backtest_history(
         # ENABLE_HURST_FILTER off (the default), that discarded ~110 bars
         # of otherwise-usable training data for a filter that isn't even
         # active, shrinking the calibration sample for no reason.
-        start_idx = max(50, _cfg.HURST_WINDOW + 10) if _cfg.ENABLE_HURST_FILTER else 50
+        start_idx = max(50, _cfg.HURST_WINDOW.get(tf, 100) + 10) if _cfg.ENABLE_HURST_FILTER else 50
 
         # 🆕 FIX (external review, P0): the loop below used to have no
         # concept of a track already being "in a position" — every idx
@@ -1374,7 +1379,12 @@ def backtest_history(
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
             hurst_v = float(hurst.iloc[idx])
-            hurst_ok = not np.isnan(hurst_v) and abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            if np.isnan(hurst_v):
+                hurst_ok = False
+            elif _cfg.HURST_MODE == "trending_only":
+                hurst_ok = (hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            else:
+                hurst_ok = abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = mfi_valid_cumcount.iloc[idx] >= _cfg.MFI_TRAINING

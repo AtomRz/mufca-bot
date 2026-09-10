@@ -13,7 +13,7 @@ const FILTER_TOGGLES = [
   {
     key: 'hurst',
     label: 'Hurst regime clarity',
-    hint: 'Direction-agnostic: rejects both long and short signals when the market is statistically close to a random walk (Hurst exponent near 0.5) — a complement to CHOP, not a replacement. Off by default until validated live.',
+    hint: 'Rejects signals when the market lacks a statistically clear regime (see Mode below) — a complement to CHOP, not a replacement. Tune Window/Mode/Deviation in the Hurst Filter panel below once enabled.',
   },
   {
     key: 'spread',
@@ -142,6 +142,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const [error, setError] = useState(null)
   const [newPair, setNewPair] = useState('')
   const [chopDraft, setChopDraft] = useState({})
+  const [hurstWindowDraft, setHurstWindowDraft] = useState({})
 
   // 🆕 FIX: if config was updated FROM OUTSIDE (a WS config_changed event
   // from another client — e.g. the Android app changed CHOP while the web
@@ -167,6 +168,7 @@ export default function SettingsPanel({ config, onChanged }) {
   }
 
   const chopValue = (t) => chopDraft[t] ?? config.chop_threshold[t]
+  const hurstWindowValue = (t) => hurstWindowDraft[t] ?? config.hurst_window[t]
   const ind = config.indicators
   const brk = config.breakout
   const colors = config.colors
@@ -335,6 +337,65 @@ export default function SettingsPanel({ config, onChanged }) {
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Hurst Filter</h3>
+            <div className="field">
+              <label title="Only Hurst > 0.5 + Min Deviation passes. Matches this bot's trend-following A/U entries — mean-reverting regimes (Hurst < 0.5) tend to hurt them, not just add noise. Use Symmetric only if you've added a mean-reversion-style entry elsewhere.">
+                Mode
+              </label>
+              <select
+                value={config.hurst_mode}
+                disabled={busy === 'hurst_mode'}
+                onChange={(e) => run('hurst_mode', () => api.setHurstConfig({ hurst_mode: e.target.value }))}
+              >
+                <option value="trending_only">Trending Only (recommended)</option>
+                <option value="symmetric">Symmetric (trend + mean-rev)</option>
+              </select>
+            </div>
+            <div className="field">
+              <label title="Reject unless the Hurst exponent clears 0.5 by at least this much. Higher = stricter, fewer but more selective signals.">
+                Min Deviation from 0.5
+              </label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  type="number"
+                  min={0}
+                  max={0.5}
+                  step={0.01}
+                  defaultValue={config.hurst_min_deviation}
+                  onBlur={(e) => run('hurst_min_dev', () => api.setHurstConfig({ hurst_min_deviation: parseFloat(e.target.value) }))}
+                />
+              </div>
+            </div>
+            {Object.keys(config.hurst_window).map((tf) => (
+              <div className="field" key={tf}>
+                <label title="Bars used for the rolling R/S estimate. The optimal value is pair/TF-specific, not universal — adjust it here and watch A/U Win Rate after a batch of trades closes.">
+                  {tf} window (16–300)
+                </label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="number"
+                    min={16}
+                    max={300}
+                    step={1}
+                    value={hurstWindowValue(tf)}
+                    onChange={(e) => setHurstWindowDraft({ ...hurstWindowDraft, [tf]: e.target.value })}
+                  />
+                  <button
+                    className="btn"
+                    disabled={busy === `hurst_window_${tf}`}
+                    onClick={() => run(`hurst_window_${tf}`, () => api.setHurstWindow(tf, parseInt(hurstWindowValue(tf), 10)))}
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            ))}
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Only applies when the "Hurst regime clarity" toggle above (Signal Filters) is on.
+            </p>
           </div>
 
           <div className="panel">

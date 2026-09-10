@@ -101,6 +101,10 @@ export const api = {
     request('/api/config/filters', { method: 'POST', body: JSON.stringify({ filter, enabled }) }),
   setChop: (tf, value) =>
     request('/api/config/chop', { method: 'POST', body: JSON.stringify({ tf, value }) }),
+  setHurstWindow: (tf, value) =>
+    request('/api/config/hurst_window', { method: 'POST', body: JSON.stringify({ tf, value }) }),
+  setHurstConfig: (patch) =>
+    request('/api/config/hurst_config', { method: 'POST', body: JSON.stringify(patch) }),
   setTpConfig: (param, value) =>
     request('/api/config/tpconfig', {
       method: 'POST',
