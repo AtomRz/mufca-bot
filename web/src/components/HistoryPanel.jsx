@@ -44,6 +44,7 @@ export default function HistoryPanel({ lastEvent }) {
   const [error, setError] = useState(null)
   const [selected, setSelected] = useState(null) // {ticker, tf, side, track}
   const [records, setRecords] = useState(null)
+  const [deletingIdx, setDeletingIdx] = useState(null)
 
   const load = useCallback(() => {
     api.getHistorySummary().then(setSummary).catch((e) => setError(e.message))
@@ -60,13 +61,34 @@ export default function HistoryPanel({ lastEvent }) {
     if (lastEvent?.type === 'signal') load()
   }, [lastEvent, load])
 
-  useEffect(() => {
+  const loadRecords = useCallback(() => {
     if (!selected) return
     api
       .getHistoryRecords(selected.ticker, selected.tf, selected.side, selected.track, 30)
       .then((d) => setRecords(d.records))
       .catch(() => setRecords([]))
   }, [selected])
+
+  useEffect(() => {
+    loadRecords()
+  }, [loadRecords])
+
+  const handleDelete = async (rec) => {
+    if (!selected) return
+    if (!window.confirm(`Delete this ${selected.ticker} ${selected.tf} ${selected.side} trade (${fmtDate(rec.timestamp)}, entry ${rec.entry})? This cannot be undone.`)) {
+      return
+    }
+    setDeletingIdx(rec.idx)
+    try {
+      await api.deleteHistoryRecord(selected.ticker, selected.tf, selected.side, rec.idx, selected.track)
+      loadRecords() // row counts/PnL aggregates changed — refresh both tables
+      load()
+    } catch (e) {
+      alert(`Failed to delete record: ${e.message}`)
+    } finally {
+      setDeletingIdx(null)
+    }
+  }
 
   if (error) return <div className="error-banner">{error}</div>
   if (!summary) return <div className="empty-state">Loading…</div>
@@ -170,11 +192,12 @@ export default function HistoryPanel({ lastEvent }) {
                     <th>MAE</th>
                     <th>Result</th>
                     <th>Regime</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {records.map((rec, i) => (
-                    <tr key={i}>
+                  {records.map((rec) => (
+                    <tr key={rec.idx}>
                       <td>{fmtDate(rec.timestamp)}</td>
                       <td>{rec.entry}</td>
                       <td>{rec.exit ?? '—'}</td>
@@ -189,6 +212,16 @@ export default function HistoryPanel({ lastEvent }) {
                         {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>sim</span>}
                       </td>
                       <td style={{ color: 'var(--text-dim)' }}>{rec.regime || '—'}</td>
+                      <td>
+                        <button
+                          className="row-delete-btn"
+                          title="Delete this record"
+                          onClick={() => handleDelete(rec)}
+                          disabled={deletingIdx === rec.idx}
+                        >
+                          {deletingIdx === rec.idx ? '…' : '×'}
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

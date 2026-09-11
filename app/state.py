@@ -314,6 +314,43 @@ def update_signal_record(
                 f"TP1 hit: {tp1_hit} | Regime: {rec.get('regime', 'unknown')}")
 
 
+def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Optional[str] = None) -> bool:
+    """Deletes a single record from signals_history.json by its index in the
+    raw (unfiltered, chronological) list for ticker/tf/side.
+
+    🆕 Added so duplicate/junk records — e.g. from re-running
+    `!backfill_breakout` after a parameter change, which can append
+    overlapping records rather than replacing the old ones — can be removed
+    individually from the web dashboard's History tab, instead of wiping the
+    whole ticker/tf/side/track combination with `!delsignals`.
+
+    `index` refers to position in the FULL stored list (not the
+    reversed/limited slice the API returns to the browser) — the web_api
+    layer is responsible for translating a displayed row back to this index
+    (see history_records()'s "idx" field). `track`, if given, is checked
+    against the record at that index as a safety guard against acting on a
+    stale index (e.g. the list changed between the browser loading the page
+    and the delete click) — the delete is refused rather than silently
+    removing the wrong row."""
+    history = load_signals_history()
+    if ticker not in history or tf not in history[ticker]:
+        return False
+
+    records = history[ticker][tf][side]
+    if index < 0 or index >= len(records):
+        return False
+    if track is not None and records[index].get("track", "a") != track:
+        return False
+
+    removed = records.pop(index)
+    save_signals_history(history)
+    logger.info(
+        f"[SIGNAL] DELETED record for {ticker} {tf} {side} (track={removed.get('track', 'a')}, "
+        f"idx={index}) | entry={removed.get('entry')} exit_type={removed.get('exit_type')}"
+    )
+    return True
+
+
 def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float, track: str = "a",
                            high: Optional[float] = None, low: Optional[float] = None):
     """

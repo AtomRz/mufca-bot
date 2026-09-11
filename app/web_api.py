@@ -44,7 +44,7 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
-from state import load_signals_history, save_signals_history
+from state import load_signals_history, save_signals_history, delete_signal_record
 import push as _push
 import derivatives
 import spread
@@ -655,9 +655,37 @@ async def history_records(ticker: str, tf: str, side: str, track: str = "a", lim
 
     history = load_signals_history()
     records = history.get(ticker, {}).get(tf, {}).get(side, [])
-    closed = [r for r in records if r.get("track") == track and r.get("exit_type") != "open"]
+    # 🆕 idx = position in the FULL stored list (records above), not in the
+    # filtered/limited slice below. Sent to the frontend so a "delete this
+    # row" click can reference the exact record via DELETE
+    # /api/history/records, which expects an index into that same full list
+    # (see delete_signal_record). We copy each dict (`{**r, ...}`) rather
+    # than mutating it in place, so "idx" never gets persisted to
+    # signals_history.json if this same object is saved elsewhere later.
+    closed = [
+        {**r, "idx": i}
+        for i, r in enumerate(records)
+        if r.get("track") == track and r.get("exit_type") != "open"
+    ]
     closed = list(reversed(closed[-limit:]))  # newest first
     return {"ticker": ticker, "tf": tf, "side": side, "track": track, "records": closed}
+
+
+@app.delete("/api/history/records")
+async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track: str = "a"):
+    """Deletes a single closed-trade record from signals_history.json —
+    used by the History tab's per-row delete button to clean up duplicate or
+    junk entries (e.g. left behind by re-running `!backfill_breakout` after
+    a parameter change)."""
+    ticker = unquote(ticker).upper().strip()
+    side = side.lower()
+    if side not in ("long", "short"):
+        raise HTTPException(400, "side must be 'long' or 'short'")
+
+    ok = delete_signal_record(ticker, tf, side, idx, track=track)
+    if not ok:
+        raise HTTPException(404, "Record not found (it may have already been deleted or the list changed — reload and try again)")
+    return {"deleted": True}
 
 
 # =====================================================================

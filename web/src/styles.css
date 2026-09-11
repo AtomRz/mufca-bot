@@ -467,7 +467,7 @@ input {
   padding: 30px 0;
 }
 
-/* ── Таблицы (History) ──────────────────────────────────────── */
+/* ── Tables (History) ──────────────────────────────────────── */
 .table-wrap {
   overflow-x: auto;
 }
@@ -503,6 +503,32 @@ table.data-table tbody tr:hover {
 }
 table.data-table tbody tr.selected {
   background: var(--accent-dim);
+}
+/* Per-row delete button in the recent-trades table (History tab) — same
+   look as the tracked-pairs chip's × button, dimmed until hovered so it
+   doesn't compete with the data for attention. */
+.row-delete-btn {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0.5;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+table.data-table tbody tr:hover .row-delete-btn {
+  opacity: 1;
+}
+.row-delete-btn:hover {
+  color: var(--short);
+  background: var(--short-dim);
+}
+.row-delete-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
 }
 .winrate-bar {
   display: inline-block;

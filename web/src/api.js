@@ -123,6 +123,11 @@ export const api = {
     request(
       `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}`,
     ),
+  deleteHistoryRecord: (ticker, tf, side, idx, track = 'a') =>
+    request(
+      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&idx=${idx}&track=${track}`,
+      { method: 'DELETE' },
+    ),
   getPulse: (ticker, tf = '1h') =>
     request(`/api/pulse?tf=${tf}${ticker ? `&ticker=${encodeURIComponent(ticker)}` : ''}`),
   getDevices: () => request('/api/devices'),
