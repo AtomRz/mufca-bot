@@ -242,10 +242,31 @@ ENABLE_SPREAD_FILTER     = _filter_toggles["spread"]
 # below are a reasonable starting point (from that testing), not a tuned
 # value for every pair — adjust per pair/TF via the web Settings panel.
 HURST_WINDOW_FILE = os.path.join(DATA_DIR, "hurst_window.json")
+_HURST_WINDOW_DEFAULTS = {"1h": 29, "4h": 23}
 
 def load_hurst_window() -> dict:
-    data = safe_json_load(HURST_WINDOW_FILE, {"1h": 29, "4h": 23})
-    return data
+    """🆕 FIX (2026-09 audit, point 4): validate the loaded shape instead of
+    trusting the file verbatim. A hand-edited or otherwise malformed
+    hurst_window.json (e.g. a JSON list instead of an object, or a
+    non-numeric value for one timeframe) used to pass straight through to
+    HURST_WINDOW.get(tf, 100) and blow up with an AttributeError/TypeError
+    on the very next scan. Falls back per-key rather than all-or-nothing, so
+    one bad timeframe doesn't take the other one down with it."""
+    data = safe_json_load(HURST_WINDOW_FILE, _HURST_WINDOW_DEFAULTS)
+    if not isinstance(data, dict):
+        logger.error(f"[CONFIG] hurst_window.json is not an object ({type(data).__name__}) — using defaults {_HURST_WINDOW_DEFAULTS}")
+        return dict(_HURST_WINDOW_DEFAULTS)
+
+    result = {}
+    for tf in TIMEFRAMES:
+        fallback = _HURST_WINDOW_DEFAULTS.get(tf, 100)
+        v = data.get(tf, fallback)
+        try:
+            result[tf] = int(v)
+        except (TypeError, ValueError):
+            logger.error(f"[CONFIG] hurst_window.json[{tf!r}]={v!r} is not a valid int — using default {fallback}")
+            result[tf] = fallback
+    return result
 
 def save_hurst_window(data: dict):
     safe_json_save(HURST_WINDOW_FILE, data)
@@ -275,8 +296,32 @@ _HURST_DEFAULTS = {
 }
 
 def load_hurst_config() -> dict:
+    """🆕 FIX (2026-09 audit, point 3): validate values pulled in from the
+    file, not just merge them in blind. Previously a corrupted or
+    hand-edited hurst_config.json with e.g. HURST_MODE="Trending" or null
+    would merge straight over the default, and signals.py's
+    `elif _cfg.HURST_MODE == "trending_only": ... else: (symmetric)` would
+    silently fall through to symmetric mode — the opposite filter behavior
+    from what trending_only was chosen for, with no error or log line
+    anywhere. Same treatment for HURST_MIN_DEVIATION (must be a number in
+    the range the /api/config/hurst_config endpoint itself enforces)."""
     data = safe_json_load(HURST_FILE, _HURST_DEFAULTS)
-    return {**_HURST_DEFAULTS, **data}
+    if not isinstance(data, dict):
+        logger.error(f"[CONFIG] hurst_config.json is not an object ({type(data).__name__}) — using defaults {_HURST_DEFAULTS}")
+        return dict(_HURST_DEFAULTS)
+
+    merged = {**_HURST_DEFAULTS, **data}
+
+    if merged["HURST_MODE"] not in ("trending_only", "symmetric"):
+        logger.error(f"[CONFIG] hurst_config.json HURST_MODE={merged['HURST_MODE']!r} invalid — using default {_HURST_DEFAULTS['HURST_MODE']!r}")
+        merged["HURST_MODE"] = _HURST_DEFAULTS["HURST_MODE"]
+
+    dev = merged["HURST_MIN_DEVIATION"]
+    if not isinstance(dev, (int, float)) or isinstance(dev, bool) or not (0.0 <= dev <= 0.5):
+        logger.error(f"[CONFIG] hurst_config.json HURST_MIN_DEVIATION={dev!r} invalid — using default {_HURST_DEFAULTS['HURST_MIN_DEVIATION']}")
+        merged["HURST_MIN_DEVIATION"] = _HURST_DEFAULTS["HURST_MIN_DEVIATION"]
+
+    return merged
 
 def save_hurst_config(data: dict):
     safe_json_save(HURST_FILE, data)
@@ -507,6 +552,40 @@ MIN_RR = 1.5
 # would need updating both of those call sites; it isn't currently read as
 # a live branch, it's documentation of the policy already in effect.
 SAME_BAR_EXIT_POLICY = "sl_first"  # the only implemented option currently
+
+# 🆕 FIX (2026-09, real trade + Kimi audit): the SAME_BAR_EXIT_POLICY above
+# only ever answered "SL vs TP2, which won" — it said nothing about TP1,
+# because check_tp_sl_hit() never looked at TP1 at all on the closed-bar
+# path. That made TP1 credit exist ONLY via bot.py's live ticker poll (once
+# per scan cycle) — a bar that pierced TP1 and then reversed back through
+# the ORIGINAL SL before the poll ever sampled the touch closed as a flat
+# "sl" (full loss), even though TP1 demonstrably printed first on that
+# bar's own OHLC. Real example that surfaced this: BTCUSDT.P 1h short,
+# TP1=76,121.70, SL=77,570.81, bar O 77,001.5 / H 77,983.1 / L 75,921.0 /
+# C 77,892.4 — L is below TP1, H is above SL, both crossed in one bar;
+# closed as "sl" @ -0.96% instead of "sl_after_tp1" @ ~+0.47% modelled.
+# SAME_BAR_TP1_POLICY governs ONLY the case where a single closed bar's
+# low/high crosses BOTH TP1 and the (pre-TP1) SL — same category of
+# unprovable intrabar ordering as SAME_BAR_EXIT_POLICY above, just for a
+# different pair of levels:
+#   "tp1_first" — (default) credit TP1 (move SL per TP1_SL_MODE, label the
+#                 eventual exit "sl_after_tp1", blended PnL) whenever a bar
+#                 crosses both — the resolution that actually fixes the bug
+#                 above instead of just documenting it. TP1 sits much closer
+#                 to entry than SL does (it's the earlier, smaller-move
+#                 target by construction), so a bar that reaches both is far
+#                 more often "ran a little, hit TP1, then reversed hard into
+#                 SL" than the other way around — optimistic, but the more
+#                 realistic default of the two.
+#   "sl_first"  — assume the worse outcome on every ambiguous bar instead
+#                 (the old, silent default — this is what let the bug above
+#                 through). Available if a stretch of live sl_after_tp1
+#                 trades under tp1_first looks too generous vs. what
+#                 actually printed on the exchange and you want the
+#                 conservative resolution back.
+# Whichever is chosen, check_tp_sl_hit() (signals.py) and backtest_history()
+# apply it identically so live and backtest keep agreeing on the same bars.
+SAME_BAR_TP1_POLICY = "tp1_first"
 
 # =====================================================================
 # 🎯  SL-MOVE MODE AFTER TP1

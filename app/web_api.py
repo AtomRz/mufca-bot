@@ -1074,10 +1074,28 @@ async def set_hurst_window(body: HurstWindowIn):
     tf = body.tf.lower()
     if tf not in TIMEFRAMES:
         raise HTTPException(400, f"tf must be one of {TIMEFRAMES}")
-    if not (16 <= body.value <= 300):
-        raise HTTPException(400, "value must be between 16 and 300 (below ~16-20 the R/S estimate degrades to a meaningless neutral 0.5)")
+    # 🆕 FIX (2026-09 audit): floor raised 16 -> 18. Windows 16 and 17 both
+    # resolve to max_k = window // 2 = 8 in indicators._hurst_rs /
+    # _hurst_window_numba's log-spaced chunk sizing, which leaves exactly
+    # ONE chunk size — with a single (k, R/S) point there's no slope to fit,
+    # so the function returns the neutral fallback 0.5 on EVERY bar,
+    # silently zeroing out 100% of signals if ENABLE_HURST_FILTER is on.
+    # Verified against the actual chunk-sizing code for every window 8-40:
+    # 18 is the first value that produces >=2 distinct chunk sizes
+    # (max_k=9 -> [8, 9]). Deliberately NOT raised further to e.g. 32+ for
+    # "statistical robustness" — the per-pair windows already tuned and
+    # running live in production (21 on BTC 4h, 23 on ETH 4h) sit well under
+    # that and are validated by real trading results, not just theory; a
+    # higher floor would lock operators out of re-entering their own
+    # already-working values.
+    if not (18 <= body.value <= 300):
+        raise HTTPException(400, "value must be between 18 and 300 (16-17 always degrade to a meaningless neutral 0.5 — only one usable chunk size at that window length)")
     _cfg.HURST_WINDOW[tf] = body.value
     _cfg.save_hurst_window(_cfg.HURST_WINDOW)
+    # 🆕 FIX (2026-09 audit): was missing here while present on the sibling
+    # set_hurst_config endpoint below — open dashboards never learned about
+    # a window change until manually reloaded.
+    await broadcast_event({"type": "config_changed", "key": "hurst_window"})
     return {"hurst_window": _cfg.HURST_WINDOW}
 
 

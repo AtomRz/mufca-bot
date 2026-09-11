@@ -88,6 +88,27 @@ def crossunder(s, lvl, i):
         return False
     return float(s.iloc[i]) < _lvl_at(lvl, i) and float(s.iloc[i-1]) >= _lvl_at(lvl, i-1)
 
+
+def _hurst_passes(hurst_v: float, mode: str, min_deviation: float) -> bool:
+    """Shared Hurst regime-clarity check — used by both the live scanner
+    (check_signals) and the backtester (backtest_history), which previously
+    each had their own copy of this exact 4-line if/elif/else inline
+    (flagged in a 2026-09 audit as a duplication risk: two copies drifting
+    out of sync on the next edit). NaN (not enough warmed-up bars yet, or a
+    zero-variance window) always fails closed rather than passing by
+    default.
+
+    mode == "trending_only" (the default) only passes H clearly above 0.5 —
+    appropriate for the A/U tracks' trend-following entries. mode ==
+    "symmetric" passes H clearly on EITHER side of 0.5 — see
+    config.HURST_MODE's docstring for why trending_only measured better
+    live for these entry styles."""
+    if np.isnan(hurst_v):
+        return False
+    if mode == "trending_only":
+        return (hurst_v - 0.5) >= min_deviation
+    return abs(hurst_v - 0.5) >= min_deviation
+
 def crossover2(s1, s2, i):
     if i < 1:
         return False
@@ -415,14 +436,25 @@ def apply_onchain_with_safety(
 # 📊  TP/SL CHECK
 # =====================================================================
 
+def _tp1_moved_sl(entry: float, tp1_price: float, side: str) -> float:
+    """New SL after a TP1 hit, per config.TP1_SL_MODE. Factored out so
+    bot.py's live TP1-hit block, check_tp_sl_hit() below, and
+    backtest_history() all compute the exact same number — previously only
+    bot.py had this formula, so the closed-bar/backtest paths had no way to
+    apply a TP1-driven SL move at all (see SAME_BAR_TP1_POLICY)."""
+    if _cfg.TP1_SL_MODE == "half_tp1":
+        return entry + (tp1_price - entry) / 2 if side == "long" else entry - (entry - tp1_price) / 2
+    return entry  # "breakeven"
+
+
 def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
                      bar_time: Optional[int] = None) -> Optional[str]:
     """Checks whether TP or SL was hit for the given track.
 
     🆕 A single bar's high/low can't tell you which was actually touched
-    first intrabar if both SL and TP fall within its range — see
+    first intrabar if both SL and TP2 fall within its range — see
     config.SAME_BAR_EXIT_POLICY ("sl_first", the only option implemented):
-    SL is checked before TP below, consistently with backtest_history()'s
+    SL is checked before TP2 below, consistently with backtest_history()'s
     equivalent block, so live and backtest agree on the same conservative
     resolution of that ambiguity.
 
@@ -433,17 +465,57 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
     halfway/breakeven level. This produced a false "sl" on the very first
     scan after a TP1 hit, at a price the market never actually touched after
     the move. bar_time + trade["sl_moved_after_bar"] (set in bot.py at the
-    moment of the move) excludes such bars."""
+    moment of the move) excludes such bars.
+
+    🆕 FIX (2026-09, real trade + Kimi audit): before this fix, TP1 was
+    invisible to this function entirely — the ONLY way trade["tp1_hit"]
+    ever became True was bot.py's live ticker poll, once per scan cycle.
+    A bar that pierced TP1 and then reversed back through the ORIGINAL SL
+    before that poll ever sampled the touch closed as a flat "sl" (full
+    loss), with no trace that TP1 had in fact printed on that very bar's own
+    low/high. Now, whenever this bar's range crosses BOTH TP1 and the
+    original SL and TP1 hasn't already been credited, config.SAME_BAR_TP1_
+    POLICY decides the ambiguous ordering the same way SAME_BAR_EXIT_POLICY
+    decides SL-vs-TP2: under "tp1_first" (the default), trade["tp1_hit"]
+    and trade["sl"] are updated in place (mirroring bot.py's live TP1
+    block) BEFORE the sl/tp2 checks run below, so a caller reading
+    trade["sl"] right after this call already sees the moved, tighter stop
+    — close_trade() then labels the exit "sl_after_tp1" with the correct
+    blended PnL automatically, no changes needed at the call site. Under
+    "sl_first", this block is a no-op and behavior is unchanged from
+    before."""
     trade = state.get(f"{track}_active_trade")
     if not trade:
         return None
 
     side = trade["side"]
-    sl = trade["sl"]
     tp = trade["tp"]
 
     sl_valid_from = trade.get("sl_moved_after_bar")
     sl_applicable = sl_valid_from is None or (bar_time is not None and bar_time > sl_valid_from)
+
+    # 🆕 FIX (2026-09): see the docstring above. Only meaningful when the
+    # ORIGINAL (pre-TP1) SL is what's in play — once TP1 is already
+    # credited, trade["sl"] is already the moved stop and this whole
+    # question doesn't apply.
+    tp1_price = trade.get("tp1")
+    if (
+        _cfg.SAME_BAR_TP1_POLICY == "tp1_first"
+        and not trade.get("tp1_hit")
+        and tp1_price is not None
+        and sl_applicable
+    ):
+        sl_touch = (side == "long" and low <= trade["sl"]) or (side == "short" and high >= trade["sl"])
+        tp1_touch = (side == "long" and high >= tp1_price) or (side == "short" and low <= tp1_price)
+        tp2_touch = (side == "long" and high >= tp) or (side == "short" and low <= tp)
+        # tp2_touch is excluded here: reaching TP2 directly already implies
+        # crossing TP1 on the way (tp1 sits strictly between entry and tp2)
+        # and is an unambiguous full win either way — nothing to resolve.
+        if sl_touch and tp1_touch and not tp2_touch:
+            trade["tp1_hit"] = True
+            trade["sl"] = _tp1_moved_sl(trade["entry"], tp1_price, side)
+
+    sl = trade["sl"]
 
     if side == "long":
         if sl_applicable and low <= sl:
@@ -885,13 +957,7 @@ async def check_signals(
         # not what this first version does).
         hurst_ok = True
         if _cfg.ENABLE_HURST_FILTER and hurst is not None:
-            hurst_v = float(hurst.iloc[idx])
-            if np.isnan(hurst_v):
-                hurst_ok = False
-            elif _cfg.HURST_MODE == "trending_only":
-                hurst_ok = (hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
-            else:
-                hurst_ok = abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            hurst_ok = _hurst_passes(float(hurst.iloc[idx]), _cfg.HURST_MODE, _cfg.HURST_MIN_DEVIATION)
 
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
 
@@ -1379,12 +1445,7 @@ def backtest_history(
             liq_sweep_short = float(df["high"].iloc[idx]) > hh5_prev and close_v < hh5_prev and close_v < open_v
 
             hurst_v = float(hurst.iloc[idx])
-            if np.isnan(hurst_v):
-                hurst_ok = False
-            elif _cfg.HURST_MODE == "trending_only":
-                hurst_ok = (hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
-            else:
-                hurst_ok = abs(hurst_v - 0.5) >= _cfg.HURST_MIN_DEVIATION
+            hurst_ok = _hurst_passes(hurst_v, _cfg.HURST_MODE, _cfg.HURST_MIN_DEVIATION)
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = mfi_valid_cumcount.iloc[idx] >= _cfg.MFI_TRAINING
@@ -1540,6 +1601,28 @@ def backtest_history(
                         max_adverse = max(max_adverse, adverse)
 
                         if not tp1_reached:
+                            # 🆕 FIX (2026-09, real trade + Kimi audit): a
+                            # bar that crosses BOTH TP1 and the (pre-TP1) SL
+                            # is the same unprovable-intrabar-order ambiguity
+                            # as SAME_BAR_EXIT_POLICY handles for SL vs TP2 —
+                            # see config.SAME_BAR_TP1_POLICY and
+                            # check_tp_sl_hit()'s docstring (signals.py) for
+                            # the live-path mirror of this exact block. TP2
+                            # excluded (fh < tp) because reaching TP2 in the
+                            # same bar is already an unambiguous full win,
+                            # handled below regardless of this policy. Under
+                            # "tp1_first" the new (tighter) stop necessarily
+                            # falls within THIS bar's range whenever the old
+                            # one did (breakeven/half_tp1 only ever tighten
+                            # toward entry), so the position closes on this
+                            # same bar at the moved stop rather than deferring
+                            # to a later one.
+                            if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fh >= tp1 and fh < tp and fl_ <= current_sl:
+                                tp1_reached = True
+                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
                             if fl_ <= current_sl:
                                 sl_hit = True
                                 exit_price = current_sl
@@ -1564,10 +1647,7 @@ def backtest_history(
                                 # we can't know whether the touch happened
                                 # at the start or end of this bar's range.
                                 tp1_reached = True
-                                if _cfg.TP1_SL_MODE == "half_tp1":
-                                    current_sl = close_v + (tp1 - close_v) / 2
-                                else:
-                                    current_sl = close_v
+                                current_sl = _tp1_moved_sl(close_v, tp1, side)
                                 continue
                         else:
                             if fl_ <= current_sl:
@@ -1585,6 +1665,19 @@ def backtest_history(
                         max_adverse = max(max_adverse, adverse)
 
                         if not tp1_reached:
+                            # 🆕 FIX (2026-09, real trade + Kimi audit): see
+                            # the identical comment in the long branch above
+                            # and check_tp_sl_hit()'s docstring — same
+                            # SAME_BAR_TP1_POLICY resolution, mirrored for
+                            # shorts (fh <= sl becomes fh >= sl, fl_ <= tp1
+                            # stays the same direction as the long case's
+                            # fh >= tp1 since shorts profit downward).
+                            if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fl_ <= tp1 and fl_ > tp and fh >= current_sl:
+                                tp1_reached = True
+                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                sl_hit = True
+                                exit_price = current_sl
+                                break
                             if fh >= current_sl:
                                 sl_hit = True
                                 exit_price = current_sl
@@ -1596,10 +1689,7 @@ def backtest_history(
                                 break
                             if fl_ <= tp1:
                                 tp1_reached = True
-                                if _cfg.TP1_SL_MODE == "half_tp1":
-                                    current_sl = close_v - (close_v - tp1) / 2
-                                else:
-                                    current_sl = close_v
+                                current_sl = _tp1_moved_sl(close_v, tp1, side)
                                 continue
                         else:
                             if fh >= current_sl:

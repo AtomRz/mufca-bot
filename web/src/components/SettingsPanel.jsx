@@ -372,12 +372,12 @@ export default function SettingsPanel({ config, onChanged }) {
             {Object.keys(config.hurst_window).map((tf) => (
               <div className="field" key={tf}>
                 <label title="Bars used for the rolling R/S estimate. The optimal value is pair/TF-specific, not universal — adjust it here and watch A/U Win Rate after a batch of trades closes.">
-                  {tf} window (16–300)
+                  {tf} window (18–300)
                 </label>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input
                     type="number"
-                    min={16}
+                    min={18}
                     max={300}
                     step={1}
                     value={hurstWindowValue(tf)}

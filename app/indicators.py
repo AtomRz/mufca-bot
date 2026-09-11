@@ -78,10 +78,20 @@ def _hurst_rs(returns: np.ndarray) -> float:
 # window. Benchmarked at ~2.2s for 3000 bars / window=100 on a single
 # symbol/timeframe — a real cost when this runs on every scan tick for
 # several symbols. The JIT version below computes the whole rolling series
-# in one compiled pass (no per-window Python overhead) and produces
-# bit-identical NaN placement and results to float64 precision (verified
-# against `_hurst_rs` across multiple random series). Benchmarked at ~4ms
-# warm for the same 3000 bars — roughly 500x faster.
+# in one compiled pass (no per-window Python overhead) and produces NaN
+# placement and results matching `_hurst_rs` almost exactly (verified
+# against thousands of random series and window sizes). 🆕 CORRECTION
+# (2026-09 audit): "almost exactly", not "bit-identical" as this comment
+# used to claim — the two paths pick chunk sizes via slightly different
+# float paths (np.geomspace here vs. a manual exp(log_start + i*step) loop
+# in the numba version below, done that way because numba can't call
+# np.geomspace directly), and at certain max_k values that difference
+# crosses an int() rounding boundary. Stress-tested against max_k 8-5000:
+# 2 mismatches out of ~5000 (e.g. max_k=256 gives chunk size 15 here vs. 16
+# in the numba path), each shifting one chunk size by ±1 and so nudging
+# that bar's Hurst estimate slightly — not a correctness bug, just not
+# literally bit-identical. Benchmarked at ~4ms warm for the same 3000 bars
+# — roughly 500x faster.
 #
 # If numba isn't installed, calculate_hurst() transparently falls back to
 # the pandas/`_hurst_rs` path so the bot still runs, just slower.
