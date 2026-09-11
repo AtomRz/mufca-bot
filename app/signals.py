@@ -448,7 +448,8 @@ def _tp1_moved_sl(entry: float, tp1_price: float, side: str) -> float:
 
 
 def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
-                     bar_time: Optional[int] = None) -> Optional[str]:
+                     bar_time: Optional[int] = None,
+                     ticker: Optional[str] = None, tf: Optional[str] = None) -> Optional[str]:
     """Checks whether TP or SL was hit for the given track.
 
     🆕 A single bar's high/low can't tell you which was actually touched
@@ -483,7 +484,12 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
     — close_trade() then labels the exit "sl_after_tp1" with the correct
     blended PnL automatically, no changes needed at the call site. Under
     "sl_first", this block is a no-op and behavior is unchanged from
-    before."""
+    before.
+
+    ticker/tf are optional and used ONLY for the [TP1-CLOSEDBAR] log line
+    below — check_tp_sl_hit() itself doesn't need them for anything else.
+    Passing None just means that one log line is skipped, everything else
+    behaves the same either way."""
     trade = state.get(f"{track}_active_trade")
     if not trade:
         return None
@@ -512,8 +518,23 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
         # crossing TP1 on the way (tp1 sits strictly between entry and tp2)
         # and is an unambiguous full win either way — nothing to resolve.
         if sl_touch and tp1_touch and not tp2_touch:
+            old_sl = trade["sl"]
+            new_sl = _tp1_moved_sl(trade["entry"], tp1_price, side)
             trade["tp1_hit"] = True
-            trade["sl"] = _tp1_moved_sl(trade["entry"], tp1_price, side)
+            trade["sl"] = new_sl
+            # 🆕 FIX (Kimi audit, dedup pass 2): the live-poll TP1 credit in
+            # bot.py always logs (see [TP1]/[TP1-SL]/[LIVE-SL] there) — this
+            # closed-bar credit path used to be silent, so comparing the
+            # bot's log against the exchange for a trade like this had no
+            # trace of WHY the exit got labeled sl_after_tp1. Distinct tag
+            # ([TP1-CLOSEDBAR], not [TP1]) so a log grep can tell which path
+            # actually caught it — useful signal on its own for how often
+            # the live poll is missing quick wicks vs. this fallback.
+            logger.info(
+                f"[TP1-CLOSEDBAR] {ticker or '?'} {tf or '?'} {track.upper()}-track | "
+                f"bar (high={high}, low={low}) crossed both TP1={tp1_price} and original SL={old_sl} | "
+                f"SAME_BAR_TP1_POLICY=tp1_first → TP1 credited, SL moved {old_sl} -> {new_sl}"
+            )
 
     sl = trade["sl"]
 
@@ -869,7 +890,8 @@ async def check_signals(
             if trade:
                 update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
                                        high=last_high, low=last_low)
-                hit = check_tp_sl_hit(state, last_high, last_low, track, bar_time=current_bar_time)
+                hit = check_tp_sl_hit(state, last_high, last_low, track, bar_time=current_bar_time,
+                                       ticker=ticker, tf=timeframe)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
                     close_trade(state, exit_price, hit, ticker, timeframe, track)

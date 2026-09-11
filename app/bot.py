@@ -21,7 +21,7 @@ from config import (
     ONCHAIN_ENABLED,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, format_price
-from signals import check_signals, backtest_history, make_state
+from signals import check_signals, backtest_history, make_state, _tp1_moved_sl
 from onchain import get_onchain_bias
 import derivatives
 import spread
@@ -616,15 +616,19 @@ async def market_scanner():
                         # itself automatically, with no further changes needed
                         # in signals.py.
                         entry = trade.get("entry", 0)
+                        # 🆕 FIX (Kimi audit, dedup pass 2): use the shared
+                        # _tp1_moved_sl() helper (signals.py) instead of this
+                        # inline formula — it's the same number either way
+                        # today, but before this fix a future change to
+                        # TP1_SL_MODE's math would have needed updating here
+                        # AND in signals.py's check_tp_sl_hit()/
+                        # backtest_history(), with no compiler or test to
+                        # catch a missed spot.
+                        new_sl = _tp1_moved_sl(entry, tp1_price, side)
                         if _cfg.TP1_SL_MODE == "half_tp1":
-                            if side == "long":
-                                new_sl = entry + (tp1_price - entry) / 2
-                            else:
-                                new_sl = entry - (entry - tp1_price) / 2
                             sl_label = f"halfway to TP1 (${format_price(new_sl)})"
                         else:
-                            new_sl = entry
-                            sl_label = f"breakeven (${format_price(entry)})"
+                            sl_label = f"breakeven (${format_price(new_sl)})"
                         trade["sl"] = new_sl
                         # 🆕 FIX BUG-LO009: SL moved WITHIN the still-forming
                         # bar — the low/high of this and all preceding bars

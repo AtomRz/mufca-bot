@@ -584,7 +584,22 @@ SAME_BAR_EXIT_POLICY = "sl_first"  # the only implemented option currently
 #                 actually printed on the exchange and you want the
 #                 conservative resolution back.
 # Whichever is chosen, check_tp_sl_hit() (signals.py) and backtest_history()
-# apply it identically so live and backtest keep agreeing on the same bars.
+# apply it identically so live and backtest keep agreeing on the same bars —
+# for the SAME_BAR_TP1_POLICY question specifically (a bar hitting BOTH TP1
+# and SL). They still DISAGREE on one narrower, deliberate case though (Kimi
+# audit, pass 2): a bar that touches ONLY TP1 with no SL/TP2 in the same
+# bar. backtest_history() credits tp1_reached straight from that bar's own
+# OHLC (it has no other source of truth to consult). The live closed-bar
+# path (check_tp_sl_hit) does NOT — it leaves tp1_hit False and waits for
+# bot.py's live ticker poll to independently confirm the touch, on the
+# reasoning that a signal bot never actually told the person to close 50%
+# manually until that poll fires, so crediting it purely from a historical
+# bar would model a partial close that was never actionable in real time.
+# Net effect: backtest_history() is a little more optimistic than live on
+# this one narrow case — a real trade can print "sl" where the backtest
+# would have called "sl_after_tp1" for the identical bar. Worth remembering
+# when comparing live hit-rate against backtest hit-rate for calibration;
+# it is NOT the same gap the bug above was about (that one is fixed).
 SAME_BAR_TP1_POLICY = "tp1_first"
 
 # =====================================================================
