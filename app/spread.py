@@ -72,12 +72,11 @@ def clear_ticker_cache(ticker: str):
     logger.info(f"[SPREAD] Cleared history for {ticker}")
 
 
-def clear_all_history():
-    """Full reset (use with !reset_cache)."""
-    _history.clear()
-    safe_json_save(_cfg.SPREAD_HISTORY_FILE, {})
-    logger.info("[SPREAD] Full history cleared")
-
+# 🆕 REMOVED (dead code cleanup): clear_all_history() ("full reset, use
+# with !reset_cache") used to sit here. !reset_cache deliberately never
+# touches spread history (see reset_cache_cmd's docstring), and !spread
+# reset only ever resets a single ticker via clear_ticker_cache() above —
+# there was no "reset everything" command path left calling this.
 
 def get_sample_count(ticker: str) -> int:
     return len(_history.get(ticker, []))

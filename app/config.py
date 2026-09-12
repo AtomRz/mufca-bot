@@ -380,7 +380,11 @@ SPREAD_HISTORY_SAVE_INTERVAL = 300        # seconds — throttled disk write, sa
 TRACKS = ("a", "u", "b")
 TRACK_LABELS = {"a": "A", "u": "U", "b": "B"}                     # single-letter, used in "A BUY", "U SELL", etc.
 TRACK_NAMES = {"a": "Andean+MFI", "u": "UT Bot", "b": "Breakout"}  # descriptive, used in "(Andean+MFI)", etc.
-TRACK_FULL_NAMES = {"a": "Andean", "u": "UT Bot", "b": "Breakout"} # used in Discord/web track selectors
+# 🆕 REMOVED (dead code cleanup): TRACK_FULL_NAMES = {"a": "Andean", ...}
+# used to sit here, claimed by its own comment to be "used in Discord/web
+# track selectors" — it wasn't; nothing in the codebase (backend or web
+# frontend) ever read it. TRACK_LABELS and TRACK_NAMES above cover every
+# actual display need.
 
 # =====================================================================
 # 🚀  BREAKOUT TRACK (track "b") — volatility-squeeze + volume/range expansion
@@ -746,7 +750,8 @@ SL_ADAPTIVE_ENABLED   = True    # Enable adaptive SL
 SL_MAE_PERCENTILE     = 0.85    # MAE percentile (85% — covers most retraces)
 SL_MAE_BUFFER         = 0.002   # Extra margin added on top of the percentile (0.2%)
 SL_MIN_HISTORY        = 10      # Minimum winning trades to activate adaptive SL
-SL_FALLBACK_PCT       = 0.015   # Fallback SL when there's not enough history (1.5% of price)
+# 🆕 REMOVED (dead code cleanup): SL_FALLBACK_PCT = 0.015 used to sit here
+# — defined but never read anywhere in the codebase.
 # 🆕 FIX: TP has an ATR cap (calculate_adaptive_tp), the adaptive SL didn't —
 # an unbounded MAE percentile could give an unreasonably wide stop on outliers in the history.
 SL_MAX_ATR_MULT        = 4.0    # Adaptive SL can't be farther than 4×ATR from entry

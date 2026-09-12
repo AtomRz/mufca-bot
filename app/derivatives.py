@@ -50,14 +50,13 @@ _oi_baseline_last_saved = 0.0
 _oi_baseline_dirty = False
 
 
-def clear_derivatives_cache():
-    """Clears the TTL cache (does not touch the OI baseline)."""
-    _cache.clear()
-    logger.info("[DERIVATIVES] TTL cache cleared (OI baseline preserved)")
-
-
 def clear_derivatives_cache_full():
-    """Full reset, including the OI baseline (use with !reset_cache)."""
+    """Full reset, including the OI baseline (use with !reset_cache).
+
+    🆕 REMOVED (dead code cleanup): a partial clear_derivatives_cache()
+    (TTL cache only, OI baseline preserved) used to sit above this
+    function with no caller left anywhere in the codebase — only this
+    full-reset version is actually used (by !reset_cache)."""
     _cache.clear()
     _oi_baseline.clear()
     safe_json_save(_OI_BASELINE_FILE, {})

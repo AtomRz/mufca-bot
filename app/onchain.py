@@ -69,21 +69,15 @@ def _cache_get(key: str) -> Optional[Any]:
 def _cache_set(key: str, value: Any):
     _cache[key] = (time.time(), value)
 
-def clear_onchain_cache():
-    """Clears the TTL cache of on-chain data.
-
-    BUGFIX BUG-HI004: this used to also clear _prev_balances, which meant the
-    next call to get_eth_flow_delta() fell into the first_run branch again
-    (no baseline → returns note='first_run' → bot.py called
-    clear_onchain_cache() → infinite loop). Now _prev_balances is NOT
-    cleared — the baseline survives a cache reset. For a full reset including
-    the baseline, use clear_onchain_cache_full().
-    """
-    _cache.clear()
-    logger.info("[ONCHAIN] TTL cache cleared (baseline balances preserved)")
-
 def clear_onchain_cache_full():
-    """Full cache reset, including the balance baseline (only use with !reset_cache)."""
+    """Full cache reset, including the balance baseline (only use with !reset_cache).
+
+    🆕 REMOVED (dead code cleanup): the partial clear_onchain_cache()
+    (TTL cache only, baseline preserved) that used to sit above this
+    function had no caller left anywhere in the codebase — it was
+    imported into discord_commands.py but never actually invoked there,
+    only mentioned in a comment. Only this full-reset version is used
+    (by !reset_cache)."""
     global _prev_balances_ts
     _cache.clear()
     _prev_balances.clear()

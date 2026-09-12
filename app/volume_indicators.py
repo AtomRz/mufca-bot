@@ -200,18 +200,6 @@ def volume_score_for_side(info: Dict, side: str) -> float:
         return -score  # Negative = outflow = good for short
 
 
-def volume_confidence_adjustment(info: Dict, side: str) -> int:
-    """
-    Adjusts confidence based on volume.
-
-    Returns: delta to add to confidence score (-15 to +15)
-    """
-    directional = volume_score_for_side(info, side)
-
-    # Map -1..+1 to -15..+15 confidence points
-    return int(round(directional * 15))
-
-
 def volume_leverage_adjustment_v3(info: Dict, side: str, base_lev: int) -> Tuple[int, str]:
     """
     Adjusts leverage based on volume.
@@ -278,29 +266,10 @@ def volume_filter_v3(df: pd.DataFrame, side: str, regime: str,
     else:
         return True, f"VOL_NEUTRAL({directional:+.2f},RV={rel_vol:.1f}): pass", info
 
-
-# =====================================================================
-# 🔄  BACKWARD COMPATIBILITY
-# =====================================================================
-
-def volume_flow_signal(df: pd.DataFrame, obv_period: int = 20) -> str:
-    return volume_flow_signal_v3(df, obv_period)["flow"]
-
-
-def volume_confirm(df: pd.DataFrame, side: str, obv_period: int = 20) -> bool:
-    info = volume_flow_signal_v3(df, obv_period)
-    directional = volume_score_for_side(info, side)
-    return directional > 0.1  # Soft threshold for backward compat
-
-
-def volume_filter(df: pd.DataFrame, side: str, regime: str,
-                  obv_period: int = 20) -> Tuple[bool, str]:
-    passed, reason, _ = volume_filter_v3(df, side, regime, obv_period)
-    return passed, reason
-
-
-def volume_leverage_adjustment(df: pd.DataFrame, regime: str,
-                               base_lev: int, side: str,
-                               obv_period: int = 20) -> Tuple[int, str]:
-    info = volume_flow_signal_v3(df, obv_period)
-    return volume_leverage_adjustment_v3(info, side, base_lev)
+# 🆕 REMOVED (dead code cleanup): the "BACKWARD COMPATIBILITY" block that
+# used to live here — volume_flow_signal(), volume_confirm(),
+# volume_filter(), volume_leverage_adjustment(), plus
+# volume_confidence_adjustment() above — were thin wrappers around the
+# _v3 functions from an earlier pre-v3 API. Every real call site in the
+# codebase (signals.py, discord_commands.py, embeds.py) already calls the
+# _v3 functions directly; none of these wrappers had a single caller left.

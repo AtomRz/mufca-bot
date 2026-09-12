@@ -421,9 +421,12 @@ async def test_push():
     return result
 
 
-@app.get("/api/pairs")
-async def get_pairs():
-    return {"tickers": _cfg.TICKERS}
+# 🆕 REMOVED (dead code cleanup): GET /api/pairs used to sit here,
+# returning {"tickers": _cfg.TICKERS}. Nothing calls it — the web
+# dashboard gets its pairs list from GET /api/config (config.pairs), and
+# the Android client is a thin WebView shell that doesn't hit this
+# endpoint directly either. POST/DELETE /api/pairs below (add/remove) are
+# both still in real use.
 
 
 class PairIn(BaseModel):

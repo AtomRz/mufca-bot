@@ -51,7 +51,7 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, format_pric
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache
-from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache, clear_onchain_cache_full
+from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full
 import derivatives
 import spread
 from state import (
