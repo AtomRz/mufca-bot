@@ -698,53 +698,98 @@ async def chop_cmd(ctx, tf: str = "", value: str = ""):
         logger.error(f"Chop command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
+def _history_closed_records(history: dict, ticker: str, tf: str) -> list:
+    """Collects real (non-synthetic) closed records for a ticker/tf from
+    signals_history.json, combining the long/short lists into one and
+    sorting by signal timestamp (the only timestamp the file stores — it
+    marks when the signal opened, not when it closed, but is a good enough
+    proxy for chronological order since trades close in roughly the same
+    order they open).
+
+    🆕 FIX (architecture): !history used to read
+    core.state[ticker][tf]["trade_history"] — a live, in-memory list that
+    _reset_states_after_regime_change() (web_api.py: mode/htf/indicator
+    parameter changes) wipes back to an empty list on every regime change,
+    even when no trade is open at that moment. The web dashboard's History
+    tab never had this problem because it reads signals_history.json
+    instead, a separate on-disk log that regime-change resets never touch.
+    Switching this command to the same source means Discord and the web
+    dashboard always agree, and a config change can no longer make Discord
+    "forget" real trade history.
+    Synthetic records (from !sim, track="sim") are excluded — they are a
+    what-if run against historical data, never a real executed trade."""
+    slots = history.get(ticker, {}).get(tf, {})
+    records = []
+    for side in ("long", "short"):
+        for rec in slots.get(side, []):
+            if rec.get("exit_type") == "open" or rec.get("synthetic"):
+                continue
+            merged = dict(rec)
+            merged["side"] = side
+            records.append(merged)
+    records.sort(key=lambda r: r.get("timestamp") or "")
+    return records
+
+
+def _history_format_line(i: int, rec: dict) -> str:
+    """Formats one closed-trade line for !history. 'cancelled' (see
+    reconcile_orphaned_signals in state.py) gets its own neutral marker —
+    it isn't a win or a loss, it's an honest "we lost track of this one"."""
+    exit_type = rec.get("exit_type", "?")
+    pnl = rec.get("moved_pct", 0.0)
+    if exit_type == "cancelled":
+        emoji = "⚪"
+    else:
+        emoji = "🟢" if pnl > 0 else "🔴"
+    result_label = "SL (post-TP1)" if exit_type == "sl_after_tp1" else exit_type.upper()
+    track_label = rec.get("track", "a").upper()
+    return f"{emoji} #{i} [{track_label}] {rec['side'].upper()} | PnL: {pnl:.2f}% | {result_label}"
+
+
 @core.bot.command(name="history")
 async def history_cmd(ctx, ticker: str = "", tf: str = ""):
     try:
+        history = load_signals_history()
         lines = []
 
         if not ticker:
             lines = ["**📊 Trade History:**\n"]
-            for t in TICKERS:
-                for timeframe in TIMEFRAMES:
-                    st = core.state[t][timeframe]
-                    trades = st.get("trade_history", [])
-                    if trades:
-                        lines.append(f"\n**`{t}` `{timeframe}` — {len(trades)} trades:**")
-                        for i, trade in enumerate(trades[-5:], 1):
-                            emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                            lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+            for t in history:
+                for timeframe in history[t]:
+                    records = _history_closed_records(history, t, timeframe)
+                    if records:
+                        lines.append(f"\n**`{t}` `{timeframe}` — {len(records)} trades:**")
+                        for i, rec in enumerate(records[-5:], 1):
+                            lines.append(_history_format_line(i, rec))
 
             if len(lines) == 1:
                 await ctx.send("📭 No trade history yet.")
                 return
         else:
             ticker = ticker.upper()
+            if ticker not in history:
+                await ctx.send(f"📭 No trade history for `{ticker}`")
+                return
             if tf:
                 tf = tf.lower()
-                st = core.state.get(ticker, {}).get(tf)
-                if not st:
+                if tf not in history[ticker]:
                     await ctx.send(f"❌ No data for `{ticker}` `{tf}`")
                     return
-                trades = st.get("trade_history", [])
-                if not trades:
+                records = _history_closed_records(history, ticker, tf)
+                if not records:
                     await ctx.send(f"📭 No trade history for `{ticker}` `{tf}`")
                     return
-                lines = [f"**📊 `{ticker}` `{tf}` Trade History ({len(trades)} trades):**\n"]
-                for i, trade in enumerate(trades[-10:], 1):
-                    emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                    lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+                lines = [f"**📊 `{ticker}` `{tf}` Trade History ({len(records)} trades):**\n"]
+                for i, rec in enumerate(records[-10:], 1):
+                    lines.append(_history_format_line(i, rec))
             else:
                 lines = [f"**📊 `{ticker}` Trade History:**\n"]
-                for timeframe in TIMEFRAMES:
-                    st = core.state.get(ticker, {}).get(timeframe)
-                    if st:
-                        trades = st.get("trade_history", [])
-                        if trades:
-                            lines.append(f"\n**`{timeframe}` — {len(trades)} trades:**")
-                            for i, trade in enumerate(trades[-5:], 1):
-                                emoji = "🟢" if trade["pnl_pct"] > 0 else "🔴"
-                                lines.append(f"{emoji} #{i} {trade['side'].upper()} | PnL: {trade['pnl_pct']:.2f}% | {trade['result'].upper()}")
+                for timeframe in history[ticker]:
+                    records = _history_closed_records(history, ticker, timeframe)
+                    if records:
+                        lines.append(f"\n**`{timeframe}` — {len(records)} trades:**")
+                        for i, rec in enumerate(records[-5:], 1):
+                            lines.append(_history_format_line(i, rec))
 
         msg = "\n".join(lines)
         # ✅ FIXED: split long messages into chunks
