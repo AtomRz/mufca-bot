@@ -616,8 +616,17 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     state[history_key].append(closed_trade)
     state[history_key] = state[history_key][-50:]
 
-    state["trade_history"].append(closed_trade)
-    state["trade_history"] = state["trade_history"][-50:]
+    # 🆕 REMOVED: the generic (non-tracked) state["trade_history"] used to
+    # be appended here too, duplicating every closed trade into a 4th list
+    # on top of a_/u_/b_trade_history. Its only reader was the old
+    # !history Discord command (see discord_commands.py), which read
+    # core.state directly and therefore got silently wiped on every
+    # _reset_states_after_regime_change() (mode/htf/indicator changes,
+    # web_api.py) even with no trade open at the time. !history was
+    # switched to read signals_history.json instead (same source as the
+    # web dashboard's History tab, which never had this bug), so this
+    # field has no reader left anywhere in the codebase — removed instead
+    # of carrying dead weight in every scan and in bot_state_snapshot.json.
 
     # 🆕 FIX: pass track through so we don't accidentally close the other
     # track's record (A and U can simultaneously hold a position on the same
@@ -1835,7 +1844,6 @@ def make_state() -> Dict:
         "b_bars_in_trade": 0,
         "b_last_closure_notified": False,
         "active_trade": None,
-        "trade_history": [],
         "bars_in_trade": 0,
         "last_closure_notified": False,
     }
