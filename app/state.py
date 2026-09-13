@@ -400,8 +400,20 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 # 📊  SIGNAL STATISTICS
 # =====================================================================
 
-def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None, as_of: Optional[str] = None) -> Dict:
+def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None, as_of: Optional[str] = None, track: Optional[str] = None) -> Dict:
     """Returns statistics for the given signal.
+
+    track — "a" | "u" | "b" | None. 🆕 FIX: each track's adaptive TP/SL is
+    supposed to be calibrated off its OWN track's history (that's the
+    entire point of tracking `track` on every record — see
+    add_signal_record's docstring) but this function used to read
+    history[ticker][tf][side] unfiltered, silently pooling A+U+B together.
+    Two tracks opening on the same ticker/tf/side at the same time ended
+    up with byte-identical TP1/TP2/SL, regardless of how differently each
+    track actually performs. None (the default) keeps the old pooled
+    behavior — used by !tp/!sim/!forcerun, which aren't tied to a specific
+    track. Real signal generation (open_position(), backtest_history())
+    now passes its own track explicitly.
 
     as_of — ISO timestamp string; if given, only records strictly before
     this point are used. 🆕 FIX (external review, P0): without this,
@@ -433,6 +445,8 @@ def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = No
         return empty
 
     records = history[ticker][tf][side]
+    if track is not None:
+        records = [r for r in records if r.get("track", "a") == track]
     # 🆕 FIX: synthetic records (!sim) are excluded from stats/calibration —
     # they don't reflect real market behavior and were skewing the percentiles.
     # 🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 gave profit, the remainder closed
@@ -685,6 +699,7 @@ def calculate_adaptive_tp(
     atr14: Optional[float] = None,
     regime: Optional[str] = None,
     as_of: Optional[str] = None,
+    track: Optional[str] = None,
 ) -> float:
     """
     Adaptive TP based on historical MFE with a hit-rate feedback loop.
@@ -695,6 +710,11 @@ def calculate_adaptive_tp(
     3. If < 5 — use all signals weighted by exit_type
     4. 🆕 Auto-adjusts the percentile based on the real hit rate
     5. 🆕 Realistic capture rate (70% of the ideal MFE)
+
+    track — see get_signal_stats' docstring; same per-track isolation
+    purpose, independent filter since this pulls its own records directly
+    rather than through get_signal_stats. None (the default) pools all
+    tracks together, same as before this fix.
 
     as_of — see get_signal_stats' docstring; same look-ahead-prevention
     purpose, independent filter since this pulls its own records directly
@@ -708,6 +728,8 @@ def calculate_adaptive_tp(
         return round_price(fallback_tp)
 
     records = history[ticker][tf][side]
+    if track is not None:
+        records = [r for r in records if r.get("track", "a") == track]
     # 🆕 FIX: synthetic records (!sim) are excluded — see get_signal_stats.
     # 🆕 FIX BUG-LO008: sl_after_tp1 is a real closed outcome, included in the sample.
     closed = [r for r in records if r["exit_type"] in ("tp", "sl", "sl_after_tp1", "cancelled") and not r.get("synthetic", False)]
@@ -831,11 +853,16 @@ def calculate_combined_tp(
     atr14,
     regime: Optional[str] = None,
     as_of: Optional[str] = None,
+    track: Optional[str] = None,
 ) -> Tuple[float, float, str]:
     """
     Combined TP with two levels:
       TP1 — statistical (MFE percentile without an R:R cap), target for 50% of the position
       TP2 — with an R:R cap (minimum R:R 1.5), target for the remaining 50%
+
+    track — see get_signal_stats' docstring (per-track calibration
+    isolation); threaded through to both stats calls below. None (the
+    default) pools all tracks together, same as before this fix.
 
     as_of — see get_signal_stats' docstring (look-ahead prevention for
     backtest_history()); threaded through to both stats calls below. None
@@ -843,7 +870,7 @@ def calculate_combined_tp(
 
     Returns: (tp1, tp2, desc)
     """
-    stats = get_signal_stats(ticker, tf, side, regime, as_of=as_of)
+    stats = get_signal_stats(ticker, tf, side, regime, as_of=as_of, track=track)
     risk = abs(entry - sl)
     mode_label = "SAFE" if _cfg.USE_SAFE_TP else "AGGR"
     regime_label = f" | Regime: {regime}" if regime else ""
@@ -863,7 +890,7 @@ def calculate_combined_tp(
     atr_at_idx = float(atr14.iloc[idx]) if hasattr(atr14, "iloc") else (float(atr14) if atr14 is not None else None)
 
     # ── TP1: purely statistical, no R:R cap ───────────────────────
-    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr_at_idx, regime, as_of=as_of)
+    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr_at_idx, regime, as_of=as_of, track=track)
 
     # ── TP2: with R:R cap (minimum 1.5) ──────────────────────────────────
     min_rr_tp = entry + 1.5 * risk if side == "long" else entry - 1.5 * risk

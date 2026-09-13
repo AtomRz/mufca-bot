@@ -247,6 +247,7 @@ def calculate_adaptive_sl(
     atr14: pd.Series,
     idx: int,
     as_of: Optional[str] = None,
+    track: Optional[str] = None,
 ) -> tuple[float, str]:
     """
     Adaptive SL based on historical MAE of winning trades.
@@ -256,6 +257,16 @@ def calculate_adaptive_sl(
       true MAE: price moved against us but came back without touching the stop.
     - Take the SL_MAE_PERCENTILE percentile of these MAE values + an SL_MAE_BUFFER buffer.
     - If there are fewer winning trades than SL_MIN_HISTORY — fall back to a fixed % or ATR-based SL.
+
+    track — "a" | "u" | "b" | None. 🆕 FIX: each track is supposed to be
+    calibrated off its OWN MAE history — that's the whole reason records
+    are tagged with `track` (see state.add_signal_record's docstring) —
+    but this pulled history.get(ticker, {}).get(timeframe, {}).get(side, [])
+    unfiltered, pooling every track together. Two tracks opening the same
+    ticker/tf/side at the same time got byte-identical SL, regardless of
+    how differently each track's own trades actually behaved. None (the
+    default) keeps the old pooled behavior; open_position() and
+    backtest_history() now pass their own track explicitly.
 
     as_of — ISO timestamp string; same look-ahead-prevention purpose as
     calculate_adaptive_tp's as_of (see state.get_signal_stats' docstring) —
@@ -274,6 +285,8 @@ def calculate_adaptive_sl(
     try:
         history = load_signals_history()
         records = history.get(ticker, {}).get(timeframe, {}).get(side, [])
+        if track is not None:
+            records = [r for r in records if r.get("track", "a") == track]
 
         # Winning trades only (price came back without touching the stop)
         # 🆕 FIX: exclude synthetic records (!sim) — they don't reflect real MAE.
@@ -689,7 +702,7 @@ async def open_position(
     if state.get(trade_key):
         return None
 
-    sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx)
+    sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, timeframe, fs, fu, fl, atr14, idx, track=track)
 
     # 🆕 FIX: leverage used to be computed BEFORE calling calculate_adaptive_sl,
     # from a rough estimate of the FRAMA channel width (frama_sl_long/short in
@@ -706,7 +719,7 @@ async def open_position(
     lev, vol_lev_reason = volume_leverage_adjustment_v3(vol_info, side, lev)
     lev = max(1, min(MAX_ALLOWED_LEV, lev + oc_lev_delta))
 
-    tp1, tp2, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime)
+    tp1, tp2, tp_desc = calculate_combined_tp(ticker, timeframe, side, close_v, sl, df, idx, atr14, regime, track=track)
     tp = tp2  # primary TP for R:R calculations and filters — we use tp2
     tp_desc = f"SL:{sl_desc} | {tp_desc}"
 
@@ -843,7 +856,7 @@ async def open_position(
         # 🆕 FIX: pass track through so A- and U-track records don't get mixed up in history
         add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
 
-    stats = get_signal_stats(ticker, timeframe, side, regime)
+    stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
     conf = calc_confidence(side == "long")
 
     return (signal_label, close_v, regime, lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
@@ -1571,9 +1584,9 @@ def backtest_history(
                 # trades — pure look-ahead bias.
                 as_of_ts = normalize_timestamp(int(df["timestamp"].iloc[idx]))
 
-                sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx, as_of=as_of_ts)
+                sl, sl_desc = calculate_adaptive_sl(close_v, side, ticker, tf, fs, fu, fl, atr14, idx, as_of=as_of_ts, track=track)
                 risk_fixed = abs(close_v - sl)
-                tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime, as_of=as_of_ts)
+                tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, close_v, sl, df, idx, atr14, bt_regime, as_of=as_of_ts, track=track)
                 # 🆕 FIX: the backtest used to check tp_hit against tp1
                 # (statistical, no RR cap), while live trading actually
                 # exits at tp2 (same calculate_combined_tp, but with the RR
