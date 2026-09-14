@@ -14,9 +14,14 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 import config as _cfg
-from utils import format_price, round_price
+from utils import format_price
+# 🆕 S/R and Volume Profile now live in market_structure.py — the single
+# shared implementation used both here (for rendering) and by the signal/
+# TP engine (later stages), so the chart and the trading logic can never
+# end up computing different levels with different algorithms.
+from market_structure import calc_support_resistance, calc_volume_profile
 
 logger = logging.getLogger(__name__)
 
@@ -75,181 +80,6 @@ def calc_bollinger_bands(
     return upper, mid, lower
 
 
-def calc_support_resistance(
-    df: pd.DataFrame,
-    pivot_window: int = 10,
-    max_levels: int = 4
-) -> Dict[str, List[float]]:
-    """
-    Support/resistance levels:
-    - Pivot Points (local min/max)
-    - Round Numbers (round-number levels)
-
-    Returns dict: {"support": [...], "resistance": [...], "pivot": [...]}
-    """
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    last_close = float(close.iloc[-2])  # confirmed bar
-
-    supports: List[float] = []
-    resistances: List[float] = []
-    pivots: List[float] = []
-
-    # 1. Pivot Points (local extremes)
-    w = pivot_window
-    for i in range(w, len(df) - w):
-        hi_window = high.iloc[i - w:i + w + 1]
-        lo_window = low.iloc[i - w:i + w + 1]
-        if high.iloc[i] == hi_window.max():
-            resistances.append(float(high.iloc[i]))
-        if low.iloc[i] == lo_window.min():
-            supports.append(float(low.iloc[i]))
-
-    # Filter — keep only levels near the current price
-    def near_price(levels, price, pct=0.05):
-        return [l for l in levels if abs(l - price) / price < pct]
-
-    # 🆕 FIX: direction filtering (resistance above price / support below
-    # price) now happens BEFORE selecting the top-N nearest, not after.
-    # Before, _cluster_levels could fill all max_levels slots with
-    # candidates that would just get filtered out by the final direction
-    # check anyway — e.g. after a sharp breakout upward, most historical
-    # resistance pivots end up BELOW the current price (already broken
-    # through), and if they're closer by distance, they'd crowd out the few
-    # remaining levels ABOVE the price, leaving resistance empty even though
-    # real resistance levels exist — just a bit farther out in price than
-    # the already-broken ones.
-    resistances = [l for l in resistances if l > last_close]
-    supports = [l for l in supports if l < last_close]
-
-    # 🆕 FIX: when selecting max_levels from clusters, sorting used to be by
-    # closeness to the MEDIAN of the candidate set, not to the current
-    # price — as a result, levels genuinely close to price (and therefore
-    # the most trading-relevant) could get filtered out in favor of ones
-    # more "typical of the sample" but far from price. Now sorted by
-    # closeness to last_close — the nearest levels are always prioritized.
-    supports    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels, last_close)
-    resistances = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels, last_close)
-
-    return {
-        "support":    supports,
-        "resistance": resistances,
-        "pivot":      [],
-    }
-
-
-def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: float = 0.005) -> List[float]:
-    """Clusters nearby levels, keeps up to max_n CLOSEST to ref_price (the current price)."""
-    if not levels:
-        return []
-    levels = sorted(set(levels))
-    clustered: List[float] = []
-    used = [False] * len(levels)
-    for i, l in enumerate(levels):
-        if used[i]:
-            continue
-        used[i] = True  # mark the pivot element itself as consumed too, not just its cluster-mates
-        cluster = [l]
-        for j in range(i + 1, len(levels)):
-            if not used[j] and abs(levels[j] - l) / (l + 1e-8) < tol:
-                cluster.append(levels[j])
-                used[j] = True
-        clustered.append(float(np.mean(cluster)))
-    if len(clustered) <= max_n:
-        return sorted(clustered)
-    clustered.sort(key=lambda x: abs(x - ref_price))
-    return sorted(clustered[:max_n])
-
-
-def calc_volume_profile(
-    df: pd.DataFrame,
-    bins: int = 50,
-    value_area_pct: float = 0.70,
-) -> Dict:
-    """
-    Volume Profile approximated from OHLCV — there's no tick-level trade
-    data available (Gate.io's public API doesn't provide it, and we don't
-    want to pull the full trade stream just for this), so this is a
-    TPO-style approximation, not a "real" exchange volume profile: each
-    bar's volume is distributed evenly across the price bins its
-    [low, high] range spans, instead of weighting toward where trades
-    actually printed within the bar. This is the standard approach used by
-    most retail tools that only have OHLCV, and gives a statistically
-    reasonable POC/Value Area — just not pixel-identical to what a
-    tick-level profile would show.
-
-    Returns:
-        {
-            "poc": float | None,   # Point of Control — price bin with the most volume
-            "vah": float | None,   # Value Area High
-            "val": float | None,   # Value Area Low
-            "bins": [{"price": float, "volume": float}, ...],  # for histogram rendering, low to high
-        }
-    """
-    empty = {"poc": None, "vah": None, "val": None, "bins": []}
-    if len(df) < 10:
-        return empty
-
-    price_min = float(df["low"].min())
-    price_max = float(df["high"].max())
-    if price_max <= price_min:
-        return empty
-
-    bin_width = (price_max - price_min) / bins
-    volume_by_bin = np.zeros(bins)
-
-    for row in df.itertuples():
-        low, high, vol = float(row.low), float(row.high), float(row.volume)
-        if vol <= 0:
-            continue
-        if high <= low:
-            # doji / zero-range bar — dump its volume into a single bin
-            idx = min(max(int((low - price_min) / bin_width), 0), bins - 1)
-            volume_by_bin[idx] += vol
-            continue
-        first_bin = min(max(int((low - price_min) / bin_width), 0), bins - 1)
-        last_bin = min(max(int((high - price_min) / bin_width), 0), bins - 1)
-        n_spanned = last_bin - first_bin + 1
-        volume_by_bin[first_bin:last_bin + 1] += vol / n_spanned
-
-    total_volume = float(volume_by_bin.sum())
-    if total_volume <= 0:
-        return empty
-
-    poc_idx = int(np.argmax(volume_by_bin))
-    poc_price = price_min + (poc_idx + 0.5) * bin_width
-
-    # Expand the Value Area outward from the POC bin — at each step, add
-    # whichever neighbor (above or below) has more volume — until we've
-    # covered value_area_pct of the total.
-    target_volume = total_volume * value_area_pct
-    covered_volume = float(volume_by_bin[poc_idx])
-    lo_idx = hi_idx = poc_idx
-    while covered_volume < target_volume and (lo_idx > 0 or hi_idx < bins - 1):
-        vol_below = float(volume_by_bin[lo_idx - 1]) if lo_idx > 0 else -1.0
-        vol_above = float(volume_by_bin[hi_idx + 1]) if hi_idx < bins - 1 else -1.0
-        if vol_above >= vol_below:
-            hi_idx += 1
-            covered_volume += float(volume_by_bin[hi_idx])
-        else:
-            lo_idx -= 1
-            covered_volume += float(volume_by_bin[lo_idx])
-
-    val_price = price_min + lo_idx * bin_width
-    vah_price = price_min + (hi_idx + 1) * bin_width
-
-    bins_out = [
-        {"price": round_price(price_min + (i + 0.5) * bin_width), "volume": round(float(volume_by_bin[i]), 4)}
-        for i in range(bins)
-    ]
-
-    return {
-        "poc": round_price(poc_price),
-        "vah": round_price(vah_price),
-        "val": round_price(val_price),
-        "bins": bins_out,
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────
