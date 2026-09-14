@@ -124,18 +124,30 @@ _exchange_ref: Optional[ccxt.Exchange] = None
 _closure_notified_file = os.path.join(DATA_DIR, "closure_notified.json")
 _CLOSURE_NOTIFIED_MAX = 2000  # 🆕 FIX: the set used to grow unbounded (1 ID per closed trade, forever)
 
-def _load_closure_notified() -> set:
-    """Load set of already-notified trade IDs."""
+def _load_closure_notified() -> dict:
+    """Load already-notified trade IDs as an insertion-ordered set.
+
+    🆕 FIX (external review): this used to return a plain `set`. Sets don't
+    preserve insertion/temporal order, so trimming in
+    _save_closure_notified() via `list(notified)[-MAX:]` kept an arbitrary
+    MAX entries rather than the most recently notified ones — after enough
+    closures, an old ID could survive the trim while a recent one got
+    dropped, causing that trade's closure to be (re-)notified again later.
+    A `dict` (ordered by insertion since Python 3.7, unused values) is a
+    drop-in ordered-set replacement: same O(1) `in`/add, but trimming now
+    reliably keeps the last _CLOSURE_NOTIFIED_MAX IDs by the order they
+    were actually added.
+    """
     try:
         with open(_closure_notified_file, "r") as f:
-            return set(json.load(f))
+            return dict.fromkeys(json.load(f))
     except Exception:
-        return set()
+        return {}
 
-def _save_closure_notified(notified: set):
-    """Save notified trade IDs. Trimmed to the last _CLOSURE_NOTIFIED_MAX so the file doesn't grow forever."""
+def _save_closure_notified(notified: dict):
+    """Save notified trade IDs. Trimmed to the last _CLOSURE_NOTIFIED_MAX (by insertion order) so the file doesn't grow forever."""
     try:
-        ids = list(notified)
+        ids = list(notified.keys())
         if len(ids) > _CLOSURE_NOTIFIED_MAX:
             ids = ids[-_CLOSURE_NOTIFIED_MAX:]
         temp = _closure_notified_file + ".tmp"
@@ -509,7 +521,7 @@ async def market_scanner():
                                             )
                                         except Exception as discord_err:
                                             logger.error(f"[DISCORD] Failed to send trade closed for {ticker} {tf}: {discord_err}", exc_info=True)
-                                    notified_ids.add(trade_id)
+                                    notified_ids[trade_id] = None
                                     _save_closure_notified(notified_ids)
                                     st[notified_key] = True
                                 except ValueError:
