@@ -63,6 +63,11 @@ from state import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price
 from config import ONCHAIN_ENABLED
 import spread
+# 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
+# market_structure.py / relative_strength.py docstrings for why these are
+# separate modules that know nothing about confidence/TP themselves.
+from market_structure import get_market_structure
+from relative_strength import get_relative_strength
 
 logger = logging.getLogger(__name__)
 
@@ -852,12 +857,18 @@ async def open_position(
         state[last_bar_key] = bar_idx_val               # debug/backward compatibility
         state[f"last_{track}_{side}_time"] = bar_time_val
 
+    # 🆕 conf is now computed before add_signal_record() so the persisted
+    # record can carry *why* the score came out the way it did
+    # (confidence_components) instead of the score being purely ephemeral
+    # display info as before.
+    conf, confidence_components = calc_confidence(side == "long")
+
     if not dry_run:
         # 🆕 FIX: pass track through so A- and U-track records don't get mixed up in history
-        add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime, track=track)
+        add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime,
+                           track=track, confidence_components=confidence_components)
 
     stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
-    conf = calc_confidence(side == "long")
 
     return (signal_label, close_v, regime, lev, int(df["timestamp"].iloc[idx]), conf, sl, tp, tp1, risk, stats, tp_desc)
 
@@ -1004,6 +1015,27 @@ async def check_signals(
             hurst_ok = _hurst_passes(float(hurst.iloc[idx]), _cfg.HURST_MODE, _cfg.HURST_MIN_DEVIATION)
 
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
+
+        # 🆕 Market structure (POC/VA/S-R) and relative-strength context —
+        # informational only at this stage: nothing thresholds on
+        # calc_confidence()'s score today, and adding these two doesn't
+        # change that. They only feed a couple of new, separately-labeled
+        # components inside calc_confidence() below, so their real
+        # contribution can be checked against actual trade outcomes later
+        # instead of just trusted because they were added. Wrapped
+        # defensively — neither should ever be able to break the core
+        # signal pipeline if the exchange call or the calc itself hiccups.
+        market_structure = None
+        try:
+            market_structure = get_market_structure(df, ticker, timeframe)
+        except Exception as e:
+            logger.warning(f"[MARKET_STRUCTURE] {ticker} {timeframe}: {e}")
+
+        rel_strength = None
+        try:
+            rel_strength = await get_relative_strength(exchange, df, ticker, timeframe)
+        except Exception as e:
+            logger.warning(f"[RELATIVE_STRENGTH] {ticker} {timeframe}: {e}")
 
         vol_info = volume_flow_signal_v3(df)
         vol_lev_reason = "no signal"
@@ -1193,16 +1225,55 @@ async def check_signals(
             oc_bias_short     = onchain_bias.get("bias_short",     0)
             oc_lev_delta      = onchain_bias.get("lev_delta",      0)
 
-        def calc_confidence(is_long: bool) -> int:
-            score = 20 if chop_ok else 0
-            score += 20 if atr_ok else 0
-            score += 15 if (frama_bull if is_long else frama_bear) else 0
+        def calc_confidence(is_long: bool) -> Tuple[int, Dict[str, float]]:
+            """Returns (final_score, components). Components are logged into
+            the signal history (add_signal_record's confidence_components
+            param) instead of only being folded into the score, so a new
+            component's real contribution can be checked against actual
+            trade outcomes later — rather than assumed to help just because
+            it was added (external review).
+
+            Still purely informational at this stage: nothing gates trade
+            entry on this score today, this function only decides what
+            gets displayed/logged.
+            """
+            components: Dict[str, float] = {
+                "regime_chop": 20 if chop_ok else 0,
+                "regime_atr": 20 if atr_ok else 0,
+                "frama": 15 if (frama_bull if is_long else frama_bear) else 0,
+            }
             a_sig = sig_a_long if is_long else sig_a_short
             u_sig = sig_u_long if is_long else sig_u_short
-            score += 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
-            score += 20 if (htf_bull if is_long else htf_bear) else 0
-            score += oc_bias_long if is_long else oc_bias_short
-            return max(0, min(100, score))
+            components["signal_confluence"] = 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0
+            components["htf_bias"] = 20 if (htf_bull if is_long else htf_bear) else 0
+            components["onchain_bias"] = oc_bias_long if is_long else oc_bias_short
+
+            # 🆕 New components (external review) — deliberately kept small
+            # and separate from the core confirmations above: until real
+            # outcomes show whether they carry information, they should be
+            # able to nudge a borderline signal, not dominate one the way
+            # an equal-weight "+1 per extra confirmation" would risk doing
+            # with several correlated confirmations already in play.
+            rs_component = 0
+            if rel_strength is not None:
+                trend = rel_strength.get("trend")
+                if trend == "up":
+                    rs_component = 5 if is_long else -5
+                elif trend == "down":
+                    rs_component = -5 if is_long else 5
+            components["relative_strength"] = rs_component
+
+            vp_component = 0
+            if market_structure is not None:
+                loc = market_structure.price_location
+                if loc == "above_vah":
+                    vp_component = 5 if is_long else -5
+                elif loc == "below_val":
+                    vp_component = -5 if is_long else 5
+            components["volume_profile"] = vp_component
+
+            score = max(0, min(100, sum(components.values())))
+            return score, components
 
         async def _safe_open_position(track: str, side: str):
             """Wraps open_position with exception safety (Kimi review #2).

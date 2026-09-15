@@ -210,6 +210,7 @@ def add_signal_record(
     regime: str = "unknown",
     track: str = "a",
     synthetic: bool = False,
+    confidence_components: Optional[Dict[str, float]] = None,
 ):
     """Adds a record for a new signal.
 
@@ -221,6 +222,14 @@ def add_signal_record(
     would close/update the wrong trade.
     `synthetic` marks records created outside the real scanner (e.g. !sim),
     so they're excluded from adaptive TP/SL calibration.
+
+    🆕 confidence_components (external review): the named breakdown behind
+    calc_confidence()'s score (regime_chop, htf_bias, relative_strength,
+    volume_profile, ...), persisted alongside the trade instead of only
+    ever existing as an ephemeral display value. Purely a record for later
+    analysis — nothing reads this back to affect trading decisions today.
+    Optional and additive: older records simply won't have this key, and
+    every existing reader of history records uses .get() already.
     """
     history = load_signals_history()
     _ensure_history_slot(history, ticker, tf)
@@ -237,6 +246,7 @@ def add_signal_record(
         "regime": regime,
         "track": track,
         "synthetic": synthetic,
+        "confidence_components": confidence_components,
     }
 
     history[ticker][tf][side].append(record)
