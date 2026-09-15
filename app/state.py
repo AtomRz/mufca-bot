@@ -211,6 +211,9 @@ def add_signal_record(
     track: str = "a",
     synthetic: bool = False,
     confidence_components: Optional[Dict[str, float]] = None,
+    tp_raw: Optional[float] = None,
+    cap_reason: Optional[str] = None,
+    cap_level: Optional[float] = None,
 ):
     """Adds a record for a new signal.
 
@@ -228,8 +231,18 @@ def add_signal_record(
     volume_profile, ...), persisted alongside the trade instead of only
     ever existing as an ephemeral display value. Purely a record for later
     analysis — nothing reads this back to affect trading decisions today.
-    Optional and additive: older records simply won't have this key, and
-    every existing reader of history records uses .get() already.
+
+    🆕 tp_raw / cap_reason / cap_level (external review, TP-obstacle
+    stage): tp_raw is calculate_combined_tp()'s own output before any
+    obstacle cap (see apply_tp_obstacle_cap()); cap_reason/cap_level
+    describe which level capped it, if any. The record's own entry/exit
+    still reflect the EXECUTED (possibly capped) trade — these three
+    fields are only here so a capped trade's raw target stays visible for
+    later analysis of whether capping is actually a net improvement.
+
+    All of the above are optional and additive: older records simply
+    won't have these keys, and every existing reader of history records
+    already uses .get() rather than direct indexing.
     """
     history = load_signals_history()
     _ensure_history_slot(history, ticker, tf)
@@ -247,6 +260,9 @@ def add_signal_record(
         "track": track,
         "synthetic": synthetic,
         "confidence_components": confidence_components,
+        "tp_raw": tp_raw,
+        "cap_reason": cap_reason,
+        "cap_level": cap_level,
     }
 
     history[ticker][tf][side].append(record)
@@ -273,9 +289,42 @@ def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
     return None
 
 
+def _find_tracking_record(records: List[Dict], track: str) -> Optional[Dict]:
+    """Finds the most recently CLOSED record for this track that's still
+    within its raw-outcome observation window — see update_raw_outcome()
+    for what that window is and why it exists."""
+    for rec in reversed(records):
+        if (rec.get("exit_type") not in (None, "open")
+                and rec.get("track") == track
+                and rec.get("raw_tracking_bars_remaining", 0) > 0):
+            return rec
+    return None
+
+
 def _pct_move(side: str, entry: float, price: float) -> float:
     """% price move in favor of the position — shared formula for long/short."""
     return (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
+
+
+def _fav_adv_prices(side: str, current_price: float, high: Optional[float], low: Optional[float]) -> Tuple[float, float]:
+    """Returns (favorable_price, adverse_price) — which OHLC extreme
+    favors vs hurts the position, for the given side. Falls back to
+    current_price for both when high/low aren't given (matches !sim-style
+    callers that only have a single reference price, not a bar)."""
+    fav_price = (high if high is not None else current_price) if side == "long" else (low if low is not None else current_price)
+    adv_price = (low if low is not None else current_price) if side == "long" else (high if high is not None else current_price)
+    return fav_price, adv_price
+
+
+def _fav_adv_pct(side: str, entry: float, fav_price: float, adv_price: float) -> Tuple[float, float]:
+    """% favorable / % adverse move from entry, for the given side."""
+    if side == "long":
+        favorable = (fav_price - entry) / entry * 100
+        adverse = (entry - adv_price) / entry * 100
+    else:
+        favorable = (entry - fav_price) / entry * 100
+        adverse = (adv_price - entry) / entry * 100
+    return favorable, adverse
 
 
 def update_signal_record(
@@ -311,6 +360,19 @@ def update_signal_record(
     rec["bars_held"] = bars_held
     rec["tp1_hit"] = bool(tp1_hit)
     entry = rec["entry"]
+
+    # 🆕 (external review, TP-obstacle stage): seed the raw-outcome
+    # tracking fields at close — see update_raw_outcome()'s docstring for
+    # why max_favorable_pct/max_adverse_pct alone aren't a policy-free
+    # read of the market. raw_mfe_pct/raw_mae_pct start as a copy of
+    # what's already been observed and keep extending for
+    # max(0, MAX_HOLD_BARS - bars_held) more bars — the same total
+    # horizon this trade could have run to anyway had it not exited
+    # early — via update_raw_outcome(), called every scan tick
+    # regardless of whether a position is currently open.
+    rec["raw_mfe_pct"] = rec.get("max_favorable_pct", 0.0)
+    rec["raw_mae_pct"] = rec.get("max_adverse_pct", 0.0)
+    rec["raw_tracking_bars_remaining"] = max(0, _cfg.MAX_HOLD_BARS - bars_held)
 
     if tp1_hit and tp1_price is not None:
         tp1_leg_pct = _pct_move(side, entry, tp1_price)      # first 50%, locked in at TP1
@@ -387,15 +449,8 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
 
     if rec is not None:
         entry = rec["entry"]
-        fav_price = (high if high is not None else current_price) if side == "long" else (low if low is not None else current_price)
-        adv_price = (low if low is not None else current_price) if side == "long" else (high if high is not None else current_price)
-
-        if side == "long":
-            favorable = (fav_price - entry) / entry * 100
-            adverse = (entry - adv_price) / entry * 100
-        else:
-            favorable = (entry - fav_price) / entry * 100
-            adverse = (adv_price - entry) / entry * 100
+        fav_price, adv_price = _fav_adv_prices(side, current_price, high, low)
+        favorable, adverse = _fav_adv_pct(side, entry, fav_price, adv_price)
 
         new_favorable = round(max(float(rec.get("max_favorable_pct", 0)), favorable), 4)
         new_adverse = round(max(float(rec.get("max_adverse_pct", 0)), adverse), 4)
@@ -404,6 +459,72 @@ def update_signal_mae_mfe(ticker: str, tf: str, side: str, current_price: float,
             rec["max_favorable_pct"] = new_favorable
             rec["max_adverse_pct"] = new_adverse
             save_signals_history(history)
+
+
+def update_raw_outcome(ticker: str, tf: str, side: str, current_price: float, track: str = "a",
+                        high: Optional[float] = None, low: Optional[float] = None,
+                        is_new_bar: bool = False):
+    """Continues tracking MFE/MAE for a CLOSED record for a fixed number of
+    bars after exit (raw_tracking_bars_remaining, seeded in
+    update_signal_record()), independent of whatever TP/SL actually closed
+    the trade. Call this every scan tick for every track, regardless of
+    whether a position is currently open — most ticks will simply find no
+    record in its observation window and do nothing.
+
+    🆕 (external review, TP-obstacle stage): hitting TP or SL closes the
+    position, and update_signal_mae_mfe() only ever updates a record while
+    exit_type == "open" — so max_favorable_pct is truncated at whatever
+    level the CURRENT TP policy happened to close the trade at. That makes
+    "raw" adaptive TP already policy-contaminated: the training
+    distribution reflects the outcome of the previous TP policy, not an
+    independent read of the market. Continuing to watch price for
+    max(0, MAX_HOLD_BARS - bars_held) bars after close — the same total
+    horizon this trade could have run to anyway had it not exited early —
+    gives a genuine counterfactual: raw_mfe_pct/raw_mae_pct approximate
+    "what if this position had never been closed early". Any future TP
+    policy (adaptive percentile, an S/R-obstacle cap, or anything else)
+    should be validated against raw_mfe_pct, and adaptive TP/SL
+    calibration should eventually learn from it too — NOT from a figure
+    that already reflects being capped by the very policy being evaluated.
+
+    This function only ever writes the new raw_* fields. It never touches
+    max_favorable_pct/max_adverse_pct or any other field the CURRENT
+    adaptive TP/SL calibration reads — so introducing it cannot change
+    today's adaptive TP/SL behavior.
+    """
+    history = load_signals_history()
+    if ticker not in history or tf not in history[ticker]:
+        return
+
+    records = history[ticker][tf][side]
+    rec = _find_tracking_record(records, track)
+    if rec is None:
+        return
+
+    entry = rec["entry"]
+    fav_price, adv_price = _fav_adv_prices(side, current_price, high, low)
+    favorable, adverse = _fav_adv_pct(side, entry, fav_price, adv_price)
+
+    new_raw_favorable = round(max(float(rec.get("raw_mfe_pct", 0)), favorable), 4)
+    new_raw_adverse = round(max(float(rec.get("raw_mae_pct", 0)), adverse), 4)
+
+    changed = False
+    if new_raw_favorable != rec.get("raw_mfe_pct"):
+        rec["raw_mfe_pct"] = new_raw_favorable
+        changed = True
+    if new_raw_adverse != rec.get("raw_mae_pct"):
+        rec["raw_mae_pct"] = new_raw_adverse
+        changed = True
+
+    # Only spend a bar off the observation window on an actual new closed
+    # bar — this function may be called several times within the same
+    # bar (once per scan tick), same as update_signal_mae_mfe already is.
+    if is_new_bar:
+        rec["raw_tracking_bars_remaining"] = max(0, rec.get("raw_tracking_bars_remaining", 0) - 1)
+        changed = True
+
+    if changed:
+        save_signals_history(history)
 
 
 # =====================================================================
@@ -918,3 +1039,102 @@ def calculate_combined_tp(
         desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
 
     return tp1, tp2, desc
+
+
+def apply_tp_obstacle_cap(
+    entry: float,
+    side: str,
+    sl: float,
+    raw_tp2: float,
+    market_structure: Optional[Any],
+    min_rr: float,
+) -> Dict:
+    """Caps a raw adaptive TP2 target against the nearest SIGNIFICANT
+    obstacle between entry and the target — a support/resistance level
+    (market_structure.resistance_levels / .support_levels, each with a
+    "touches" count) or the Volume Profile's POC/VAH/VAL.
+
+    market_structure is duck-typed here on purpose (expects .poc, .vah,
+    .val, .support_levels, .resistance_levels) rather than imported as
+    market_structure.MarketStructure — this module (the TP engine) reads
+    levels, it has no need to depend on how they're computed. Pass a
+    market_structure.MarketStructure instance, or None to skip capping
+    entirely (e.g. when it couldn't be computed this bar).
+
+    Guards, both required before a cap is ever applied:
+      - significance: an S/R level needs >= _cfg.TP_CAP_MIN_TOUCHES raw
+        pivot touches (see market_structure._cluster_levels) to count —
+        a level formed by a single stray pivot shouldn't be able to
+        systematically clip profit. POC/VAH/VAL are always significant
+        (they're already the single most important price/volume levels
+        on the chart, not clustered pivots).
+      - min_rr: if capping to the nearest significant obstacle would put
+        R:R below min_rr (the same MIN_RR the normal entry gate already
+        enforces — see check_signals), the cap is skipped and tp2_raw is
+        used uncapped instead. A trade this close to a real level is
+        exactly the case that should be evaluated at its normal target,
+        not artificially forced into a bad R:R just because something
+        happens to sit nearby.
+
+    Returns:
+        {
+            "tp2_raw": float,              # unchanged — calculate_combined_tp()'s own output
+            "tp2": float,                  # execution target: capped if applicable, else == tp2_raw
+            "cap_reason": Optional[str],   # e.g. "resistance@2650.0 (3 touches)"
+            "cap_level": Optional[float],
+        }
+
+    Deliberately does NOT touch calculate_combined_tp()'s training data
+    (max_favorable_pct, read from signals_history.json) — see
+    update_raw_outcome()'s docstring for why raw and capped outcomes must
+    stay separate for now. tp2_raw is exactly what the adaptive percentile
+    model already produced; only tp2 (the executed target) changes here.
+    """
+    result = {"tp2_raw": round_price(raw_tp2), "tp2": round_price(raw_tp2), "cap_reason": None, "cap_level": None}
+
+    if market_structure is None:
+        return result
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return result
+
+    is_long = side == "long"
+    candidates = []  # (level_price, label, touches_or_None)
+
+    if is_long:
+        for lvl in market_structure.resistance_levels:
+            if entry < lvl["price"] < raw_tp2:
+                candidates.append((lvl["price"], "resistance", lvl["touches"]))
+        if market_structure.vah is not None and entry < market_structure.vah < raw_tp2:
+            candidates.append((market_structure.vah, "VAH", None))
+        if market_structure.poc is not None and entry < market_structure.poc < raw_tp2:
+            candidates.append((market_structure.poc, "POC", None))
+    else:
+        for lvl in market_structure.support_levels:
+            if raw_tp2 < lvl["price"] < entry:
+                candidates.append((lvl["price"], "support", lvl["touches"]))
+        if market_structure.val is not None and raw_tp2 < market_structure.val < entry:
+            candidates.append((market_structure.val, "VAL", None))
+        if market_structure.poc is not None and raw_tp2 < market_structure.poc < entry:
+            candidates.append((market_structure.poc, "POC", None))
+
+    # VP levels (touches=None) are always significant; S/R levels need the
+    # configured minimum touch count.
+    significant = [c for c in candidates if c[2] is None or c[2] >= _cfg.TP_CAP_MIN_TOUCHES]
+    if not significant:
+        return result
+
+    # Nearest significant obstacle to ENTRY — the first one price would
+    # actually have to clear — not the nearest to raw_tp2.
+    level_price, label, touches = min(significant, key=lambda c: abs(c[0] - entry))
+
+    candidate_rr = abs(level_price - entry) / risk
+    if candidate_rr < min_rr:
+        return result
+
+    result["tp2"] = round_price(level_price)
+    result["cap_level"] = round_price(level_price)
+    touches_suffix = f" ({touches} touches)" if touches is not None else ""
+    result["cap_reason"] = f"{label}@{round_price(level_price)}{touches_suffix}"
+    return result

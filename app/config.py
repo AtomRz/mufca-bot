@@ -500,6 +500,16 @@ BB_PERIOD = _indicators["BB_PERIOD"]
 BB_STDDEV = _indicators["BB_STDDEV"]
 SR_PIVOT_WINDOW = _indicators["SR_PIVOT_WINDOW"]
 SR_MAX_LEVELS = _indicators["SR_MAX_LEVELS"]
+
+# 🆕 TP obstacle-cap (external review, TP-obstacle stage): a support/
+# resistance level needs at least this many raw pivot touches (see
+# market_structure._cluster_levels' touch-count) to be considered
+# significant enough to cap an adaptive TP2 target against — a level
+# formed from a single stray pivot shouldn't be able to systematically
+# clip profit. POC/VAH/VAL from the Volume Profile are always treated as
+# significant regardless of this setting (they're already the single most
+# important price/volume levels on the chart, not clustered pivots).
+TP_CAP_MIN_TOUCHES = 2
 # 🆕 Minimum history depth for finding S/R pivots in get_chart_data() —
 # independent of the UI's selected barsLimit (100/200/300/500 bars). Levels
 # formed deeper than the visible window still need to be included in the

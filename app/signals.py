@@ -55,8 +55,10 @@ from state import (
     add_signal_record,
     update_signal_record,
     update_signal_mae_mfe,
+    update_raw_outcome,
     get_signal_stats,
     calculate_combined_tp,
+    apply_tp_obstacle_cap,
     normalize_timestamp,
     is_before_ts,
 )
@@ -698,6 +700,7 @@ async def open_position(
     calc_confidence,
     MIN_RR: float,
     spread_info: Optional[Dict] = None,
+    market_structure: Optional[Any] = None,
 ) -> Optional[Tuple]:
     """
     Unified position opening logic for any track (a/u) and side (long/short).
@@ -740,6 +743,15 @@ async def open_position(
         close_v, sl, tp, side, onchain_bias, min_rr=MIN_RR
     )
     tp_desc += oc_desc
+
+    # 🆕 TP obstacle cap (external review, TP-obstacle stage): applied
+    # here — after the on-chain adjustment, before TP1 is proportionally
+    # rebuilt from tp2 below — so TP1 always stays consistent with
+    # whatever TP2 actually ends up being executed at, capped or not.
+    cap_info = apply_tp_obstacle_cap(close_v, side, sl, tp, market_structure, MIN_RR)
+    tp = cap_info["tp2"]
+    if cap_info["cap_reason"]:
+        tp_desc += f" | capped@{cap_info['cap_reason']}"
 
     # Recompute TP1 proportionally if on-chain changed TP2.
     # Without this, when tp_mult < 1.0, TP1 > TP2 becomes possible (for a
@@ -831,7 +843,7 @@ async def open_position(
         "side": side,
         "entry": close_v,
         "sl": sl,
-        "tp": tp,    # TP2 — target for 100% of the position
+        "tp": tp,    # TP2 — target for 100% of the position (execution target: capped if applicable)
         "tp1": tp1,  # TP1 — statistical, target for 50% of the position
         "lev": lev,
         "bar_opened": idx,
@@ -841,6 +853,13 @@ async def open_position(
         # fetched df.
         "bar_opened_time": int(df["timestamp"].iloc[idx]),
         "tp1_hit": False,  # flag: TP1 notification already sent
+        # 🆕 (external review, TP-obstacle stage): tp_raw is what
+        # calculate_combined_tp() actually produced, before any obstacle
+        # cap — kept alongside the executed "tp" purely for the record;
+        # nothing reads it back to affect trading decisions today.
+        "tp_raw": cap_info["tp2_raw"],
+        "cap_reason": cap_info["cap_reason"],
+        "cap_level": cap_info["cap_level"],
     }
     state[bars_key] = 0
 
@@ -866,7 +885,8 @@ async def open_position(
     if not dry_run:
         # 🆕 FIX: pass track through so A- and U-track records don't get mixed up in history
         add_signal_record(ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime,
-                           track=track, confidence_components=confidence_components)
+                           track=track, confidence_components=confidence_components,
+                           tp_raw=cap_info["tp2_raw"], cap_reason=cap_info["cap_reason"], cap_level=cap_info["cap_level"])
 
     stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
 
@@ -934,6 +954,16 @@ async def check_signals(
                     if state[bars_key] >= MAX_HOLD_BARS:
                         close_trade(state, last_close, "cancelled", ticker, timeframe, track)
                         logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
+            else:
+                # 🆕 (external review, TP-obstacle stage): no active trade on
+                # this track right now doesn't mean nothing needs updating —
+                # a just-closed record may still be inside its raw-outcome
+                # observation window (see update_raw_outcome()). Checked for
+                # both sides since we don't know here which side the most
+                # recently closed trade was on.
+                for closed_side in ("long", "short"):
+                    update_raw_outcome(ticker, timeframe, closed_side, last_close, track=track,
+                                        high=last_high, low=last_low, is_new_bar=is_new_bar)
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1290,7 +1320,8 @@ async def check_signals(
             try:
                 return await open_position(state, track, side, close_v, fs, fu, fl, atr14, df, idx,
                                             ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, dry_run,
-                                            calc_confidence, MIN_RR, spread_info=spread_info)
+                                            calc_confidence, MIN_RR, spread_info=spread_info,
+                                            market_structure=market_structure)
             except Exception as e:
                 logger.error(f"[OPEN_POSITION] {ticker} {timeframe} {track.upper()}-{side.upper()} failed: {e}", exc_info=True)
                 if not dry_run:
