@@ -554,6 +554,20 @@ TARGET_RISK_DEP = 5.0
 # get_market_pulse() for the topbar R:R indicator; single source of truth.
 MIN_RR = 1.5
 
+# 🆕 (external review): TP1/TP2 fallback R:R multipliers, used only when
+# calculate_adaptive_tp() doesn't have enough closed history yet (< 3
+# signals) to compute a real statistical TP1. TP2_FALLBACK_RR must stay
+# strictly greater than TP1_FALLBACK_RR — calculate_combined_tp() used to
+# apply a 1.5R "floor" to TP2 in this situation, assuming TP1 was a real
+# (possibly too-close) statistical estimate; but the TP1 fallback itself
+# is already 2.0R, wider than that floor, so the floor never actually
+# bound and TP1 == TP2 on every signal for a ticker/tf/side/track with
+# under 3 closed trades — collapsing the two-stage 50%/50% TP into a
+# single target. TP2_FALLBACK_RR is used directly (not as a floor) in
+# that case instead, so the two stay meaningfully distinct.
+TP1_FALLBACK_RR = 2.0
+TP2_FALLBACK_RR = 3.0
+
 # 🆕 A single OHLC bar can't tell you whether price touched SL or TP first
 # intrabar — only that both happened to be crossed somewhere within that
 # bar's high/low range. This was always resolved by checking SL first (see

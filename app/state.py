@@ -831,7 +831,7 @@ def calculate_adaptive_tp(
     regime: Optional[str] = None,
     as_of: Optional[str] = None,
     track: Optional[str] = None,
-) -> float:
+) -> Tuple[float, bool]:
     """
     Adaptive TP based on historical MFE with a hit-rate feedback loop.
 
@@ -850,13 +850,19 @@ def calculate_adaptive_tp(
     as_of — see get_signal_stats' docstring; same look-ahead-prevention
     purpose, independent filter since this pulls its own records directly
     rather than through get_signal_stats.
+
+    Returns (tp, is_fallback). 🆕 (external review): is_fallback tells the
+    caller (calculate_combined_tp()) whether this TP came from real
+    historical MFE data or from the generic TP1_FALLBACK_RR estimate —
+    see TP2_FALLBACK_RR's config comment for why that distinction matters
+    for TP2.
     """
     history = load_signals_history()
     risk = abs(entry - current_sl)
-    fallback_tp = entry + (2.0 * risk) if side == "long" else entry - (2.0 * risk)
+    fallback_tp = entry + (_cfg.TP1_FALLBACK_RR * risk) if side == "long" else entry - (_cfg.TP1_FALLBACK_RR * risk)
 
     if ticker not in history or tf not in history[ticker]:
-        return round_price(fallback_tp)
+        return round_price(fallback_tp), True
 
     records = history[ticker][tf][side]
     if track is not None:
@@ -868,7 +874,7 @@ def calculate_adaptive_tp(
         closed = [r for r in closed if is_before_ts(r.get("timestamp"), as_of)]
 
     if len(closed) < 3:
-        return round_price(fallback_tp)
+        return round_price(fallback_tp), True
 
     # 🆕 FIX: HYBRID LOGIC BY REGIME
     use_records = []
@@ -930,7 +936,7 @@ def calculate_adaptive_tp(
     weighted_mfes = _extract_weighted_mfes(recent)
 
     if not weighted_mfes:
-        return round_price(fallback_tp)
+        return round_price(fallback_tp), True
 
     mfe_values = [m for m, _w in weighted_mfes]
     mfe_weights = [w for _m, w in weighted_mfes]
@@ -970,7 +976,7 @@ def calculate_adaptive_tp(
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)
 
     logger.info(f"[TP] {ticker} {tf} {side}: {tp_pct:.2f}% | pct={adjusted_percentile:.0%} (base={base_percentile:.0%}) | {regime_info} | {hit_rate_info} | capture={'full' if regime_discount >= 1.0 else 'soft'}")
-    return round_price(tp)
+    return round_price(tp), False
 
 
 def calculate_combined_tp(
@@ -1021,22 +1027,46 @@ def calculate_combined_tp(
     atr_at_idx = float(atr14.iloc[idx]) if hasattr(atr14, "iloc") else (float(atr14) if atr14 is not None else None)
 
     # ── TP1: purely statistical, no R:R cap ───────────────────────
-    tp1 = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr_at_idx, regime, as_of=as_of, track=track)
+    tp1, tp1_is_fallback = calculate_adaptive_tp(ticker, tf, side, entry, sl, atr_at_idx, regime, as_of=as_of, track=track)
 
-    # ── TP2: with R:R cap (minimum 1.5) ──────────────────────────────────
-    min_rr_tp = entry + 1.5 * risk if side == "long" else entry - 1.5 * risk
-    if side == "long":
-        tp2 = max(tp1, min_rr_tp)
+    # ── TP2: with an R:R cap (minimum MIN_RR) ─────────────────────────────
+    # 🆕 FIX (external review): this used to apply a flat 1.5R FLOOR to TP2
+    # regardless of how TP1 was computed — max(tp1, floor) for long,
+    # min(tp1, floor) for short. That's correct when tp1 is a real
+    # statistical estimate that might come out too close. But when TP1 has
+    # fewer than 3 closed signals to work with, calculate_adaptive_tp()
+    # falls back to a flat TP1_FALLBACK_RR (2.0R) estimate instead — which
+    # is already wider than the 1.5R floor, so the floor never actually
+    # bound: max/min(2.0R, 1.5R) always resolves back to the 2.0R value,
+    # making TP2 == TP1 exactly on every signal for a ticker/tf/side/track
+    # with under 3 closed trades (collapsing the intended two-stage
+    # 50%/50% TP into one single target — the bug this comment is fixing).
+    # When TP1 is a fallback, TP2 now uses the separate, strictly wider
+    # TP2_FALLBACK_RR directly instead of a floor that can't do anything.
+    if tp1_is_fallback:
+        tp2 = entry + _cfg.TP2_FALLBACK_RR * risk if side == "long" else entry - _cfg.TP2_FALLBACK_RR * risk
     else:
-        tp2 = min(tp1, min_rr_tp)
+        min_rr_tp = entry + _cfg.MIN_RR * risk if side == "long" else entry - _cfg.MIN_RR * risk
+        tp2 = max(tp1, min_rr_tp) if side == "long" else min(tp1, min_rr_tp)
     tp2 = round_price(tp2)
 
-    if stats["count"] >= 5:
+    # 🆕 FIX (external review): this description used to branch on
+    # stats["count"] as a PROXY for "was TP1 a real statistical estimate or
+    # a fallback" — but stats["count"] (from get_signal_stats(), used for
+    # display) and calculate_adaptive_tp()'s own internal closed-trade count
+    # (used for the actual tp1_is_fallback decision) aren't necessarily the
+    # same number, and the fallback R:R was hardcoded as "2.0" text
+    # regardless of TP2_FALLBACK_RR's actual configured value. Branch on
+    # tp1_is_fallback directly — the thing that actually determines what
+    # happened — and read both multipliers from config so the message can
+    # never drift from the real numbers used above.
+    if not tp1_is_fallback:
         active_pct = _cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE
         hit_info = f" | Hit rate: {stats.get('tp_hit_rate', 0):.1%}" if stats.get('tp_hit_rate', 0) > 0 else ""
         desc = f"📚 Adaptive {active_pct:.0%} %ile [{mode_label}] | {stats['count']} signals{hit_info}{regime_label}"
     else:
-        desc = f"📐 Fallback R:R 2.0 (only {stats['count']} signals){regime_label}"
+        desc = (f"📐 Fallback TP1 R:R {_cfg.TP1_FALLBACK_RR:.1f} / TP2 R:R {_cfg.TP2_FALLBACK_RR:.1f} "
+                f"(only {stats['count']} signals){regime_label}")
 
     return tp1, tp2, desc
 
