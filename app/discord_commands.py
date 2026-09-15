@@ -881,6 +881,82 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         logger.error(f"Signals command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
+@core.bot.command(name="components", aliases=["confcomp"])
+async def components_cmd(ctx, min_samples: int = 30):
+    """
+    🆕 (external review): reports whether the relative_strength /
+    volume_profile confidence components (see calc_confidence() in
+    signals.py) actually correlate with trade outcomes, bucketed by
+    (side, component value) — long/short kept separate since these are
+    direction-dependent bonuses/penalties; pooling them could hide a real
+    effect that flips sign with direction, or fabricate one that isn't
+    there.
+
+    Same logic as the standalone analyze_component_correlation.py script,
+    ported here as a Discord command so it can be run against the live
+    signals_history.json without shell/exec access to the container (e.g.
+    a TrueNAS custom-app deployment).
+
+    win_rate / avg_mfe are both truncated by whatever TP policy closed
+    each trade (see update_raw_outcome()'s docstring in state.py) —
+    avg_mfe (from raw_mfe_pct) is the metric closest to a policy-free
+    read of what the market actually did, and the one worth trusting once
+    it has enough samples of its own; win_rate/avg_mfe (the older fields)
+    are only a first look.
+    """
+    try:
+        history = load_signals_history()
+        win_exit_types = ("tp", "sl_after_tp1")  # sl_after_tp1 = TP1 hit before SL, a partial win
+
+        buckets = {}  # (component_name, side, value) -> list of records
+        total_closed = 0
+
+        for ticker, tfs in history.items():
+            for tf, sides in tfs.items():
+                for side, records in sides.items():
+                    for rec in records:
+                        if rec.get("exit_type") in (None, "open") or rec.get("synthetic", False):
+                            continue
+                        total_closed += 1
+                        comps = rec.get("confidence_components")
+                        if not comps:
+                            continue
+                        for comp_name in ("relative_strength", "volume_profile"):
+                            if comp_name in comps:
+                                buckets.setdefault((comp_name, side, comps[comp_name]), []).append(rec)
+
+        lines = [f"**🧪 Confidence component analysis** ({total_closed} closed records total)\n"]
+
+        for comp_name in ("relative_strength", "volume_profile"):
+            comp_rows = {k: v for k, v in buckets.items() if k[0] == comp_name}
+            lines.append(f"**{comp_name}:**")
+            if not comp_rows:
+                lines.append("  no closed records carry this component yet.\n")
+                continue
+            for (_, side, value), recs in sorted(comp_rows.items(), key=lambda kv: (kv[0][1], kv[0][2])):
+                n = len(recs)
+                wins = sum(1 for r in recs if r.get("exit_type") in win_exit_types)
+                win_rate = wins / n if n else 0
+                avg_mfe = sum(r.get("max_favorable_pct", 0.0) for r in recs) / n
+                raw_vals = [r["raw_mfe_pct"] for r in recs if r.get("raw_mfe_pct") is not None]
+                raw_str = f", raw_mfe={sum(raw_vals)/len(raw_vals):.2f}% (n={len(raw_vals)})" if raw_vals else ", raw_mfe=n/a"
+                flag = "" if n >= min_samples else f" ⚠️ only {n}/{min_samples}"
+                lines.append(f"  `{side}` value={value:>3}: n={n} win_rate={win_rate:.0%} avg_mfe={avg_mfe:.2f}%{raw_str}{flag}")
+            lines.append("")
+
+        lines.append(f"Rule of thumb: trust a row once n >= {min_samples} AND raw_mfe's own n is close to it — avg_mfe alone is a first look, raw_mfe is the real read.")
+
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
+    except Exception as e:
+        logger.error(f"Components command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
 @core.bot.command(name="tp")
 async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "long"):
     side = side.lower()
