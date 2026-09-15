@@ -335,9 +335,31 @@ def get_market_structure(
 
     last_close = float(df["close"].iloc[-2])
 
+    # 🆕 FIX (external review, P1): df's last row is the still-forming,
+    # unclosed candle. bar_time/last_close above already correctly read
+    # iloc[-2] (the last CONFIRMED bar) — but vp_window used to be built
+    # from the full df via df.tail(...), which still included that
+    # unclosed row: calc_volume_profile() would distribute the live
+    # candle's own high/low/volume into its bins. That's a live-repaint
+    # leak — the snapshot cached under bar_time could come out differently
+    # depending on where price happened to be mid-candle the first time it
+    # was computed for that bar, then stay wrong for the rest of the
+    # candle's duration (the cache holds it until the NEXT bar closes).
+    # Slicing off the unclosed row before building vp_window fixes this.
+    #
+    # calc_support_resistance() below is NOT given the same treatment: it
+    # has its own internal iloc[-2] convention (see its docstring/code),
+    # designed around chart.py's build_chart() passing it a df that still
+    # includes the live candle — pre-trimming here would double-trim and
+    # shift its internal "last_close" reference back by one extra bar.
+    # calc_support_resistance()'s own -2 indexing already keeps it off the
+    # unclosed candle correctly; only the caller-side df.tail() here (which
+    # has no such built-in protection) needed the explicit fix.
+    confirmed_df = df.iloc[:-1]
+
     vp = {"poc": None, "vah": None, "val": None, "bins": []}
     if _cfg.VP_ENABLED:
-        vp_window = df.tail(min(_cfg.VP_LOOKBACK, len(df)))
+        vp_window = confirmed_df.tail(min(_cfg.VP_LOOKBACK, len(confirmed_df)))
         vp = calc_volume_profile(vp_window, bins=_cfg.VP_BINS, value_area_pct=_cfg.VP_VALUE_AREA_PCT)
 
     sr_source = sr_df if sr_df is not None and len(sr_df) > len(df) else df
