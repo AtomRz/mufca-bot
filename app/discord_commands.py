@@ -85,6 +85,7 @@ async def help_cmd(ctx):
         "`!scan <pair> <tf>` — manual scan (e.g. `!scan BTC/USDT 1h`)",
         "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — signal statistics for a pair",
+        "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
