@@ -82,7 +82,16 @@ def calc_relative_strength(
     window = ratio.tail(lookback)
 
     last_ratio = float(ratio.iloc[-1])
-    first_ratio = float(window.iloc[0])
+    # 🆕 FIX (external review): this used to take first_ratio from
+    # window.iloc[0] — the first of the LAST `lookback` bars — which spans
+    # only lookback-1 intervals to last_ratio, not a genuine lookback-bar
+    # return (e.g. lookback=20 measured a 19-bar change). The
+    # `len(asset_closes) < lookback + 1` guard above already assumes one
+    # extra bar exists for exactly this reason; iloc[-lookback-1] is that
+    # bar — the reference point exactly `lookback` bars before the last
+    # one. window (used only for the SMA below) is unaffected — the SMA is
+    # deliberately still over the last `lookback` bars, not lookback+1.
+    first_ratio = float(ratio.iloc[-lookback - 1])
     if first_ratio == 0:
         return None
 

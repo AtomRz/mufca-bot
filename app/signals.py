@@ -932,7 +932,22 @@ async def check_signals(
             state["last_processed_bar_time"] is None or
             current_bar_time > state["last_processed_bar_time"]
         )
-        state["last_processed_bar_time"] = current_bar_time
+        # 🆕 FIX (external review): last_processed_bar_time used to be
+        # committed HERE, immediately after being read — before almost the
+        # entire rest of this function runs (indicators, market structure,
+        # relative strength, confidence, open_position calls, TP capping).
+        # The whole function body is wrapped in one try/except below that
+        # catches any exception and returns [], None, "ERROR", 1 — but by
+        # then last_processed_bar_time was already updated. On the retry,
+        # is_new_bar would read False for a bar that was never actually
+        # processed, and since sig_u_long/short and sig_b_long/short are
+        # gated on `and is_new_bar`, that bar's U/B signal opportunity
+        # would be silently lost forever (A-track has its own separate
+        # last_a_*_attempt_bar guard and isn't affected the same way).
+        # The commit now happens only at the bottom, right before the
+        # single successful return — see the matching line there. Any
+        # exception before that point leaves last_processed_bar_time
+        # untouched, so a retry correctly sees this bar as still new.
 
         last_high = float(df["high"].iloc[-2])
         last_low = float(df["low"].iloc[-2])
@@ -1382,6 +1397,11 @@ async def check_signals(
             else:
                 sig_b_short = False
 
+        # 🆕 FIX (external review): commit point for last_processed_bar_time
+        # — see the comment where is_new_bar was computed above for why
+        # this moved from immediately-after-read to immediately-before the
+        # only successful return in this function.
+        state["last_processed_bar_time"] = current_bar_time
         return signals, bar_time, regime, sugg_lev
 
     except Exception as e:

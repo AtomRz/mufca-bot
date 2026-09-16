@@ -66,10 +66,28 @@ def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: floa
             continue
         used[i] = True  # mark the pivot element itself as consumed too, not just its cluster-mates
         cluster = [l]
+        last_accepted = l
+        # 🆕 FIX (external review): this used to compare every candidate
+        # against the cluster's fixed first element `l` — so a chain like
+        # 100.00 / 100.40 / 100.80 (each ~0.4% from its neighbor) could
+        # split in two under a 0.5% tolerance, because 100.80 is ~0.8%
+        # from 100.00 even though it's right next to 100.40. That
+        # under-counts touches and can make a real level fail the
+        # TP_CAP_MIN_TOUCHES significance check it should have passed.
+        # Comparing against the LAST ACCEPTED member instead (single-
+        # linkage / chain clustering) fixes this — levels is sorted
+        # ascending, so once a candidate falls outside tolerance of the
+        # nearest accepted member, nothing farther out can be closer, and
+        # it's safe to stop extending this cluster.
         for j in range(i + 1, len(levels)):
-            if not used[j] and abs(levels[j] - l) / (l + 1e-8) < tol:
+            if used[j]:
+                continue
+            if abs(levels[j] - last_accepted) / (last_accepted + 1e-8) < tol:
                 cluster.append(levels[j])
                 used[j] = True
+                last_accepted = levels[j]
+            else:
+                break
         clustered.append((float(np.mean(cluster)), len(cluster)))
     if len(clustered) <= max_n:
         return sorted(clustered, key=lambda t: t[0])
