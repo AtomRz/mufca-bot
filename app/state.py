@@ -1168,3 +1168,101 @@ def apply_tp_obstacle_cap(
     touches_suffix = f" ({touches} touches)" if touches is not None else ""
     result["cap_reason"] = f"{label}@{round_price(level_price)}{touches_suffix}"
     return result
+
+
+WIN_EXIT_TYPES = ("tp", "sl_after_tp1")  # sl_after_tp1 = TP1 hit before SL, a partial win
+DEFAULT_COMPONENT_MIN_SAMPLES = 30
+
+
+def _iter_closed_records(history: Dict):
+    """Yields (ticker, tf, side, record) for every real (non-synthetic),
+    closed record across the whole history file."""
+    for ticker, tfs in history.items():
+        for tf, sides in tfs.items():
+            for side, records in sides.items():
+                for rec in records:
+                    if rec.get("exit_type") not in (None, "open") and not rec.get("synthetic", False):
+                        yield ticker, tf, side, rec
+
+
+def analyze_confidence_components(history: Optional[Dict] = None, min_samples: int = DEFAULT_COMPONENT_MIN_SAMPLES) -> Dict:
+    """Reports whether the relative_strength / volume_profile confidence
+    components (see calc_confidence() in signals.py) actually correlate
+    with trade outcomes — bucketed by (side, component value), since these
+    are direction-dependent bonuses/penalties; pooling long+short could
+    hide a real effect that flips sign with direction, or fabricate one
+    that isn't there.
+
+    Single source of truth for this analysis — both discord_commands.py's
+    !components command and web_api.py's /api/components endpoint call
+    this rather than each recomputing it, so the two can never drift out
+    of sync with each other.
+
+    win_rate / avg_mfe are both truncated by whatever TP policy closed
+    each trade (see update_raw_outcome()'s docstring above) — avg_raw_mfe
+    (from raw_mfe_pct) is the metric closest to a policy-free read of what
+    the market actually did, and the one worth trusting once it has
+    enough samples of its own; win_rate/avg_mfe are only a first look.
+
+    Returns a JSON-serializable dict:
+        {
+            "total_closed": int,
+            "min_samples": int,
+            "components": {
+                "relative_strength": [
+                    {"side": "long", "value": -5, "n": 40, "win_rate": 0.525,
+                     "avg_mfe": 1.36, "avg_raw_mfe": 1.53, "raw_mfe_n": 25,
+                     "exit_counts": {"tp": 21, "sl": 19}, "enough_samples": True},
+                    ...
+                ],
+                "volume_profile": [...],
+            },
+        }
+    """
+    if history is None:
+        history = load_signals_history()
+
+    buckets: Dict[Tuple[str, str, float], List[Dict]] = {}
+    total_closed = 0
+
+    for ticker, tf, side, rec in _iter_closed_records(history):
+        total_closed += 1
+        comps = rec.get("confidence_components")
+        if not comps:
+            continue
+        for comp_name in ("relative_strength", "volume_profile"):
+            if comp_name in comps:
+                buckets.setdefault((comp_name, side, comps[comp_name]), []).append(rec)
+
+    components_out: Dict[str, List[Dict]] = {"relative_strength": [], "volume_profile": []}
+    for (comp_name, side, value), records in buckets.items():
+        n = len(records)
+        exit_counts: Dict[str, int] = {}
+        for r in records:
+            et = r.get("exit_type", "?")
+            exit_counts[et] = exit_counts.get(et, 0) + 1
+        wins = sum(exit_counts.get(et, 0) for et in WIN_EXIT_TYPES)
+        avg_mfe = sum(r.get("max_favorable_pct", 0.0) for r in records) / n
+
+        raw_vals = [r["raw_mfe_pct"] for r in records if r.get("raw_mfe_pct") is not None]
+
+        components_out[comp_name].append({
+            "side": side,
+            "value": value,
+            "n": n,
+            "win_rate": round(wins / n, 4) if n else 0.0,
+            "avg_mfe": round(avg_mfe, 4),
+            "avg_raw_mfe": round(sum(raw_vals) / len(raw_vals), 4) if raw_vals else None,
+            "raw_mfe_n": len(raw_vals),
+            "exit_counts": exit_counts,
+            "enough_samples": n >= min_samples,
+        })
+
+    for comp_name in components_out:
+        components_out[comp_name].sort(key=lambda row: (row["side"], row["value"]))
+
+    return {
+        "total_closed": total_closed,
+        "min_samples": min_samples,
+        "components": components_out,
+    }

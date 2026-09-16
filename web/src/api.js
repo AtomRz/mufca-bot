@@ -97,6 +97,8 @@ export const api = {
     request(`/api/derivatives${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   getSpread: (ticker) =>
     request(`/api/spread${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
+  getComponents: (minSamples = 30) =>
+    request(`/api/components?min_samples=${minSamples}`),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

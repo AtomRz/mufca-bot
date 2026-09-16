@@ -44,7 +44,7 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
-from state import load_signals_history, save_signals_history, delete_signal_record
+from state import load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components
 import push as _push
 import derivatives
 import spread
@@ -341,6 +341,18 @@ async def get_spread(ticker: Optional[str] = None):
         "warmed_up": snapshot["sample_count"] >= _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
         "min_samples_for_anomaly": _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
     }
+
+
+@app.get("/api/components")
+async def get_components(min_samples: int = 30):
+    """Reports whether the relative_strength / volume_profile confidence
+    components (see calc_confidence() in signals.py) actually correlate
+    with trade outcomes — same report as the Discord !components command,
+    both call state.analyze_confidence_components() so the two can never
+    drift out of sync. See that function's docstring for the exact shape
+    of the response and why avg_raw_mfe is the metric worth trusting over
+    win_rate/avg_mfe once it has enough samples of its own."""
+    return analyze_confidence_components(min_samples=min_samples)
 
 
 @app.get("/api/health")

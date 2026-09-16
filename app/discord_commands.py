@@ -63,6 +63,7 @@ from state import (
     update_signal_mae_mfe,
     clear_history_cache,
     get_signal_stats,
+    analyze_confidence_components,
 )
 from embeds import build_embed, _flow_label
 
@@ -906,43 +907,24 @@ async def components_cmd(ctx, min_samples: int = 30):
     are only a first look.
     """
     try:
-        history = load_signals_history()
-        win_exit_types = ("tp", "sl_after_tp1")  # sl_after_tp1 = TP1 hit before SL, a partial win
+        report = analyze_confidence_components(min_samples=min_samples)
 
-        buckets = {}  # (component_name, side, value) -> list of records
-        total_closed = 0
-
-        for ticker, tfs in history.items():
-            for tf, sides in tfs.items():
-                for side, records in sides.items():
-                    for rec in records:
-                        if rec.get("exit_type") in (None, "open") or rec.get("synthetic", False):
-                            continue
-                        total_closed += 1
-                        comps = rec.get("confidence_components")
-                        if not comps:
-                            continue
-                        for comp_name in ("relative_strength", "volume_profile"):
-                            if comp_name in comps:
-                                buckets.setdefault((comp_name, side, comps[comp_name]), []).append(rec)
-
-        lines = [f"**🧪 Confidence component analysis** ({total_closed} closed records total)\n"]
+        lines = [f"**🧪 Confidence component analysis** ({report['total_closed']} closed records total)\n"]
 
         for comp_name in ("relative_strength", "volume_profile"):
-            comp_rows = {k: v for k, v in buckets.items() if k[0] == comp_name}
+            rows = report["components"][comp_name]
             lines.append(f"**{comp_name}:**")
-            if not comp_rows:
+            if not rows:
                 lines.append("  no closed records carry this component yet.\n")
                 continue
-            for (_, side, value), recs in sorted(comp_rows.items(), key=lambda kv: (kv[0][1], kv[0][2])):
-                n = len(recs)
-                wins = sum(1 for r in recs if r.get("exit_type") in win_exit_types)
-                win_rate = wins / n if n else 0
-                avg_mfe = sum(r.get("max_favorable_pct", 0.0) for r in recs) / n
-                raw_vals = [r["raw_mfe_pct"] for r in recs if r.get("raw_mfe_pct") is not None]
-                raw_str = f", raw_mfe={sum(raw_vals)/len(raw_vals):.2f}% (n={len(raw_vals)})" if raw_vals else ", raw_mfe=n/a"
-                flag = "" if n >= min_samples else f" ⚠️ only {n}/{min_samples}"
-                lines.append(f"  `{side}` value={value:>3}: n={n} win_rate={win_rate:.0%} avg_mfe={avg_mfe:.2f}%{raw_str}{flag}")
+            for row in rows:
+                raw_str = f", raw_mfe={row['avg_raw_mfe']:.2f}% (n={row['raw_mfe_n']})" if row["avg_raw_mfe"] is not None else ", raw_mfe=n/a"
+                flag = "" if row["enough_samples"] else f" ⚠️ only {row['n']}/{min_samples}"
+                exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
+                lines.append(
+                    f"  `{row['side']}` value={row['value']:>3}: n={row['n']} win_rate={row['win_rate']:.0%} "
+                    f"avg_mfe={row['avg_mfe']:.2f}%{raw_str}  [{exit_str}]{flag}"
+                )
             lines.append("")
 
         lines.append(f"Rule of thumb: trust a row once n >= {min_samples} AND raw_mfe's own n is close to it — avg_mfe alone is a first look, raw_mfe is the real read.")
