@@ -86,7 +86,7 @@ export default function StatusPanel({ lastEvent }) {
             <span className="row-value">{fmtPrice(tp1Banner.entry)} → {fmtPrice(tp1Banner.tp1)}</span>
           </div>
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
-            Close 50% of the position and move SL to breakeven ({fmtPrice(tp1Banner.entry)}) — same as the Discord alert.
+            Close 50% of the position and move SL to {(tp1Banner.sl_mode || 'breakeven').replace(/_/g, ' ')} ({fmtPrice(tp1Banner.new_sl ?? tp1Banner.entry)}) — same as the Discord alert.
           </p>
           <button className="btn" style={{ marginTop: 8 }} onClick={() => setTp1Banner(null)}>Dismiss</button>
         </div>

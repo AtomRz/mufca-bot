@@ -887,16 +887,25 @@ class Tp1SlModeIn(BaseModel):
 
 @app.post("/api/config/tp1-sl-mode")
 async def set_tp1_sl_mode(body: Tp1SlModeIn):
-    """SL-move mode after TP1: 'breakeven' (SL = entry) or 'half_tp1' (SL =
-    entry + halfway to TP1, tighter than breakeven). Applied immediately, no
-    container restart needed — bot.py reads _cfg.TP1_SL_MODE on every TP1 hit."""
+    """SL-move mode after TP1 — one of config.TP1_SL_MODE_FRACTIONS'
+    keys: 'breakeven' (SL = entry), 'quarter_tp1' (1/4 of the way to TP1),
+    'half_tp1' (halfway to TP1), or 'three_quarter_tp1' (3/4 of the way).
+    Applied immediately, no container restart needed — bot.py's
+    _tp1_moved_sl() reads _cfg.TP1_SL_FRACTION on every TP1 hit."""
     new_mode = body.tp1_sl_mode.lower()
-    if new_mode not in ("breakeven", "half_tp1"):
-        raise HTTPException(400, "tp1_sl_mode must be 'breakeven' or 'half_tp1'")
+    if new_mode not in _cfg.TP1_SL_MODE_FRACTIONS:
+        raise HTTPException(400, f"tp1_sl_mode must be one of {list(_cfg.TP1_SL_MODE_FRACTIONS)}")
     if new_mode == _cfg.TP1_SL_MODE:
         return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": False}
 
     _cfg.TP1_SL_MODE = new_mode
+    # 🆕 FIX (external review, TP1-mode comparison): _tp1_moved_sl() now
+    # reads TP1_SL_FRACTION, not TP1_SL_MODE directly — this used to only
+    # update TP1_SL_MODE at runtime, so the label would change but the
+    # actual SL math wouldn't move until the next container restart
+    # re-evaluated TP1_SL_FRACTION = TP1_SL_MODE_FRACTIONS[TP1_SL_MODE] at
+    # module load time. Both must be kept in sync here.
+    _cfg.TP1_SL_FRACTION = _cfg.TP1_SL_MODE_FRACTIONS[new_mode]
     save_tp1_sl_mode(_cfg.TP1_SL_MODE)
     await broadcast_event({"type": "config_changed", "key": "tp1_sl_mode", "value": _cfg.TP1_SL_MODE})
     return {"tp1_sl_mode": _cfg.TP1_SL_MODE, "changed": True}

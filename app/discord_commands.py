@@ -87,6 +87,7 @@ async def help_cmd(ctx):
         "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — signal statistics for a pair",
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
+        "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
@@ -938,6 +939,111 @@ async def components_cmd(ctx, min_samples: int = 30):
             msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"Components command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+@core.bot.command(name="tp1sim", aliases=["tp1compare"])
+async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
+    """
+    🆕 (external review, TP1-mode comparison): dry-run backtest_history()
+    once per TP1_SL_MODE_FRACTIONS value (breakeven/quarter_tp1/half_tp1/
+    three_quarter_tp1) on real historical OHLCV — reusing the exact same
+    simulation the live bot's own backtest already runs, not a separate
+    bespoke replay — and reports win rate / avg PnL per mode, split by
+    track and regime (the breakdown the original analysis specifically
+    wanted). Every run uses dry_run=True: nothing is written to
+    signals_history.json and the live TP1_SL_MODE setting is never
+    touched, so this is safe to run repeatedly without corrupting
+    production history or affecting the currently deployed mode.
+
+    Usage: !tp1sim [ticker] [tf] [num_bars]
+      no args        — every tracked pair × timeframe, 3000 bars each
+      !tp1sim BTC/USDT 4h        — just that pair/timeframe
+      !tp1sim BTC/USDT 4h 1500   — fewer bars, faster
+
+    Caveat: backtest_history()'s records don't carry a separate tp1_hit
+    flag — TP1 involvement is inferred from exit_type in ("tp",
+    "sl_after_tp1"). A trade that hit TP1 and then just ran out of bars
+    (exit_type="cancelled") isn't distinguishable from one that never
+    reached TP1 at all, so the sample counted here is slightly
+    conservative — real TP1 hit-rate is >= what's shown.
+
+    This is a slow, CPU-heavy command (num_pairs × num_timeframes × 4
+    full backtests) — expect it to take a while on the default scope.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+
+    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in TICKERS:
+            await ctx.send(f"❌ `{t}` is not a tracked pair.")
+            return
+    for f in scope_tfs:
+        if f not in TIMEFRAMES:
+            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
+            return
+
+    await ctx.send(
+        f"⏳ Running TP1-mode comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 4 modes, "
+        f"{num_bars} bars each. This is slow — sit tight."
+    )
+
+    win_exit_type = "tp"
+    tp1_exit_types = ("tp", "sl_after_tp1")
+
+    # (mode_name, track, regime) -> list of records
+    buckets = {}
+
+    try:
+        for t in scope_tickers:
+            for f in scope_tfs:
+                for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
+                    try:
+                        count, history = await asyncio.to_thread(
+                            backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True
+                        )
+                    except Exception as e:
+                        logger.error(f"tp1sim backtest error for {t} {f} {mode_name}: {e}")
+                        continue
+
+                    for side in ("long", "short"):
+                        for rec in history.get(t, {}).get(f, {}).get(side, []):
+                            if rec.get("exit_type") in tp1_exit_types:
+                                key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
+                                buckets.setdefault(key, []).append(rec)
+                    await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+
+        lines = [f"**🧪 TP1-mode comparison** (dry-run backtest, {num_bars} bars — nothing written to history)\n"]
+
+        for mode_name in _cfg.TP1_SL_MODE_FRACTIONS:
+            rows = sorted((k, v) for k, v in buckets.items() if k[0] == mode_name)
+            lines.append(f"**{mode_name}:**")
+            if not rows:
+                lines.append("  no TP1-hit trades in this sample.\n")
+                continue
+            for (_, track, regime), recs in rows:
+                n = len(recs)
+                wins = sum(1 for r in recs if r.get("exit_type") == win_exit_type)
+                win_rate = wins / n if n else 0.0
+                avg_pnl = sum(r.get("moved_pct", 0.0) for r in recs) / n
+                flag = "" if n >= 5 else " ⚠️ tiny sample"
+                lines.append(f"  track={track} regime={regime}: n={n} win_rate={win_rate:.0%} avg_pnl={avg_pnl:+.2f}%{flag}")
+            lines.append("")
+
+        lines.append("Caveat: cancelled-after-TP1 trades aren't distinguishable from never-reached-TP1 in backtest_history()'s current record shape — real TP1 sample size is >= what's shown above.")
+
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
+    except Exception as e:
+        logger.error(f"tp1sim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 @core.bot.command(name="tp")

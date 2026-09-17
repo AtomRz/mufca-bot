@@ -633,25 +633,59 @@ SAME_BAR_TP1_POLICY = "tp1_first"
 # =====================================================================
 # 🎯  SL-MOVE MODE AFTER TP1
 # =====================================================================
-# "breakeven" — SL = entry (zero risk on the remainder, but more often catches
-#               a final shakeout retrace before continuing to TP2, especially
-#               in a choppy market)
-# "half_tp1"  — SL = entry + (TP1 - entry) / 2 (tighter than breakeven —
-#               already in profit; triggers more often on noise, but every
-#               trigger locks in a small guaranteed profit instead of zero)
+# "breakeven"          — SL = entry (zero risk on the remainder, but more
+#                         often catches a final shakeout retrace before
+#                         continuing to TP2, especially in a choppy market)
+# "quarter_tp1"        — SL = entry + (TP1 - entry) / 4
+# "half_tp1"           — SL = entry + (TP1 - entry) / 2 (tighter than
+#                         breakeven — already in profit; triggers more
+#                         often on noise, but every trigger locks in a
+#                         small guaranteed profit instead of zero)
+# "three_quarter_tp1"  — SL = entry + (TP1 - entry) * 3/4
+#
+# 🆕 (external review, TP1-mode comparison): generalized from a 2-value
+# enum (breakeven/half_tp1) to a fraction of the entry->TP1 distance, so
+# quarter_tp1/three_quarter_tp1 exist as real, executable modes rather
+# than needing their own bespoke code path. TP1_SL_MODE_FRACTIONS is a
+# strict superset of the old two values — existing tp1_sl_mode.json files
+# ("breakeven" or "half_tp1") keep working unchanged, no migration needed.
+# _tp1_moved_sl() (signals.py) reads TP1_SL_FRACTION directly instead of
+# special-casing mode strings, so live, backtest, and the tp1_sl_fraction
+# override used by tp1_mode_comparison.py all share one formula.
+TP1_SL_MODE_FRACTIONS = {
+    "breakeven": 0.0,
+    "quarter_tp1": 0.25,
+    "half_tp1": 0.5,
+    "three_quarter_tp1": 0.75,
+}
 TP1_SL_MODE_FILE = os.path.join(DATA_DIR, "tp1_sl_mode.json")
 
 def load_tp1_sl_mode() -> str:
     data = safe_json_load(TP1_SL_MODE_FILE, {"tp1_sl_mode": "breakeven"})
     mode = data.get("tp1_sl_mode", "breakeven")
-    return mode if mode in ("breakeven", "half_tp1") else "breakeven"
+    return mode if mode in TP1_SL_MODE_FRACTIONS else "breakeven"
 
 def save_tp1_sl_mode(mode: str):
-    if mode not in ("breakeven", "half_tp1"):
-        raise ValueError(f"Unknown TP1_SL_MODE: {mode!r}")
+    if mode not in TP1_SL_MODE_FRACTIONS:
+        raise ValueError(f"Unknown TP1_SL_MODE: {mode!r} (expected one of {list(TP1_SL_MODE_FRACTIONS)})")
     safe_json_save(TP1_SL_MODE_FILE, {"tp1_sl_mode": mode})
 
 TP1_SL_MODE = load_tp1_sl_mode()
+TP1_SL_FRACTION = TP1_SL_MODE_FRACTIONS[TP1_SL_MODE]
+
+TP1_SL_MODE_LABELS = {
+    "breakeven": "breakeven",
+    "quarter_tp1": "1/4 of the way to TP1",
+    "half_tp1": "halfway to TP1",
+    "three_quarter_tp1": "3/4 of the way to TP1",
+}
+
+def tp1_sl_label(mode: str) -> str:
+    """Human-readable description of a TP1_SL_MODE value — single source
+    of truth for the notification text bot.py builds after a TP1 hit, so
+    a new mode only needs a label added here, not in every notification
+    call site."""
+    return TP1_SL_MODE_LABELS.get(mode, mode)
 
 # =====================================================================
 # 🔕  DISCORD NOTIFICATIONS TOGGLE

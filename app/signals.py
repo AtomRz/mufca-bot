@@ -456,15 +456,23 @@ def apply_onchain_with_safety(
 # 📊  TP/SL CHECK
 # =====================================================================
 
-def _tp1_moved_sl(entry: float, tp1_price: float, side: str) -> float:
-    """New SL after a TP1 hit, per config.TP1_SL_MODE. Factored out so
+def _tp1_moved_sl(entry: float, tp1_price: float, side: str, fraction: Optional[float] = None) -> float:
+    """New SL after a TP1 hit, per config.TP1_SL_FRACTION. Factored out so
     bot.py's live TP1-hit block, check_tp_sl_hit() below, and
     backtest_history() all compute the exact same number — previously only
     bot.py had this formula, so the closed-bar/backtest paths had no way to
-    apply a TP1-driven SL move at all (see SAME_BAR_TP1_POLICY)."""
-    if _cfg.TP1_SL_MODE == "half_tp1":
-        return entry + (tp1_price - entry) / 2 if side == "long" else entry - (entry - tp1_price) / 2
-    return entry  # "breakeven"
+    apply a TP1-driven SL move at all (see SAME_BAR_TP1_POLICY).
+
+    fraction — 🆕 (external review, TP1-mode comparison): explicit override
+    of config.TP1_SL_FRACTION for this one call. None (the default) reads
+    the live config, exactly as before this parameter existed — every
+    existing caller is unaffected. Used by backtest_history()'s own
+    tp1_sl_fraction parameter, which tp1_mode_comparison.py sets to
+    replay history under breakeven/quarter/half/three-quarter without
+    touching the live TP1_SL_MODE setting.
+    """
+    frac = _cfg.TP1_SL_FRACTION if fraction is None else fraction
+    return entry + frac * (tp1_price - entry) if side == "long" else entry - frac * (entry - tp1_price)
 
 
 def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
@@ -1418,7 +1426,9 @@ def backtest_history(
     tf: str,
     num_bars: int = 3000,
     tracks: tuple = _cfg.TRACKS,
-) -> int:
+    tp1_sl_fraction: Optional[float] = None,
+    dry_run: bool = False,
+):
     """Backtest for accumulating signal history.
 
     tracks — restrict which track(s) get simulated (default: all of them).
@@ -1428,18 +1438,39 @@ def backtest_history(
     duplicate every existing A/U record (see startup_sequence's comment on
     this in bot.py), so this is the safe way to add coverage for a track
     added after the others already had months of accumulated history.
+
+    tp1_sl_fraction — 🆕 (external review, TP1-mode comparison): overrides
+    config.TP1_SL_FRACTION for this one backtest run only (see
+    _tp1_moved_sl()'s fraction param). None (the default) uses the live
+    config, exactly as before this parameter existed.
+
+    dry_run — 🆕 (external review, TP1-mode comparison): when True, this
+    function does NOT call load_signals_history()/save_signals_history()
+    at all — it starts from an empty, isolated history dict and never
+    touches the real signals_history.json, so it's safe to call more than
+    once (e.g. once per tp1_sl_fraction value) without duplicating or
+    corrupting production data the way a second normal run on an
+    already-populated ticker/tf would. See tp1_mode_comparison.py, which
+    is the only caller that sets this to True today.
+
+    Returns signals_found (int) when dry_run=False — unchanged from
+    before this parameter existed, every existing caller keeps working
+    exactly as before. Returns (signals_found, history) when dry_run=True,
+    so the caller can inspect the simulated records directly.
     """
-    logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars, tracks={tracks})...")
+    logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars, tracks={tracks}"
+                f"{f', tp1_sl_fraction={tp1_sl_fraction}' if tp1_sl_fraction is not None else ''}"
+                f"{', dry_run' if dry_run else ''})...")
 
     try:
         bars = exchange.fetch_ohlcv(ticker, tf, limit=num_bars)
         if not bars or len(bars) < 100:
             logger.warning(f"[BACKTEST] Not enough bars for {ticker} {tf}")
-            return 0
+            return (0, {}) if dry_run else 0
 
         df = parse_ohlcv(bars)
         if not validate_dataframe(df, 100):
-            return 0
+            return (0, {}) if dry_run else 0
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1534,7 +1565,7 @@ def backtest_history(
             logger.warning(f"[BACKTEST] HTF bias fetch failed for {ticker} {tf}: {e}")
 
         signals_found = 0
-        history = load_signals_history()
+        history = {} if dry_run else load_signals_history()
 
         # Hurst is always computed above (unlike check_signals, not gated
         # behind ENABLE_HURST_FILTER) and is NaN for its first HURST_WINDOW
@@ -1785,7 +1816,7 @@ def backtest_history(
                             # to a later one.
                             if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fh >= tp1 and fh < tp and fl_ <= current_sl:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
                                 sl_hit = True
                                 exit_price = current_sl
                                 break
@@ -1813,7 +1844,7 @@ def backtest_history(
                                 # we can't know whether the touch happened
                                 # at the start or end of this bar's range.
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
                                 continue
                         else:
                             if fl_ <= current_sl:
@@ -1840,7 +1871,7 @@ def backtest_history(
                             # fh >= tp1 since shorts profit downward).
                             if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fl_ <= tp1 and fl_ > tp and fh >= current_sl:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
                                 sl_hit = True
                                 exit_price = current_sl
                                 break
@@ -1855,7 +1886,7 @@ def backtest_history(
                                 break
                             if fl_ <= tp1:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side)
+                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
                                 continue
                         else:
                             if fh >= current_sl:
@@ -1916,13 +1947,17 @@ def backtest_history(
                 history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1
 
+        if dry_run:
+            logger.info(f"[BACKTEST] {ticker} {tf}: (dry run, tp1_sl_fraction={tp1_sl_fraction}) found {signals_found} historical signals")
+            return signals_found, history
+
         save_signals_history(history)
         logger.info(f"[BACKTEST] {ticker} {tf}: found {signals_found} historical signals")
         return signals_found
 
     except Exception as e:
         logger.error(f"[BACKTEST] Failed for {ticker} {tf}: {e}", exc_info=True)
-        return 0
+        return (0, {}) if dry_run else 0
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

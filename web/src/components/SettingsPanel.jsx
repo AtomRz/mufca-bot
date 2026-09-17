@@ -216,7 +216,9 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(e) => run('tp1_sl_mode', () => api.setTp1SlMode(e.target.value))}
               >
                 <option value="breakeven">Breakeven (SL = entry)</option>
+                <option value="quarter_tp1">1/4 of the way to TP1</option>
                 <option value="half_tp1">Half-way to TP1 (SL &gt; entry)</option>
+                <option value="three_quarter_tp1">3/4 of the way to TP1</option>
               </select>
             </div>
             <div className="field">

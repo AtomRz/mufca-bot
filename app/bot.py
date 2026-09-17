@@ -637,10 +637,12 @@ async def market_scanner():
                         # backtest_history(), with no compiler or test to
                         # catch a missed spot.
                         new_sl = _tp1_moved_sl(entry, tp1_price, side)
-                        if _cfg.TP1_SL_MODE == "half_tp1":
-                            sl_label = f"halfway to TP1 (${format_price(new_sl)})"
-                        else:
-                            sl_label = f"breakeven (${format_price(new_sl)})"
+                        # 🆕 (external review, TP1-mode comparison): was a
+                        # hardcoded half_tp1/breakeven if-else — now reads
+                        # from config.tp1_sl_label() so quarter_tp1/
+                        # three_quarter_tp1 get a correct label too, not
+                        # silently mislabeled as "breakeven".
+                        sl_label = f"{_cfg.tp1_sl_label(_cfg.TP1_SL_MODE)} (${format_price(new_sl)})"
                         trade["sl"] = new_sl
                         # 🆕 FIX BUG-LO009: SL moved WITHIN the still-forming
                         # bar — the low/high of this and all preceding bars
