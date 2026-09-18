@@ -976,6 +976,13 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
 
     This is a slow, CPU-heavy command (num_pairs × num_timeframes × 4
     full backtests) — expect it to take a while on the default scope.
+
+    🆕 Scope note: n is summed across whatever pair(s)/timeframe(s) this
+    particular call covers — a narrower scope (e.g. one pair/tf) will
+    naturally show a smaller n than a broader one, even with more bars
+    per pair. Compare runs with the SAME ticker/tf scope to isolate the
+    effect of num_bars; comparing e.g. one broad 3000-bar run against one
+    narrow 6000-bar run conflates "more history" with "fewer pairs".
     """
     exchange = core._exchange_ref
     if exchange is None:
@@ -1003,18 +1010,25 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
     # see the docstring's asymmetric-dropout note for why the latter must
     # be included rather than silently dropped).
     buckets = {}
+    # (ticker, tf) -> {"requested": num_bars, "got": min bars actually
+    # returned across the 4 fraction runs} — see the docstring note below
+    # on why num_bars can be silently truncated by the exchange.
+    bar_coverage = {}
 
     try:
         for t in scope_tickers:
             for f in scope_tfs:
                 for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
                     try:
-                        count, history = await asyncio.to_thread(
+                        count, history, bars_fetched = await asyncio.to_thread(
                             backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True
                         )
                     except Exception as e:
                         logger.error(f"tp1sim backtest error for {t} {f} {mode_name}: {e}")
                         continue
+
+                    cov = bar_coverage.setdefault((t, f), {"requested": num_bars, "got": bars_fetched})
+                    cov["got"] = min(cov["got"], bars_fetched)
 
                     for side in ("long", "short"):
                         for rec in history.get(t, {}).get(f, {}).get(side, []):
@@ -1024,7 +1038,20 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
                                 buckets.setdefault(key, []).append(rec)
                     await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
 
-        lines = [f"**🧪 TP1-mode comparison** (dry-run backtest, {num_bars} bars — nothing written to history)\n"]
+        lines = [f"**🧪 TP1-mode comparison** (dry-run backtest, {num_bars} bars requested — nothing written to history)\n"]
+
+        # 🆕 (external review, TP1-mode comparison): backtest_history()'s
+        # fetch is a single, unpaginated call — asking for more bars than
+        # the exchange returns per request silently gets fewer than
+        # expected, which would otherwise show up only as "n looks lower
+        # than I'd guess" with no way to tell why. Surfacing it here
+        # directly, once per pair/tf, instead of leaving it to server logs.
+        short_pairs = [(t, f, c) for (t, f), c in bar_coverage.items() if c["got"] < c["requested"]]
+        if short_pairs:
+            lines.append("⚠️ Bars requested vs. actually received (single fetch_ohlcv call, no pagination):")
+            for t, f, c in short_pairs:
+                lines.append(f"  {t} {f}: requested {c['requested']}, got {c['got']}")
+            lines.append("")
 
         for mode_name in _cfg.TP1_SL_MODE_FRACTIONS:
             rows = sorted((k, v) for k, v in buckets.items() if k[0] == mode_name)

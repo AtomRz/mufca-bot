@@ -1450,27 +1450,46 @@ def backtest_history(
     touches the real signals_history.json, so it's safe to call more than
     once (e.g. once per tp1_sl_fraction value) without duplicating or
     corrupting production data the way a second normal run on an
-    already-populated ticker/tf would. See tp1_mode_comparison.py, which
-    is the only caller that sets this to True today.
+    already-populated ticker/tf would. See discord_commands.py's
+    tp1sim_cmd (!tp1sim), which is the only caller that sets this to True
+    today.
 
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
-    exactly as before. Returns (signals_found, history) when dry_run=True,
-    so the caller can inspect the simulated records directly.
+    exactly as before. Returns (signals_found, history, bars_fetched) when
+    dry_run=True — bars_fetched is the ACTUAL number of candles the
+    exchange returned, which can be less than num_bars asked for since the
+    fetch above is a single, unpaginated call (see its comment) — so the
+    caller can tell "ran on the full requested window" apart from
+    "silently got fewer bars than expected" instead of just assuming
+    num_bars was honored.
     """
     logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars, tracks={tracks}"
                 f"{f', tp1_sl_fraction={tp1_sl_fraction}' if tp1_sl_fraction is not None else ''}"
                 f"{', dry_run' if dry_run else ''})...")
 
+    bars = None  # so the exception handler below can safely report 0 if the fetch itself never completed
     try:
         bars = exchange.fetch_ohlcv(ticker, tf, limit=num_bars)
         if not bars or len(bars) < 100:
             logger.warning(f"[BACKTEST] Not enough bars for {ticker} {tf}")
-            return (0, {}) if dry_run else 0
+            return (0, {}, len(bars) if bars else 0) if dry_run else 0
+
+        # 🆕 (external review, TP1-mode comparison): this is a SINGLE
+        # fetch_ohlcv call with no pagination — if the exchange caps how
+        # many candles it returns per request below num_bars, ccxt just
+        # hands back whatever it got, silently. Logging the actual count
+        # here is the only way to tell "got everything I asked for" apart
+        # from "quietly got capped" without reading exchange docs.
+        if len(bars) < num_bars:
+            logger.warning(
+                f"[BACKTEST] {ticker} {tf}: requested {num_bars} bars, exchange returned only {len(bars)} "
+                f"(single fetch_ohlcv call, no pagination — this may be the exchange's own per-request cap)"
+            )
 
         df = parse_ohlcv(bars)
         if not validate_dataframe(df, 100):
-            return (0, {}) if dry_run else 0
+            return (0, {}, len(bars)) if dry_run else 0
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1965,7 +1984,7 @@ def backtest_history(
 
         if dry_run:
             logger.info(f"[BACKTEST] {ticker} {tf}: (dry run, tp1_sl_fraction={tp1_sl_fraction}) found {signals_found} historical signals")
-            return signals_found, history
+            return signals_found, history, len(bars)
 
         save_signals_history(history)
         logger.info(f"[BACKTEST] {ticker} {tf}: found {signals_found} historical signals")
@@ -1973,7 +1992,7 @@ def backtest_history(
 
     except Exception as e:
         logger.error(f"[BACKTEST] Failed for {ticker} {tf}: {e}", exc_info=True)
-        return (0, {}) if dry_run else 0
+        return (0, {}, len(bars) if bars else 0) if dry_run else 0
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS
