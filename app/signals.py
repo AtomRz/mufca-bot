@@ -1420,6 +1420,56 @@ async def check_signals(
 # 🔙  BACKTEST
 # =====================================================================
 
+def _fetch_ohlcv_paginated(exchange: ccxt.Exchange, ticker: str, tf: str, num_bars: int, page_limit: int = 1000) -> list:
+    """Fetches up to num_bars candles, paginating backward in time.
+
+    🆕 (external review, TP1-mode comparison): backtest_history() used to
+    make a single exchange.fetch_ohlcv(ticker, tf, limit=num_bars) call —
+    Gate.io (confirmed empirically: requesting 3000 or 6000 both silently
+    returned exactly 1000) caps how many candles it returns per request
+    regardless of what limit asks for, and ccxt has no way to know that in
+    advance — it just hands back whatever the exchange gave it, no error,
+    no warning. Walking `since` forward in page_limit-sized chunks from
+    num_bars back is the standard ccxt pattern for getting more history
+    than one call allows.
+
+    Stops early if the exchange returns fewer than page_limit bars (caught
+    up to the present, or reached the start of available listing history)
+    or makes no forward progress (safety net against an infinite loop on
+    an exchange quirk) — so the result can still be shorter than num_bars
+    if that much history genuinely isn't available, same as before this
+    function existed; the difference is it now goes past 1000 when more
+    actually exists.
+    """
+    tf_ms = exchange.parse_timeframe(tf) * 1000
+    since = exchange.milliseconds() - num_bars * tf_ms
+
+    all_bars = []
+    while len(all_bars) < num_bars:
+        chunk = exchange.fetch_ohlcv(ticker, tf, since=since, limit=min(page_limit, num_bars - len(all_bars)))
+        if not chunk:
+            break
+        all_bars.extend(chunk)
+        next_since = chunk[-1][0] + tf_ms
+        if next_since <= since:
+            break  # no forward progress — exchange quirk, stop rather than loop forever
+        since = next_since
+        if len(chunk) < page_limit:
+            break  # caught up to "now", or hit the start of available history
+
+    # Pagination pages can overlap by one bar at the boundary — dedup by
+    # timestamp and keep only the most recent num_bars, sorted ascending
+    # (the order every caller of this function already assumes).
+    seen = set()
+    deduped = []
+    for bar in all_bars:
+        if bar[0] not in seen:
+            seen.add(bar[0])
+            deduped.append(bar)
+    deduped.sort(key=lambda b: b[0])
+    return deduped[-num_bars:] if len(deduped) > num_bars else deduped
+
+
 def backtest_history(
     exchange: ccxt.Exchange,
     ticker: str,
@@ -1428,6 +1478,7 @@ def backtest_history(
     tracks: tuple = _cfg.TRACKS,
     tp1_sl_fraction: Optional[float] = None,
     dry_run: bool = False,
+    df: Optional[pd.DataFrame] = None,
 ):
     """Backtest for accumulating signal history.
 
@@ -1454,42 +1505,58 @@ def backtest_history(
     tp1sim_cmd (!tp1sim), which is the only caller that sets this to True
     today.
 
+    df — 🆕 (external review, TP1-mode comparison): pass an already-fetched
+    OHLCV dataframe to skip fetching entirely and simulate directly on it.
+    tp1sim_cmd uses this to fetch each ticker/tf's history ONCE (via
+    _fetch_ohlcv_paginated()) and reuse it across all 4 tp1_sl_fraction
+    runs, instead of re-fetching (now paginated, so potentially several
+    requests) four times for identical data. None (the default) fetches
+    internally exactly as before this parameter existed.
+
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
     exactly as before. Returns (signals_found, history, bars_fetched) when
-    dry_run=True — bars_fetched is the ACTUAL number of candles the
-    exchange returned, which can be less than num_bars asked for since the
-    fetch above is a single, unpaginated call (see its comment) — so the
-    caller can tell "ran on the full requested window" apart from
-    "silently got fewer bars than expected" instead of just assuming
-    num_bars was honored.
+    dry_run=True — bars_fetched is the ACTUAL number of candles used,
+    which can be less than num_bars asked for if that much history isn't
+    available at all (rare) — so the caller can tell "ran on the full
+    requested window" apart from "fewer bars existed" instead of just
+    assuming num_bars was honored. When df is passed in, bars_fetched is
+    simply len(df).
     """
     logger.info(f"[BACKTEST] Starting {ticker} {tf} ({num_bars} bars, tracks={tracks}"
                 f"{f', tp1_sl_fraction={tp1_sl_fraction}' if tp1_sl_fraction is not None else ''}"
-                f"{', dry_run' if dry_run else ''})...")
+                f"{', dry_run' if dry_run else ''}{', reusing pre-fetched df' if df is not None else ''})...")
 
-    bars = None  # so the exception handler below can safely report 0 if the fetch itself never completed
+    bars_fetched = 0  # so the exception handler below can safely report 0 if the fetch itself never completed
     try:
-        bars = exchange.fetch_ohlcv(ticker, tf, limit=num_bars)
-        if not bars or len(bars) < 100:
-            logger.warning(f"[BACKTEST] Not enough bars for {ticker} {tf}")
-            return (0, {}, len(bars) if bars else 0) if dry_run else 0
+        if df is not None:
+            bars_fetched = len(df)
+            if not validate_dataframe(df, 100):
+                return (0, {}, bars_fetched) if dry_run else 0
+        else:
+            # 🆕 FIX (external review, TP1-mode comparison): this used to be
+            # a single exchange.fetch_ohlcv(ticker, tf, limit=num_bars) call
+            # — Gate.io caps candles per request well below num_bars
+            # (confirmed empirically: requesting 3000 or 6000 both silently
+            # returned exactly 1000), and ccxt has no way to surface that as
+            # an error, it just hands back whatever it got. Paginating via
+            # _fetch_ohlcv_paginated() actually reaches num_bars when that
+            # much history exists, instead of silently capping at whatever
+            # the exchange's own per-request limit happens to be.
+            bars = _fetch_ohlcv_paginated(exchange, ticker, tf, num_bars)
+            bars_fetched = len(bars)
+            if not bars or len(bars) < 100:
+                logger.warning(f"[BACKTEST] Not enough bars for {ticker} {tf}")
+                return (0, {}, bars_fetched) if dry_run else 0
+            if bars_fetched < num_bars:
+                logger.warning(
+                    f"[BACKTEST] {ticker} {tf}: requested {num_bars} bars, got {bars_fetched} "
+                    f"(that may be all the history the exchange has for this pair/timeframe)"
+                )
 
-        # 🆕 (external review, TP1-mode comparison): this is a SINGLE
-        # fetch_ohlcv call with no pagination — if the exchange caps how
-        # many candles it returns per request below num_bars, ccxt just
-        # hands back whatever it got, silently. Logging the actual count
-        # here is the only way to tell "got everything I asked for" apart
-        # from "quietly got capped" without reading exchange docs.
-        if len(bars) < num_bars:
-            logger.warning(
-                f"[BACKTEST] {ticker} {tf}: requested {num_bars} bars, exchange returned only {len(bars)} "
-                f"(single fetch_ohlcv call, no pagination — this may be the exchange's own per-request cap)"
-            )
-
-        df = parse_ohlcv(bars)
-        if not validate_dataframe(df, 100):
-            return (0, {}, len(bars)) if dry_run else 0
+            df = parse_ohlcv(bars)
+            if not validate_dataframe(df, 100):
+                return (0, {}, bars_fetched) if dry_run else 0
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1984,7 +2051,7 @@ def backtest_history(
 
         if dry_run:
             logger.info(f"[BACKTEST] {ticker} {tf}: (dry run, tp1_sl_fraction={tp1_sl_fraction}) found {signals_found} historical signals")
-            return signals_found, history, len(bars)
+            return signals_found, history, bars_fetched
 
         save_signals_history(history)
         logger.info(f"[BACKTEST] {ticker} {tf}: found {signals_found} historical signals")
@@ -1992,7 +2059,7 @@ def backtest_history(
 
     except Exception as e:
         logger.error(f"[BACKTEST] Failed for {ticker} {tf}: {e}", exc_info=True)
-        return (0, {}, len(bars) if bars else 0) if dry_run else 0
+        return (0, {}, bars_fetched) if dry_run else 0
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

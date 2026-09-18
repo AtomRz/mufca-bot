@@ -128,7 +128,17 @@ async def help_cmd(ctx):
         "`!reset_cache`  — reset HTF, on-chain, and derivatives cache",
         "`!help` / `!?` — this help",
     ]
-    await ctx.send("\n".join(lines))
+    # 🆕 FIX: was a single ctx.send(), unchunked — Discord hard-caps a
+    # message at 2000 chars, and this list has grown past that (the
+    # !components/!tp1sim additions were what tipped it over). Same
+    # chunking pattern as !components/!tp1sim below.
+    msg = "\n".join(lines)
+    while msg:
+        chunk = msg[:1900]
+        if len(msg) > 1900:
+            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+        await ctx.send(chunk)
+        msg = msg[len(chunk):].lstrip("\n")
 
 
 @core.bot.command(name="status")
@@ -283,7 +293,13 @@ async def pairs_cmd(ctx):
     lines = ["**📋 Scanned Pairs:**\n"]
     for t in TICKERS:
         lines.append(f"• `{t}`")
-    await ctx.send("\n".join(lines))
+    msg = "\n".join(lines)
+    while msg:
+        chunk = msg[:1900]
+        if len(msg) > 1900:
+            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+        await ctx.send(chunk)
+        msg = msg[len(chunk):].lstrip("\n")
 
 @core.bot.command(name="add")
 async def add_cmd(ctx, ticker: str = ""):
@@ -464,7 +480,13 @@ async def cleanup_sim_cmd(ctx, confirm: str = ""):
         if len(to_remove) > 15:
             lines.append(f"… and {len(to_remove) - 15} more")
         lines.append("\nTo confirm, type: `!cleanup_sim yes`")
-        await ctx.send("\n".join(lines))
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
         return
 
     removed = 0
@@ -673,7 +695,13 @@ async def chop_cmd(ctx, tf: str = "", value: str = ""):
             for t, v in CHOP_THRESHOLD.items():
                 lines.append(f"• `{t}`: **{v}** (below = trend, above = sideways)")
             lines.append("\nTo change: `!chop 1h 55` or `!chop 4h 61.8`")
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
             return
 
         tf = tf.lower()
@@ -824,7 +852,13 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
             if len(lines) == 1:
                 await ctx.send("📭 No signal history yet.")
                 return
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
             return
 
         ticker = ticker.upper()
@@ -841,7 +875,13 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
                         wins = sum(1 for r in records if r["moved_pct"] > 0)
                         avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
                         lines.append(f"• `{timeframe}` {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
             return
 
         tf = tf.lower()
@@ -857,7 +897,13 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
                     wins = sum(1 for r in records if r["moved_pct"] > 0)
                     avg_mfe = np.mean([r["max_favorable_pct"] for r in records])
                     lines.append(f"• {s.upper()}: {len(records)} signals | Wins: {wins}/{len(records)} | Avg MFE: {avg_mfe:.2f}%")
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
             return
 
         side = side.lower()
@@ -879,7 +925,13 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
                 f"MFE: {rec['max_favorable_pct']:.2f}% | MAE: {rec['max_adverse_pct']:.2f}% | "
                 f"Result: {result_label}"
             )
-        await ctx.send("\n".join(lines))
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"Signals command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -1160,7 +1212,13 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
                 lines.append(f"• Avg MFE: **{stats['avg_mfe']:.2f}%** | Best: **{stats['best']:.2f}%**")
             else:
                 lines.append(f"• ⚠️ Only **{stats['count']}** signals in history — using fallback R:R 2.0")
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
         except Exception as e:
             logger.error(f"TP command error: {e}", exc_info=True)
             await ctx.send(f"❌ Error: {e}")
@@ -1279,7 +1337,13 @@ async def debug_cmd(ctx):
                 except Exception:
                     pass
 
-    await ctx.send("\n".join(lines))
+    msg = "\n".join(lines)
+    while msg:
+        chunk = msg[:1900]
+        if len(msg) > 1900:
+            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+        await ctx.send(chunk)
+        msg = msg[len(chunk):].lstrip("\n")
 
 @core.bot.command(name="reset")
 async def reset_cmd(ctx, confirm: str = ""):
@@ -1426,7 +1490,13 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
             # signals — the synthetic sim record isn't part of the calibration.
             lines.append(f"• Real closed {side} signals in history: **{stats['count']}** (the sim record is tagged separately and doesn't affect adaptive TP/SL)")
 
-            await ctx.send("\n".join(lines))
+            msg = "\n".join(lines)
+            while msg:
+                chunk = msg[:1900]
+                if len(msg) > 1900:
+                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+                await ctx.send(chunk)
+                msg = msg[len(chunk):].lstrip("\n")
 
         except Exception as e:
             logger.error(f"Sim command error: {e}", exc_info=True)
