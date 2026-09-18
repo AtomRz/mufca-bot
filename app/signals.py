@@ -1943,6 +1943,22 @@ def backtest_history(
                     "max_adverse_pct": round(max_adverse, 4),
                     "regime": bt_regime,
                     "track": track,
+                    # 🆕 FIX (external review, TP1-mode comparison): exit_type
+                    # alone can't tell "cancelled after touching TP1" apart
+                    # from "cancelled without ever reaching TP1" — and since
+                    # the MAX_HOLD_BARS horizon is measured from ENTRY, not
+                    # from the TP1-hit bar, a LOOSER post-TP1 SL (e.g.
+                    # breakeven) needs a bigger adverse move to resolve and
+                    # is systematically more likely to run out of bars
+                    # before resolving than a TIGHTER one (e.g.
+                    # three_quarter_tp1) — so different tp1_sl_fraction runs
+                    # over the IDENTICAL historical window can end up with
+                    # different numbers of "cancelled" trades, silently
+                    # dropping more samples for looser fractions. Persisting
+                    # tp1_reached lets a consumer (tp1sim_cmd) recover those
+                    # trades instead of having that asymmetric dropout
+                    # quietly bias a cross-fraction comparison.
+                    "tp1_reached": bool(tp1_reached),
                 })
                 history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1

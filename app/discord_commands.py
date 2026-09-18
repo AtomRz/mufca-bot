@@ -960,12 +960,19 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
       !tp1sim BTC/USDT 4h        — just that pair/timeframe
       !tp1sim BTC/USDT 4h 1500   — fewer bars, faster
 
-    Caveat: backtest_history()'s records don't carry a separate tp1_hit
-    flag — TP1 involvement is inferred from exit_type in ("tp",
-    "sl_after_tp1"). A trade that hit TP1 and then just ran out of bars
-    (exit_type="cancelled") isn't distinguishable from one that never
-    reached TP1 at all, so the sample counted here is slightly
-    conservative — real TP1 hit-rate is >= what's shown.
+    🆕 Asymmetric-dropout fix: backtest_history()'s inner horizon
+    (idx + MAX_HOLD_BARS) is measured from ENTRY, not from the TP1-hit
+    bar. A LOOSER post-TP1 SL (breakeven) needs a bigger adverse move to
+    resolve than a TIGHTER one (three_quarter_tp1), so it's systematically
+    more likely to run out of bars before resolving — over the exact same
+    historical window, breakeven can end up with FEWER counted trades than
+    three_quarter_tp1 purely from this timeout effect, not because TP1 was
+    reached less often. backtest_history() now persists tp1_reached so
+    those timed-out trades can be recovered here instead of silently
+    vanishing from one mode's sample and not another's — each row below
+    reports n_timeout separately, included in avg_pnl (their moved_pct at
+    the force-close price is real) but not counted as a win in win_rate
+    (their outcome past that point is genuinely unknown).
 
     This is a slow, CPU-heavy command (num_pairs × num_timeframes × 4
     full backtests) — expect it to take a while on the default scope.
@@ -991,10 +998,10 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
         f"{num_bars} bars each. This is slow — sit tight."
     )
 
-    win_exit_type = "tp"
-    tp1_exit_types = ("tp", "sl_after_tp1")
-
-    # (mode_name, track, regime) -> list of records
+    # (mode_name, track, regime) -> list of records that ever reached TP1
+    # (exit_type "tp"/"sl_after_tp1", OR "cancelled" with tp1_reached=True —
+    # see the docstring's asymmetric-dropout note for why the latter must
+    # be included rather than silently dropped).
     buckets = {}
 
     try:
@@ -1011,7 +1018,8 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
 
                     for side in ("long", "short"):
                         for rec in history.get(t, {}).get(f, {}).get(side, []):
-                            if rec.get("exit_type") in tp1_exit_types:
+                            et = rec.get("exit_type")
+                            if et in ("tp", "sl_after_tp1") or (et == "cancelled" and rec.get("tp1_reached")):
                                 key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
                                 buckets.setdefault(key, []).append(rec)
                     await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
@@ -1026,14 +1034,23 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
                 continue
             for (_, track, regime), recs in rows:
                 n = len(recs)
-                wins = sum(1 for r in recs if r.get("exit_type") == win_exit_type)
+                n_timeout = sum(1 for r in recs if r.get("exit_type") == "cancelled")
+                wins = sum(1 for r in recs if r.get("exit_type") == "tp")
                 win_rate = wins / n if n else 0.0
                 avg_pnl = sum(r.get("moved_pct", 0.0) for r in recs) / n
                 flag = "" if n >= 5 else " ⚠️ tiny sample"
-                lines.append(f"  track={track} regime={regime}: n={n} win_rate={win_rate:.0%} avg_pnl={avg_pnl:+.2f}%{flag}")
+                timeout_str = f" (incl. {n_timeout} timed-out)" if n_timeout else ""
+                lines.append(
+                    f"  track={track} regime={regime}: n={n}{timeout_str} win_rate={win_rate:.0%} avg_pnl={avg_pnl:+.2f}%{flag}"
+                )
             lines.append("")
 
-        lines.append("Caveat: cancelled-after-TP1 trades aren't distinguishable from never-reached-TP1 in backtest_history()'s current record shape — real TP1 sample size is >= what's shown above.")
+        lines.append(
+            "n_timeout = reached TP1 but neither TP2 nor the moved SL resolved within MAX_HOLD_BARS of entry — "
+            "counted in avg_pnl (real force-close PnL), not counted as a win. Compare n_timeout across modes for "
+            "the same track/regime before trusting a win_rate difference — a big gap there means the comparison "
+            "itself is lopsided, not just the underlying trades."
+        )
 
         msg = "\n".join(lines)
         while msg:
