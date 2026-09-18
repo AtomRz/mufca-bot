@@ -1100,7 +1100,7 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
         # directly, once per pair/tf, instead of leaving it to server logs.
         short_pairs = [(t, f, c) for (t, f), c in bar_coverage.items() if c["got"] < c["requested"]]
         if short_pairs:
-            lines.append("⚠️ Bars requested vs. actually received (single fetch_ohlcv call, no pagination):")
+            lines.append("⚠️ Bars requested vs. actually received (may reflect real available history, not necessarily a fetch problem):")
             for t, f, c in short_pairs:
                 lines.append(f"  {t} {f}: requested {c['requested']}, got {c['got']}")
             lines.append("")

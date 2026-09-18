@@ -1425,24 +1425,26 @@ def _fetch_ohlcv_paginated(exchange: ccxt.Exchange, ticker: str, tf: str, num_ba
 
     🆕 (external review, TP1-mode comparison): backtest_history() used to
     make a single exchange.fetch_ohlcv(ticker, tf, limit=num_bars) call —
-    Gate.io (confirmed empirically: requesting 3000 or 6000 both silently
-    returned exactly 1000) caps how many candles it returns per request
-    regardless of what limit asks for, and ccxt has no way to know that in
-    advance — it just hands back whatever the exchange gave it, no error,
-    no warning. Walking `since` forward in page_limit-sized chunks from
-    num_bars back is the standard ccxt pattern for getting more history
-    than one call allows.
+    Gate.io caps how many candles it returns per request regardless of
+    what limit asks for, and ccxt has no way to know that in advance — it
+    just hands back whatever the exchange gave it, no error, no warning.
+    Walking `since` forward in page_limit-sized chunks from num_bars back
+    is the standard ccxt pattern for getting more history than one call
+    allows.
 
-    Stops early if the exchange returns fewer than page_limit bars (caught
-    up to the present, or reached the start of available listing history)
-    or makes no forward progress (safety net against an infinite loop on
-    an exchange quirk) — so the result can still be shorter than num_bars
-    if that much history genuinely isn't available, same as before this
-    function existed; the difference is it now goes past 1000 when more
-    actually exists.
+    🆕 FIX (external review, real-run follow-up): this used to stop as
+    soon as a page came back shorter than page_limit, assuming that meant
+    "caught up to now" — but Gate.io's actual per-request cap turned out
+    to be 999, not the assumed round 1000, so EVERY page was "shorter than
+    page_limit" and the loop exited after page 1 every time, regardless of
+    how much more history actually existed (confirmed: requesting both
+    3000 and 6000 bars silently came back with the same ~999). Stopping
+    now only once `since` has genuinely caught up to "now" (within one bar
+    duration) — not by guessing the exchange's exact per-call limit.
     """
     tf_ms = exchange.parse_timeframe(tf) * 1000
-    since = exchange.milliseconds() - num_bars * tf_ms
+    now_ms = exchange.milliseconds()
+    since = now_ms - num_bars * tf_ms
 
     all_bars = []
     while len(all_bars) < num_bars:
@@ -1454,8 +1456,8 @@ def _fetch_ohlcv_paginated(exchange: ccxt.Exchange, ticker: str, tf: str, num_ba
         if next_since <= since:
             break  # no forward progress — exchange quirk, stop rather than loop forever
         since = next_since
-        if len(chunk) < page_limit:
-            break  # caught up to "now", or hit the start of available history
+        if since >= now_ms - tf_ms:
+            break  # genuinely caught up to "now", not just "this page was a bit short"
 
     # Pagination pages can overlap by one bar at the boundary — dedup by
     # timestamp and keep only the most recent num_bars, sorted ascending
