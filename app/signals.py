@@ -59,6 +59,7 @@ from state import (
     get_signal_stats,
     calculate_combined_tp,
     apply_tp_obstacle_cap,
+    analyze_confidence_components,
     normalize_timestamp,
     is_before_ts,
 )
@@ -69,7 +70,7 @@ import spread
 # market_structure.py / relative_strength.py docstrings for why these are
 # separate modules that know nothing about confidence/TP themselves.
 from market_structure import get_market_structure
-from relative_strength import get_relative_strength
+from relative_strength import get_relative_strength, calc_relative_strength, default_benchmark_for
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,47 @@ def _hurst_passes(hurst_v: float, mode: str, min_deviation: float) -> bool:
     if mode == "trending_only":
         return (hurst_v - 0.5) >= min_deviation
     return abs(hurst_v - 0.5) >= min_deviation
+
+def _rs_vp_components(is_long: bool, rel_strength: Optional[Dict], market_structure: Optional[Any]) -> Dict[str, float]:
+    """The relative_strength/volume_profile confidence-score components —
+    shared between live's calc_confidence() (inside check_signals) and
+    backtest_history()'s point-in-time equivalent, same reasoning as
+    _hurst_passes() above: one implementation instead of two that could
+    silently score the same inputs differently after the next edit to
+    either one.
+
+    rel_strength — a relative_strength.calc_relative_strength()-shaped
+    dict (or get_relative_strength()'s live wrapper), or None if
+    unavailable (e.g. this IS the benchmark itself, or too little aligned
+    history exists yet — see default_benchmark_for()).
+
+    market_structure — a market_structure.MarketStructure snapshot, or
+    None if unavailable.
+
+    Deliberately kept small (±5) and separate from the core signal
+    confirmations: until real outcomes show whether these carry
+    information, they should be able to nudge a borderline signal, not
+    dominate one the way an equal-weight "+1 per extra confirmation"
+    would risk doing with several correlated confirmations already in
+    play.
+    """
+    rs_component = 0
+    if rel_strength is not None:
+        trend = rel_strength.get("trend")
+        if trend == "up":
+            rs_component = 5 if is_long else -5
+        elif trend == "down":
+            rs_component = -5 if is_long else 5
+
+    vp_component = 0
+    if market_structure is not None:
+        loc = market_structure.price_location
+        if loc == "above_vah":
+            vp_component = 5 if is_long else -5
+        elif loc == "below_val":
+            vp_component = -5 if is_long else 5
+
+    return {"relative_strength": rs_component, "volume_profile": vp_component}
 
 def crossover2(s1, s2, i):
     if i < 1:
@@ -1307,23 +1349,11 @@ async def check_signals(
             # able to nudge a borderline signal, not dominate one the way
             # an equal-weight "+1 per extra confirmation" would risk doing
             # with several correlated confirmations already in play.
-            rs_component = 0
-            if rel_strength is not None:
-                trend = rel_strength.get("trend")
-                if trend == "up":
-                    rs_component = 5 if is_long else -5
-                elif trend == "down":
-                    rs_component = -5 if is_long else 5
-            components["relative_strength"] = rs_component
-
-            vp_component = 0
-            if market_structure is not None:
-                loc = market_structure.price_location
-                if loc == "above_vah":
-                    vp_component = 5 if is_long else -5
-                elif loc == "below_val":
-                    vp_component = -5 if is_long else 5
-            components["volume_profile"] = vp_component
+            # 🆕 (external review, component-backtest): factored into
+            # _rs_vp_components() so backtest_history()'s point-in-time
+            # equivalent scores these two exactly the same way live does —
+            # one implementation, not two that could quietly drift apart.
+            components.update(_rs_vp_components(is_long, rel_strength, market_structure))
 
             score = max(0, min(100, sum(components.values())))
             return score, components
@@ -1481,6 +1511,7 @@ def backtest_history(
     tp1_sl_fraction: Optional[float] = None,
     dry_run: bool = False,
     df: Optional[pd.DataFrame] = None,
+    compute_confidence: bool = False,
 ):
     """Backtest for accumulating signal history.
 
@@ -1514,6 +1545,22 @@ def backtest_history(
     runs, instead of re-fetching (now paginated, so potentially several
     requests) four times for identical data. None (the default) fetches
     internally exactly as before this parameter existed.
+
+    compute_confidence — 🆕 (external review, component-backtest): when
+    True, also computes and persists confidence_components on every
+    record — the same relative_strength/volume_profile/regime/htf/
+    confluence breakdown calc_confidence() builds live (see
+    _rs_vp_components(), shared between both), reconstructed point-in-time
+    at each simulated entry instead of waiting for live signals to
+    accumulate it. Costs an extra benchmark (BTC) OHLCV fetch and a
+    get_market_structure()/calc_relative_strength() call per triggered
+    signal — off by default so every existing caller (including
+    tp1sim_cmd's 4 fraction runs, which don't need this) keeps its current
+    performance. onchain_bias has no historical equivalent (it's a live
+    API read of current sentiment, not a point-in-time queryable series)
+    and is simply omitted from the dict rather than guessed at — a
+    consumer checking `"onchain_bias" in components` can tell backtest-
+    sourced records apart from live ones for that reason alone.
 
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
@@ -1559,6 +1606,33 @@ def backtest_history(
             df = parse_ohlcv(bars)
             if not validate_dataframe(df, 100):
                 return (0, {}, bars_fetched) if dry_run else 0
+
+        # 🆕 (external review, component-backtest): point-in-time relative
+        # strength needs the benchmark's (BTC) OHLCV for the same window,
+        # fetched ONCE here rather than per-bar. Aligned by timestamp (not
+        # position) the same way relative_strength.get_relative_strength()
+        # aligns live — the two series were fetched independently and can
+        # have off-by-one differences at the edges even on the same
+        # exchange/timeframe. self-excluded when ticker IS the benchmark
+        # itself (see default_benchmark_for()), same as live. Only done at
+        # all when compute_confidence=True — see that param's docstring.
+        rs_merged = None
+        rs_ts_to_pos = {}
+        if compute_confidence:
+            benchmark_ticker = default_benchmark_for(ticker)
+            if benchmark_ticker is not None:
+                try:
+                    benchmark_bars = _fetch_ohlcv_paginated(exchange, benchmark_ticker, tf, bars_fetched)
+                    if benchmark_bars and len(benchmark_bars) >= 30:
+                        benchmark_df = parse_ohlcv(benchmark_bars)
+                        rs_merged = pd.merge(
+                            df[["timestamp", "close"]].rename(columns={"close": "asset_close"}),
+                            benchmark_df[["timestamp", "close"]].rename(columns={"close": "benchmark_close"}),
+                            on="timestamp", how="inner",
+                        ).sort_values("timestamp").reset_index(drop=True)
+                        rs_ts_to_pos = {int(ts): i for i, ts in enumerate(rs_merged["timestamp"])}
+                except Exception as e:
+                    logger.warning(f"[BACKTEST] {ticker} {tf}: relative-strength benchmark fetch failed: {e}")
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1802,6 +1876,38 @@ def backtest_history(
             sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt) and b_warmed_up_bt
             sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt) and b_warmed_up_bt
 
+            # 🆕 (external review, component-backtest): market_structure/
+            # relative_strength for THIS bar, computed at most once (lazily,
+            # only if at least one track's signal actually fires here) and
+            # reused across all triggered tracks/sides below — they're not
+            # side- or track-dependent, only their contribution to each
+            # side's confidence score is (see _rs_vp_components()). Sliced
+            # to df.iloc[:idx+2] so get_market_structure()'s own internal
+            # iloc[-2]/iloc[-1] convention (last CONFIRMED bar / still-
+            # forming bar) lines up with idx being the confirmed signal bar
+            # — exactly mirroring how live's df[..., :-2] vs [-1] split
+            # works, just replayed at a historical idx instead of "now".
+            ms_this_bar = None
+            rs_this_bar = None
+            if compute_confidence and (sig_a_long or sig_a_short or sig_u_long or sig_u_short or sig_b_long or sig_b_short):
+                try:
+                    ms_slice = df.iloc[:min(idx + 2, len(df))]
+                    if len(ms_slice) >= 10:
+                        ms_this_bar = get_market_structure(ms_slice, ticker, tf)
+                except Exception as e:
+                    logger.warning(f"[BACKTEST] {ticker} {tf} idx={idx}: market_structure failed: {e}")
+
+                if rs_merged is not None:
+                    pos = rs_ts_to_pos.get(int(df["timestamp"].iloc[idx]))
+                    if pos is not None:
+                        try:
+                            rs_this_bar = calc_relative_strength(
+                                rs_merged["asset_close"].iloc[:pos + 1],
+                                rs_merged["benchmark_close"].iloc[:pos + 1],
+                            )
+                        except Exception as e:
+                            logger.warning(f"[BACKTEST] {ticker} {tf} idx={idx}: relative_strength failed: {e}")
+
             for track, side, sig_ok in [
                 ("a", "long", sig_a_long), ("a", "short", sig_a_short),
                 ("u", "long", sig_u_long), ("u", "short", sig_u_short),
@@ -2020,6 +2126,27 @@ def backtest_history(
                 else:
                     moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
 
+                # 🆕 (external review, component-backtest): same shape
+                # calc_confidence() builds live, from the local vars this
+                # loop already computes for entry filtering — onchain_bias
+                # omitted (see compute_confidence's docstring for why),
+                # relative_strength/volume_profile from _rs_vp_components()
+                # so they score identically to how live would score the
+                # same market_structure/rel_strength reading.
+                confidence_components_bt = None
+                if compute_confidence:
+                    is_long = side == "long"
+                    a_sig = sig_a_long if is_long else sig_a_short
+                    u_sig = sig_u_long if is_long else sig_u_short
+                    confidence_components_bt = {
+                        "regime_chop": 20 if chop_ok else 0,
+                        "regime_atr": 20 if atr_ok else 0,
+                        "frama": 15 if (frama_bull if is_long else frama_bear) else 0,
+                        "signal_confluence": 25 if (a_sig and u_sig) else 10 if (a_sig or u_sig) else 0,
+                        "htf_bias": 20 if (htf_bull_bt if is_long else htf_bear_bt) else 0,
+                    }
+                    confidence_components_bt.update(_rs_vp_components(is_long, rs_this_bar, ms_this_bar))
+
                 history[ticker][tf][side].append({
                     "entry": round_price(close_v),
                     "exit": round_price(exit_price),
@@ -2031,6 +2158,7 @@ def backtest_history(
                     "max_adverse_pct": round(max_adverse, 4),
                     "regime": bt_regime,
                     "track": track,
+                    "confidence_components": confidence_components_bt,
                     # 🆕 FIX (external review, TP1-mode comparison): exit_type
                     # alone can't tell "cancelled after touching TP1" apart
                     # from "cancelled without ever reaching TP1" — and since
@@ -2062,6 +2190,122 @@ def backtest_history(
     except Exception as e:
         logger.error(f"[BACKTEST] Failed for {ticker} {tf}: {e}", exc_info=True)
         return (0, {}, bars_fetched) if dry_run else 0
+
+
+async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000) -> Dict:
+    """Compares breakeven/quarter/half/three_quarter SL-after-TP1 modes on
+    real historical OHLCV via dry-run backtest_history() calls — one per
+    (ticker, tf, fraction) combo, sharing one fetched df across all 4
+    fractions per ticker/tf. Never writes to signals_history.json or
+    touches the live TP1_SL_MODE setting.
+
+    🆕 (external review, TP1-mode comparison): shared between
+    discord_commands.py's !tp1sim and web_api.py's /api/tp1sim so both
+    surfaces run and report the identical comparison — single source of
+    truth for what used to only live inline in the Discord command.
+
+    Returns:
+        {
+            "bar_coverage": [{"ticker":.., "tf":.., "requested":.., "got":..}, ...],
+            "modes": {
+                "breakeven": [{"track":.., "regime":.., "n":.., "n_timeout":..,
+                                "win_rate":.., "avg_pnl":..}, ...],
+                "quarter_tp1": [...], "half_tp1": [...], "three_quarter_tp1": [...],
+            },
+        }
+
+    n_timeout counts records that reached TP1 but neither TP2 nor the
+    moved SL resolved within MAX_HOLD_BARS of entry (see
+    backtest_history()'s tp1_reached field) — included in avg_pnl (their
+    force-close PnL is real) but not counted as a win, since their actual
+    outcome past that point is unknown. See tp1sim_cmd's docstring for the
+    fuller reasoning (asymmetric dropout across fractions).
+    """
+    buckets: Dict[tuple, list] = {}
+    bar_coverage: List[Dict] = []
+
+    for t in tickers:
+        for f in tfs:
+            for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
+                try:
+                    count, history, bars_fetched = await asyncio.to_thread(
+                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True
+                    )
+                except Exception as e:
+                    logger.error(f"run_tp1_mode_comparison: backtest error for {t} {f} {mode_name}: {e}")
+                    continue
+
+                existing = next((c for c in bar_coverage if c["ticker"] == t and c["tf"] == f), None)
+                if existing is None:
+                    bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": bars_fetched})
+                else:
+                    existing["got"] = min(existing["got"], bars_fetched)
+
+                for side in ("long", "short"):
+                    for rec in history.get(t, {}).get(f, {}).get(side, []):
+                        et = rec.get("exit_type")
+                        if et in ("tp", "sl_after_tp1") or (et == "cancelled" and rec.get("tp1_reached")):
+                            key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
+                            buckets.setdefault(key, []).append(rec)
+                await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+
+    modes_out: Dict[str, List[Dict]] = {m: [] for m in _cfg.TP1_SL_MODE_FRACTIONS}
+    for mode_name in _cfg.TP1_SL_MODE_FRACTIONS:
+        rows = sorted((k, v) for k, v in buckets.items() if k[0] == mode_name)
+        for (_, track, regime), recs in rows:
+            n = len(recs)
+            n_timeout = sum(1 for r in recs if r.get("exit_type") == "cancelled")
+            wins = sum(1 for r in recs if r.get("exit_type") == "tp")
+            avg_pnl = sum(r.get("moved_pct", 0.0) for r in recs) / n
+            modes_out[mode_name].append({
+                "track": track,
+                "regime": regime,
+                "n": n,
+                "n_timeout": n_timeout,
+                "win_rate": round(wins / n, 4) if n else 0.0,
+                "avg_pnl": round(avg_pnl, 4),
+            })
+
+    return {"bar_coverage": bar_coverage, "modes": modes_out}
+
+
+async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000, min_samples: int = 30) -> Dict:
+    """Replays real historical OHLCV through dry-run backtest_history(...,
+    compute_confidence=True) across the given tickers/tfs, merges the
+    resulting records, and runs them through
+    state.analyze_confidence_components() — the exact same report
+    !components builds from live history, just sourced from a backtest
+    instead of waiting for the live bot to accumulate signals.
+
+    🆕 (external review, component-backtest): shared between
+    discord_commands.py's !compsim and web_api.py's /api/compsim.
+
+    Returns analyze_confidence_components()'s own report dict (see its
+    docstring in state.py) plus a "bar_coverage" key with the same shape
+    as run_tp1_mode_comparison()'s. Never writes to signals_history.json.
+    """
+    combined_history: Dict = {}
+    bar_coverage: List[Dict] = []
+
+    for t in tickers:
+        for f in tfs:
+            try:
+                count, history, bars_fetched = await asyncio.to_thread(
+                    backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, None, True, None, True
+                )
+            except Exception as e:
+                logger.error(f"run_component_backtest: backtest error for {t} {f}: {e}")
+                continue
+
+            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": bars_fetched})
+            for side in ("long", "short"):
+                combined_history.setdefault(t, {}).setdefault(f, {}).setdefault(side, [])
+                combined_history[t][f][side].extend(history.get(t, {}).get(f, {}).get(side, []))
+            await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+
+    report = analyze_confidence_components(history=combined_history, min_samples=min_samples)
+    report["bar_coverage"] = bar_coverage
+    return report
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

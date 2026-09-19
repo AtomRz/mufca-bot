@@ -50,7 +50,10 @@ from config import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, format_price
 from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
-from signals import check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache
+from signals import (
+    check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
+    run_tp1_mode_comparison, run_component_backtest,
+)
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full
 import derivatives
 import spread
@@ -88,6 +91,7 @@ async def help_cmd(ctx):
         "`!signals <pair> <tf>` — signal statistics for a pair",
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
+        "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
@@ -1057,70 +1061,36 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
         f"{num_bars} bars each. This is slow — sit tight."
     )
 
-    # (mode_name, track, regime) -> list of records that ever reached TP1
-    # (exit_type "tp"/"sl_after_tp1", OR "cancelled" with tp1_reached=True —
-    # see the docstring's asymmetric-dropout note for why the latter must
-    # be included rather than silently dropped).
-    buckets = {}
-    # (ticker, tf) -> {"requested": num_bars, "got": min bars actually
-    # returned across the 4 fraction runs} — see the docstring note below
-    # on why num_bars can be silently truncated by the exchange.
-    bar_coverage = {}
-
     try:
-        for t in scope_tickers:
-            for f in scope_tfs:
-                for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
-                    try:
-                        count, history, bars_fetched = await asyncio.to_thread(
-                            backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True
-                        )
-                    except Exception as e:
-                        logger.error(f"tp1sim backtest error for {t} {f} {mode_name}: {e}")
-                        continue
-
-                    cov = bar_coverage.setdefault((t, f), {"requested": num_bars, "got": bars_fetched})
-                    cov["got"] = min(cov["got"], bars_fetched)
-
-                    for side in ("long", "short"):
-                        for rec in history.get(t, {}).get(f, {}).get(side, []):
-                            et = rec.get("exit_type")
-                            if et in ("tp", "sl_after_tp1") or (et == "cancelled" and rec.get("tp1_reached")):
-                                key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
-                                buckets.setdefault(key, []).append(rec)
-                    await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+        result = await run_tp1_mode_comparison(exchange, scope_tickers, scope_tfs, num_bars)
 
         lines = [f"**🧪 TP1-mode comparison** (dry-run backtest, {num_bars} bars requested — nothing written to history)\n"]
 
-        # 🆕 (external review, TP1-mode comparison): backtest_history()'s
-        # fetch is a single, unpaginated call — asking for more bars than
-        # the exchange returns per request silently gets fewer than
-        # expected, which would otherwise show up only as "n looks lower
-        # than I'd guess" with no way to tell why. Surfacing it here
-        # directly, once per pair/tf, instead of leaving it to server logs.
-        short_pairs = [(t, f, c) for (t, f), c in bar_coverage.items() if c["got"] < c["requested"]]
+        # 🆕 (external review, real-run follow-up): more bars than one
+        # request can return get paginated (_fetch_ohlcv_paginated()) — but
+        # even so, num_bars can still come back short if that much history
+        # genuinely doesn't exist for this pair/timeframe. Surfacing it
+        # here directly, once per pair/tf, instead of leaving it to server
+        # logs, so a short count isn't mistaken for a bug when it's just
+        # limited listing history.
+        short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
         if short_pairs:
             lines.append("⚠️ Bars requested vs. actually received (may reflect real available history, not necessarily a fetch problem):")
-            for t, f, c in short_pairs:
-                lines.append(f"  {t} {f}: requested {c['requested']}, got {c['got']}")
+            for c in short_pairs:
+                lines.append(f"  {c['ticker']} {c['tf']}: requested {c['requested']}, got {c['got']}")
             lines.append("")
 
-        for mode_name in _cfg.TP1_SL_MODE_FRACTIONS:
-            rows = sorted((k, v) for k, v in buckets.items() if k[0] == mode_name)
+        for mode_name, rows in result["modes"].items():
             lines.append(f"**{mode_name}:**")
             if not rows:
                 lines.append("  no TP1-hit trades in this sample.\n")
                 continue
-            for (_, track, regime), recs in rows:
-                n = len(recs)
-                n_timeout = sum(1 for r in recs if r.get("exit_type") == "cancelled")
-                wins = sum(1 for r in recs if r.get("exit_type") == "tp")
-                win_rate = wins / n if n else 0.0
-                avg_pnl = sum(r.get("moved_pct", 0.0) for r in recs) / n
-                flag = "" if n >= 5 else " ⚠️ tiny sample"
-                timeout_str = f" (incl. {n_timeout} timed-out)" if n_timeout else ""
+            for row in rows:
+                flag = "" if row["n"] >= 5 else " ⚠️ tiny sample"
+                timeout_str = f" (incl. {row['n_timeout']} timed-out)" if row["n_timeout"] else ""
                 lines.append(
-                    f"  track={track} regime={regime}: n={n}{timeout_str} win_rate={win_rate:.0%} avg_pnl={avg_pnl:+.2f}%{flag}"
+                    f"  track={row['track']} regime={row['regime']}: n={row['n']}{timeout_str} "
+                    f"win_rate={row['win_rate']:.0%} avg_pnl={row['avg_pnl']:+.2f}%{flag}"
                 )
             lines.append("")
 
@@ -1140,6 +1110,105 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
             msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"tp1sim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+@core.bot.command(name="compsim", aliases=["compcompare"])
+async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000, min_samples: int = 30):
+    """
+    🆕 (external review, component-backtest): dry-run backtest_history()
+    with compute_confidence=True on real historical OHLCV — reconstructs
+    relative_strength/volume_profile confidence components point-in-time
+    at each simulated entry, the same way calc_confidence() scores them
+    live (via the shared _rs_vp_components()) — then feeds the result
+    through the same analyze_confidence_components() the live !components
+    command uses, so the report format and thresholds are identical.
+
+    The point: !components only has as many samples as the live bot has
+    actually closed since confidence_components was added — could be
+    weeks away from a trustworthy n. This replays real market history
+    instead of waiting for it to happen again live.
+
+    Usage: !compsim [ticker] [tf] [num_bars] [min_samples]
+      no args        — every tracked pair × timeframe, 3000 bars each
+      !compsim ETH/USDT 4h 6000       — just that pair/timeframe, more history
+      !compsim ETH/USDT 4h 6000 50    — stricter sample threshold
+
+    dry_run=True throughout: nothing is written to signals_history.json.
+
+    Caveat: onchain_bias has no historical equivalent (see
+    backtest_history()'s compute_confidence docstring) — it's simply
+    absent from these records, not zero. regime/track/htf/frama/
+    signal_confluence ARE all reconstructed point-in-time, same inputs
+    live's calc_confidence() would have seen.
+
+    This is a slow, CPU-heavy command (num_pairs × num_timeframes full
+    backtests, each also fetching BTC as the relative-strength benchmark)
+    — expect it to take a while on the default scope.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+
+    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in TICKERS:
+            await ctx.send(f"❌ `{t}` is not a tracked pair.")
+            return
+    for f in scope_tfs:
+        if f not in TIMEFRAMES:
+            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
+            return
+
+    await ctx.send(
+        f"⏳ Running component backtest: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), "
+        f"{num_bars} bars each (+ BTC benchmark fetch per pair). This is slow — sit tight."
+    )
+
+    try:
+        report = await run_component_backtest(exchange, scope_tickers, scope_tfs, num_bars, min_samples)
+
+        lines = [f"**🧪 Component backtest** ({report['total_closed']} closed records simulated, {num_bars} bars requested per pair/tf)\n"]
+
+        short_pairs = [c for c in report["bar_coverage"] if c["got"] < num_bars]
+        if short_pairs:
+            lines.append("⚠️ Bars requested vs. actually received (may reflect real available history):")
+            for c in short_pairs:
+                lines.append(f"  {c['ticker']} {c['tf']}: requested {num_bars}, got {c['got']}")
+            lines.append("")
+
+        for comp_name in ("relative_strength", "volume_profile"):
+            rows = report["components"][comp_name]
+            lines.append(f"**{comp_name}:**")
+            if not rows:
+                lines.append("  no records carry this component.\n")
+                continue
+            for row in rows:
+                raw_str = f", raw_mfe={row['avg_raw_mfe']:.2f}% (n={row['raw_mfe_n']})" if row["avg_raw_mfe"] is not None else ", raw_mfe=n/a"
+                flag = "" if row["enough_samples"] else f" ⚠️ only {row['n']}/{min_samples}"
+                exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
+                lines.append(
+                    f"  `{row['side']}` value={row['value']:>3}: n={row['n']} win_rate={row['win_rate']:.0%} "
+                    f"avg_mfe={row['avg_mfe']:.2f}%{raw_str}  [{exit_str}]{flag}"
+                )
+            lines.append("")
+
+        lines.append(
+            f"Same report shape as !components. raw_mfe here comes from max_favorable_pct at simulation time "
+            f"(backtest records don't get the live raw-outcome extension — see update_raw_outcome() — so "
+            f"avg_raw_mfe will typically read n/a for these). Rule of thumb: trust a row once n >= {min_samples}."
+        )
+
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
+    except Exception as e:
+        logger.error(f"compsim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 @core.bot.command(name="tp")

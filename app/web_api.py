@@ -355,6 +355,86 @@ async def get_components(min_samples: int = 30):
     return analyze_confidence_components(min_samples=min_samples)
 
 
+class Tp1SimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = 3000
+
+
+@app.post("/api/tp1sim")
+async def run_tp1sim(body: Tp1SimIn):
+    """🆕 (external review, TP1-mode comparison): compares breakeven/
+    quarter_tp1/half_tp1/three_quarter_tp1 SL-after-TP1 modes on real
+    historical OHLCV via dry-run backtests — same computation as the
+    Discord !tp1sim command, both call signals.run_tp1_mode_comparison()
+    so the two can never disagree. Never writes to signals_history.json or
+    touches the live TP1_SL_MODE setting. See that function's docstring
+    (signals.py) for the exact response shape.
+
+    ticker/tf default to every tracked pair/timeframe when omitted — this
+    is a slow, CPU-heavy call (pairs × timeframes × 4 modes, each a full
+    backtest); the frontend should show it as a long-running action, not
+    something polled quickly."""
+    ticker = body.ticker.upper().strip() if body.ticker else None
+    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
+    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in _cfg.TICKERS:
+            raise HTTPException(404, f"{t} is not a tracked pair")
+    for f in scope_tfs:
+        if f not in _cfg.TIMEFRAMES:
+            raise HTTPException(404, f"{f} is not a tracked timeframe")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    from signals import run_tp1_mode_comparison
+    return await run_tp1_mode_comparison(exchange, scope_tickers, scope_tfs, body.num_bars)
+
+
+class CompSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = 3000
+    min_samples: int = 30
+
+
+@app.post("/api/compsim")
+async def run_compsim(body: CompSimIn):
+    """🆕 (external review, component-backtest): replays real historical
+    OHLCV through a dry-run backtest with confidence_components
+    reconstructed point-in-time (relative_strength/volume_profile, the
+    same way calc_confidence() scores them live), then reports through
+    the same analyze_confidence_components() /api/components uses — so
+    a large, trustworthy n doesn't require waiting for the live bot to
+    accumulate it. Same computation as the Discord !compsim command, both
+    call signals.run_component_backtest(). Never writes to
+    signals_history.json. See that function's docstring (signals.py) for
+    the exact response shape (analyze_confidence_components()'s own
+    report shape, plus a bar_coverage list).
+
+    Slower than /api/tp1sim per pair/tf — each also fetches BTC as the
+    relative-strength benchmark and runs get_market_structure() at every
+    triggered signal, not just 4 backtests but 1 with extra per-bar work."""
+    ticker = body.ticker.upper().strip() if body.ticker else None
+    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
+    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in _cfg.TICKERS:
+            raise HTTPException(404, f"{t} is not a tracked pair")
+    for f in scope_tfs:
+        if f not in _cfg.TIMEFRAMES:
+            raise HTTPException(404, f"{f} is not a tracked timeframe")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    from signals import run_component_backtest
+    return await run_component_backtest(exchange, scope_tickers, scope_tfs, body.num_bars, body.min_samples)
+
+
 @app.get("/api/health")
 async def health():
     """Lightweight liveness/readiness probe for Docker/orchestrator healthchecks —

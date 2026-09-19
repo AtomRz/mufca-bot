@@ -99,6 +99,10 @@ export const api = {
     request(`/api/spread${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   getComponents: (minSamples = 30) =>
     request(`/api/components?min_samples=${minSamples}`),
+  runTp1Sim: ({ ticker, tf, numBars = 3000 } = {}) =>
+    request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
+  runCompSim: ({ ticker, tf, numBars = 3000, minSamples = 30 } = {}) =>
+    request('/api/compsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, min_samples: minSamples }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

@@ -477,12 +477,200 @@ function ComponentsView({ lastEvent }) {
 }
 
 // =====================================================================
-// 🏠  TOP LEVEL — sub-nav between Bias / Spread / Components.
+// 🧪  SIMULATE — new: run !tp1sim / !compsim-equivalent dry-run backtests
+// from the web, not just Discord. Both are slow, user-triggered actions
+// (not auto-polled like the views above), so this is a form + a button,
+// not a useEffect poll.
+// =====================================================================
+const SIM_TIMEFRAMES = ['1h', '4h'] // matches config.py's TIMEFRAMES — small, fixed list, not worth a round trip
+
+function SimScopeFields({ pairs, ticker, setTicker, tf, setTf, numBars, setNumBars, extra }) {
+  return (
+    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
+      <div>
+        <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Pair</label>
+        <select value={ticker} onChange={(e) => setTicker(e.target.value)}>
+          <option value="">All tracked pairs</option>
+          {pairs?.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+      </div>
+      <div>
+        <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Timeframe</label>
+        <select value={tf} onChange={(e) => setTf(e.target.value)}>
+          <option value="">All timeframes</option>
+          {SIM_TIMEFRAMES.map((f) => <option key={f} value={f}>{f}</option>)}
+        </select>
+      </div>
+      <div>
+        <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Bars</label>
+        <input type="number" value={numBars} min={100} step={500}
+               onChange={(e) => setNumBars(Number(e.target.value))} style={{ width: 90 }} />
+      </div>
+      {extra}
+    </div>
+  )
+}
+
+function BarCoverageWarning({ coverage, requested }) {
+  const short = (coverage || []).filter((c) => c.got < requested)
+  if (short.length === 0) return null
+  return (
+    <p style={{ fontSize: 11, color: 'var(--accent)', marginBottom: 10 }}>
+      ⚠️ Bars requested vs. received (may reflect real available history):{' '}
+      {short.map((c) => `${c.ticker} ${c.tf}: got ${c.got}/${requested}`).join(' · ')}
+    </p>
+  )
+}
+
+function Tp1SimSection({ pairs }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(3000)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  const run = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const r = await api.runTp1Sim({ ticker, tf, numBars })
+      setResult(r)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">TP1-mode comparison</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
+        Compares breakeven / quarter / half (current) / three-quarter SL-after-TP1 on real historical data.
+        Dry-run — nothing is written to history or changes the live setting.
+      </p>
+      <SimScopeFields
+        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+      />
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
+      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests across pairs × timeframes × 4 modes — this is slow, sit tight…</p>}
+      {result && !loading && (
+        <>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          {Object.entries(result.modes).map(([modeName, rows]) => (
+            <div key={modeName} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{modeName}</div>
+              {rows.length === 0 ? (
+                <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No TP1-hit trades in this sample.</p>
+              ) : (
+                rows.map((row, i) => (
+                  <div className="row" key={i} style={{ fontSize: 12 }}>
+                    <span className="row-label">track={row.track} regime={row.regime}</span>
+                    <span className="row-value">
+                      n={row.n}{row.n_timeout ? ` (${row.n_timeout} timed-out)` : ''} · win_rate={(row.win_rate * 100).toFixed(0)}% · avg_pnl={row.avg_pnl > 0 ? '+' : ''}{row.avg_pnl.toFixed(2)}%
+                      {row.n < 5 && <span style={{ color: 'var(--accent)' }}> ⚠ tiny sample</span>}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          ))}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            n_timeout = reached TP1 but neither TP2 nor the moved SL resolved within MAX_HOLD_BARS of entry —
+            counted in avg_pnl, not counted as a win. A big gap in n_timeout between modes for the same
+            track/regime means the comparison itself is lopsided, not just the underlying trades.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+function CompSimSection({ pairs }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(3000)
+  const [minSamples, setMinSamples] = useState(30)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  const run = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const r = await api.runCompSim({ ticker, tf, numBars, minSamples })
+      setResult(r)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Component backtest</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
+        Replays real historical data with relative_strength/volume_profile reconstructed point-in-time,
+        instead of waiting for the live bot to accumulate enough closed signals. Dry-run — nothing written to history.
+      </p>
+      <SimScopeFields
+        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+      />
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
+      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests (each also fetches BTC as the relative-strength benchmark) — this is slow, sit tight…</p>}
+      {result && !loading && (
+        <>
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>{result.total_closed} closed records simulated.</p>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          {['relative_strength', 'volume_profile'].map((compName) => {
+            const rows = result.components[compName] || []
+            return (
+              <div key={compName} style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{compName}</div>
+                {rows.length === 0 ? (
+                  <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No records carry this component.</p>
+                ) : (
+                  rows.map((row, i) => (
+                    <ComponentRow key={i} row={row} minSamples={minSamples} />
+                  ))
+                )}
+              </div>
+            )
+          })}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            onchain_bias has no historical equivalent and is simply absent from these records — everything
+            else (regime, track, htf, frama, signal_confluence) is reconstructed point-in-time.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+function SimulateView({ pairs }) {
+  return (
+    <div>
+      <Tp1SimSection pairs={pairs} />
+      <CompSimSection pairs={pairs} />
+    </div>
+  )
+}
+
+// =====================================================================
+// 🏠  TOP LEVEL — sub-nav between Bias / Spread / Components / Simulate.
 // =====================================================================
 const VIEWS = [
   { id: 'bias', label: 'Bias' },
   { id: 'spread', label: 'Spread' },
   { id: 'components', label: 'Components' },
+  { id: 'simulate', label: 'Simulate' },
 ]
 
 export default function InsightsPanel({ lastEvent, pairs }) {
@@ -501,6 +689,7 @@ export default function InsightsPanel({ lastEvent, pairs }) {
       {view === 'bias' && <BiasView lastEvent={lastEvent} pairs={pairs} />}
       {view === 'spread' && <SpreadView lastEvent={lastEvent} pairs={pairs} />}
       {view === 'components' && <ComponentsView lastEvent={lastEvent} />}
+      {view === 'simulate' && <SimulateView pairs={pairs} />}
     </div>
   )
 }
