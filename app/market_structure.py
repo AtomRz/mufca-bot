@@ -1,174 +1,425 @@
 """
-MUFCA v4.0 — Market Structure Module
+MUFCA v4.1 - Market Structure Engine
 
-Computes where the significant price levels are: Volume Profile
-(POC / Value Area) and Support/Resistance pivots. This module ONLY
-describes market structure — it has no knowledge of confidence scoring,
-adaptive TP/SL, or the A/U/B tracks. Those layers (signals.py, and later
-a TP engine) consume a MarketStructure snapshot from here; this module
-never reaches back into them. Keeping that boundary means chart.py and
-the trading engine are structurally unable to compute different levels
-with different algorithms — there is exactly one implementation of
-"where is the POC" in the codebase, and everything else reads it.
+Single source of truth for:
+- Pivot support/resistance
+- Demand/supply zones
+- Volume Profile (POC / Value Area)
+- Price location and zone interaction
 
-Architecture:
-
-    check_signals()
-            |
-            v
-           df
-            |
-            v
-     market_structure
-            |
-      +-----+-----+
-      v     v     v
-     POC   VA    S/R
-      |     |     |
-      +--+--+--+--+
-         v     v
-   confidence   TP engine   (both future stages — not wired up yet)
-         |
-         v
-       chart
+No signal/TP policy lives here. Consumers only read the snapshot.
+All source comments and strings are ASCII-only.
 """
 
 import threading
-import numpy as np
-import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
 
 import config as _cfg
 from utils import round_price
 
+
 # =====================================================================
-# 📐  SUPPORT / RESISTANCE
+# Helpers
 # =====================================================================
 
-def _cluster_levels(levels: List[float], max_n: int, ref_price: float, tol: float = 0.005) -> List[Tuple[float, int]]:
-    """Clusters nearby raw pivot prices, keeps up to max_n CLOSEST to
-    ref_price (the current price).
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
 
-    Returns (clustered_price, touch_count) pairs instead of plain prices —
-    touch_count is how many raw pivots fell into that cluster, and is used
-    as a simple strength proxy by calc_support_resistance()'s
-    *_levels output (a level that formed from 5 separate pivots is more
-    significant than one that formed from a single touch).
-    """
+
+def _pct_distance(a: float, b: float) -> float:
+    if abs(b) <= 1e-12:
+        return 0.0
+    return abs(a - b) / abs(b) * 100.0
+
+
+def _cluster_levels(
+    levels: List[float],
+    max_n: int,
+    ref_price: float,
+    tol: float = 0.005,
+) -> List[Tuple[float, int]]:
     if not levels:
         return []
-    levels = sorted(set(levels))
+    levels = sorted(float(x) for x in levels if np.isfinite(x))
+    if not levels:
+        return []
+
     clustered: List[Tuple[float, int]] = []
     used = [False] * len(levels)
-    for i, l in enumerate(levels):
+    for i, level in enumerate(levels):
         if used[i]:
             continue
-        used[i] = True  # mark the pivot element itself as consumed too, not just its cluster-mates
-        cluster = [l]
-        last_accepted = l
-        # 🆕 FIX (external review): this used to compare every candidate
-        # against the cluster's fixed first element `l` — so a chain like
-        # 100.00 / 100.40 / 100.80 (each ~0.4% from its neighbor) could
-        # split in two under a 0.5% tolerance, because 100.80 is ~0.8%
-        # from 100.00 even though it's right next to 100.40. That
-        # under-counts touches and can make a real level fail the
-        # TP_CAP_MIN_TOUCHES significance check it should have passed.
-        # Comparing against the LAST ACCEPTED member instead (single-
-        # linkage / chain clustering) fixes this — levels is sorted
-        # ascending, so once a candidate falls outside tolerance of the
-        # nearest accepted member, nothing farther out can be closer, and
-        # it's safe to stop extending this cluster.
+        used[i] = True
+        cluster = [level]
         for j in range(i + 1, len(levels)):
             if used[j]:
                 continue
-            if abs(levels[j] - last_accepted) / (last_accepted + 1e-8) < tol:
+            if abs(levels[j] - level) / (abs(level) + 1e-8) < tol:
                 cluster.append(levels[j])
                 used[j] = True
-                last_accepted = levels[j]
-            else:
-                break
         clustered.append((float(np.mean(cluster)), len(cluster)))
-    if len(clustered) <= max_n:
-        return sorted(clustered, key=lambda t: t[0])
-    clustered.sort(key=lambda t: abs(t[0] - ref_price))
-    return sorted(clustered[:max_n], key=lambda t: t[0])
+
+    if len(clustered) > max_n:
+        clustered.sort(key=lambda x: abs(x[0] - ref_price))
+        clustered = clustered[:max_n]
+    return sorted(clustered, key=lambda x: x[0])
 
 
 def _levels_to_dicts(pairs: List[Tuple[float, int]], ref_price: float) -> List[Dict]:
     return [
         {
             "price": round_price(price),
-            "touches": touches,
-            "distance_pct": round(abs(price - ref_price) / ref_price * 100, 3),
+            "touches": int(touches),
+            "distance_pct": round(_pct_distance(price, ref_price), 3),
         }
         for price, touches in pairs
     ]
 
 
+def _atr_series(df: pd.DataFrame, period: int) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(max(2, int(period)), min_periods=max(2, int(period))).mean()
+
+
+# =====================================================================
+# Pivot Support / Resistance
+# =====================================================================
+
 def calc_support_resistance(
     df: pd.DataFrame,
     pivot_window: int = 10,
-    max_levels: int = 4
+    max_levels: int = 4,
 ) -> Dict:
-    """
-    Support/resistance levels from Pivot Points (local min/max).
-
-    Returns:
-        {
-            "support": [float, ...],        # legacy plain-price list, nearest levels first by price
-            "resistance": [float, ...],
+    """Return legacy S/R plus touch-enriched level dictionaries."""
+    if len(df) < max(5, pivot_window * 2 + 2):
+        return {
+            "support": [],
+            "resistance": [],
             "pivot": [],
-            "support_levels": [{"price":.., "touches":.., "distance_pct":..}, ...],
-            "resistance_levels": [...],      # same shape, strength-enriched — used by
-                                              # get_market_structure() for anything beyond
-                                              # just drawing a line, e.g. deciding whether a
-                                              # level is significant enough to cap a TP target
+            "support_levels": [],
+            "resistance_levels": [],
         }
-    """
+
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    last_close = float(close.iloc[-2])  # confirmed bar
-
+    last_close = _safe_float(close.iloc[-2] if len(close) >= 2 else close.iloc[-1])
+    w = max(1, int(pivot_window))
     supports: List[float] = []
     resistances: List[float] = []
 
-    # 1. Pivot Points (local extremes)
-    w = pivot_window
     for i in range(w, len(df) - w):
         hi_window = high.iloc[i - w:i + w + 1]
         lo_window = low.iloc[i - w:i + w + 1]
-        if high.iloc[i] == hi_window.max():
-            resistances.append(float(high.iloc[i]))
-        if low.iloc[i] == lo_window.min():
-            supports.append(float(low.iloc[i]))
+        if high.iloc[i] >= hi_window.max():
+            resistances.append(_safe_float(high.iloc[i]))
+        if low.iloc[i] <= lo_window.min():
+            supports.append(_safe_float(low.iloc[i]))
 
-    # Filter — keep only levels near the current price
-    def near_price(levels, price, pct=0.05):
-        return [l for l in levels if abs(l - price) / price < pct]
+    supports = [x for x in supports if x < last_close and _pct_distance(x, last_close) <= 12.0]
+    resistances = [x for x in resistances if x > last_close and _pct_distance(x, last_close) <= 12.0]
 
-    # Direction filtering (resistance above price / support below price)
-    # happens BEFORE selecting the top-N nearest, not after — otherwise
-    # already-broken levels on the wrong side of price could crowd out
-    # the few remaining levels that are still actually ahead of price.
-    resistances = [l for l in resistances if l > last_close]
-    supports = [l for l in supports if l < last_close]
-
-    supports_ct    = _cluster_levels(near_price(supports,    last_close, 0.12), max_levels, last_close)
-    resistances_ct = _cluster_levels(near_price(resistances, last_close, 0.12), max_levels, last_close)
+    supports_ct = _cluster_levels(supports, max_levels, last_close)
+    resistances_ct = _cluster_levels(resistances, max_levels, last_close)
 
     return {
-        "support":    [price for price, _ in supports_ct],
+        "support": [price for price, _ in supports_ct],
         "resistance": [price for price, _ in resistances_ct],
-        "pivot":      [],
-        "support_levels":    _levels_to_dicts(supports_ct, last_close),
+        "pivot": [],
+        "support_levels": _levels_to_dicts(supports_ct, last_close),
         "resistance_levels": _levels_to_dicts(resistances_ct, last_close),
     }
 
 
 # =====================================================================
-# 📊  VOLUME PROFILE (POC / Value Area)
+# Demand / Supply Zone Engine
+# =====================================================================
+
+def _base_mask(
+    df: pd.DataFrame,
+    atr: pd.Series,
+    i: int,
+    base_bars: int,
+    max_base_atr: float,
+) -> bool:
+    start = max(0, i - base_bars + 1)
+    segment = df.iloc[start:i + 1]
+    if len(segment) < 2:
+        return False
+    width = float(segment["high"].max() - segment["low"].min())
+    atr_i = _safe_float(atr.iloc[i], 0.0)
+    if atr_i <= 0:
+        return False
+    return width <= atr_i * max_base_atr
+
+
+def _zone_overlap(a_low, a_high, b_low, b_high) -> bool:
+    return min(a_high, b_high) >= max(a_low, b_low)
+
+
+def _merge_zones(zones: List[Dict], max_zones: int) -> List[Dict]:
+    if not zones:
+        return []
+    zones = sorted(zones, key=lambda z: (-z["score"], z["low"]))
+    kept: List[Dict] = []
+    for zone in zones:
+        merged = False
+        for existing in kept:
+            mid_a = (zone["low"] + zone["high"]) / 2.0
+            mid_b = (existing["low"] + existing["high"]) / 2.0
+            scale = max(abs(mid_a), abs(mid_b), 1e-12)
+            overlap = _zone_overlap(
+                zone["low"], zone["high"], existing["low"], existing["high"]
+            )
+            close = abs(mid_a - mid_b) / scale <= 0.006
+            if overlap or close:
+                new_low = min(existing["low"], zone["low"])
+                new_high = max(existing["high"], zone["high"])
+                existing["low"] = new_low
+                existing["high"] = new_high
+                existing["score"] = max(existing["score"], zone["score"])
+                existing["touches"] = max(existing["touches"], zone["touches"])
+                existing["age"] = min(existing["age"], zone["age"])
+                existing["fresh"] = existing["fresh"] and zone["fresh"]
+                existing["retests"] = max(existing["retests"], zone["retests"])
+                existing["volume_ratio"] = max(existing["volume_ratio"], zone["volume_ratio"])
+                existing["displacement_atr"] = max(existing["displacement_atr"], zone["displacement_atr"])
+                merged = True
+                break
+        if not merged:
+            kept.append(dict(zone))
+        if len(kept) >= max_zones * 3:
+            break
+    kept.sort(key=lambda z: (-z["score"], z["distance_pct"]))
+    return kept[:max_zones]
+
+
+def _zone_state(
+    zone_low: float,
+    zone_high: float,
+    side: str,
+    confirmed: pd.DataFrame,
+    created_idx: int,
+) -> Tuple[str, int, int]:
+    """Classify a zone using bars after creation only."""
+    if created_idx >= len(confirmed) - 1:
+        return "fresh", 0, 0
+
+    later = confirmed.iloc[created_idx + 1:]
+    retests = 0
+    broken = False
+    for row in later.itertuples():
+        high = _safe_float(row.high)
+        low = _safe_float(row.low)
+        if side == "demand":
+            if low <= zone_low:
+                broken = True
+            if low <= zone_high and high >= zone_low:
+                retests += 1
+            if _safe_float(row.close) < zone_low:
+                broken = True
+        else:
+            if high >= zone_high:
+                broken = True
+            if high >= zone_low and low <= zone_high:
+                retests += 1
+            if _safe_float(row.close) > zone_high:
+                broken = True
+
+    if broken:
+        return "broken", retests, len(later)
+    if retests == 0:
+        return "fresh", 0, len(later)
+    if retests == 1:
+        return "tested", 1, len(later)
+    return "weakened", retests, len(later)
+
+
+def detect_demand_supply_zones(
+    df: pd.DataFrame,
+    atr_period: int = 14,
+    lookback: int = 300,
+    base_bars: int = 4,
+    impulse_bars: int = 3,
+    max_zones: int = 5,
+    max_base_atr: float = 1.6,
+    min_displacement_atr: float = 1.1,
+    min_volume_ratio: float = 1.15,
+) -> Dict[str, List[Dict]]:
+    """Detect fresh and tested demand/supply zones from confirmed OHLCV bars.
+
+    A zone is formed by a compact base followed by directional displacement.
+    The detector never uses the currently forming candle. Zones are scored from
+    structure, displacement, volume, freshness, retests, and distance.
+    """
+    empty = {"demand": [], "supply": []}
+    if df is None or len(df) < max(30, atr_period + base_bars + impulse_bars + 5):
+        return empty
+
+    confirmed = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
+    if len(confirmed) < 30:
+        return empty
+    confirmed = confirmed.tail(max(30, int(lookback))).reset_index(drop=True)
+    atr = _atr_series(confirmed, atr_period)
+    volume_ma = confirmed["volume"].rolling(20, min_periods=5).mean()
+    ref_price = _safe_float(confirmed["close"].iloc[-1])
+
+    candidates = {"demand": [], "supply": []}
+    start = max(base_bars, atr_period + base_bars)
+    end = len(confirmed) - impulse_bars
+
+    for i in range(start, end):
+        atr_i = _safe_float(atr.iloc[i], 0.0)
+        if atr_i <= 0:
+            continue
+        if not _base_mask(confirmed, atr, i, base_bars, max_base_atr):
+            continue
+
+        base = confirmed.iloc[i - base_bars + 1:i + 1]
+        base_low = _safe_float(base["low"].min())
+        base_high = _safe_float(base["high"].max())
+        base_range = base_high - base_low
+        if base_range <= 0:
+            continue
+
+        after = confirmed.iloc[i + 1:i + 1 + impulse_bars]
+        up_move = _safe_float(after["high"].max()) - _safe_float(base_high)
+        down_move = _safe_float(base_low) - _safe_float(after["low"].min())
+        vol_ratio = _safe_float(
+            confirmed["volume"].iloc[i + 1:i + 1 + impulse_bars].mean()
+            / max(_safe_float(volume_ma.iloc[i], 1.0), 1e-12),
+            0.0,
+        )
+
+        def make_zone(side: str, displacement: float):
+            if displacement / atr_i < min_displacement_atr:
+                return
+            if vol_ratio < min_volume_ratio:
+                return
+            state, retests, age = _zone_state(
+                base_low, base_high, side, confirmed, i
+            )
+            if state == "broken":
+                return
+
+            distance_pct = _pct_distance(
+                ref_price,
+                base_high if side == "demand" else base_low,
+            )
+            if distance_pct > 12.0:
+                return
+
+            displacement_atr = displacement / atr_i
+            freshness_bonus = 15.0 if state == "fresh" else 8.0 if state == "tested" else 2.0
+            retest_penalty = min(18.0, retests * 5.0)
+            distance_bonus = max(0.0, 12.0 - min(12.0, distance_pct))
+            displacement_score = min(25.0, displacement_atr * 10.0)
+            volume_score = min(18.0, max(0.0, (vol_ratio - 1.0) * 18.0))
+            base_quality = max(0.0, 10.0 - (base_range / atr_i) * 4.0)
+            score = max(
+                0.0,
+                min(
+                    100.0,
+                    20.0
+                    + freshness_bonus
+                    + distance_bonus
+                    + displacement_score
+                    + volume_score
+                    + base_quality
+                    - retest_penalty,
+                ),
+            )
+
+            zone = {
+                "low": round_price(base_low),
+                "high": round_price(base_high),
+                "mid": round_price((base_low + base_high) / 2.0),
+                "score": round(score, 2),
+                "state": state,
+                "fresh": state == "fresh",
+                "touches": max(1, retests + 1),
+                "retests": int(retests),
+                "age": int(age),
+                "distance_pct": round(distance_pct, 3),
+                "volume_ratio": round(vol_ratio, 3),
+                "displacement_atr": round(displacement_atr, 3),
+                "base_atr": round(base_range / atr_i, 3),
+                "created_bar": int(i),
+                "source": "base_displacement",
+            }
+            candidates[side].append(zone)
+
+        if up_move >= down_move:
+            make_zone("demand", up_move)
+        if down_move > up_move:
+            make_zone("supply", down_move)
+
+    return {
+        "demand": _merge_zones(candidates["demand"], max_zones),
+        "supply": _merge_zones(candidates["supply"], max_zones),
+    }
+
+
+def _nearest_zone(zones: List[Dict], price: float, side: str) -> Optional[Dict]:
+    if not zones:
+        return None
+    if side == "demand":
+        candidates = [z for z in zones if z["high"] <= price * 1.002]
+    else:
+        candidates = [z for z in zones if z["low"] >= price * 0.998]
+    if not candidates:
+        candidates = zones
+    return min(candidates, key=lambda z: abs(z["mid"] - price))
+
+
+def evaluate_zone_context(price: float, zones: Dict[str, List[Dict]]) -> Dict:
+    demand = None
+    supply = None
+    for z in zones.get("demand", []):
+        if z["low"] <= price <= z["high"]:
+            demand = z
+            break
+    for z in zones.get("supply", []):
+        if z["low"] <= price <= z["high"]:
+            supply = z
+            break
+
+    nearest_demand = _nearest_zone(zones.get("demand", []), price, "demand")
+    nearest_supply = _nearest_zone(zones.get("supply", []), price, "supply")
+
+    return {
+        "in_demand": demand is not None,
+        "in_supply": supply is not None,
+        "demand": demand,
+        "supply": supply,
+        "nearest_demand": nearest_demand,
+        "nearest_supply": nearest_supply,
+        "demand_distance_pct": round(_pct_distance(price, nearest_demand["mid"]), 3) if nearest_demand else None,
+        "supply_distance_pct": round(_pct_distance(price, nearest_supply["mid"]), 3) if nearest_supply else None,
+    }
+
+
+# =====================================================================
+# Volume Profile
 # =====================================================================
 
 def calc_volume_profile(
@@ -176,51 +427,32 @@ def calc_volume_profile(
     bins: int = 50,
     value_area_pct: float = 0.70,
 ) -> Dict:
-    """
-    Volume Profile approximated from OHLCV — there's no tick-level trade
-    data available (Gate.io's public API doesn't provide it, and we don't
-    want to pull the full trade stream just for this), so this is a
-    TPO-style approximation, not a "real" exchange volume profile: each
-    bar's volume is distributed evenly across the price bins its
-    [low, high] range spans, instead of weighting toward where trades
-    actually printed within the bar. This is the standard approach used by
-    most retail tools that only have OHLCV, and gives a statistically
-    reasonable POC/Value Area — just not pixel-identical to what a
-    tick-level profile would show.
-
-    Returns:
-        {
-            "poc": float | None,   # Point of Control — price bin with the most volume
-            "vah": float | None,   # Value Area High
-            "val": float | None,   # Value Area Low
-            "bins": [{"price": float, "volume": float}, ...],  # for histogram rendering, low to high
-        }
-    """
     empty = {"poc": None, "vah": None, "val": None, "bins": []}
-    if len(df) < 10:
+    if len(df) < 10 or bins < 2:
         return empty
 
-    price_min = float(df["low"].min())
-    price_max = float(df["high"].max())
+    price_min = _safe_float(df["low"].min())
+    price_max = _safe_float(df["high"].max())
     if price_max <= price_min:
         return empty
 
-    bin_width = (price_max - price_min) / bins
-    volume_by_bin = np.zeros(bins)
+    bin_width = (price_max - price_min) / int(bins)
+    volume_by_bin = np.zeros(int(bins), dtype=float)
 
     for row in df.itertuples():
-        low, high, vol = float(row.low), float(row.high), float(row.volume)
+        low = _safe_float(row.low)
+        high = _safe_float(row.high)
+        vol = _safe_float(row.volume)
         if vol <= 0:
             continue
         if high <= low:
-            # doji / zero-range bar — dump its volume into a single bin
             idx = min(max(int((low - price_min) / bin_width), 0), bins - 1)
             volume_by_bin[idx] += vol
             continue
         first_bin = min(max(int((low - price_min) / bin_width), 0), bins - 1)
         last_bin = min(max(int((high - price_min) / bin_width), 0), bins - 1)
-        n_spanned = last_bin - first_bin + 1
-        volume_by_bin[first_bin:last_bin + 1] += vol / n_spanned
+        count = last_bin - first_bin + 1
+        volume_by_bin[first_bin:last_bin + 1] += vol / count
 
     total_volume = float(volume_by_bin.sum())
     if total_volume <= 0:
@@ -228,31 +460,29 @@ def calc_volume_profile(
 
     poc_idx = int(np.argmax(volume_by_bin))
     poc_price = price_min + (poc_idx + 0.5) * bin_width
-
-    # Expand the Value Area outward from the POC bin — at each step, add
-    # whichever neighbor (above or below) has more volume — until we've
-    # covered value_area_pct of the total.
-    target_volume = total_volume * value_area_pct
-    covered_volume = float(volume_by_bin[poc_idx])
+    target = total_volume * min(max(float(value_area_pct), 0.1), 0.95)
+    covered = float(volume_by_bin[poc_idx])
     lo_idx = hi_idx = poc_idx
-    while covered_volume < target_volume and (lo_idx > 0 or hi_idx < bins - 1):
-        vol_below = float(volume_by_bin[lo_idx - 1]) if lo_idx > 0 else -1.0
-        vol_above = float(volume_by_bin[hi_idx + 1]) if hi_idx < bins - 1 else -1.0
-        if vol_above >= vol_below:
+
+    while covered < target and (lo_idx > 0 or hi_idx < bins - 1):
+        below = float(volume_by_bin[lo_idx - 1]) if lo_idx > 0 else -1.0
+        above = float(volume_by_bin[hi_idx + 1]) if hi_idx < bins - 1 else -1.0
+        if above >= below:
             hi_idx += 1
-            covered_volume += float(volume_by_bin[hi_idx])
+            covered += float(volume_by_bin[hi_idx])
         else:
             lo_idx -= 1
-            covered_volume += float(volume_by_bin[lo_idx])
+            covered += float(volume_by_bin[lo_idx])
 
     val_price = price_min + lo_idx * bin_width
     vah_price = price_min + (hi_idx + 1) * bin_width
-
     bins_out = [
-        {"price": round_price(price_min + (i + 0.5) * bin_width), "volume": round(float(volume_by_bin[i]), 4)}
+        {
+            "price": round_price(price_min + (i + 0.5) * bin_width),
+            "volume": round(float(volume_by_bin[i]), 4),
+        }
         for i in range(bins)
     ]
-
     return {
         "poc": round_price(poc_price),
         "vah": round_price(vah_price),
@@ -261,14 +491,7 @@ def calc_volume_profile(
     }
 
 
-def classify_price_location(
-    price: float,
-    poc: Optional[float],
-    vah: Optional[float],
-    val: Optional[float],
-) -> str:
-    """Where price sits relative to the Value Area. "unknown" when VP
-    couldn't be computed (not enough bars, or disabled)."""
+def classify_price_location(price: float, poc: Optional[float], vah: Optional[float], val: Optional[float]) -> str:
     if vah is None or val is None:
         return "unknown"
     if price > vah:
@@ -279,15 +502,11 @@ def classify_price_location(
 
 
 # =====================================================================
-# 🧊  MARKET STRUCTURE SNAPSHOT (cache + entry point for future consumers)
+# Snapshot and cache
 # =====================================================================
 
 @dataclass(frozen=True)
 class MarketStructure:
-    """Immutable snapshot of market structure for one ticker/timeframe,
-    as of one confirmed closed bar. Consumers (confidence scoring, a
-    future TP engine) read this; they never compute POC/VA/S-R themselves.
-    """
     ticker: str
     timeframe: str
     bar_time: int
@@ -295,27 +514,19 @@ class MarketStructure:
     poc: Optional[float]
     vah: Optional[float]
     val: Optional[float]
-    price_location: str  # "above_vah" | "in_value_area" | "below_val" | "unknown"
-    support_levels: List[Dict] = field(default_factory=list)     # [{"price","touches","distance_pct"}, ...]
+    price_location: str
+    support_levels: List[Dict] = field(default_factory=list)
     resistance_levels: List[Dict] = field(default_factory=list)
+    demand_zones: List[Dict] = field(default_factory=list)
+    supply_zones: List[Dict] = field(default_factory=list)
+    zone_context: Dict = field(default_factory=dict)
 
 
-# 🆕 Cache keyed on the last CONFIRMED closed bar's own timestamp, not a
-# wall-clock TTL. A TTL doesn't guarantee the cached snapshot matches the
-# latest closed candle — a slow scan cycle can outlive a short TTL while
-# the bar hasn't actually changed yet, and a fast one can return a stale
-# snapshot from within the TTL window even though a new bar just closed.
-# Recomputing exactly once per new closed bar is both more correct and,
-# since nothing here needs to be known more often than that, strictly
-# less work than polling on a timer would be over the same period.
 _ms_cache: Dict[Tuple[str, str], Tuple[int, "MarketStructure"]] = {}
 _ms_cache_lock = threading.Lock()
 
 
 def clear_market_structure_cache():
-    """Resets the market-structure cache — call after a manual history
-    reset or similar bulk state change that could otherwise leave a stale
-    snapshot behind for a ticker/timeframe."""
     global _ms_cache
     with _ms_cache_lock:
         _ms_cache = {}
@@ -327,61 +538,48 @@ def get_market_structure(
     timeframe: str,
     sr_df: Optional[pd.DataFrame] = None,
 ) -> MarketStructure:
-    """Returns the MarketStructure snapshot for this ticker/timeframe,
-    computed from df's last CONFIRMED closed bar (iloc[-2] — matching the
-    no-repainting rule the rest of the signal pipeline already follows).
-
-    Cached per (ticker, timeframe); see the _ms_cache comment above for
-    why the cache key is the closed bar's timestamp rather than a TTL.
-
-    sr_df — optionally a longer lookback than df to compute support/
-    resistance from (mirrors chart.py's build_chart(), which computes S/R
-    from a fuller history than what's actually displayed, since pivots
-    need more context than a short chart window gives them). Defaults to
-    df itself when not given.
-    """
-    if len(df) < 10:
-        raise ValueError("get_market_structure: df needs at least 10 rows")
+    """Return one point-in-time snapshot based on the last closed candle."""
+    if len(df) < 30:
+        raise ValueError("get_market_structure: df needs at least 30 rows")
 
     bar_time = int(df["timestamp"].iloc[-2])
     cache_key = (ticker, timeframe)
-
     with _ms_cache_lock:
         cached = _ms_cache.get(cache_key)
         if cached is not None and cached[0] == bar_time:
             return cached[1]
 
-    last_close = float(df["close"].iloc[-2])
-
-    # 🆕 FIX (external review, P1): df's last row is the still-forming,
-    # unclosed candle. bar_time/last_close above already correctly read
-    # iloc[-2] (the last CONFIRMED bar) — but vp_window used to be built
-    # from the full df via df.tail(...), which still included that
-    # unclosed row: calc_volume_profile() would distribute the live
-    # candle's own high/low/volume into its bins. That's a live-repaint
-    # leak — the snapshot cached under bar_time could come out differently
-    # depending on where price happened to be mid-candle the first time it
-    # was computed for that bar, then stay wrong for the rest of the
-    # candle's duration (the cache holds it until the NEXT bar closes).
-    # Slicing off the unclosed row before building vp_window fixes this.
-    #
-    # calc_support_resistance() below is NOT given the same treatment: it
-    # has its own internal iloc[-2] convention (see its docstring/code),
-    # designed around chart.py's build_chart() passing it a df that still
-    # includes the live candle — pre-trimming here would double-trim and
-    # shift its internal "last_close" reference back by one extra bar.
-    # calc_support_resistance()'s own -2 indexing already keeps it off the
-    # unclosed candle correctly; only the caller-side df.tail() here (which
-    # has no such built-in protection) needed the explicit fix.
+    last_close = _safe_float(df["close"].iloc[-2])
     confirmed_df = df.iloc[:-1]
 
     vp = {"poc": None, "vah": None, "val": None, "bins": []}
-    if _cfg.VP_ENABLED:
+    if getattr(_cfg, "VP_ENABLED", False):
         vp_window = confirmed_df.tail(min(_cfg.VP_LOOKBACK, len(confirmed_df)))
-        vp = calc_volume_profile(vp_window, bins=_cfg.VP_BINS, value_area_pct=_cfg.VP_VALUE_AREA_PCT)
+        vp = calc_volume_profile(
+            vp_window,
+            bins=_cfg.VP_BINS,
+            value_area_pct=_cfg.VP_VALUE_AREA_PCT,
+        )
 
     sr_source = sr_df if sr_df is not None and len(sr_df) > len(df) else df
-    sr = calc_support_resistance(sr_source, pivot_window=_cfg.SR_PIVOT_WINDOW, max_levels=_cfg.SR_MAX_LEVELS)
+    sr = calc_support_resistance(
+        sr_source,
+        pivot_window=_cfg.SR_PIVOT_WINDOW,
+        max_levels=_cfg.SR_MAX_LEVELS,
+    )
+
+    zones = detect_demand_supply_zones(
+        df,
+        atr_period=getattr(_cfg, "ZONE_ATR_PERIOD", 14),
+        lookback=getattr(_cfg, "ZONE_LOOKBACK", 300),
+        base_bars=getattr(_cfg, "ZONE_BASE_BARS", 4),
+        impulse_bars=getattr(_cfg, "ZONE_IMPULSE_BARS", 3),
+        max_zones=getattr(_cfg, "ZONE_MAX_ZONES", 5),
+        max_base_atr=getattr(_cfg, "ZONE_MAX_BASE_ATR", 1.6),
+        min_displacement_atr=getattr(_cfg, "ZONE_MIN_DISPLACEMENT_ATR", 1.1),
+        min_volume_ratio=getattr(_cfg, "ZONE_MIN_VOLUME_RATIO", 1.15),
+    )
+    zone_context = evaluate_zone_context(last_close, zones)
 
     snapshot = MarketStructure(
         ticker=ticker,
@@ -394,9 +592,11 @@ def get_market_structure(
         price_location=classify_price_location(last_close, vp.get("poc"), vp.get("vah"), vp.get("val")),
         support_levels=sr.get("support_levels", []),
         resistance_levels=sr.get("resistance_levels", []),
+        demand_zones=zones.get("demand", []),
+        supply_zones=zones.get("supply", []),
+        zone_context=zone_context,
     )
 
     with _ms_cache_lock:
         _ms_cache[cache_key] = (bar_time, snapshot)
-
     return snapshot
