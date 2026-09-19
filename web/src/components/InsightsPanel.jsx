@@ -390,6 +390,11 @@ function ComponentRow({ row, minSamples }) {
           {row.side}
         </span>
         value {row.value > 0 ? `+${row.value}` : row.value}
+        {(row.track || row.regime) && (
+          <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
+            {row.track ? `track=${row.track}` : ''}{row.track && row.regime ? ' ' : ''}{row.regime ? `regime=${row.regime}` : ''}
+          </span>
+        )}
         {!row.enough_samples && (
           <span style={{ color: 'var(--accent)', fontSize: 11 }} title={`Only ${row.n}/${minSamples} — not enough yet to trust this row`}>
             ⚠ {row.n}/{minSamples}

@@ -1188,10 +1188,17 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
                 raw_str = f", raw_mfe={row['avg_raw_mfe']:.2f}% (n={row['raw_mfe_n']})" if row["avg_raw_mfe"] is not None else ", raw_mfe=n/a"
                 flag = "" if row["enough_samples"] else f" ⚠️ only {row['n']}/{min_samples}"
                 exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
+                # 🆕 (external review, component-backtest follow-up): now
+                # broken down by track/regime (run_component_backtest()
+                # defaults to group_by=["track","regime"]) — pooling A/U/B
+                # and TREND/NORMAL together risked hiding a real effect or
+                # manufacturing one that's really two cancelling out.
+                slice_str = f"track={row.get('track', '?')} regime={row.get('regime', '?')}"
                 lines.append(
-                    f"  `{row['side']}` value={row['value']:>3}: n={row['n']} win_rate={row['win_rate']:.0%} "
+                    f"  `{row['side']}` value={row['value']:>3} {slice_str}: n={row['n']} win_rate={row['win_rate']:.0%} "
                     f"avg_mfe={row['avg_mfe']:.2f}%{raw_str}  [{exit_str}]{flag}"
                 )
+
             lines.append("")
 
         lines.append(

@@ -2269,7 +2269,7 @@ async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     return {"bar_coverage": bar_coverage, "modes": modes_out}
 
 
-async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000, min_samples: int = 30) -> Dict:
+async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000, min_samples: int = 30, group_by: Optional[List[str]] = None) -> Dict:
     """Replays real historical OHLCV through dry-run backtest_history(...,
     compute_confidence=True) across the given tickers/tfs, merges the
     resulting records, and runs them through
@@ -2280,10 +2280,22 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     🆕 (external review, component-backtest): shared between
     discord_commands.py's !compsim and web_api.py's /api/compsim.
 
+    group_by — 🆕 (external review, component-backtest follow-up):
+    forwarded to analyze_confidence_components() (see its docstring for
+    the exact effect). Defaults to ["track", "regime"] here — unlike live
+    !components, a backtest run easily produces enough samples per cell
+    for the finer breakdown to be worth it, and pooling across A/U/B
+    tracks (different strategies entirely) or TREND/NORMAL regimes risks
+    hiding a real effect or manufacturing an apparent one that's really
+    just two that cancel differently when pooled.
+
     Returns analyze_confidence_components()'s own report dict (see its
     docstring in state.py) plus a "bar_coverage" key with the same shape
     as run_tp1_mode_comparison()'s. Never writes to signals_history.json.
     """
+    if group_by is None:
+        group_by = ["track", "regime"]
+
     combined_history: Dict = {}
     bar_coverage: List[Dict] = []
 
@@ -2303,7 +2315,7 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
                 combined_history[t][f][side].extend(history.get(t, {}).get(f, {}).get(side, []))
             await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
 
-    report = analyze_confidence_components(history=combined_history, min_samples=min_samples)
+    report = analyze_confidence_components(history=combined_history, min_samples=min_samples, group_by=group_by)
     report["bar_coverage"] = bar_coverage
     return report
 

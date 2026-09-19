@@ -1185,7 +1185,11 @@ def _iter_closed_records(history: Dict):
                         yield ticker, tf, side, rec
 
 
-def analyze_confidence_components(history: Optional[Dict] = None, min_samples: int = DEFAULT_COMPONENT_MIN_SAMPLES) -> Dict:
+def analyze_confidence_components(
+    history: Optional[Dict] = None,
+    min_samples: int = DEFAULT_COMPONENT_MIN_SAMPLES,
+    group_by: Optional[List[str]] = None,
+) -> Dict:
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
     with trade outcomes — bucketed by (side, component value), since these
@@ -1194,15 +1198,29 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
     that isn't there.
 
     Single source of truth for this analysis — both discord_commands.py's
-    !components command and web_api.py's /api/components endpoint call
-    this rather than each recomputing it, so the two can never drift out
-    of sync with each other.
+    !components/!compsim commands and web_api.py's /api/components and
+    /api/compsim endpoints call this rather than each recomputing it, so
+    none of them can drift out of sync with each other.
 
     win_rate / avg_mfe are both truncated by whatever TP policy closed
     each trade (see update_raw_outcome()'s docstring above) — avg_raw_mfe
     (from raw_mfe_pct) is the metric closest to a policy-free read of what
     the market actually did, and the one worth trusting once it has
     enough samples of its own; win_rate/avg_mfe are only a first look.
+
+    group_by — 🆕 (external review, component-backtest follow-up):
+    optional extra grouping keys, any of "track"/"regime", e.g.
+    group_by=["track", "regime"]. None (the default) keeps the original,
+    coarser (side, value) bucketing — every existing caller that doesn't
+    pass this keeps getting exactly the same rows as before. Pooling
+    across track (A/U/B are different strategies entirely) and regime
+    (TREND/NORMAL) can hide a real effect that only shows up in one
+    track/regime, or manufacture an apparent one that's really just a mix
+    of two that cancel differently — run_component_backtest() defaults to
+    grouping by both, since backtest sample sizes are large enough for it
+    to be worth the extra rows; the live !components command keeps the
+    coarser default since live samples are far scarcer per (track,
+    regime) cell.
 
     Returns a JSON-serializable dict:
         {
@@ -1212,7 +1230,9 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
                 "relative_strength": [
                     {"side": "long", "value": -5, "n": 40, "win_rate": 0.525,
                      "avg_mfe": 1.36, "avg_raw_mfe": 1.53, "raw_mfe_n": 25,
-                     "exit_counts": {"tp": 21, "sl": 19}, "enough_samples": True},
+                     "exit_counts": {"tp": 21, "sl": 19}, "enough_samples": True,
+                     # present only for each name passed in group_by:
+                     "track": "u", "regime": "TREND"},
                     ...
                 ],
                 "volume_profile": [...],
@@ -1221,8 +1241,9 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
     """
     if history is None:
         history = load_signals_history()
+    group_by = group_by or []
 
-    buckets: Dict[Tuple[str, str, float], List[Dict]] = {}
+    buckets: Dict[Tuple, List[Dict]] = {}
     total_closed = 0
 
     for ticker, tf, side, rec in _iter_closed_records(history):
@@ -1230,12 +1251,15 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
         comps = rec.get("confidence_components")
         if not comps:
             continue
+        extra_key = tuple(rec.get(g, "?") for g in group_by)
         for comp_name in ("relative_strength", "volume_profile"):
             if comp_name in comps:
-                buckets.setdefault((comp_name, side, comps[comp_name]), []).append(rec)
+                buckets.setdefault((comp_name, side, comps[comp_name]) + extra_key, []).append(rec)
 
     components_out: Dict[str, List[Dict]] = {"relative_strength": [], "volume_profile": []}
-    for (comp_name, side, value), records in buckets.items():
+    for key, records in buckets.items():
+        comp_name, side, value = key[0], key[1], key[2]
+        extra_values = key[3:]
         n = len(records)
         exit_counts: Dict[str, int] = {}
         for r in records:
@@ -1246,7 +1270,7 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
 
         raw_vals = [r["raw_mfe_pct"] for r in records if r.get("raw_mfe_pct") is not None]
 
-        components_out[comp_name].append({
+        row = {
             "side": side,
             "value": value,
             "n": n,
@@ -1256,10 +1280,13 @@ def analyze_confidence_components(history: Optional[Dict] = None, min_samples: i
             "raw_mfe_n": len(raw_vals),
             "exit_counts": exit_counts,
             "enough_samples": n >= min_samples,
-        })
+        }
+        for g, v in zip(group_by, extra_values):
+            row[g] = v
+        components_out[comp_name].append(row)
 
     for comp_name in components_out:
-        components_out[comp_name].sort(key=lambda row: (row["side"], row["value"]))
+        components_out[comp_name].sort(key=lambda row: (row["side"], row["value"], *(row.get(g, "") for g in group_by)))
 
     return {
         "total_closed": total_closed,
