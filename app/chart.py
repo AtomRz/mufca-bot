@@ -1,78 +1,75 @@
 """
-MUFCA v4.0 — Chart Module
-Generates candlestick charts with indicators for Discord.
-Command: !chart [PAIR] [TIMEFRAME] [LIMIT]
+MUFCA Chart Module
+
+Renders candles, indicators, legacy support/resistance, volume profile,
+and Demand/Supply zones from the shared market structure engine.
+
+All source comments and strings are ASCII-only.
 """
 
+import asyncio
 import io
 import logging
-import numpy as np
-import pandas as pd
+from typing import Optional, Tuple, Dict, List
+
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
-from typing import Optional, Tuple, Dict
+
 import config as _cfg
 from utils import format_price
-# 🆕 S/R and Volume Profile now live in market_structure.py — the single
-# shared implementation used both here (for rendering) and by the signal/
-# TP engine (later stages), so the chart and the trading logic can never
-# end up computing different levels with different algorithms.
-from market_structure import calc_support_resistance, calc_volume_profile
+from market_structure import (
+    calc_support_resistance,
+    calc_volume_profile,
+    detect_demand_supply_zones,
+)
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────
-# 🎨  THEME
-# ─────────────────────────────────────────────────────────────────────
+
 THEME = {
-    "bg":         "#0d1117",
-    "bg2":        "#161b22",
-    "grid":       "#21262d",
-    "text":       "#c9d1d9",
-    "text_dim":   "#6e7681",
-    "bull":       "#26a641",
-    "bear":       "#f85149",
-    "bull_body":  "#1a7f37",
-    "bear_body":  "#b91c1c",
-    "volume":     "#388bfd",
-    "frama":      "#f0883e",
-    "bb_mid":     "#a5d6ff",
-    "bb_band":    "#388bfd",
-    "bb_fill":    "#388bfd",
-    "support":    "#00bcd4",
-    "resist":     "#9e9e9e",
-    "poc":        "#e6c619",
-    "pivot":      "#d29922",
-    "entry":      "#f0883e",
-    "tp":         "#26a641",
-    "sl":         "#f85149",
-    "signal_long":  "#26a641",
+    "bg": "#0d1117",
+    "bg2": "#161b22",
+    "grid": "#21262d",
+    "text": "#c9d1d9",
+    "text_dim": "#6e7681",
+    "bull": "#26a641",
+    "bear": "#f85149",
+    "bull_body": "#1a7f37",
+    "bear_body": "#b91c1c",
+    "volume": "#388bfd",
+    "frama": "#f0883e",
+    "bb_mid": "#a5d6ff",
+    "bb_band": "#388bfd",
+    "bb_fill": "#388bfd",
+    "support": "#00bcd4",
+    "resist": "#9e9e9e",
+    "poc": "#e6c619",
+    "entry": "#f0883e",
+    "tp": "#26a641",
+    "sl": "#f85149",
+    "signal_long": "#26a641",
     "signal_short": "#f85149",
-    "mfi_line":   "#a371f7",
-    "mfi_ob":     "#f85149",
-    "mfi_os":     "#26a641",
+    "mfi_line": "#a371f7",
+    "mfi_ob": "#f85149",
+    "mfi_os": "#26a641",
+    "demand": "#00d4a8",
+    "supply": "#ff4d8d",
 }
 
-# Fraction of the candle panel's width the volume-profile histogram strip
-# occupies (right-anchored). Shared between where the Value Area band/POC
-# line stop (see build_chart) and where the histogram bars themselves are
-# drawn, so the two can't drift out of sync.
 _VP_STRIP_FRAC = 0.16
 
-# ─────────────────────────────────────────────────────────────────────
-# 📐  CHART INDICATORS
-# ─────────────────────────────────────────────────────────────────────
 
 def calc_bollinger_bands(
     close: pd.Series,
     period: int = 20,
-    std_mult: float = 2.0
+    std_mult: float = 2.0,
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Bollinger Bands: upper, mid, lower."""
     mid = close.rolling(window=period).mean()
     std = close.rolling(window=period).std()
     upper = mid + std_mult * std
@@ -80,11 +77,99 @@ def calc_bollinger_bands(
     return upper, mid, lower
 
 
+def _cfg_value(name: str, default):
+    return getattr(_cfg, name, default)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 🏗️  CHART CONSTRUCTION
-# ─────────────────────────────────────────────────────────────────────
+def _zone_alpha(score: float, state: str) -> float:
+    base = 0.07 + min(max(float(score), 0.0), 100.0) / 100.0 * 0.10
+    if state == "fresh":
+        return min(0.20, base + 0.03)
+    if state == "tested":
+        return min(0.17, base + 0.01)
+    return min(0.14, base)
+
+
+def _zone_label(zone: Dict, side: str) -> str:
+    state = str(zone.get("state", "unknown")).upper()
+    score = float(zone.get("score", 0.0))
+    touches = int(zone.get("touches", 0))
+    return f"{side.upper()} {score:.0f} {state} T{touches}"
+
+
+def _prepare_zone_positions(
+    zones: Dict[str, List[Dict]],
+    full_len: int,
+    display_start: int,
+    lookback: int,
+) -> Dict[str, List[Dict]]:
+    result = {"demand": [], "supply": []}
+    confirmed_len = min(max(30, int(lookback)), max(0, full_len - 1))
+    confirmed_start = max(0, full_len - 1 - confirmed_len)
+
+    for side in ("demand", "supply"):
+        for source in zones.get(side, []):
+            zone = dict(source)
+            created_bar = int(zone.get("created_bar", 0))
+            absolute_index = confirmed_start + created_bar
+            chart_index = absolute_index - display_start
+            zone["chart_index"] = int(chart_index)
+            result[side].append(zone)
+    return result
+
+
+def _draw_zones(
+    ax,
+    zones: Dict[str, List[Dict]],
+    n: int,
+    x_start: float,
+    x_end: float,
+    theme: Dict,
+):
+    for side, color_key in (("demand", "demand"), ("supply", "supply")):
+        color = theme[color_key]
+        for zone in zones.get(side, []):
+            low = float(zone.get("low", 0.0))
+            high = float(zone.get("high", 0.0))
+            if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+                continue
+
+            start = float(zone.get("chart_index", 0))
+            start = max(x_start, min(start, x_end))
+            state = str(zone.get("state", "unknown"))
+            score = float(zone.get("score", 0.0))
+            alpha = _zone_alpha(score, state)
+
+            rect = Rectangle(
+                (start, low),
+                max(0.75, x_end - start),
+                high - low,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.9,
+                linestyle="-" if state == "fresh" else "--",
+                alpha=alpha,
+                zorder=1.8,
+            )
+            ax.add_patch(rect)
+
+            label_x = x_end - 0.2
+            label_y = (low + high) / 2.0
+            label = _zone_label(zone, side)
+            ax.text(
+                label_x,
+                label_y,
+                label,
+                color=color,
+                fontsize=6.5,
+                va="center",
+                ha="right",
+                fontweight="bold",
+                bbox=dict(facecolor=theme["bg2"], edgecolor=color, linewidth=0.5, pad=1.5, alpha=0.78),
+                zorder=9,
+                clip_on=True,
+            )
+
 
 def build_chart(
     df: pd.DataFrame,
@@ -100,53 +185,35 @@ def build_chart(
     entry_price: Optional[float] = None,
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
-    signal_side: Optional[str] = None,  # "long" | "short"
-    signal_bar_offset: int = -2,        # signal bar offset FROM THE END of the displayed df
+    signal_side: Optional[str] = None,
+    signal_bar_offset: int = -2,
     limit: int = 50,
-    volume_profile: Optional[Dict] = None,  # output of calc_volume_profile(), or None if disabled
+    volume_profile: Optional[Dict] = None,
+    demand_supply_zones: Optional[Dict[str, List[Dict]]] = None,
 ) -> io.BytesIO:
-    """
-    Builds the full candlestick chart and returns a BytesIO PNG.
-
-    Panels:
-      [0] Candles + FRAMA + BB + S/R + Entry/TP/SL + signal arrows
-      [1] Volume
-      [2] KMeans MFI (if provided)
-
-    🆕 FIX: signal_bar used to be an "absolute index into the original df
-    before tail()", which the calling code (bot.py) computed against ITS OWN
-    df (limit=100), while generate_chart internally does its OWN independent
-    fetch (limit≈300+). The indices from the two different series didn't
-    line up, and the arrow almost always ended up flying to the start of the
-    chart (clamped to 0). Now signal_bar_offset is an offset FROM THE END of
-    the already-displayed (tail-ed) df, independent of how many bars were
-    originally fetched or how. Per the bot's rules a signal always forms on
-    the last confirmed closed bar (iloc[-2]), so the default is -2.
-    """
+    """Build the chart PNG and return it as a BytesIO object."""
+    original_display_len = len(df)
+    display_start = max(0, original_display_len - limit)
     df = df.tail(limit).copy().reset_index(drop=True)
     n = len(df)
-
     has_mfi = mfi is not None and len(mfi) >= limit
 
-    # ── Layout ──────────────────────────────────────────────────────
     T = THEME
     fig = plt.figure(figsize=(14, 9 if has_mfi else 8), facecolor=T["bg"])
-
     if has_mfi:
         gs = gridspec.GridSpec(
             3, 1, height_ratios=[5, 1.2, 1.2],
-            hspace=0.04, left=0.06, right=0.95, top=0.93, bottom=0.07
+            hspace=0.04, left=0.06, right=0.95, top=0.93, bottom=0.07,
         )
     else:
         gs = gridspec.GridSpec(
             2, 1, height_ratios=[5, 1.2],
-            hspace=0.04, left=0.06, right=0.95, top=0.93, bottom=0.07
+            hspace=0.04, left=0.06, right=0.95, top=0.93, bottom=0.07,
         )
 
-    ax_c = fig.add_subplot(gs[0])  # candles
-    ax_v = fig.add_subplot(gs[1], sharex=ax_c)  # volume
+    ax_c = fig.add_subplot(gs[0])
+    ax_v = fig.add_subplot(gs[1], sharex=ax_c)
     ax_m = fig.add_subplot(gs[2], sharex=ax_c) if has_mfi else None
-
     for ax in ([ax_c, ax_v] + ([ax_m] if ax_m else [])):
         ax.set_facecolor(T["bg2"])
         ax.tick_params(colors=T["text_dim"], labelsize=8)
@@ -154,18 +221,20 @@ def build_chart(
         for spine in ax.spines.values():
             spine.set_edgecolor(T["grid"])
 
-    # ── X labels ────────────────────────────────────────────────────
     x = np.arange(n)
     timestamps = pd.to_datetime(df["timestamp"], unit="ms")
     step = max(1, n // 8)
     tick_positions = x[::step]
     tick_labels = [timestamps.iloc[i].strftime("%d/%m %H:%M") for i in tick_positions]
     ax_c.set_xticks(tick_positions)
-    ax_c.set_xticklabels([""] * len(tick_positions))  # hide on the top panel
+    ax_c.set_xticklabels([""] * len(tick_positions))
 
-    # ── Bollinger Bands — computed from the full df, take tail(limit) ──
-    _bb_src = df_full["close"] if df_full is not None and len(df_full) > len(df) else df["close"]
-    _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(_bb_src, period=_cfg.BB_PERIOD, std_mult=_cfg.BB_STDDEV)
+    full = df_full if df_full is not None else df
+    _bb_u_full, _bb_m_full, _bb_l_full = calc_bollinger_bands(
+        full["close"],
+        period=_cfg_value("BB_PERIOD", 20),
+        std_mult=_cfg_value("BB_STDDEV", 2.0),
+    )
     bb_u = _bb_u_full.tail(limit).values
     bb_m = _bb_m_full.tail(limit).values
     bb_l = _bb_l_full.tail(limit).values
@@ -174,46 +243,32 @@ def build_chart(
     ax_c.plot(x, bb_m, color=T["bb_mid"], linewidth=0.8, alpha=0.6, linestyle="--", zorder=2)
     ax_c.plot(x, bb_l, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
 
-    # ── S/R levels — computed from the full df (200+ bars) ─────────────
-    _sr_df = df_full if df_full is not None and len(df_full) > len(df) else df
-    sr = calc_support_resistance(_sr_df, pivot_window=_cfg.SR_PIVOT_WINDOW, max_levels=_cfg.SR_MAX_LEVELS)
+    sr = calc_support_resistance(
+        full,
+        pivot_window=_cfg_value("SR_PIVOT_WINDOW", 10),
+        max_levels=_cfg_value("SR_MAX_LEVELS", 4),
+    )
     x_start = -0.5
-    x_end   = n - 0.5
+    x_end = n - 0.5
 
-    for lvl in sr["support"]:
-        ax_c.hlines(lvl, x_start, x_end, colors=T["support"],
-                    linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        # 🆕 FIX: was f"S {lvl:,.0f}" — ZERO decimal places. For a sub-$1 pair
-        # (DOGE, SHIB, etc.) every S/R label on the chart would render as "S 0",
-        # indistinguishable from every other level. format_price() scales
-        # precision to the price's magnitude instead.
-        ax_c.text(n - 0.5, lvl, f"S {format_price(lvl)}", color=T["support"],
-                  fontsize=8, va="bottom", ha="right", fontweight="bold",
-                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
-                  zorder=8)
+    for lvl in sr.get("support", []):
+        ax_c.hlines(lvl, x_start, x_end, colors=T["support"], linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
+        ax_c.text(
+            n - 0.5, lvl, f"S {format_price(lvl)}", color=T["support"],
+            fontsize=8, va="bottom", ha="right", fontweight="bold",
+            bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7), zorder=8,
+        )
+    for lvl in sr.get("resistance", []):
+        ax_c.hlines(lvl, x_start, x_end, colors=T["resist"], linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
+        ax_c.text(
+            n - 0.5, lvl, f"R {format_price(lvl)}", color=T["resist"],
+            fontsize=8, va="bottom", ha="right", fontweight="bold",
+            bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7), zorder=8,
+        )
 
-    for lvl in sr["resistance"]:
-        ax_c.hlines(lvl, x_start, x_end, colors=T["resist"],
-                    linewidth=1.4, linestyles="--", alpha=0.85, zorder=7)
-        ax_c.text(n - 0.5, lvl, f"R {format_price(lvl)}", color=T["resist"],
-                  fontsize=8, va="bottom", ha="right", fontweight="bold",
-                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
-                  zorder=8)
+    if demand_supply_zones:
+        _draw_zones(ax_c, demand_supply_zones, n, x_start, x_end, T)
 
-    # ── Volume Profile: Value Area band + POC line ───────────────────
-    # Deliberately a distinct gold color (T["poc"]), not a variant of the
-    # pivot S/R colors — POC/Value Area are a different kind of level
-    # (where volume concentrated) from pivot S/R (local price extremes),
-    # and should read as visually separate on the chart, not as "more S/R".
-    #
-    # 🆕 FIX: both used to span the full chart width (x_start to x_end),
-    # including the rightmost strip where the histogram bars render (see
-    # _VP_STRIP_FRAC below) — the translucent band and the individual bars
-    # overlapped there, both in gold tones, blending into a single solid
-    # block with no visible bar boundaries. Stopping the band/line at the
-    # same boundary the histogram strip starts from keeps the two visually
-    # separate: a clean band+line across the candles, distinct bars in
-    # their own strip.
     vp_x_end = x_end - (x_end - x_start) * _VP_STRIP_FRAC
     if volume_profile and volume_profile.get("poc") is not None:
         vah = volume_profile.get("vah")
@@ -222,12 +277,12 @@ def build_chart(
         if vah is not None and val is not None:
             ax_c.fill_between([x_start, vp_x_end], val, vah, alpha=0.06, color=T["poc"], zorder=1)
         ax_c.hlines(poc, x_start, vp_x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
-        ax_c.text(n - 0.5, poc, f"POC {format_price(poc)}", color=T["poc"],
-                  fontsize=8, va="bottom", ha="right", fontweight="bold",
-                  bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7),
-                  zorder=8)
+        ax_c.text(
+            n - 0.5, poc, f"POC {format_price(poc)}", color=T["poc"],
+            fontsize=8, va="bottom", ha="right", fontweight="bold",
+            bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7), zorder=8,
+        )
 
-    # ── FRAMA ───────────────────────────────────────────────────────
     if frama is not None and len(frama) >= limit:
         fs = frama.tail(limit).values
         ax_c.plot(x, fs, color=T["frama"], linewidth=1.4, zorder=4, label="FRAMA")
@@ -238,143 +293,90 @@ def build_chart(
             ax_c.plot(x, fu, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
             ax_c.plot(x, fl, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
 
-    # ── Candles ───────────────────────────────────────────────────────
     bar_w = 0.6
     for i in range(n):
-        o = df["open"].iloc[i]
-        h = df["high"].iloc[i]
-        l = df["low"].iloc[i]
-        c = df["close"].iloc[i]
+        o = float(df["open"].iloc[i])
+        h = float(df["high"].iloc[i])
+        l = float(df["low"].iloc[i])
+        c = float(df["close"].iloc[i])
         bull = c >= o
-        color      = T["bull"]      if bull else T["bear"]
+        color = T["bull"] if bull else T["bear"]
         body_color = T["bull_body"] if bull else T["bear_body"]
-
-        # Wick
         ax_c.plot([i, i], [l, h], color=color, linewidth=0.8, zorder=5)
-        # Body
-        body_h = abs(c - o) if abs(c - o) > 0 else (h - l) * 0.01
+        body_h = abs(c - o) if abs(c - o) > 0 else max((h - l) * 0.01, 1e-12)
         rect = Rectangle(
-            (i - bar_w / 2, min(o, c)),
-            bar_w, body_h,
-            facecolor=body_color, edgecolor=color,
-            linewidth=0.6, zorder=6
+            (i - bar_w / 2, min(o, c)), bar_w, body_h,
+            facecolor=body_color, edgecolor=color, linewidth=0.6, zorder=6,
         )
         ax_c.add_patch(rect)
 
-    # ── Signal (arrow) ────────────────────────────────────────────
-    if signal_side is not None:
-        # signal_bar_offset — offset from the end of the displayed df (e.g.
-        # -2 = the last confirmed closed bar). Independent of what fetch
-        # request the df was built from.
+    if signal_side is not None and n:
         offset = signal_bar_offset if signal_bar_offset is not None else -2
         idx = n + offset if offset < 0 else offset
         idx = max(0, min(idx, n - 1))
-
         if signal_side == "long":
-            y_arrow = df["low"].iloc[idx] * 0.999
+            y_arrow = float(df["low"].iloc[idx]) * 0.999
             ax_c.annotate(
-                "▲ LONG",
-                xy=(idx, y_arrow),
-                xytext=(idx, y_arrow * 0.996),
+                "LONG", xy=(idx, y_arrow), xytext=(idx, y_arrow * 0.996),
                 color=T["signal_long"], fontsize=9, fontweight="bold",
                 ha="center", va="top", zorder=9,
-                arrowprops=dict(arrowstyle="->", color=T["signal_long"], lw=1.5)
+                arrowprops=dict(arrowstyle="->", color=T["signal_long"], lw=1.5),
             )
         else:
-            y_arrow = df["high"].iloc[idx] * 1.001
+            y_arrow = float(df["high"].iloc[idx]) * 1.001
             ax_c.annotate(
-                "▼ SHORT",
-                xy=(idx, y_arrow),
-                xytext=(idx, y_arrow * 1.004),
+                "SHORT", xy=(idx, y_arrow), xytext=(idx, y_arrow * 1.004),
                 color=T["signal_short"], fontsize=9, fontweight="bold",
                 ha="center", va="bottom", zorder=9,
-                arrowprops=dict(arrowstyle="->", color=T["signal_short"], lw=1.5)
+                arrowprops=dict(arrowstyle="->", color=T["signal_short"], lw=1.5),
             )
 
-    # ── Entry / TP / SL lines ────────────────────────────────────────
-    # 🆕 FIX: these three labels used to be f"...{price:,.2f}" — a fixed 2
-    # decimal places, same class of bug as the S/R labels above: on a
-    # sub-$1 pair, Entry/TP/SL could render as visually identical or
-    # collapse toward the same rounded value.
     if entry_price:
-        ax_c.hlines(entry_price, x_start, x_end, colors=T["entry"],
-                    linewidth=1.2, linestyles="-", zorder=8, alpha=0.9)
-        ax_c.text(0, entry_price, f"ENTRY {format_price(entry_price)}",
-                  color=T["entry"], fontsize=8, va="bottom", fontweight="bold")
-
+        ax_c.hlines(entry_price, x_start, x_end, colors=T["entry"], linewidth=1.2, zorder=8, alpha=0.9)
+        ax_c.text(0, entry_price, f"ENTRY {format_price(entry_price)}", color=T["entry"], fontsize=8, va="bottom", fontweight="bold")
     if tp_price:
-        ax_c.hlines(tp_price, x_start, x_end, colors=T["tp"],
-                    linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, tp_price, f"TP {format_price(tp_price)}",
-                  color=T["tp"], fontsize=8, va="bottom", fontweight="bold")
-
+        ax_c.hlines(tp_price, x_start, x_end, colors=T["tp"], linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
+        ax_c.text(0, tp_price, f"TP {format_price(tp_price)}", color=T["tp"], fontsize=8, va="bottom", fontweight="bold")
     if sl_price:
-        ax_c.hlines(sl_price, x_start, x_end, colors=T["sl"],
-                    linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, sl_price, f"SL {format_price(sl_price)}",
-                  color=T["sl"], fontsize=8, va="top", fontweight="bold")
-
-    # ── TP/SL zone fill ──────────────────────────────────────────
+        ax_c.hlines(sl_price, x_start, x_end, colors=T["sl"], linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
+        ax_c.text(0, sl_price, f"SL {format_price(sl_price)}", color=T["sl"], fontsize=8, va="top", fontweight="bold")
     if entry_price and tp_price and sl_price:
-        ax_c.fill_between(x, entry_price, tp_price,
-                          alpha=0.05, color=T["tp"], zorder=1)
-        ax_c.fill_between(x, sl_price, entry_price,
-                          alpha=0.05, color=T["sl"], zorder=1)
+        ax_c.fill_between(x, entry_price, tp_price, alpha=0.05, color=T["tp"], zorder=1)
+        ax_c.fill_between(x, sl_price, entry_price, alpha=0.05, color=T["sl"], zorder=1)
 
-    # ── Grid and styling for the main panel ──────────────────────
     ax_c.grid(True, color=T["grid"], linewidth=0.5, alpha=0.6, zorder=0)
-    ax_c.set_xlim(-0.5, n - 0.5)
+    ax_c.set_xlim(x_start, x_end)
     ax_c.yaxis.set_label_position("right")
 
-    # Title
-    last_close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
-    chg_pct = (last_close - prev_close) / prev_close * 100
+    last_close = float(df["close"].iloc[-1])
+    prev_close = float(df["close"].iloc[-2]) if n > 1 else last_close
+    chg_pct = (last_close - prev_close) / prev_close * 100 if prev_close else 0.0
     chg_color = T["bull"] if chg_pct >= 0 else T["bear"]
-    chg_sign  = "+" if chg_pct >= 0 else ""
+    chg_sign = "+" if chg_pct >= 0 else ""
+    fig.text(0.06, 0.955, f"{symbol}  -  {timeframe}", color=T["text"], fontsize=13, fontweight="bold", va="top")
+    fig.text(0.25, 0.955, f"${format_price(last_close)}  {chg_sign}{chg_pct:.2f}%", color=chg_color, fontsize=12, fontweight="bold", va="top")
 
-    fig.text(
-        0.06, 0.955,
-        f"{symbol}  ·  {timeframe}",
-        color=T["text"], fontsize=13, fontweight="bold", va="top"
-    )
-    # 🆕 FIX: was f"${last_close:,.2f}  ..." — same fixed-2-decimal issue.
-    fig.text(
-        0.25, 0.955,
-        f"${format_price(last_close)}  {chg_sign}{chg_pct:.2f}%",
-        color=chg_color, fontsize=12, fontweight="bold", va="top"
-    )
-
-    # Legend
     legend_elements = [
-        Line2D([0], [0], color=T["frama"],   linewidth=1.4, label="FRAMA"),
-        Line2D([0], [0], color=T["bb_mid"],  linewidth=0.8, linestyle="--", label="BB mid"),
+        Line2D([0], [0], color=T["frama"], linewidth=1.4, label="FRAMA"),
+        Line2D([0], [0], color=T["bb_mid"], linewidth=0.8, linestyle="--", label="BB mid"),
         Line2D([0], [0], color=T["bb_band"], linewidth=0.8, label="BB bands"),
         Line2D([0], [0], color=T["support"], linewidth=0.8, linestyle="--", label="Support"),
-        Line2D([0], [0], color=T["resist"],  linewidth=0.8, linestyle="--", label="Resist"),
+        Line2D([0], [0], color=T["resist"], linewidth=0.8, linestyle="--", label="Resist"),
+        Line2D([0], [0], color=T["demand"], linewidth=5, alpha=0.55, label="Demand zone"),
+        Line2D([0], [0], color=T["supply"], linewidth=5, alpha=0.55, label="Supply zone"),
     ]
     if entry_price:
-        legend_elements.append(
-            Line2D([0], [0], color=T["entry"], linewidth=1.2, label="Entry")
-        )
+        legend_elements.append(Line2D([0], [0], color=T["entry"], linewidth=1.2, label="Entry"))
     if volume_profile and volume_profile.get("poc") is not None:
-        legend_elements.append(
-            Line2D([0], [0], color=T["poc"], linewidth=1.6, label="POC / Value Area")
-        )
+        legend_elements.append(Line2D([0], [0], color=T["poc"], linewidth=1.6, label="POC / Value Area"))
     ax_c.legend(
         handles=legend_elements,
         loc="upper left", fontsize=7,
         facecolor=T["bg"], edgecolor=T["grid"],
-        labelcolor=T["text_dim"], framealpha=0.8
+        labelcolor=T["text_dim"], framealpha=0.8,
+        ncol=2,
     )
 
-    # ── Volume Profile histogram (narrow inset, right edge of the candle panel) ──
-    # A separate axes sharing ax_c's y-limits (price axis), so each bar lands
-    # at the correct price level regardless of the candle panel's own
-    # autoscale. Positioned just inside ax_c's own right edge rather than as
-    # a separate gridspec column — keeps the existing layout/margins
-    # untouched when volume_profile is None (the common case if the feature
-    # is disabled).
     if volume_profile and volume_profile.get("bins"):
         vp_bins = volume_profile["bins"]
         volumes = [b["volume"] for b in vp_bins]
@@ -386,94 +388,53 @@ def build_chart(
             ax_vp.set_ylim(ax_c.get_ylim())
             ax_vp.axis("off")
             ax_vp.patch.set_alpha(0)
-
             vah = volume_profile.get("vah")
             val = volume_profile.get("val")
+            y0, y1 = ax_c.get_ylim()
+            bin_height = (y1 - y0) / max(1, len(vp_bins))
             for b in vp_bins:
-                price = b["price"]
-                vol = b["volume"]
-                # Skip near-empty bins — at ~0 width they still leave a
-                # visible sliver right at the profile's right edge (x=1);
-                # stacked together, many of them read as a stray vertical line.
-                if vol / max_vol < 0.06:
+                price = float(b["price"])
+                vol = float(b["volume"])
+                if vol / max_vol < 0.06 or price < y0 or price > y1:
                     continue
-                y0, y1 = ax_c.get_ylim()
-                if price < y0 or price > y1:
-                    continue  # outside the visible price range — skip
                 in_value_area = val is not None and vah is not None and val <= price <= vah
-                width = (vol / max_vol) * 0.94  # fraction of the inset axes' own width
-                # 🆕 FIX: raised transparency (0.85→0.55, 0.35→0.18) and
-                # widened the gap between bars (height factor 0.9→0.6) — at
-                # the old, denser settings the bars packed too tightly and
-                # read as a solid block rather than a legible histogram
-                # shape, especially once dozens of bins were visible at once.
+                width = (vol / max_vol) * 0.94
                 bar_color = T["poc"] if in_value_area else T["text_dim"]
                 bar_alpha = 0.55 if in_value_area else 0.18
-                bin_height = (df_full["high"].max() - df_full["low"].min()) / len(vp_bins) if df_full is not None else (y1 - y0) / len(vp_bins)
-                # 🆕 FIX: bars used to be anchored at left=0 (the axes' left
-                # edge, overlapping the candles) and grow rightward — meaning
-                # the highest-volume bars stuck out farthest AWAY from the
-                # price action, toward the outer margin, instead of toward
-                # it. Anchoring at the right edge (x=1, the chart's actual
-                # outer boundary) and growing leftward matches the web
-                # dashboard's convention: bars reach toward the candles,
-                # with the tallest (POC-area) bars closest to the price.
-                ax_vp.barh(
-                    price, width, height=bin_height * 0.6,
-                    left=1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none",
-                )
+                ax_vp.barh(price, width, height=bin_height * 0.6, left=1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none")
             ax_vp.set_xlim(0, 1)
 
-    # ── Volume panel ────────────────────────────────────────────────
-    vol_colors = [
-        T["bull"] if df["close"].iloc[i] >= df["open"].iloc[i] else T["bear"]
-        for i in range(n)
-    ]
+    vol_colors = [T["bull"] if df["close"].iloc[i] >= df["open"].iloc[i] else T["bear"] for i in range(n)]
     ax_v.bar(x, df["volume"], color=vol_colors, width=0.7, alpha=0.7, zorder=3)
     ax_v.set_ylabel("Vol", color=T["text_dim"], fontsize=7, rotation=0, labelpad=20)
     ax_v.grid(True, color=T["grid"], linewidth=0.4, alpha=0.5, zorder=0)
-    ax_v.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda val, _: f"{val/1e3:.0f}K" if val >= 1000 else f"{val:.0f}")
-    )
+    ax_v.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, _: f"{val / 1e3:.0f}K" if val >= 1000 else f"{val:.0f}"))
 
-    # ── MFI panel ───────────────────────────────────────────────────
     if ax_m is not None and mfi is not None:
         mfi_vals = mfi.tail(limit).values
         ax_m.plot(x, mfi_vals, color=T["mfi_line"], linewidth=1.0, zorder=3)
         ax_m.axhline(mfi_ob, color=T["mfi_ob"], linewidth=0.6, linestyle="--", alpha=0.7)
         ax_m.axhline(mfi_os, color=T["mfi_os"], linewidth=0.6, linestyle="--", alpha=0.7)
-        ax_m.fill_between(x, mfi_os, mfi_vals,
-                          where=(mfi_vals <= mfi_os),
-                          alpha=0.2, color=T["mfi_os"], zorder=1)
-        ax_m.fill_between(x, mfi_ob, mfi_vals,
-                          where=(mfi_vals >= mfi_ob),
-                          alpha=0.2, color=T["mfi_ob"], zorder=1)
+        ax_m.fill_between(x, mfi_os, mfi_vals, where=(mfi_vals <= mfi_os), alpha=0.2, color=T["mfi_os"], zorder=1)
+        ax_m.fill_between(x, mfi_ob, mfi_vals, where=(mfi_vals >= mfi_ob), alpha=0.2, color=T["mfi_ob"], zorder=1)
         ax_m.set_ylim(0, 100)
         ax_m.set_ylabel("MFI", color=T["text_dim"], fontsize=7, rotation=0, labelpad=20)
         ax_m.grid(True, color=T["grid"], linewidth=0.4, alpha=0.5, zorder=0)
         ax_m.set_xticks(tick_positions)
-        ax_m.set_xticklabels(tick_labels, rotation=30, ha="right",
-                              fontsize=7, color=T["text_dim"])
+        ax_m.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=7, color=T["text_dim"])
     else:
         ax_v.set_xticks(tick_positions)
-        ax_v.set_xticklabels(tick_labels, rotation=30, ha="right",
-                             fontsize=7, color=T["text_dim"])
+        ax_v.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=7, color=T["text_dim"])
 
     plt.setp(ax_c.get_xticklabels(), visible=False)
     plt.setp(ax_v.get_xticklabels(), visible=False if ax_m else True)
 
-    # ── Save ───────────────────────────────────────────────────────
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
-                facecolor=T["bg"], edgecolor="none")
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=T["bg"], edgecolor="none")
     plt.close(fig)
     buf.seek(0)
     return buf
 
-
-# ─────────────────────────────────────────────────────────────────────
-# 🤖  PUBLIC FUNCTION FOR THE BOT
-# ─────────────────────────────────────────────────────────────────────
 
 async def generate_chart(
     exchange,
@@ -482,102 +443,75 @@ async def generate_chart(
     limit: int = 50,
     state_snapshot: Optional[dict] = None,
 ) -> io.BytesIO:
-    """
-    Main entry point: downloads OHLCV, computes indicators, builds the PNG.
-
-    Args:
-        exchange:        ccxt.Exchange instance
-        symbol:          "BTC/USDT"
-        timeframe:       "1h" | "4h"
-        limit:           number of candles (default 50)
-        state_snapshot:  dict with entry, tp, sl, side, signal_bar_offset
-                          fields (optional; offset from the end of df,
-                          default -2 — the last closed bar)
-
-    Returns:
-        BytesIO PNG buffer
-    """
-    import asyncio
+    """Fetch market data, compute indicators and render the chart."""
     from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
-    from indicators import (
-        calculate_frama, calculate_mfi, run_kmeans_mfi,
-        calculate_atr
-    )
+    from indicators import calculate_frama, calculate_mfi, run_kmeans_mfi
 
-    # Fetch more data to warm up the indicators
     fetch_limit = max(limit + 250, 300)
     bars = await safe_fetch_ohlcv(exchange, symbol, timeframe, limit=fetch_limit)
     df = parse_ohlcv(bars)
-
     if not validate_dataframe(df, min_rows=50):
         raise ValueError(f"Not enough data for {symbol} {timeframe}")
 
-    # ── Indicators (module-level _cfg — sees live edits from the web UI) ──
     frama_s, frama_u, frama_l, _ = calculate_frama(
-        df, length=_cfg.FRAMA_LEN, mult=_cfg.FRAMA_MULT
+        df, length=_cfg_value("FRAMA_LEN", 16), mult=_cfg_value("FRAMA_MULT", 1.6)
+    )
+    mfi_s = calculate_mfi(df, length=_cfg_value("MFI_LEN", 7))
+    mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=_cfg_value("MFI_TRAINING", 800))
+
+    volume_profile = None
+    if _cfg_value("VP_ENABLED", False):
+        confirmed_df = df.iloc[:-1]
+        vp_window = confirmed_df.tail(min(_cfg_value("VP_LOOKBACK", 200), len(confirmed_df)))
+        volume_profile = calc_volume_profile(
+            vp_window,
+            bins=_cfg_value("VP_BINS", 50),
+            value_area_pct=_cfg_value("VP_VALUE_AREA_PCT", 0.70),
+        )
+        if not _cfg_value("VP_SHOW_HISTOGRAM", True):
+            volume_profile["bins"] = []
+
+    zone_lookback = int(_cfg_value("ZONE_LOOKBACK", 300))
+    zone_data = detect_demand_supply_zones(
+        df,
+        atr_period=int(_cfg_value("ZONE_ATR_PERIOD", 14)),
+        lookback=zone_lookback,
+        base_bars=int(_cfg_value("ZONE_BASE_BARS", 4)),
+        impulse_bars=int(_cfg_value("ZONE_IMPULSE_BARS", 3)),
+        max_zones=int(_cfg_value("ZONE_MAX_ZONES", 5)),
+        max_base_atr=float(_cfg_value("ZONE_MAX_BASE_ATR", 1.6)),
+        min_displacement_atr=float(_cfg_value("ZONE_MIN_DISPLACEMENT_ATR", 1.1)),
+        min_volume_ratio=float(_cfg_value("ZONE_MIN_VOLUME_RATIO", 1.15)),
     )
 
-    mfi_s = calculate_mfi(df, length=_cfg.MFI_LEN)
-    mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=_cfg.MFI_TRAINING)
+    display_start = max(0, len(df) - limit)
+    positioned_zones = _prepare_zone_positions(zone_data, len(df), display_start, zone_lookback)
 
-    # 🆕 Volume Profile (POC / Value Area) — see calc_volume_profile() for
-    # the TPO-style approximation used since only OHLCV is available.
-    # Computed over its own lookback window (config.VP_LOOKBACK, independent
-    # of `limit` — the number of candles actually shown on the chart), so
-    # the profile reflects where volume concentrated over a meaningfully
-    # long history, not just whatever's currently on screen.
-    volume_profile = None
-    if _cfg.VP_ENABLED:
-        vp_window = df.tail(min(_cfg.VP_LOOKBACK, len(df)))
-        volume_profile = calc_volume_profile(vp_window, bins=_cfg.VP_BINS, value_area_pct=_cfg.VP_VALUE_AREA_PCT)
-        if not _cfg.VP_SHOW_HISTOGRAM:
-            volume_profile["bins"] = []  # keep POC/VA lines, drop the histogram bars
-
-    # ── Active trade data ────────────────────────────────────
-    entry_price       = None
-    tp_price          = None
-    sl_price          = None
-    signal_side       = None
+    entry_price = None
+    tp_price = None
+    sl_price = None
+    signal_side = None
     signal_bar_offset = -2
 
     if state_snapshot:
         entry_price = state_snapshot.get("entry")
-        tp_price    = state_snapshot.get("tp")
-        sl_price    = state_snapshot.get("sl")
+        tp_price = state_snapshot.get("tp")
+        sl_price = state_snapshot.get("sl")
         signal_side = state_snapshot.get("side")
-
         entry_time_ms = state_snapshot.get("entry_time_ms")
         if entry_time_ms is not None:
-            # 🆕 FIX: the trade may have been opened many bars ago, on a
-            # different df. We look up the real bar by timestamp in OUR OWN
-            # just-fetched df, instead of trusting a positional index from
-            # someone else's df.
             try:
-                ts_arr = df["timestamp"].values
+                ts_arr = df["timestamp"].values.astype(float)
                 closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
-                # If the real entry is earlier than the chart's visible
-                # window (limit bars), argmin will still find the "closest"
-                # one — usually the chart's first bar — drawing the marker
-                # in a definitely wrong spot. Check a tolerance (1.5 bar
-                # intervals); if it doesn't fit, use the default offset (-2,
-                # the last closed bar) instead of a false location.
-                bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0
+                bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0.0
                 actual_diff = abs(ts_arr[closest_i] - float(entry_time_ms))
-                if bar_interval_ms > 0 and actual_diff > bar_interval_ms * 1.5:
-                    signal_bar_offset = -2
-                else:
-                    signal_bar_offset = closest_i - len(df)  # offset from the end, always <= -1
-            except Exception as e:
-                logger.warning(f"[CHART] Failed to resolve entry_time_ms to bar index: {e}")
-                signal_bar_offset = -2
+                if bar_interval_ms > 0 and actual_diff <= bar_interval_ms * 1.5:
+                    signal_bar_offset = closest_i - len(df)
+            except Exception as exc:
+                logger.warning("Failed to resolve entry_time_ms: %s", exc)
         else:
             signal_bar_offset = state_snapshot.get("signal_bar_offset", -2)
 
-    # 🆕 FIX: build_chart() is a heavy synchronous matplotlib call (CPU-bound
-    # rendering + PNG encode, easily 100-300ms). Calling it directly here would
-    # block the whole asyncio event loop — including the scanner loop and every
-    # other coroutine — for that whole duration on every single signal chart.
-    # Offload to a worker thread so the event loop stays responsive.
     return await asyncio.to_thread(
         build_chart,
         df=df,
@@ -597,4 +531,5 @@ async def generate_chart(
         signal_bar_offset=signal_bar_offset,
         limit=limit,
         volume_profile=volume_profile,
+        demand_supply_zones=positioned_zones,
     )
