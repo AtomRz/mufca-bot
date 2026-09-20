@@ -128,36 +128,37 @@ async def get_chart_data(
     # "start_time" (unix seconds, clamped into the fetched df's own range)
     # instead of a chart_index.
     demand_supply_zones: Dict[str, List[Dict]] = {"demand": [], "supply": []}
-    try:
-        zone_data = detect_demand_supply_zones(
-            df,
-            atr_period=config.ZONE_ATR_PERIOD,
-            lookback=config.ZONE_LOOKBACK,
-            base_bars=config.ZONE_BASE_BARS,
-            impulse_bars=config.ZONE_IMPULSE_BARS,
-            max_zones=config.ZONE_MAX_ZONES,
-            max_base_atr=config.ZONE_MAX_BASE_ATR,
-            min_displacement_atr=config.ZONE_MIN_DISPLACEMENT_ATR,
-            min_volume_ratio=config.ZONE_MIN_VOLUME_RATIO,
-        )
-        for side in ("demand", "supply"):
-            for zone in zone_data.get(side, []):
-                absolute_index = zone_absolute_index(len(df), config.ZONE_LOOKBACK, zone.get("created_bar", 0))
-                absolute_index = min(max(absolute_index, 0), len(df) - 1)
-                demand_supply_zones[side].append({
-                    "low": zone["low"],
-                    "high": zone["high"],
-                    "mid": zone["mid"],
-                    "score": zone["score"],
-                    "state": zone["state"],
-                    "fresh": zone["fresh"],
-                    "touches": zone["touches"],
-                    "retests": zone["retests"],
-                    "distance_pct": zone["distance_pct"],
-                    "start_time": int(df["timestamp"].iloc[absolute_index] // 1000),
-                })
-    except Exception as e:
-        logger.warning(f"[CHART_DATA] {symbol} {timeframe}: demand/supply zone detection failed: {e}")
+    if config.ZONE_ENABLED:
+        try:
+            zone_data = detect_demand_supply_zones(
+                df,
+                atr_period=config.ZONE_ATR_PERIOD,
+                lookback=config.ZONE_LOOKBACK,
+                base_bars=config.ZONE_BASE_BARS,
+                impulse_bars=config.ZONE_IMPULSE_BARS,
+                max_zones=config.ZONE_MAX_ZONES,
+                max_base_atr=config.ZONE_MAX_BASE_ATR,
+                min_displacement_atr=config.ZONE_MIN_DISPLACEMENT_ATR,
+                min_volume_ratio=config.ZONE_MIN_VOLUME_RATIO,
+            )
+            for side in ("demand", "supply"):
+                for zone in zone_data.get(side, []):
+                    absolute_index = zone_absolute_index(len(df), config.ZONE_LOOKBACK, zone.get("created_bar", 0))
+                    absolute_index = min(max(absolute_index, 0), len(df) - 1)
+                    demand_supply_zones[side].append({
+                        "low": zone["low"],
+                        "high": zone["high"],
+                        "mid": zone["mid"],
+                        "score": zone["score"],
+                        "state": zone["state"],
+                        "fresh": zone["fresh"],
+                        "touches": zone["touches"],
+                        "retests": zone["retests"],
+                        "distance_pct": zone["distance_pct"],
+                        "start_time": int(df["timestamp"].iloc[absolute_index] // 1000),
+                    })
+        except Exception as e:
+            logger.warning(f"[CHART_DATA] {symbol} {timeframe}: demand/supply zone detection failed: {e}")
 
     candles = [
         {

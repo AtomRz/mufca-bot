@@ -468,17 +468,19 @@ async def generate_chart(
             volume_profile["bins"] = []
 
     zone_lookback = int(_cfg_value("ZONE_LOOKBACK", 300))
-    zone_data = detect_demand_supply_zones(
-        df,
-        atr_period=int(_cfg_value("ZONE_ATR_PERIOD", 14)),
-        lookback=zone_lookback,
-        base_bars=int(_cfg_value("ZONE_BASE_BARS", 4)),
-        impulse_bars=int(_cfg_value("ZONE_IMPULSE_BARS", 3)),
-        max_zones=int(_cfg_value("ZONE_MAX_ZONES", 5)),
-        max_base_atr=float(_cfg_value("ZONE_MAX_BASE_ATR", 1.6)),
-        min_displacement_atr=float(_cfg_value("ZONE_MIN_DISPLACEMENT_ATR", 1.1)),
-        min_volume_ratio=float(_cfg_value("ZONE_MIN_VOLUME_RATIO", 1.15)),
-    )
+    zone_data = {"demand": [], "supply": []}
+    if _cfg_value("ZONE_ENABLED", True):
+        zone_data = detect_demand_supply_zones(
+            df,
+            atr_period=int(_cfg_value("ZONE_ATR_PERIOD", 14)),
+            lookback=zone_lookback,
+            base_bars=int(_cfg_value("ZONE_BASE_BARS", 4)),
+            impulse_bars=int(_cfg_value("ZONE_IMPULSE_BARS", 3)),
+            max_zones=int(_cfg_value("ZONE_MAX_ZONES", 5)),
+            max_base_atr=float(_cfg_value("ZONE_MAX_BASE_ATR", 1.6)),
+            min_displacement_atr=float(_cfg_value("ZONE_MIN_DISPLACEMENT_ATR", 1.1)),
+            min_volume_ratio=float(_cfg_value("ZONE_MIN_VOLUME_RATIO", 1.15)),
+        )
 
     display_start = max(0, len(df) - limit)
     positioned_zones = _prepare_zone_positions(zone_data, len(df), display_start, zone_lookback)

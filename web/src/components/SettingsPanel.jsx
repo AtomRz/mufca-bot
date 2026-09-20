@@ -177,6 +177,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const saveBreakout = (field, value) => run(`brk_${field}`, () => api.setBreakoutConfig({ [field]: value }))
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
   const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
+  const saveZones = (field, value) => run(`zones_${field}`, () => api.setZones({ [field]: value }))
 
   return (
     <div>
@@ -617,6 +618,72 @@ export default function SettingsPanel({ config, onChanged }) {
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               POC (Point of Control) and Value Area are a different kind of level from pivot support/resistance
               above — they mark where volume actually concentrated, not local price extremes. Complementary, not a replacement.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Demand / Supply Zones</h3>
+            <div className="toggle-row">
+              <span className="row-label" title="A tight consolidation ('base') followed by a strong, high-volume move out of it. Disabling also skips the detector's per-bar work on the live scan, not just the chart overlay.">
+                Enabled
+              </span>
+              <Toggle
+                checked={config.zones?.enabled ?? true}
+                disabled={busy === 'zones_enabled'}
+                onChange={(v) => saveZones('enabled', v)}
+              />
+            </div>
+            <NumberField
+              label="ATR period" hint="5–50, for base-tightness and displacement-strength checks"
+              value={config.zones?.atr_period ?? 14}
+              min={5} max={50} busyKey="zones_atr_period" busy={busy}
+              onSave={(v) => saveZones('atr_period', v)}
+            />
+            <NumberField
+              label="Lookback" hint="50–2000 confirmed bars searched for zones"
+              value={config.zones?.lookback ?? 300}
+              min={50} max={2000} busyKey="zones_lookback" busy={busy}
+              onSave={(v) => saveZones('lookback', v)}
+            />
+            <NumberField
+              label="Base bars" hint="2–10, the consolidation window before a displacement move"
+              value={config.zones?.base_bars ?? 4}
+              min={2} max={10} busyKey="zones_base_bars" busy={busy}
+              onSave={(v) => saveZones('base_bars', v)}
+            />
+            <NumberField
+              label="Impulse bars" hint="1–10, bars checked after the base for a displacement move"
+              value={config.zones?.impulse_bars ?? 3}
+              min={1} max={10} busyKey="zones_impulse_bars" busy={busy}
+              onSave={(v) => saveZones('impulse_bars', v)}
+            />
+            <NumberField
+              label="Max zones" hint="1–20, kept per side (demand/supply) after merging and scoring"
+              value={config.zones?.max_zones ?? 5}
+              min={1} max={20} busyKey="zones_max_zones" busy={busy}
+              onSave={(v) => saveZones('max_zones', v)}
+            />
+            <NumberField
+              label="Max base ATR" hint="0.1–5.0, base must be tighter than this many ATRs to count as a base"
+              value={config.zones?.max_base_atr ?? 1.6}
+              min={0.1} max={5.0} step={0.1} busyKey="zones_max_base_atr" busy={busy}
+              onSave={(v) => saveZones('max_base_atr', v)}
+            />
+            <NumberField
+              label="Min displacement ATR" hint="0.1–5.0, minimum move out of the base to count as an impulse"
+              value={config.zones?.min_displacement_atr ?? 1.1}
+              min={0.1} max={5.0} step={0.1} busyKey="zones_min_displacement_atr" busy={busy}
+              onSave={(v) => saveZones('min_displacement_atr', v)}
+            />
+            <NumberField
+              label="Min volume ratio" hint="0.5–5.0, displacement bars' avg volume vs. the rolling mean, minimum to count"
+              value={config.zones?.min_volume_ratio ?? 1.15}
+              min={0.5} max={5.0} step={0.1} busyKey="zones_min_volume_ratio" busy={busy}
+              onSave={(v) => saveZones('min_volume_ratio', v)}
+            />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Shown on the Chart tab (Discord and web) as colored bands with a state label (fresh/tested/weakened/broken).
+              Not yet read by confidence scoring or TP capping — informational only, same as Volume Profile above.
             </p>
           </div>
 

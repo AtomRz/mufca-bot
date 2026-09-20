@@ -46,6 +46,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
   const seriesRef = useRef({})
   const canvasRef = useRef(null) // 🆕 overlay canvas for the volume-profile histogram
   const vpDataRef = useRef(null) // 🆕 latest { poc, vah, val, bins } for on-demand redraw
+  const zonesDataRef = useRef(null) // 🆕 latest { demand, supply } for on-demand label redraw
   const lastSelectionKeyRef = useRef(null) // 🆕 only changes on ticker/tf/track change
   const [track, setTrack] = useState('a')
   const [barsLimit, setBarsLimit] = useState(100)
@@ -100,19 +101,24 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     if (lastEvent.type === 'config_changed') load()
   }, [lastEvent, ticker, tf, load])
 
-  // 🆕 Draws the volume-profile histogram on a canvas overlaid on top of the
-  // chart (lightweight-charts v4 has no plugin/primitive API for custom
-  // horizontal bars along the price axis, unlike v5 — this is the standard
-  // workaround: a transparent <canvas> positioned over the chart container,
-  // redrawn whenever the price axis could have moved). Bars are anchored to
-  // the right edge, semi-transparent, so they read as a backdrop behind the
-  // candles rather than a separate panel — same convention most platforms
-  // use for an overlaid volume profile.
+  // 🆕 Draws the volume-profile histogram AND demand/supply zone labels on
+  // a canvas overlaid on top of the chart (lightweight-charts v4 has no
+  // plugin/primitive API for custom shapes or floating text along either
+  // axis, unlike v5 — this is the standard workaround: a transparent
+  // <canvas> positioned over the chart container, redrawn whenever the
+  // chart could have moved). VP bars are anchored to the right edge,
+  // semi-transparent, so they read as a backdrop behind the candles.
+  // Zone labels mirror chart.py's _zone_label()/_zone_alpha() so the same
+  // zone reads the same way on the Discord PNG and here — centered in the
+  // zone both vertically (zone.mid) and horizontally (between the zone's
+  // start and the chart's right edge, since a zone's band extends to
+  // "now").
   const drawVolumeProfile = useCallback(() => {
     const canvas = canvasRef.current
     const container = containerRef.current
     const s = seriesRef.current
     const vp = vpDataRef.current
+    const zones = zonesDataRef.current
     if (!canvas || !container) return
     const ctx = canvas.getContext('2d')
     const dpr = window.devicePixelRatio || 1
@@ -127,21 +133,52 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, width, height)
 
-    if (!vp || !vp.bins?.length || !s.candle) return
-    const maxVol = Math.max(...vp.bins.map((b) => b.volume))
-    if (maxVol <= 0) return
+    if (vp?.bins?.length && s.candle) {
+      const maxVol = Math.max(...vp.bins.map((b) => b.volume))
+      if (maxVol > 0) {
+        const profileWidth = width * 0.14
+        const rightEdge = width - 2
+        const barHeight = Math.max(2, height / (vp.bins.length * 3))
+        for (const b of vp.bins) {
+          const y = s.candle.priceToCoordinate(b.price)
+          if (y === null || y < 0 || y > height) continue
+          const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
+          const barWidth = (b.volume / maxVol) * profileWidth
+          ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : 'rgba(110,118,129,0.28)'
+          ctx.fillRect(rightEdge - barWidth, y - barHeight / 2, barWidth, barHeight)
+        }
+      }
+    }
 
-    const profileWidth = width * 0.14
-    const rightEdge = width - 2
-    const barHeight = Math.max(2, height / (vp.bins.length * 3))
-
-    for (const b of vp.bins) {
-      const y = s.candle.priceToCoordinate(b.price)
-      if (y === null || y < 0 || y > height) continue
-      const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
-      const barWidth = (b.volume / maxVol) * profileWidth
-      ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : 'rgba(110,118,129,0.28)'
-      ctx.fillRect(rightEdge - barWidth, y - barHeight / 2, barWidth, barHeight)
+    if (s.candle && chartRef.current && (zones?.demand?.length || zones?.supply?.length)) {
+      const timeScale = chartRef.current.timeScale()
+      ctx.font = '600 10px system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      const drawZoneLabel = (zone, side) => {
+        const y = s.candle.priceToCoordinate(zone.mid)
+        if (y === null || y < 0 || y > height) return
+        const startX = zone.start_time != null ? timeScale.timeToCoordinate(zone.start_time) : null
+        const clampedStart = startX == null ? 0 : Math.max(0, Math.min(startX, width))
+        const x = (clampedStart + width) / 2
+        const color = side === 'demand' ? C.demand_zone : C.supply_zone
+        const label = `${side.toUpperCase()} ${Math.round(zone.score)} ${String(zone.state).toUpperCase()} T${zone.touches}`
+        const textWidth = ctx.measureText(label).width
+        const padX = 4, padY = 2
+        ctx.fillStyle = 'rgba(19,25,34,0.82)'
+        ctx.strokeStyle = color
+        ctx.lineWidth = 1
+        const boxX = x - textWidth / 2 - padX
+        const boxY = y - 7 - padY
+        const boxW = textWidth + padX * 2
+        const boxH = 14 + padY * 2
+        ctx.fillRect(boxX, boxY, boxW, boxH)
+        ctx.strokeRect(boxX, boxY, boxW, boxH)
+        ctx.fillStyle = color
+        ctx.fillText(label, x, y)
+      }
+      zones?.demand?.forEach((z) => drawZoneLabel(z, 'demand'))
+      zones?.supply?.forEach((z) => drawZoneLabel(z, 'supply'))
     }
   }, [C])
 
@@ -450,6 +487,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       return Math.min(0.14, base)
     }
     const dsz = data.demand_supply_zones
+    zonesDataRef.current = dsz
     dsz?.demand?.forEach((z) => {
       s.dsZones.push(bandZone(z.low, z.high, hexToRgba(C.demand_zone, zoneAlpha(z.score, z.state)), z.start_time))
     })

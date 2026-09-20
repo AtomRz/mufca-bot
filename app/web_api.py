@@ -846,6 +846,17 @@ async def get_config():
             "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
             "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
         },
+        "zones": {
+            "enabled": _cfg.ZONE_ENABLED,
+            "atr_period": _cfg.ZONE_ATR_PERIOD,
+            "lookback": _cfg.ZONE_LOOKBACK,
+            "base_bars": _cfg.ZONE_BASE_BARS,
+            "impulse_bars": _cfg.ZONE_IMPULSE_BARS,
+            "max_zones": _cfg.ZONE_MAX_ZONES,
+            "max_base_atr": _cfg.ZONE_MAX_BASE_ATR,
+            "min_displacement_atr": _cfg.ZONE_MIN_DISPLACEMENT_ATR,
+            "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
+        },
         "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
         "pairs": _cfg.TICKERS,
@@ -1510,6 +1521,94 @@ async def set_volume_profile(body: VolumeProfileIn):
         "lookback": _cfg.VP_LOOKBACK,
         "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
         "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+    }
+
+
+class ZonesIn(BaseModel):
+    # Any subset of fields — a partial PATCH, same as VolumeProfileIn.
+    enabled: Optional[bool] = None
+    atr_period: Optional[int] = None
+    lookback: Optional[int] = None
+    base_bars: Optional[int] = None
+    impulse_bars: Optional[int] = None
+    max_zones: Optional[int] = None
+    max_base_atr: Optional[float] = None
+    min_displacement_atr: Optional[float] = None
+    min_volume_ratio: Optional[float] = None
+
+
+@app.post("/api/config/zones")
+async def set_zones(body: ZonesIn):
+    """Demand/supply zone detector (market_structure.detect_demand_supply_zones())
+    settings. Purely a chart overlay right now — zone_context is computed
+    onto every MarketStructure snapshot but nothing in confidence scoring
+    or TP-obstacle capping reads it yet — so like Volume Profile, no state
+    reset is needed here; disabling also skips the detector's per-bar work
+    on the live scan path, not just the chart render."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+
+    # Validate everything first, apply only once everything passes — same
+    # reasoning as set_indicators()/set_volume_profile() above.
+    if "atr_period" in updates and not (5 <= updates["atr_period"] <= 50):
+        raise HTTPException(400, "atr_period must be between 5 and 50")
+    if "lookback" in updates and not (50 <= updates["lookback"] <= 2000):
+        raise HTTPException(400, "lookback must be between 50 and 2000")
+    if "base_bars" in updates and not (2 <= updates["base_bars"] <= 10):
+        raise HTTPException(400, "base_bars must be between 2 and 10")
+    if "impulse_bars" in updates and not (1 <= updates["impulse_bars"] <= 10):
+        raise HTTPException(400, "impulse_bars must be between 1 and 10")
+    if "max_zones" in updates and not (1 <= updates["max_zones"] <= 20):
+        raise HTTPException(400, "max_zones must be between 1 and 20")
+    if "max_base_atr" in updates and not (0.1 <= updates["max_base_atr"] <= 5.0):
+        raise HTTPException(400, "max_base_atr must be between 0.1 and 5.0")
+    if "min_displacement_atr" in updates and not (0.1 <= updates["min_displacement_atr"] <= 5.0):
+        raise HTTPException(400, "min_displacement_atr must be between 0.1 and 5.0")
+    if "min_volume_ratio" in updates and not (0.5 <= updates["min_volume_ratio"] <= 5.0):
+        raise HTTPException(400, "min_volume_ratio must be between 0.5 and 5.0")
+
+    if "enabled" in updates:
+        _cfg.ZONE_ENABLED = updates["enabled"]
+    if "atr_period" in updates:
+        _cfg.ZONE_ATR_PERIOD = updates["atr_period"]
+    if "lookback" in updates:
+        _cfg.ZONE_LOOKBACK = updates["lookback"]
+    if "base_bars" in updates:
+        _cfg.ZONE_BASE_BARS = updates["base_bars"]
+    if "impulse_bars" in updates:
+        _cfg.ZONE_IMPULSE_BARS = updates["impulse_bars"]
+    if "max_zones" in updates:
+        _cfg.ZONE_MAX_ZONES = updates["max_zones"]
+    if "max_base_atr" in updates:
+        _cfg.ZONE_MAX_BASE_ATR = updates["max_base_atr"]
+    if "min_displacement_atr" in updates:
+        _cfg.ZONE_MIN_DISPLACEMENT_ATR = updates["min_displacement_atr"]
+    if "min_volume_ratio" in updates:
+        _cfg.ZONE_MIN_VOLUME_RATIO = updates["min_volume_ratio"]
+
+    _cfg.save_zone_config({
+        "enabled": _cfg.ZONE_ENABLED,
+        "atr_period": _cfg.ZONE_ATR_PERIOD,
+        "lookback": _cfg.ZONE_LOOKBACK,
+        "base_bars": _cfg.ZONE_BASE_BARS,
+        "impulse_bars": _cfg.ZONE_IMPULSE_BARS,
+        "max_zones": _cfg.ZONE_MAX_ZONES,
+        "max_base_atr": _cfg.ZONE_MAX_BASE_ATR,
+        "min_displacement_atr": _cfg.ZONE_MIN_DISPLACEMENT_ATR,
+        "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
+    })
+    await broadcast_event({"type": "config_changed", "key": "zones"})
+    return {
+        "enabled": _cfg.ZONE_ENABLED,
+        "atr_period": _cfg.ZONE_ATR_PERIOD,
+        "lookback": _cfg.ZONE_LOOKBACK,
+        "base_bars": _cfg.ZONE_BASE_BARS,
+        "impulse_bars": _cfg.ZONE_IMPULSE_BARS,
+        "max_zones": _cfg.ZONE_MAX_ZONES,
+        "max_base_atr": _cfg.ZONE_MAX_BASE_ATR,
+        "min_displacement_atr": _cfg.ZONE_MIN_DISPLACEMENT_ATR,
+        "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
     }
 
 

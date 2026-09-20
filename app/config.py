@@ -520,19 +520,43 @@ SR_MIN_LOOKBACK = 900
 # 🆕 (external review, S/R-zones polish): demand/supply zone detector
 # (market_structure.detect_demand_supply_zones()) — previously only lived
 # as getattr(_cfg, "ZONE_...", default) fallbacks in market_structure.py
-# and chart.py, meaning these had no real home in config and couldn't be
-# tuned or exposed to the web/Discord settings UI at all. Values below
-# match the defaults both call sites were already using, so this is a
-# pure "give it a real config entry" change — zone detection behaves
-# identically to before until one of these is actually changed.
-ZONE_ATR_PERIOD = 14            # ATR period used for base-tightness and displacement-strength checks
-ZONE_LOOKBACK = 300              # how many confirmed bars back to search for zones
-ZONE_BASE_BARS = 4               # consolidation ("base") window before a displacement move
-ZONE_IMPULSE_BARS = 3            # bars after the base checked for a displacement move
-ZONE_MAX_ZONES = 5               # kept per side (demand/supply) after merging/scoring
-ZONE_MAX_BASE_ATR = 1.6          # base must be tighter than this many ATRs to count as a "base"
-ZONE_MIN_DISPLACEMENT_ATR = 1.1  # minimum displacement (in ATRs) out of the base to count as an impulse
-ZONE_MIN_VOLUME_RATIO = 1.15     # displacement bars' avg volume vs. the rolling mean, minimum to count
+# and chart.py, with no real home in config and no way to disable them or
+# tune them from the web/Discord settings UI. Now a persisted JSON
+# config, same pattern as VP_* just above — "enabled" plus the 8 numeric
+# knobs, editable at runtime via /api/config/zones, applied immediately
+# (no restart, no state reset — same reasoning as Volume Profile: this is
+# a chart overlay, it doesn't affect signal generation).
+ZONE_FILE = os.path.join(DATA_DIR, "zones.json")
+_ZONE_DEFAULTS = {
+    "enabled": True,
+    "atr_period": 14,             # ATR period used for base-tightness and displacement-strength checks
+    "lookback": 300,              # how many confirmed bars back to search for zones
+    "base_bars": 4,               # consolidation ("base") window before a displacement move
+    "impulse_bars": 3,            # bars after the base checked for a displacement move
+    "max_zones": 5,               # kept per side (demand/supply) after merging/scoring
+    "max_base_atr": 1.6,          # base must be tighter than this many ATRs to count as a "base"
+    "min_displacement_atr": 1.1,  # minimum displacement (in ATRs) out of the base to count as an impulse
+    "min_volume_ratio": 1.15,     # displacement bars' avg volume vs. the rolling mean, minimum to count
+}
+
+def load_zone_config() -> dict:
+    data = safe_json_load(ZONE_FILE, _ZONE_DEFAULTS)
+    # fill in any keys missing from an older config file with defaults
+    return {**_ZONE_DEFAULTS, **data}
+
+def save_zone_config(data: dict):
+    safe_json_save(ZONE_FILE, data)
+
+_zone_config = load_zone_config()
+ZONE_ENABLED = _zone_config["enabled"]
+ZONE_ATR_PERIOD = _zone_config["atr_period"]
+ZONE_LOOKBACK = _zone_config["lookback"]
+ZONE_BASE_BARS = _zone_config["base_bars"]
+ZONE_IMPULSE_BARS = _zone_config["impulse_bars"]
+ZONE_MAX_ZONES = _zone_config["max_zones"]
+ZONE_MAX_BASE_ATR = _zone_config["max_base_atr"]
+ZONE_MIN_DISPLACEMENT_ATR = _zone_config["min_displacement_atr"]
+ZONE_MIN_VOLUME_RATIO = _zone_config["min_volume_ratio"]
 
 # =====================================================================
 # 📊  VOLUME PROFILE (POC / Value Area)

@@ -584,18 +584,21 @@ def get_market_structure(
         max_levels=_cfg.SR_MAX_LEVELS,
     )
 
-    zones = detect_demand_supply_zones(
-        df,
-        atr_period=_cfg.ZONE_ATR_PERIOD,
-        lookback=_cfg.ZONE_LOOKBACK,
-        base_bars=_cfg.ZONE_BASE_BARS,
-        impulse_bars=_cfg.ZONE_IMPULSE_BARS,
-        max_zones=_cfg.ZONE_MAX_ZONES,
-        max_base_atr=_cfg.ZONE_MAX_BASE_ATR,
-        min_displacement_atr=_cfg.ZONE_MIN_DISPLACEMENT_ATR,
-        min_volume_ratio=_cfg.ZONE_MIN_VOLUME_RATIO,
-    )
-    zone_context = evaluate_zone_context(last_close, zones)
+    zones: Dict[str, List[Dict]] = {"demand": [], "supply": []}
+    zone_context: Dict = {}
+    if _cfg.ZONE_ENABLED:
+        zones = detect_demand_supply_zones(
+            df,
+            atr_period=_cfg.ZONE_ATR_PERIOD,
+            lookback=_cfg.ZONE_LOOKBACK,
+            base_bars=_cfg.ZONE_BASE_BARS,
+            impulse_bars=_cfg.ZONE_IMPULSE_BARS,
+            max_zones=_cfg.ZONE_MAX_ZONES,
+            max_base_atr=_cfg.ZONE_MAX_BASE_ATR,
+            min_displacement_atr=_cfg.ZONE_MIN_DISPLACEMENT_ATR,
+            min_volume_ratio=_cfg.ZONE_MIN_VOLUME_RATIO,
+        )
+        zone_context = evaluate_zone_context(last_close, zones)
 
     snapshot = MarketStructure(
         ticker=ticker,
