@@ -254,6 +254,22 @@ def _zone_state(
     return "weakened", retests, len(later)
 
 
+def zone_absolute_index(full_len: int, lookback: int, created_bar: int) -> int:
+    """Maps a zone's created_bar (an index into detect_demand_supply_zones()'s
+    internal confirmed-bars slice: df.iloc[:-1].tail(lookback)) back to an
+    index into the ORIGINAL, full df that was passed to it.
+
+    Shared by chart.py (Discord PNG) and chart_data.py (web JSON) so a
+    zone renders at the same bar in both — the same reasoning as
+    get_market_structure() being the one place that computes POC/S-R:
+    interpreting WHERE a zone sits shouldn't be reimplemented twice
+    either, or the two renderers could silently drift apart on it.
+    """
+    confirmed_len = min(max(30, int(lookback)), max(0, int(full_len) - 1))
+    confirmed_start = max(0, int(full_len) - 1 - confirmed_len)
+    return confirmed_start + int(created_bar)
+
+
 def detect_demand_supply_zones(
     df: pd.DataFrame,
     atr_period: int = 14,
@@ -553,7 +569,7 @@ def get_market_structure(
     confirmed_df = df.iloc[:-1]
 
     vp = {"poc": None, "vah": None, "val": None, "bins": []}
-    if getattr(_cfg, "VP_ENABLED", False):
+    if _cfg.VP_ENABLED:
         vp_window = confirmed_df.tail(min(_cfg.VP_LOOKBACK, len(confirmed_df)))
         vp = calc_volume_profile(
             vp_window,
@@ -570,14 +586,14 @@ def get_market_structure(
 
     zones = detect_demand_supply_zones(
         df,
-        atr_period=getattr(_cfg, "ZONE_ATR_PERIOD", 14),
-        lookback=getattr(_cfg, "ZONE_LOOKBACK", 300),
-        base_bars=getattr(_cfg, "ZONE_BASE_BARS", 4),
-        impulse_bars=getattr(_cfg, "ZONE_IMPULSE_BARS", 3),
-        max_zones=getattr(_cfg, "ZONE_MAX_ZONES", 5),
-        max_base_atr=getattr(_cfg, "ZONE_MAX_BASE_ATR", 1.6),
-        min_displacement_atr=getattr(_cfg, "ZONE_MIN_DISPLACEMENT_ATR", 1.1),
-        min_volume_ratio=getattr(_cfg, "ZONE_MIN_VOLUME_RATIO", 1.15),
+        atr_period=_cfg.ZONE_ATR_PERIOD,
+        lookback=_cfg.ZONE_LOOKBACK,
+        base_bars=_cfg.ZONE_BASE_BARS,
+        impulse_bars=_cfg.ZONE_IMPULSE_BARS,
+        max_zones=_cfg.ZONE_MAX_ZONES,
+        max_base_atr=_cfg.ZONE_MAX_BASE_ATR,
+        min_displacement_atr=_cfg.ZONE_MIN_DISPLACEMENT_ATR,
+        min_volume_ratio=_cfg.ZONE_MIN_VOLUME_RATIO,
     )
     zone_context = evaluate_zone_context(last_close, zones)
 

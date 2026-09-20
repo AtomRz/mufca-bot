@@ -27,6 +27,7 @@ from market_structure import (
     calc_support_resistance,
     calc_volume_profile,
     detect_demand_supply_zones,
+    zone_absolute_index,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,16 +105,11 @@ def _prepare_zone_positions(
     lookback: int,
 ) -> Dict[str, List[Dict]]:
     result = {"demand": [], "supply": []}
-    confirmed_len = min(max(30, int(lookback)), max(0, full_len - 1))
-    confirmed_start = max(0, full_len - 1 - confirmed_len)
-
     for side in ("demand", "supply"):
         for source in zones.get(side, []):
             zone = dict(source)
-            created_bar = int(zone.get("created_bar", 0))
-            absolute_index = confirmed_start + created_bar
-            chart_index = absolute_index - display_start
-            zone["chart_index"] = int(chart_index)
+            absolute_index = zone_absolute_index(full_len, lookback, zone.get("created_bar", 0))
+            zone["chart_index"] = int(absolute_index - display_start)
             result[side].append(zone)
     return result
 
@@ -153,7 +149,7 @@ def _draw_zones(
             )
             ax.add_patch(rect)
 
-            label_x = x_end - 0.2
+            label_x = (start + x_end) / 2.0
             label_y = (low + high) / 2.0
             label = _zone_label(zone, side)
             ax.text(
@@ -163,7 +159,7 @@ def _draw_zones(
                 color=color,
                 fontsize=6.5,
                 va="center",
-                ha="right",
+                ha="center",
                 fontweight="bold",
                 bbox=dict(facecolor=theme["bg2"], edgecolor=color, linewidth=0.5, pad=1.5, alpha=0.78),
                 zorder=9,

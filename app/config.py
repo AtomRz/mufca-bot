@@ -517,6 +517,23 @@ TP_CAP_MIN_TOUCHES = 2
 # barsLimit.
 SR_MIN_LOOKBACK = 900
 
+# 🆕 (external review, S/R-zones polish): demand/supply zone detector
+# (market_structure.detect_demand_supply_zones()) — previously only lived
+# as getattr(_cfg, "ZONE_...", default) fallbacks in market_structure.py
+# and chart.py, meaning these had no real home in config and couldn't be
+# tuned or exposed to the web/Discord settings UI at all. Values below
+# match the defaults both call sites were already using, so this is a
+# pure "give it a real config entry" change — zone detection behaves
+# identically to before until one of these is actually changed.
+ZONE_ATR_PERIOD = 14            # ATR period used for base-tightness and displacement-strength checks
+ZONE_LOOKBACK = 300              # how many confirmed bars back to search for zones
+ZONE_BASE_BARS = 4               # consolidation ("base") window before a displacement move
+ZONE_IMPULSE_BARS = 3            # bars after the base checked for a displacement move
+ZONE_MAX_ZONES = 5               # kept per side (demand/supply) after merging/scoring
+ZONE_MAX_BASE_ATR = 1.6          # base must be tighter than this many ATRs to count as a "base"
+ZONE_MIN_DISPLACEMENT_ATR = 1.1  # minimum displacement (in ATRs) out of the base to count as an impulse
+ZONE_MIN_VOLUME_RATIO = 1.15     # displacement bars' avg volume vs. the rolling mean, minimum to count
+
 # =====================================================================
 # 📊  VOLUME PROFILE (POC / Value Area)
 # =====================================================================

@@ -19,6 +19,8 @@ const DEFAULT_COLORS = {
   sl_line: '#f2637a',
   signal_long: '#45d0a5',
   signal_short: '#f2637a',
+  demand_zone: '#45d0a5',
+  supply_zone: '#f2637a',
 }
 
 function hexToRgba(hex, alpha) {
@@ -255,7 +257,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     })
     mfi.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 }, visible: true })
 
-    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [], vpZone: null, vpLine: null }
+    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [], vpZone: null, vpLine: null, dsZones: [] }
 
     const handleResize = () => {
       if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth })
@@ -395,6 +397,9 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
       try { s.candle.removePriceLine(line) } catch (_) {}
       try { chartRef.current.removeSeries(line) } catch (_) {}
     })
+    s.dsZones?.forEach((zone) => {
+      try { chartRef.current.removeSeries(zone) } catch (_) {}
+    })
     if (s.vpLine) {
       try { s.candle.removePriceLine(s.vpLine) } catch (_) {}
       s.vpLine = null
@@ -402,9 +407,10 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     s.srLines = []
     s.srZones = []
     s.tradeLines = []
+    s.dsZones = []
     s.vpZone = null
 
-    const bandZone = (bottom, top, color) => {
+    const bandZone = (bottom, top, color, startTime = null) => {
       const zone = chartRef.current.addBaselineSeries({
         baseValue: { type: 'price', price: bottom },
         topLineColor: 'transparent',
@@ -419,12 +425,37 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         lastValueVisible: false,
         crosshairMarkerVisible: false,
       })
-      zone.setData(times.map((t) => ({ time: t, value: top })))
+      // startTime lets a zone begin partway through the chart instead of
+      // spanning its full width (unlike S/R and Volume Profile, which are
+      // "here's a level" and drawn edge-to-edge) — demand/supply zones are
+      // "this price range mattered starting from when it formed", so the
+      // band should only appear from that point onward, matching how
+      // chart.py's Discord PNG draws them.
+      const zoneTimes = startTime == null ? times : times.filter((t) => t >= startTime)
+      zone.setData(zoneTimes.map((t) => ({ time: t, value: top })))
       return zone
     }
 
     data.support?.forEach((level) => s.srZones.push(bandZone(level - level * 0.0012, level + level * 0.0012, hexToRgba(C.support, 0.16))))
     data.resistance?.forEach((level) => s.srZones.push(bandZone(level - level * 0.0012, level + level * 0.0012, hexToRgba(C.resistance, 0.16))))
+
+    // 🆕 Demand/Supply zones (market_structure.detect_demand_supply_zones())
+    // — same alpha-by-score/state scaling as chart.py's _zone_alpha(), so a
+    // fresher/higher-scored zone reads visibly stronger than a weakened one
+    // on both the Discord PNG and here.
+    const zoneAlpha = (score, state) => {
+      const base = 0.07 + Math.min(Math.max(score, 0), 100) / 100 * 0.10
+      if (state === 'fresh') return Math.min(0.20, base + 0.03)
+      if (state === 'tested') return Math.min(0.17, base + 0.01)
+      return Math.min(0.14, base)
+    }
+    const dsz = data.demand_supply_zones
+    dsz?.demand?.forEach((z) => {
+      s.dsZones.push(bandZone(z.low, z.high, hexToRgba(C.demand_zone, zoneAlpha(z.score, z.state)), z.start_time))
+    })
+    dsz?.supply?.forEach((z) => {
+      s.dsZones.push(bandZone(z.low, z.high, hexToRgba(C.supply_zone, zoneAlpha(z.score, z.state)), z.start_time))
+    })
 
     // 🆕 Volume Profile: Value Area band + POC line. Deliberately drawn with
     // its own distinct color (C.poc), not reusing the support/resistance
@@ -529,6 +560,8 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         <span><span className="legend-dot" style={{ background: C.bb }} />Bollinger</span>
         <span><span className="legend-dot" style={{ background: C.support }} />Support</span>
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
+        <span><span className="legend-dot" style={{ background: C.demand_zone }} />Demand Zone</span>
+        <span><span className="legend-dot" style={{ background: C.supply_zone }} />Supply Zone</span>
         <span><span className="legend-dot" style={{ background: C.poc }} />POC / Value Area</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>

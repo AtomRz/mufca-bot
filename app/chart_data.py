@@ -24,6 +24,7 @@ from indicators import (
     calculate_hurst,
 )
 from chart import calc_bollinger_bands, calc_support_resistance, calc_volume_profile
+from market_structure import detect_demand_supply_zones, zone_absolute_index
 # 🆕 Signal/filter lamps in the top bar: reuses the exact same crossover/
 # bars_since helpers and get_htf_bias that signals.check_signals uses, so the
 # UI lamps match EXACTLY the logic that actually decides whether a trade
@@ -118,6 +119,46 @@ async def get_chart_data(
 
     df_tail = df.tail(limit).reset_index(drop=True)
 
+    # 🆕 (external review, S/R-zones polish): demand/supply zones for the
+    # web chart — same detect_demand_supply_zones() engine chart.py's
+    # Discord PNG uses, positioned with the SAME zone_absolute_index()
+    # helper so a zone lands on the identical bar in both renderers.
+    # Unlike chart.py (which places a zone by bar index on its own x-axis),
+    # lightweight-charts on the web plots by time — so each zone gets a
+    # "start_time" (unix seconds, clamped into the fetched df's own range)
+    # instead of a chart_index.
+    demand_supply_zones: Dict[str, List[Dict]] = {"demand": [], "supply": []}
+    try:
+        zone_data = detect_demand_supply_zones(
+            df,
+            atr_period=config.ZONE_ATR_PERIOD,
+            lookback=config.ZONE_LOOKBACK,
+            base_bars=config.ZONE_BASE_BARS,
+            impulse_bars=config.ZONE_IMPULSE_BARS,
+            max_zones=config.ZONE_MAX_ZONES,
+            max_base_atr=config.ZONE_MAX_BASE_ATR,
+            min_displacement_atr=config.ZONE_MIN_DISPLACEMENT_ATR,
+            min_volume_ratio=config.ZONE_MIN_VOLUME_RATIO,
+        )
+        for side in ("demand", "supply"):
+            for zone in zone_data.get(side, []):
+                absolute_index = zone_absolute_index(len(df), config.ZONE_LOOKBACK, zone.get("created_bar", 0))
+                absolute_index = min(max(absolute_index, 0), len(df) - 1)
+                demand_supply_zones[side].append({
+                    "low": zone["low"],
+                    "high": zone["high"],
+                    "mid": zone["mid"],
+                    "score": zone["score"],
+                    "state": zone["state"],
+                    "fresh": zone["fresh"],
+                    "touches": zone["touches"],
+                    "retests": zone["retests"],
+                    "distance_pct": zone["distance_pct"],
+                    "start_time": int(df["timestamp"].iloc[absolute_index] // 1000),
+                })
+    except Exception as e:
+        logger.warning(f"[CHART_DATA] {symbol} {timeframe}: demand/supply zone detection failed: {e}")
+
     candles = [
         {
             "time": int(row.timestamp // 1000),  # unix seconds — for lightweight-charts
@@ -146,6 +187,7 @@ async def get_chart_data(
         "support": sr["support"],
         "resistance": sr["resistance"],
         "volume_profile": vp,
+        "demand_supply_zones": demand_supply_zones,
     }
 
     # ── Active trade (if state_snapshot was passed from !status/state) ──
