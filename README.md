@@ -19,7 +19,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
   - **TP1** — pure statistical percentile (no R:R cap), target for closing 50% of the position
   - **TP2** — same distribution but with a minimum R:R 1.5 cap, target for the remaining 50%
 - **Adaptive SL** — based on historical MAE of winning trades: 85th percentile of true MAE (price went against the trade but recovered without hitting stop) + a small buffer; falls back to the opposite FRAMA line when there isn't enough history
-- **SL after TP1** — once TP1 hits, SL moves to either breakeven (entry) or halfway to TP1, selectable live from the web dashboard (`tp1_sl_mode.json`) with no restart needed
+- **SL after TP1** — once TP1 hits, SL moves to a configurable fraction of the entry→TP1 distance: breakeven (0%), quarter (25%), half (50%, current default), or three-quarter (75%), selectable live from the web dashboard (`tp1_sl_mode.json`) with no restart needed. The same fraction-based formula (`TP1_SL_MODE_FRACTIONS`) is shared by the live path and the backtest, so `!tp1sim` can compare all four against real history without a separate simulation engine
 - **TP hit-rate auto-adjust (`TP_AUTO_ADJUST`)** — feedback loop that nudges the TP percentile up/down based on recent real hit-rate vs. target
 - **Aggressive / Safe TP modes** — 75th vs 50th percentile, switchable via `!tpconfig mode`
 - **On-chain module** — Etherscan (exchange ETH wallet in/outflows) + CoinGecko (Fear & Greed, BTC dominance), refresh interval configurable (15m/30m/1h, default 1h) from the web dashboard; adjusts confidence score, TP/SL multipliers and leverage. Fully optional — disabled automatically if API keys aren't set
@@ -35,8 +35,19 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
   Deliberately skips the CHOP and FRAMA-direction filters (both would still read the tail end of the just-ended squeeze as "unfavorable" right as the breakout starts — gating on either would defeat the track's purpose); ATR bounds, HTF bias, fake-break/liquidity-sweep, Hurst, and spread filters still apply. All six thresholds (squeeze lookback/window/percentile, volume spike multiplier, range/ATR multiplier, close-location minimum) are live-tunable from the web dashboard's Settings panel. Has its own independent trade history/win-rate — see History tab or `!history`
 - **Volume flow score** — OBV-based, score-based confidence/leverage adjustment
 - **Candlestick chart generation (`!chart`)** — dark-themed PNG with FRAMA bands, Bollinger Bands, support/resistance levels, signal arrows, volume panel and K-means MFI panel, attached directly to Discord signal embeds
-- **Volume Profile (POC / Value Area)** — TPO-style approximation from OHLCV (see `chart.calc_volume_profile()` for why it's an approximation rather than tick-level "real" volume), rendered as a POC line + Value Area band (+ optional histogram) on both the Discord PNG chart and the web dashboard's canvas chart overlay. On by default, configurable bin count/lookback/Value Area % from the web dashboard
-- **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Status, Chart, History, and Onchain tabs (all live-updated over WebSocket), plus a Settings panel to edit market mode, HTF bias, CHOP thresholds, adaptive TP, SL-after-TP1 mode, Discord notification toggle, scan/on-chain refresh intervals, all indicator parameters (FRAMA/MFI/Andean/UT Bot), and chart colors — no redeploy needed
+- **Volume Profile (POC / Value Area)** — TPO-style approximation from OHLCV (see `market_structure.calc_volume_profile()` for why it's an approximation rather than tick-level "real" volume), rendered as a POC line + Value Area band (+ optional histogram) on both the Discord PNG chart and the web dashboard's canvas chart overlay. On by default, configurable bin count/lookback/Value Area % from the web dashboard
+- **Market Structure module (`market_structure.py`)** — single shared implementation of Volume Profile, support/resistance, and demand/supply zone detection, used identically by the Discord chart, the web chart, and the live signal path (`get_market_structure()`), so none of them can ever compute different levels for the same market. All structural calculations use only confirmed (closed) bars — the still-forming candle is explicitly excluded before any of them run
+  - **Support/Resistance** — pivot-based, clustered by proximity (single-linkage: compared against the nearest already-accepted level in the cluster, not a fixed anchor, so a chain of close pivots merges into one level instead of splintering), each level carries a `touches` count as a significance measure
+  - **Demand/Supply zones** — a tight consolidation ("base") immediately followed by a strong, high-volume displacement move out of it; each zone is scored (tightness of the base, size of the displacement, volume confirmation) and tracked as `fresh` / `tested` / `weakened` / `broken` as price revisits it later. Rendered as colored bands with a centered label on both the Discord PNG and the web chart (canvas overlay — `lightweight-charts` has no native primitive for arbitrary rectangles/text). **On by default**, fully configurable (ATR period, lookback, base/impulse bar counts, max zones kept, base tightness, minimum displacement, minimum volume ratio) or toggled off entirely from the web dashboard — informational only right now, not yet read by confidence scoring or TP capping, so disabling it also skips the extra per-bar work on the live scan, not just the chart overlay
+- **Relative Strength module (`relative_strength.py`)** — trend of an asset's price ratio against BTC (the natural benchmark for everything else; BTC is self-excluded from comparing against itself), using a plain N-bar return + SMA on the ratio rather than another adaptive layer stacked on top of an already highly adaptive system. Reuses the asset's own already-fetched OHLCV, fetches only the BTC side, and aligns the two series by timestamp (not position) since they're fetched independently
+- **TP obstacle cap** — the adaptive TP2 target is capped against the nearest *significant* S/R or Volume Profile level between entry and the raw target (an S/R level needs a minimum touch count to count; POC/VAH/VAL always count), but only if the cap still clears the minimum R:R — a weak or too-close level can never turn a good signal into a nonsensical target. Live-path only, deliberately not applied in the startup/manual backtest, so the adaptive TP training distribution isn't contaminated by its own capping policy. The raw (uncapped) target and the capping reason/level are both recorded alongside the executed trade
+- **Confidence scoring (`calc_confidence()`)** — a 0–100 informational score attached to every signal (regime/ATR/FRAMA/signal-confluence/HTF-bias/on-chain components, plus small ±5 `relative_strength`/`volume_profile` nudges from the two modules above), logged into signal history for later analysis. **Does not gate entry** — nothing in the codebase currently thresholds on this score; it exists so a new component's real predictive value can be checked against actual outcomes instead of assumed
+- **Raw-outcome tracking (`update_raw_outcome()`)** — continues measuring MFE/MAE for a closed trade for up to `MAX_HOLD_BARS` past its actual exit, independent of whatever TP/SL policy closed it. Exists because a trade's outcome is normally truncated the instant it closes, which makes any *change* to TP/SL policy partly self-referential (the "before" data already reflects the old policy) — raw MFE/MAE is a policy-free read of what the market actually did next, used to validate whether a policy change (or a new confidence component) is really an improvement
+- **Historical experiment tooling (`!components`, `!compsim`, `!tp1sim`, matching web dashboard controls)** — rather than waiting weeks for enough live signals to evaluate an idea, these dry-run a backtest against real historical OHLCV and report the same win-rate/PnL breakdown, split by track and market regime:
+  - **`!components` / `!compsim`** — does `relative_strength`/`volume_profile` actually correlate with trade outcome, or just add noise? `!components` reads live signal history as it accumulates; `!compsim` replays real historical data (reconstructing both components point-in-time at each simulated entry) instead of waiting
+  - **`!tp1sim`** — compares breakeven / quarter / half (current default) / three-quarter SL-after-TP1 policies against real history, tracking (and separately reporting) trades that reached TP1 but timed out before resolving either way, since a looser post-TP1 SL needs more bars to resolve than a tighter one and is otherwise silently under-counted relative to it
+  - All of the above are dry-run: nothing is written to `signals_history.json`, and no live setting is changed as a side effect
+- **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Status, Chart, History, and Insights tabs (all live-updated over WebSocket) — Insights groups on-chain/derivatives bias, order book spread, confidence-component analysis, and the historical-experiment tools (`!tp1sim`/`!compsim` equivalents) under one tab with a sub-nav — plus a Settings panel to edit market mode, HTF bias, CHOP thresholds, adaptive TP, SL-after-TP1 mode, Discord notification toggle, scan/on-chain refresh intervals, all indicator parameters (FRAMA/MFI/Andean/UT Bot), Volume Profile, demand/supply zones, and chart colors — no redeploy needed
 - **Signal & filter lamps** — top-bar indicator showing live MFI/Andean/UT Bot signal state plus every filter's pass/block direction (including an R:R lamp), computed with the exact same functions the scanner itself uses, so the lamps never disagree with what actually opens a trade
 - **Android push notifications** — Firebase Cloud Messaging, device registration/dedup via the web dashboard's Settings panel or the Android app, test-push endpoint to verify the full server → Firebase → device pipeline
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.5 (configurable via `MIN_RR`) or SL already hit by bar
@@ -46,7 +57,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
 - **Retry fetch** — exponential backoff on Gate.io rate limits
 - **Graceful shutdown** — on `SIGTERM`/`SIGINT` the bot flushes all in-memory signal history and active-position state to disk and closes the Discord connection cleanly before exiting
 - **Full data persistence** — all settings and history survive container restarts
-- **Multi-module architecture** — `config`, `indicators`, `volume_indicators`, `signals`, `state`, `onchain`, `derivatives`, `spread`, `push`, `bot`, `discord_commands`, `chart`, `chart_data`, `web_api`, `embeds`, `utils`
+- **Multi-module architecture** — `config`, `indicators`, `volume_indicators`, `market_structure`, `relative_strength`, `signals`, `state`, `onchain`, `derivatives`, `spread`, `push`, `bot`, `discord_commands`, `chart`, `chart_data`, `web_api`, `embeds`, `utils`
 
 ---
 
@@ -81,8 +92,10 @@ mufca-bot/
 │   ├── config.py             # Settings, file I/O helpers, thread locks
 │   ├── indicators.py         # ATR, CHOP, FRAMA, MFI, Andean, UT Bot, Heikin Ashi, K-Means, Breakout (squeeze detector)
 │   ├── volume_indicators.py  # OBV-based volume flow score (confidence & leverage)
-│   ├── signals.py            # Signal logic, filters, backtest, HTF bias, adaptive TP/SL
-│   ├── state.py              # Signal history, MFE/MAE tracking, TP1/TP2 adaptive TP
+│   ├── market_structure.py   # Volume Profile, support/resistance, demand/supply zones — single shared implementation for Discord chart, web chart, and the live signal path
+│   ├── relative_strength.py  # Asset-vs-BTC ratio trend (relative strength confidence component)
+│   ├── signals.py            # Signal logic, filters, backtest, HTF bias, adaptive TP/SL, TP-obstacle cap, historical-experiment runners (run_tp1_mode_comparison, run_component_backtest)
+│   ├── state.py              # Signal history, MFE/MAE tracking, raw-outcome tracking, TP1/TP2 adaptive TP, confidence-component analysis
 │   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
 │   ├── derivatives.py         # Gate.io funding rate + open interest bias (futures only)
 │   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
@@ -98,7 +111,8 @@ mufca-bot/
 │   ├── src/
 │   │   ├── App.jsx
 │   │   ├── api.js             # REST + WebSocket client
-│   │   └── components/        # StatusPanel, ChartPanel, HistoryPanel, OnchainPanel,
+│   │   └── components/        # StatusPanel, ChartPanel, HistoryPanel, InsightsPanel
+│   │                           # (Bias/Spread/Components/Simulate sub-views),
 │   │                           # SettingsPanel, SignalLamps, LoginScreen
 │   └── package.json
 ├── requirements.txt
@@ -193,7 +207,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `chop_threshold.json` | Per-timeframe CHOP thresholds |
 | `filter_toggles.json` | Per-filter on/off state — FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst, order book spread (editable from the web dashboard) |
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
-| `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven or half-way-to-TP1 (editable from the web dashboard) |
+| `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven / quarter / half (default) / three-quarter of the way to TP1 (editable from the web dashboard) |
 | `discord_notifications.json` | Discord channel notifications on/off (editable from the web dashboard; independent of `DISCORD_ENABLED` — see "Running without Discord" above) |
 | `scan_interval.json` | Scanner poll interval — 15/30/60/180s (editable from the web dashboard) |
 | `onchain_interval.json` | On-chain data refresh interval — 15m/30m/1h (editable from the web dashboard) |
@@ -201,6 +215,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `derivatives_interval.json` | Derivatives data refresh interval — 15m/30m/1h (editable from the web dashboard) |
 | `derivatives_oi_baseline.json` | Previous-cycle open interest per ticker, used to compute the OI delta; written on a throttled interval (not on every fetch) and flushed immediately on graceful shutdown |
 | `volume_profile.json` | Volume Profile on/off, bin count, lookback bars, Value Area %, histogram visibility (editable from the web dashboard) |
+| `zones.json` | Demand/supply zone detector on/off + all 8 detection parameters (ATR period, lookback, base/impulse bars, max zones, base tightness, min displacement, min volume ratio — editable from the web dashboard). Disabling also skips the detector's per-bar work on the live scan path, not just the chart overlay |
 | `spread_history.json` | Rolling per-pair order book spread samples (up to `SPREAD_HISTORY_MAX_SAMPLES`), used for the spread filter's own-history anomaly check; written on a throttled interval and flushed immediately on graceful shutdown — collected regardless of whether the filter is switched on |
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
 | `breakout_config.json` | B-track squeeze/volume/range/close-location thresholds (editable from the web dashboard) |
@@ -287,6 +302,16 @@ volumes:
 | `!signals ETH/USDT 4h long` | Detailed history for pair/TF/side |
 | `!history` | Live trade history for all pairs (in-memory, resets on restart) |
 | `!history ETH/USDT 4h` | Trade history for specific pair/TF |
+| `!components [min_n]` | Does the `relative_strength`/`volume_profile` confidence component actually correlate with outcome, on live signal history so far? (default `min_n=30`) |
+
+### 🧬 Historical Experiments
+
+Dry-run — replay real historical OHLCV instead of waiting on live signals to accumulate. Nothing is written to `signals_history.json`, no live setting is changed.
+
+| Command | Description |
+|---|---|
+| `!compsim [pair] [tf] [bars] [min_n]` | `!components`, sourced from a backtest instead of live history — reconstructs `relative_strength`/`volume_profile` point-in-time at each simulated entry |
+| `!tp1sim [pair] [tf] [bars]` | Compares breakeven/quarter/half/three-quarter SL-after-TP1 on real historical data, split by track/regime, with timed-out (reached TP1, never resolved within `MAX_HOLD_BARS`) trades tracked separately so a looser SL isn't silently under-counted relative to a tighter one |
 
 ### 🧪 Testing
 
@@ -304,12 +329,16 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
 
 **Tabs:**
 - **Status** — scanner stats, active A-track/U-track/B-track trades per pair/timeframe, live-updated over WebSocket
-- **Chart** — candlestick chart (FRAMA channel, Bollinger Bands, support/resistance, volume, MFI with K-means overbought/oversold bands), per pair/timeframe/track, auto-refreshes on each scan tick and new signal
+- **Chart** — candlestick chart (FRAMA channel, Bollinger Bands, support/resistance, demand/supply zones with state labels, Volume Profile, volume, MFI with K-means overbought/oversold bands), per pair/timeframe/track, auto-refreshes on each scan tick and new signal
 - **History** — win-rate/PnL/MFE/MAE summary per pair/timeframe/side/track, plus a grand-total row and a drill-down into individual closed trades
-- **Onchain** — current on-chain bias snapshot: ETH exchange flow, Fear & Greed, BTC dominance, and the resulting TP/SL/leverage multipliers
+- **Insights** — sub-nav across four views:
+  - **Bias** — on-chain bias snapshot (ETH exchange flow, Fear & Greed, BTC dominance) and derivatives bias (funding rate, open interest), plus the resulting TP/SL/leverage multipliers
+  - **Spread** — live order book spread + filter status/warm-up progress
+  - **Components** — `!components`' report, in-browser
+  - **Simulate** — `!tp1sim`/`!compsim`, in-browser: pick a pair/timeframe/bar count, run, see the result as a table instead of Discord text
 - **Settings** — everything below is editable at runtime, no redeploy or restart required:
   - Market mode (spot/futures), HTF bias, UT Bot Heikin Ashi toggle
-  - SL-after-TP1 mode (breakeven / halfway to TP1)
+  - SL-after-TP1 mode (breakeven / quarter / half / three-quarter of the way to TP1)
   - Discord signal notifications on/off
   - Scanner poll interval (15/30/60/180s), on-chain refresh interval (15m/30m/1h), and derivatives refresh interval (15m/30m/1h)
   - Derivatives module on/off (futures only — funding rate + open interest bias)
@@ -321,13 +350,14 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
   - B-track (Breakout) thresholds — squeeze lookback/window/percentile, volume spike multiplier, range/ATR multiplier, close-location minimum
   - Chart colors (FRAMA, Bollinger, support, resistance, MFI line, MFI overbought/oversold, candle up/down, TP/SL lines, long/short signal markers)
   - Volume Profile — on/off, bin count, lookback bars, Value Area %, histogram visibility
+  - Demand/Supply zones — on/off (also gates the live-path computation, not just the chart), ATR period, lookback, base/impulse bar counts, max zones kept, base tightness, minimum displacement, minimum volume ratio
   - Android push — registered device count/names, send a test push
 
 Changing market mode, HTF bias, or any indicator parameter resets active position tracking state — same behavior as the equivalent Discord commands, since these changes affect what "warmed up" and "in-progress signal" mean for the scanner.
 
 **Top bar:** live connection status, market mode, HTF bias, CHOP/trend/suggested-leverage pulse for the pair selected on the Chart tab, and a row of signal/filter lamps (MFI, Andean, UT Bot, plus every filter's pass/block state — including R:R) computed with the exact same logic the scanner uses to decide whether a trade actually opens.
 
-**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`breakout`/`volume-profile`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
+**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `components`, `tp1sim` (POST), `compsim` (POST), `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`breakout`/`volume-profile`/`zones`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `scan_tick`, and `config_changed` events.
 
 ---
 
