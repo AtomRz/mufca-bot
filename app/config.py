@@ -451,9 +451,33 @@ ATR_MAX = 4.5
 CHOP_LENGTH = 14
 CHOP_FILE = os.path.join(DATA_DIR, "chop_threshold.json")
 
+_CHOP_DEFAULTS = {"1h": 55.0, "4h": 61.8}
+
 def load_chop() -> dict:
-    data = safe_json_load(CHOP_FILE, {"1h": 55.0, "4h": 61.8})
-    return data
+    """🆕 FIX (parity with load_hurst_window): validate the loaded shape
+    instead of trusting the file verbatim — chop_threshold.json had no such
+    guard while hurst_window.json did, even though both are read the same
+    way (a per-timeframe dict consumed via CHOP_THRESHOLD.get(tf, ...) at
+    signal-check time). A hand-edited or corrupted file (a JSON list, or a
+    non-numeric value for one timeframe) used to pass straight through and
+    raise (float < str) the next time chop_v was compared against it. Falls
+    back per-key, same as load_hurst_window, so one bad timeframe doesn't
+    take the others down with it."""
+    data = safe_json_load(CHOP_FILE, dict(_CHOP_DEFAULTS))
+    if not isinstance(data, dict):
+        logger.error(f"[CONFIG] chop_threshold.json is not an object ({type(data).__name__}) — using defaults {_CHOP_DEFAULTS}")
+        return dict(_CHOP_DEFAULTS)
+
+    result = {}
+    for tf in TIMEFRAMES:
+        fallback = _CHOP_DEFAULTS.get(tf, 61.8)
+        v = data.get(tf, fallback)
+        try:
+            result[tf] = float(v)
+        except (TypeError, ValueError):
+            logger.error(f"[CONFIG] chop_threshold.json[{tf!r}]={v!r} is not a valid number — using default {fallback}")
+            result[tf] = fallback
+    return result
 
 def save_chop(data: dict):
     safe_json_save(CHOP_FILE, data)

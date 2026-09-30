@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
@@ -9,6 +10,8 @@ except ImportError:
     _HAS_NUMBA = False
 
 from volume_indicators import calculate_relative_volume
+
+logger = logging.getLogger(__name__)
 
 # =====================================================================
 # 📊  BASE INDICATORS
@@ -552,7 +555,17 @@ def run_kmeans_mfi(mfi: pd.Series, training_size: int = 800) -> Tuple[float, flo
             c2 = float(np.nanmean(vals))
         else:
             c2 = float(np.nanmean(cl2))
-    
+
+    # 🆕 FIX: the pre-loop guard above only catches a collapsed INPUT
+    # (min≈max before any iteration). The Lloyd's-algorithm loop itself can
+    # also converge the two centers onto the same value — e.g. if every
+    # point keeps landing in one cluster on `d1 <= d2` ties — leaving the
+    # same degenerate "one threshold pretending to be both OS and OB"
+    # result this function exists to prevent, just reached after the loop
+    # instead of before it. Apply the identical fallback here.
+    if abs(c2 - c1) < 1e-6:
+        return 20.0, 80.0
+
     return min(c1, c2), max(c1, c2)
 
 

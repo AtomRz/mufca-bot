@@ -174,12 +174,24 @@ async def ensure_engine_started():
     global _engine_started, _exchange_ref
     if _engine_started:
         return
-    _engine_started = True
+    # BUGFIX: this used to set _engine_started = True BEFORE creating the
+    # exchange, with no try/except around it — if ccxt.gate(...) raised
+    # (bad config, import/network issue), _engine_started was already True,
+    # so every subsequent call (on_ready retry, a later ensure_engine_started()
+    # call) saw it as "already started" and returned immediately without ever
+    # retrying. The engine was dead for the lifetime of the process. Now the
+    # flag is only set after the exchange is actually created, and a failure
+    # here leaves it False so a later call can retry.
+    try:
+        if MARKET_MODE == "futures":
+            exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        else:
+            exchange = ccxt.gate({"enableRateLimit": True})
+    except Exception as e:
+        logger.error(f"[STARTUP] Failed to create exchange client — engine NOT started: {e}", exc_info=True)
+        return
 
-    if MARKET_MODE == "futures":
-        exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-    else:
-        exchange = ccxt.gate({"enableRateLimit": True})
+    _engine_started = True
     _exchange_ref = exchange
     asyncio.create_task(startup_sequence(exchange))
 

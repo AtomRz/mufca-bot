@@ -231,7 +231,14 @@ async def get_htf_bias(exchange: ccxt.Exchange, ticker: str, timeframe: str) -> 
         fs, fu, fl, fdir = calculate_frama(df_htf, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
         htf_close = float(df_htf["close"].iloc[-2])
         htf_frama = float(fs.iloc[-2])
-        bias = 1 if htf_close > htf_frama else -1
+        # BUGFIX: FRAMA can return NaN for the first ~22 bars. htf_close >
+        # NaN is False under IEEE 754, so an unguarded comparison silently
+        # produces bias=-1 (bear) instead of the correct neutral bias=0.
+        # Backtest already guards this (see BUG-ME003); live didn't.
+        if np.isnan(htf_frama):
+            bias = 0
+        else:
+            bias = 1 if htf_close > htf_frama else -1
 
         _htf_cache.set(cache_key, bias)
         logger.debug(f"[HTF] {ticker} -> {htf} | bias={'BULL' if bias==1 else 'BEAR'}")
@@ -620,8 +627,19 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
             return "tp"
     return None
 
-def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str, track: str = "a") -> Optional[Dict]:
-    """Closes the active position for the given track (a or u)."""
+def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str, track: str = "a",
+                 close_time_ms: Optional[int] = None) -> Optional[Dict]:
+    """Closes the active position for the given track (a or u).
+
+    close_time_ms — 🆕 FIX (live/backtest cooldown parity): the moment the
+    cooldown (last_{track}_{side}_time) is armed from — see the comment in
+    open_position for why this moved here from entry. Callers that close
+    against a specific closed bar (check_signals) pass that bar's timestamp,
+    matching backtest's exit_idx-based cooldown exactly. Callers that close
+    against a live ticker touch between bar closes (bot.py's TP1/SL poll)
+    leave this None and get the current wall-clock time — close enough,
+    since those closes are detected within ~1s of the real touch.
+    """
     trade_key = f"{track}_active_trade"
     trade = state.get(trade_key)
     if not trade:
@@ -631,6 +649,8 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     side = trade["side"]
     bars_key = f"{track}_bars_in_trade"
     bars_held = state.get(bars_key, 0)
+
+    state[f"last_{track}_{side}_time"] = close_time_ms if close_time_ms is not None else int(time.time() * 1000)
 
     tp1_hit = bool(trade.get("tp1_hit"))
     tp1_price = trade.get("tp1")
@@ -917,14 +937,20 @@ async def open_position(
     # cooldown_ok in check_signals) used to be armed in check_signals BEFORE
     # open_position was even called — meaning even an attempt rejected here
     # (R:R < MIN_RR or extreme_violation just above) already blocked the next
-    # COOLDOWN_BARS bars, even though no trade was actually opened. Now the
-    # cooldown is only armed here, at the point of actually opening a position.
+    # COOLDOWN_BARS bars, even though no trade was actually opened.
+    # BUGFIX (live/backtest cooldown parity): this used to arm
+    # last_{track}_{side}_time HERE, on ENTRY — but backtest_history() has
+    # always counted COOLDOWN_BARS from the EXIT bar (next_available_idx =
+    # exit_idx + COOLDOWN_BARS), so live let a new entry back in sooner than
+    # backtest ever would for the same trade (the cooldown could even lapse
+    # while the position was still open, since nothing here waits for it to
+    # close). The debug/backward-compat bar-index fields are still recorded
+    # at entry; the actual cooldown gate (last_{track}_{side}_time) is now
+    # armed in close_trade(), on exit, matching backtest.
     if not dry_run:
         bar_idx_val = idx
-        bar_time_val = int(df["timestamp"].iloc[idx])
         state[f"{track}_{side}_bar"] = bar_idx_val
         state[last_bar_key] = bar_idx_val               # debug/backward compatibility
-        state[f"last_{track}_{side}_time"] = bar_time_val
 
     # 🆕 conf is now computed before add_signal_record() so the persisted
     # record can carry *why* the score came out the way it did
@@ -1012,12 +1038,12 @@ async def check_signals(
                                        ticker=ticker, tf=timeframe)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
-                    close_trade(state, exit_price, hit, ticker, timeframe, track)
+                    close_trade(state, exit_price, hit, ticker, timeframe, track, close_time_ms=current_bar_time)
                 elif is_new_bar:
                     bars_key = f"{track}_bars_in_trade"
                     state[bars_key] = state.get(bars_key, 0) + 1
                     if state[bars_key] >= MAX_HOLD_BARS:
-                        close_trade(state, last_close, "cancelled", ticker, timeframe, track)
+                        close_trade(state, last_close, "cancelled", ticker, timeframe, track, close_time_ms=current_bar_time)
                         logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
             else:
                 # 🆕 (external review, TP-obstacle stage): no active trade on
@@ -1388,7 +1414,12 @@ async def check_signals(
         # --- A-track LONG ---
         if sig_a_long:
             sig = await _safe_open_position("a", "long")
-            state["last_a_long_attempt_bar"] = bar_time
+            # BUGFIX: this write was unconditional, so a dry_run call (e.g.
+            # !scan) permanently committed last_a_long_attempt_bar into the
+            # real live state — silently consuming that bar's live A-track
+            # attempt without ever opening a position for it.
+            if not dry_run:
+                state["last_a_long_attempt_bar"] = bar_time
             if sig:
                 signals.append(sig)
             else:
@@ -1405,7 +1436,9 @@ async def check_signals(
         # --- A-track SHORT ---
         if sig_a_short:
             sig = await _safe_open_position("a", "short")
-            state["last_a_short_attempt_bar"] = bar_time
+            # BUGFIX: same dry_run leak as A-track LONG above.
+            if not dry_run:
+                state["last_a_short_attempt_bar"] = bar_time
             if sig:
                 signals.append(sig)
             else:
@@ -1439,7 +1472,12 @@ async def check_signals(
         # — see the comment where is_new_bar was computed above for why
         # this moved from immediately-after-read to immediately-before the
         # only successful return in this function.
-        state["last_processed_bar_time"] = current_bar_time
+        # BUGFIX: this write was unconditional, so a dry_run call (e.g.
+        # !scan) permanently advanced the real live last_processed_bar_time
+        # — silently consuming that bar's live U/B-track opportunity
+        # (both gated on is_new_bar) without ever opening a position for it.
+        if not dry_run:
+            state["last_processed_bar_time"] = current_bar_time
         return signals, bar_time, regime, sugg_lev
 
     except Exception as e:

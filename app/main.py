@@ -108,6 +108,26 @@ async def _main():
     # Wait for either a stop signal, or (an unexpected) completion of one of the tasks
     done, pending = await asyncio.wait(tasks_to_wait, return_when=asyncio.FIRST_COMPLETED)
 
+    # 🆕 FIX: this used to fall straight through to shutdown on ANY task
+    # completing, with no distinction between "stop_event fired because of
+    # a deliberate SIGTERM/SIGINT" (the expected case) and "discord-bot or
+    # web-api actually crashed" — and no log line naming which task
+    # finished or what exception it raised, so a crash and a clean shutdown
+    # were indistinguishable after the fact. Log every task in `done`
+    # (skipping the expected stop-event task itself) with its outcome.
+    for task in done:
+        if task.get_name() == "stop-event":
+            continue
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.warning(f"[SHUTDOWN] Task '{task.get_name()}' was cancelled unexpectedly.")
+            continue
+        if exc is not None:
+            logger.error(f"[SHUTDOWN] Task '{task.get_name()}' crashed — shutting down: {exc}", exc_info=exc)
+        else:
+            logger.warning(f"[SHUTDOWN] Task '{task.get_name()}' finished unexpectedly (no error) — shutting down.")
+
     _flush_state_to_disk()
 
     if bot_task is not None:

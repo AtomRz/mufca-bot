@@ -15,7 +15,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
   - ≥10 signals in current regime → uses regime-specific percentile
   - 5–9 signals → blends regime + general history with discount
   - <5 signals → uses all history with exit-type weighting (TP=1.0, SL_after_TP1=0.8, SL=0.6, cancelled=0.4)
-  - ATR cap (3×ATR max) to prevent unrealistic targets
+  - ATR cap (2×ATR max) to prevent unrealistic targets
   - **TP1** — pure statistical percentile (no R:R cap), target for closing 50% of the position
   - **TP2** — same distribution but with a minimum R:R 1.5 cap, target for the remaining 50%
 - **Adaptive SL** — based on historical MAE of winning trades: 85th percentile of true MAE (price went against the trade but recovered without hitting stop) + a small buffer; falls back to the opposite FRAMA line when there isn't enough history
@@ -420,7 +420,7 @@ On startup the bot backtests 3000 historical bars per pair/timeframe using the *
 1. ≥10 signals in current market regime (TREND/CHAOS/NORMAL) → uses only regime signals
 2. 5–9 regime signals → blends with general history at 0.85× discount
 3. <5 regime signals → uses all signals with exit-type weighting
-4. ATR cap: TP cannot exceed 3×ATR from entry
+4. ATR cap: TP cannot exceed 2×ATR from entry
 
 **Two-level TP:**
 - **TP1** — statistical percentile of MFE, no R:R cap, closes 50% of the position
