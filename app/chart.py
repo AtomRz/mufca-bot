@@ -181,6 +181,8 @@ def build_chart(
     entry_price: Optional[float] = None,
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
+    tp1_price: Optional[float] = None,
+    tp1_hit: bool = False,
     signal_side: Optional[str] = None,
     signal_bar_offset: int = -2,
     limit: int = 50,
@@ -330,12 +332,20 @@ def build_chart(
     if entry_price:
         ax_c.hlines(entry_price, x_start, x_end, colors=T["entry"], linewidth=1.2, zorder=8, alpha=0.9)
         ax_c.text(0, entry_price, f"ENTRY {format_price(entry_price)}", color=T["entry"], fontsize=8, va="bottom", fontweight="bold")
+    # TP1 (partial close, ~50%) — drawn only when it's distinct from TP2,
+    # mirroring the web dashboard (ChartPanel.jsx). TP2 keeps the old line.
+    has_tp1 = bool(tp1_price) and tp1_price != tp_price
+    if has_tp1:
+        ax_c.hlines(tp1_price, x_start, x_end, colors=T["tp"], linewidth=1.0, linestyles="--", zorder=8, alpha=0.65)
+        tp1_label = "TP1 ✓" if tp1_hit else "TP1"
+        ax_c.text(0, tp1_price, f"{tp1_label} {format_price(tp1_price)}", color=T["tp"], fontsize=8, va="bottom", fontweight="bold", alpha=0.85)
     if tp_price:
         ax_c.hlines(tp_price, x_start, x_end, colors=T["tp"], linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, tp_price, f"TP {format_price(tp_price)}", color=T["tp"], fontsize=8, va="bottom", fontweight="bold")
+        ax_c.text(0, tp_price, f"TP2 {format_price(tp_price)}", color=T["tp"], fontsize=8, va="bottom", fontweight="bold")
     if sl_price:
         ax_c.hlines(sl_price, x_start, x_end, colors=T["sl"], linewidth=1.0, linestyles="-.", zorder=8, alpha=0.9)
-        ax_c.text(0, sl_price, f"SL {format_price(sl_price)}", color=T["sl"], fontsize=8, va="top", fontweight="bold")
+        sl_label = "SL (BE)" if tp1_hit else "SL"
+        ax_c.text(0, sl_price, f"{sl_label} {format_price(sl_price)}", color=T["sl"], fontsize=8, va="top", fontweight="bold")
     if entry_price and tp_price and sl_price:
         ax_c.fill_between(x, entry_price, tp_price, alpha=0.05, color=T["tp"], zorder=1)
         ax_c.fill_between(x, sl_price, entry_price, alpha=0.05, color=T["sl"], zorder=1)
@@ -487,6 +497,8 @@ async def generate_chart(
 
     entry_price = None
     tp_price = None
+    tp1_price = None
+    tp1_hit = False
     sl_price = None
     signal_side = None
     signal_bar_offset = -2
@@ -494,6 +506,8 @@ async def generate_chart(
     if state_snapshot:
         entry_price = state_snapshot.get("entry")
         tp_price = state_snapshot.get("tp")
+        tp1_price = state_snapshot.get("tp1")
+        tp1_hit = bool(state_snapshot.get("tp1_hit", False))
         sl_price = state_snapshot.get("sl")
         signal_side = state_snapshot.get("side")
         entry_time_ms = state_snapshot.get("entry_time_ms")
@@ -525,6 +539,8 @@ async def generate_chart(
         entry_price=entry_price,
         tp_price=tp_price,
         sl_price=sl_price,
+        tp1_price=tp1_price,
+        tp1_hit=tp1_hit,
         signal_side=signal_side,
         signal_bar_offset=signal_bar_offset,
         limit=limit,

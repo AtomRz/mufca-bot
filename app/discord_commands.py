@@ -1350,6 +1350,8 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
                     state_snapshot = {
                         "entry": active.get("entry"),
                         "tp":    active.get("tp"),
+                        "tp1":   active.get("tp1"),
+                        "tp1_hit": active.get("tp1_hit", False),
                         "sl":    active.get("sl"),
                         "side":  active.get("side"),
                         "entry_time_ms": active.get("bar_opened_time"),
