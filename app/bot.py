@@ -254,6 +254,262 @@ _onchain_cache_loaded = _cfg.load_onchain_bias_cache()
 _onchain_bias_cache: Optional[Dict] = _onchain_cache_loaded.get("bias")
 _onchain_last_fetch: float = _onchain_cache_loaded.get("last_fetch", 0.0)
 
+# =====================================================================
+# 🕯️  TP1 CREDIT + INTRABAR (1m CANDLE) TP1/TP2/SL CHECK
+# =====================================================================
+
+async def _apply_tp1(exchange, channel, st, trade, track, ticker, tf,
+                     trigger_price, touch_ts_ms=None, note="", notify=True):
+    """Credits TP1 on `trade`: sets tp1_hit, moves SL per TP1_SL_MODE and
+    sends the Discord / WebSocket / push notifications.
+
+    Shared by the live ticker poll (touch_ts_ms=None) and the 1m-candle
+    check (touch_ts_ms = timestamp of the 1m candle that touched TP1), so
+    both paths move the stop identically.
+
+    🆕 FIX: this block used to live inline in market_scanner; extracted
+    unchanged in behavior so the intrabar check doesn't need a second copy
+    of the notification code.
+    """
+    side = trade.get("side")
+    entry = trade.get("entry", 0)
+    tp1_price = trade.get("tp1")
+
+    trade["tp1_hit"] = True
+    # check_tp_sl_hit() re-reads trade["sl"] on every check, so the new stop
+    # applies itself everywhere with no further changes in signals.py.
+    new_sl = _tp1_moved_sl(entry, tp1_price, side)
+    sl_label = f"{_cfg.tp1_sl_label(_cfg.TP1_SL_MODE)} (${format_price(new_sl)})"
+    trade["sl"] = new_sl
+
+    try:
+        tf_ms = int(exchange.parse_timeframe(tf) * 1000)
+    except Exception:
+        tf_ms = 3600_000
+
+    # 🆕 FIX BUG-LO009: the low/high of every bar that printed BEFORE price
+    # touched TP1 must not be tested against the new, tighter stop —
+    # check_tp_sl_hit() only applies trade["sl"] to bars that opened after
+    # sl_moved_after_bar.
+    if touch_ts_ms is None:
+        # Live poll: TP1 was touched "now", inside the still-forming bar Y.
+        # Threshold = Y's open time, so the bar-based check starts at the
+        # first bar to close entirely after the move. Bar Y itself is covered
+        # by the live ticker / 1m-candle check.
+        trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
+        now_ms = int(time.time() * 1000)
+        trade["intrabar_tp1_ts"] = now_ms - (now_ms % 60_000)
+    else:
+        # 1m-candle path: the touch happened in the timeframe bar that
+        # contains the candle — use that bar's open time as the threshold.
+        opened = trade.get("bar_opened_time")
+        if opened is not None:
+            bar_open = int(opened) + ((touch_ts_ms - int(opened)) // tf_ms) * tf_ms
+        else:
+            bar_open = touch_ts_ms - (touch_ts_ms % tf_ms)
+        trade["sl_moved_after_bar"] = bar_open
+        trade["intrabar_tp1_ts"] = touch_ts_ms
+
+    track_label = _cfg.TRACK_LABELS[track]
+    logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {trigger_price} | SL mode={_cfg.TP1_SL_MODE} → {new_sl}"
+                f"{' | via 1m candle' if touch_ts_ms is not None else ''}")
+    if not notify:
+        return new_sl
+
+    # Every notification channel has its own try/except (BUG-LO007): one
+    # failing must not swallow the others.
+    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+        try:
+            await channel.send(
+                f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
+                f"{side.upper()} | Entry: ${format_price(entry)} → TP1: ${format_price(tp1_price)}\n"
+                f"⚠️ **Close 50% of the position and move SL to {sl_label}**{note}"
+            )
+        except Exception as discord_err:
+            logger.error(f"[DISCORD] Failed to send TP1 hit for {ticker} {tf}: {discord_err}", exc_info=True)
+    try:
+        from web_api import broadcast_event
+        await broadcast_event({
+            "type": "tp1_hit",
+            "ticker": ticker,
+            "tf": tf,
+            "track": track,
+            "side": side,
+            "entry": entry,
+            "tp1": tp1_price,
+            "new_sl": new_sl,
+            "sl_mode": _cfg.TP1_SL_MODE,
+        })
+    except Exception as ws_err:
+        logger.warning(f"[WS] broadcast failed: {ws_err}")
+    try:
+        import push as _push
+        await asyncio.to_thread(
+            _push.send_push,
+            title=f"🎯 TP1 Hit {ticker} {tf}",
+            body=f"Close 50%, move SL to {sl_label}",
+            data={"type": "tp1_hit", "ticker": ticker, "tf": tf, "track": track},
+        )
+    except Exception as push_err:
+        logger.warning(f"[PUSH] send failed: {push_err}")
+    return new_sl
+
+
+_INTRABAR_TF = "1m"
+_INTRABAR_LIMIT = 1000  # 1m candles per fetch (~16h); a longer backlog is drained over several cycles
+
+
+async def _fetch_intrabar_candles(exchange, ticker, since_ms):
+    """1m candles from since_ms on, as [(ts, high, low), ...] sorted by time.
+    The last one is the still-forming candle — its high/low so far are real
+    prints, which is exactly what a between-polls wick check needs."""
+    try:
+        bars = await asyncio.to_thread(
+            exchange.fetch_ohlcv, ticker, _INTRABAR_TF, int(since_ms), _INTRABAR_LIMIT
+        )
+    except Exception as e:
+        logger.warning(f"[INTRABAR] 1m fetch failed for {ticker}: {e}")
+        return []
+    out = []
+    for b in bars or []:
+        try:
+            ts, high, low = int(b[0]), float(b[2]), float(b[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if high != high or low != low:  # NaN guard
+            continue
+        out.append((ts, high, low))
+    out.sort(key=lambda c: c[0])
+    return out
+
+
+def _resolve_intrabar(side, entry, sl, tp1, tp2, tp1_hit, sl_guard_ts, candles):
+    """Replays 1m candles in order against SL / TP1 / TP2.
+
+    Pure function (no state, no I/O). Returns a list of events:
+        ("tp1", ts, new_sl)            — TP1 credited, SL moves to new_sl
+        ("close", ts, price, result)   — trade closed ("sl" or "tp"); always last
+
+    Ordering rules (same conventions as check_tp_sl_hit / SAME_BAR_*):
+      * a candle that touches SL and TP2 → SL first (SAME_BAR_EXIT_POLICY)
+      * a candle that touches SL and TP1 (not TP2) → SAME_BAR_TP1_POLICY
+      * TP2 reached straight from entry → TP1 is credited first (it lies on
+        the way), so the exit is the same blended 'tp' a live TP1→TP2 run gets
+      * the moved SL is NOT tested against the candle that touched TP1 (or
+        earlier ones) — their low/high may have printed before the touch
+        (BUG-LO009); sl_guard_ts is that candle's timestamp.
+    """
+    events = []
+    is_long = side == "long"
+    policy = getattr(_cfg, "SAME_BAR_TP1_POLICY", "tp1_first")
+    guard = sl_guard_ts or 0
+
+    for ts, high, low in candles:
+        sl_t = sl is not None and ((low <= sl) if is_long else (high >= sl))
+        tp2_t = tp2 is not None and ((high >= tp2) if is_long else (low <= tp2))
+
+        if tp1_hit:
+            if sl_t and ts > guard:
+                events.append(("close", ts, sl, "sl"))
+                break
+            if tp2_t:
+                events.append(("close", ts, tp2, "tp"))
+                break
+            continue
+
+        tp1_t = tp1 is not None and ((high >= tp1) if is_long else (low <= tp1))
+
+        if sl_t and (tp2_t or not tp1_t):
+            events.append(("close", ts, sl, "sl"))
+            break
+        if sl_t and tp1_t:
+            if policy == "tp1_first":
+                new_sl = _tp1_moved_sl(entry, tp1, side)
+                events.append(("tp1", ts, new_sl))
+                # the candle also crossed the ORIGINAL SL, which sits beyond
+                # the moved one, so the moved stop is necessarily hit too
+                events.append(("close", ts, new_sl, "sl"))
+            else:
+                events.append(("close", ts, sl, "sl"))
+            break
+        if tp2_t:
+            events.append(("tp1", ts, _tp1_moved_sl(entry, tp1, side)))
+            events.append(("close", ts, tp2, "tp"))
+            break
+        if tp1_t:
+            new_sl = _tp1_moved_sl(entry, tp1, side)
+            events.append(("tp1", ts, new_sl))
+            tp1_hit, sl, guard = True, new_sl, ts
+    return events
+
+
+async def _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf):
+    """Between-polls TP1/TP2/SL check from 1m candles (INTRABAR_CHECK_ENABLED).
+
+    Keeps a per-trade cursor (trade["intrabar_cursor_ms"], persisted with the
+    state snapshot) so each scan only fetches candles since the previous one.
+    On first run for a trade the cursor starts at the entry (close of the
+    signal bar) — a TP1 touch missed earlier is credited late rather than
+    never. A trade whose TP1 was already credited starts from that moment
+    (or "now") instead, since earlier candles can't say anything about the
+    moved stop.
+    """
+    from signals import close_trade
+
+    side = trade.get("side")
+    tp1 = trade.get("tp1")
+    tp2 = trade.get("tp")
+    if side not in ("long", "short") or trade.get("sl") is None:
+        return
+
+    now_ms = int(time.time() * 1000)
+    try:
+        tf_ms = int(exchange.parse_timeframe(tf) * 1000)
+    except Exception:
+        tf_ms = 3600_000
+
+    cursor = trade.get("intrabar_cursor_ms")
+    if cursor is None:
+        if trade.get("tp1_hit"):
+            cursor = trade.get("intrabar_tp1_ts") or (now_ms - (now_ms % 60_000))
+        else:
+            opened = trade.get("bar_opened_time")
+            cursor = int(opened) + tf_ms if opened is not None else now_ms - 5 * 60_000
+    cursor = int(cursor) - (int(cursor) % 60_000)
+
+    candles = await _fetch_intrabar_candles(exchange, ticker, cursor)
+    if not candles:
+        return
+
+    events = _resolve_intrabar(
+        side, trade.get("entry", 0), trade["sl"], tp1, tp2,
+        bool(trade.get("tp1_hit")), trade.get("intrabar_tp1_ts"), candles,
+    )
+
+    for i, ev in enumerate(events):
+        if ev[0] == "tp1":
+            _, ts, _new_sl = ev
+            followed_by_close = i + 1 < len(events) and events[i + 1][0] == "close"
+            late = (now_ms - ts) > 3 * 60_000
+            note = ""
+            if late:
+                hhmm = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%H:%M UTC")
+                note = f"\n⏱️ *Touched at {hhmm} (1m candle) — missed by the live poll.*"
+            await _apply_tp1(
+                exchange, channel, st, trade, track, ticker, tf,
+                trigger_price=tp1, touch_ts_ms=ts, note=note,
+                notify=not followed_by_close,  # the Trade Closed message covers it
+            )
+        else:
+            _, ts, price, result = ev
+            async with lock:
+                close_trade(st, price, result, ticker, tf, track)
+            logger.info(f"[INTRABAR] {ticker} {tf} {track.upper()}-track | 1m candle {result.upper()} @ {price}")
+            return
+
+    trade["intrabar_cursor_ms"] = candles[-1][0]
+
+
 @tasks.loop(seconds=_cfg.SCAN_INTERVAL_SECONDS)
 async def market_scanner():
     """Main scanning loop."""
@@ -549,6 +805,22 @@ async def market_scanner():
                     if tp1_price is None:
                         continue
 
+                    # 🆕 FIX (SOL 4h short, TP1 wick between two live polls):
+                    # replay the 1m candles since the last check against
+                    # SL/TP1/TP2 (toggle: Settings → "Intrabar 1m TP/SL check").
+                    # Runs BEFORE the live-ticker logic below: if it credits
+                    # TP1, that logic then sees tp1_hit=True and watches the
+                    # moved SL / TP2 as usual; if it closes the trade, nothing
+                    # is left to do here.
+                    if _cfg.INTRABAR_CHECK_ENABLED:
+                        try:
+                            await _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf)
+                        except Exception as ib_err:
+                            logger.warning(f"[INTRABAR] check failed for {ticker} {tf} {track}: {ib_err}", exc_info=True)
+                        trade = st.get(trade_key)
+                        if not trade:
+                            continue
+
                     # 🆕 FIX BUG-LO009: once SL has already moved (post-TP1), the
                     # closed-bar check in check_signals() deliberately ignores bars
                     # that finished before the move (see check_tp_sl_hit) — otherwise
@@ -629,106 +901,7 @@ async def market_scanner():
                         (side == "short" and current_price >= sl)
                     )
                     if tp1_reached:
-                        trade["tp1_hit"] = True
-                        # 🆕 FIX: SL after TP1 used to either not move at all,
-                        # or be hardcoded to breakeven. Now the mode is read
-                        # from _cfg.TP1_SL_MODE — "breakeven" (SL = entry) or
-                        # "half_tp1" (SL = entry + halfway to TP1, tighter
-                        # than breakeven, but every trigger locks in a small
-                        # guaranteed profit instead of zero). check_tp_sl_hit()
-                        # re-reads trade["sl"] on every check, so this applies
-                        # itself automatically, with no further changes needed
-                        # in signals.py.
-                        entry = trade.get("entry", 0)
-                        # 🆕 FIX (Kimi audit, dedup pass 2): use the shared
-                        # _tp1_moved_sl() helper (signals.py) instead of this
-                        # inline formula — it's the same number either way
-                        # today, but before this fix a future change to
-                        # TP1_SL_MODE's math would have needed updating here
-                        # AND in signals.py's check_tp_sl_hit()/
-                        # backtest_history(), with no compiler or test to
-                        # catch a missed spot.
-                        new_sl = _tp1_moved_sl(entry, tp1_price, side)
-                        # 🆕 (external review, TP1-mode comparison): was a
-                        # hardcoded half_tp1/breakeven if-else — now reads
-                        # from config.tp1_sl_label() so quarter_tp1/
-                        # three_quarter_tp1 get a correct label too, not
-                        # silently mislabeled as "breakeven".
-                        sl_label = f"{_cfg.tp1_sl_label(_cfg.TP1_SL_MODE)} (${format_price(new_sl)})"
-                        trade["sl"] = new_sl
-                        # 🆕 FIX BUG-LO009: SL moved WITHIN the still-forming
-                        # bar — the low/high of this and all preceding bars
-                        # were printed BEFORE price ever touched TP1, and
-                        # check_tp_sl_hit() (signals.py) no longer checks the
-                        # new stop against them — only against bars that
-                        # closed AFTER this moment. bar_time comes from the
-                        # current scan's state (see check_signals), not from
-                        # this ticker request.
-                        # 🆕 FIX (Kimi review): originally this was set to
-                        # exactly the last closed bar (X) — but the low/high
-                        # of the CURRENT forming bar (Y), the one where TP1
-                        # was actually touched, could also have been printed
-                        # BEFORE the touch (the bar opened below the halfway
-                        # point, then rallied to TP1) — the same class of
-                        # false trigger, just in a narrower window. Bar Y is
-                        # already covered by the live ticker check below
-                        # (when tp1_hit=True), so it's safe to exclude it from
-                        # the bar-based check too — push the threshold forward
-                        # by +1 timeframe, so the bar-based check only starts
-                        # applying from bar Z (the first one to close entirely
-                        # AFTER the move).
-                        try:
-                            tf_ms = int(exchange.parse_timeframe(tf) * 1000)
-                        except Exception:
-                            tf_ms = 3600_000
-                        trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
-                        track_label = _cfg.TRACK_LABELS[track]
-                        # 🆕 FIX: this send used to not be wrapped in
-                        # try/except at all — the only one of the three
-                        # (Discord/WS/push) in this block. If channel.send()
-                        # raised (rate limit, missing permissions,
-                        # discord.HTTPException), it would abort the whole
-                        # scanner iteration and silently eat BOTH the WS
-                        # broadcast AND push for this same TP1 event — the
-                        # same class of problem fixed in BUG-LO007, just not
-                        # applied to this newer code. Now a Discord-send
-                        # failure doesn't prevent the other notification
-                        # channels from firing.
-                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
-                            try:
-                                await channel.send(
-                                    f"🎯 **TP1 Hit [{track_label}-track]** | `{ticker}` `{tf}` | "
-                                    f"{side.upper()} | Entry: ${format_price(entry)} → TP1: ${format_price(tp1_price)}\n"
-                                    f"⚠️ **Close 50% of the position and move SL to {sl_label}**"
-                                )
-                            except Exception as discord_err:
-                                logger.error(f"[DISCORD] Failed to send TP1 hit for {ticker} {tf}: {discord_err}", exc_info=True)
-                        logger.info(f"[TP1] {ticker} {tf} {track_label}-track | TP1 hit @ {current_price} | SL mode={_cfg.TP1_SL_MODE} → {new_sl}")
-                        try:
-                            from web_api import broadcast_event
-                            await broadcast_event({
-                                "type": "tp1_hit",
-                                "ticker": ticker,
-                                "tf": tf,
-                                "track": track,
-                                "side": side,
-                                "entry": entry,
-                                "tp1": tp1_price,
-                                "new_sl": new_sl,
-                                "sl_mode": _cfg.TP1_SL_MODE,
-                            })
-                        except Exception as ws_err:
-                            logger.warning(f"[WS] broadcast failed: {ws_err}")
-                        try:
-                            import push as _push
-                            await asyncio.to_thread(
-                                _push.send_push,
-                                title=f"🎯 TP1 Hit {ticker} {tf}",
-                                body=f"Close 50%, move SL to {sl_label}",
-                                data={"type": "tp1_hit", "ticker": ticker, "tf": tf, "track": track},
-                            )
-                        except Exception as push_err:
-                            logger.warning(f"[PUSH] send failed: {push_err}")
+                        await _apply_tp1(exchange, channel, st, trade, track, ticker, tf, current_price)
                     elif sl_breached:
                         from signals import close_trade
                         async with lock:

@@ -794,6 +794,7 @@ async def get_config():
         "htf_bias": _cfg.HTF_BIAS,
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
+        "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
@@ -1096,6 +1097,25 @@ async def set_derivatives_interval(body: DerivativesIntervalIn):
     _cfg.save_derivatives_interval(body.seconds)
     await broadcast_event({"type": "config_changed", "key": "derivatives_interval_seconds", "value": _cfg.DERIVATIVES_CACHE_TTL})
     return {"derivatives_interval_seconds": _cfg.DERIVATIVES_CACHE_TTL, "changed": True}
+
+
+class IntrabarCheckIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/intrabar-check")
+async def set_intrabar_check(body: IntrabarCheckIn):
+    """Turns the 1m-candle TP1/TP2/SL check on or off live (no restart).
+    ON catches wicks that touch a level between two live-ticker polls; OFF
+    restores the old behavior (live ticker poll + closed-bar check only).
+    See config.INTRABAR_CHECK_ENABLED."""
+    if body.enabled == _cfg.INTRABAR_CHECK_ENABLED:
+        return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": False}
+
+    _cfg.INTRABAR_CHECK_ENABLED = body.enabled
+    _cfg.save_intrabar_check(_cfg.INTRABAR_CHECK_ENABLED)
+    await broadcast_event({"type": "config_changed", "key": "intrabar_check_enabled", "value": _cfg.INTRABAR_CHECK_ENABLED})
+    return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": True}
 
 
 class UthaIn(BaseModel):

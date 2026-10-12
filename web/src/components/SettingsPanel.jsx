@@ -222,6 +222,16 @@ export default function SettingsPanel({ config, onChanged }) {
                 <option value="three_quarter_tp1">3/4 of the way to TP1</option>
               </select>
             </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Replays the 1m candles since the last check against SL / TP1 / TP2 on every scan, so a wick that touches a level between two live-price polls is no longer missed (e.g. TP1 touched but SL never moved). Costs one extra 1m candle fetch per open trade per scan. Off = old behavior: live price poll + closed-bar check only.">
+                Intrabar 1m TP/SL check
+              </span>
+              <Toggle
+                checked={config.intrabar_check_enabled ?? true}
+                disabled={busy === 'intrabar_check'}
+                onChange={(v) => run('intrabar_check', () => api.setIntrabarCheck(v))}
+              />
+            </div>
             <div className="field">
               <label title="How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard's live numbers are.">Scan interval</label>
               <select

@@ -753,6 +753,35 @@ def tp1_sl_label(mode: str) -> str:
     return TP1_SL_MODE_LABELS.get(mode, mode)
 
 # =====================================================================
+# 🕯️  INTRABAR (1m CANDLE) TP1 / TP2 / SL CHECK
+# =====================================================================
+# 🆕 FIX (2026-10, real trade: SOL/USDT 4h short): TP1 used to be credited
+# ONLY from bot.py's live ticker poll — one fetch_ticker()["last"] per scan
+# cycle. A wick that pierced TP1 and pulled back between two polls was never
+# seen (exchange low 106.27 vs TP1 106.47 on SOL while the poll only ever
+# sampled prices above it), and the closed-bar fallback in check_tp_sl_hit()
+# deliberately ignores a TP1-only touch, so SL never moved to the
+# TP1_SL_MODE level even though the exchange printed TP1.
+#
+# ON  (default) — every scan, for each open trade, bot.py also fetches the 1m
+#                 candles since the last check and replays their high/low in
+#                 order against SL / TP1 / TP2. A wick can no longer slip
+#                 between two polls, and SL-vs-TP1 ordering is resolved at 1m
+#                 resolution instead of the whole timeframe bar. Costs one
+#                 extra fetch_ohlcv per open trade per scan.
+# OFF           — exactly the old behavior (live ticker poll + closed bar).
+INTRABAR_CHECK_FILE = os.path.join(DATA_DIR, "intrabar_check.json")
+
+def load_intrabar_check() -> bool:
+    data = safe_json_load(INTRABAR_CHECK_FILE, {"enabled": True})
+    return bool(data.get("enabled", True))
+
+def save_intrabar_check(enabled: bool):
+    safe_json_save(INTRABAR_CHECK_FILE, {"enabled": bool(enabled)})
+
+INTRABAR_CHECK_ENABLED = load_intrabar_check()
+
+# =====================================================================
 # 🔕  DISCORD NOTIFICATIONS TOGGLE
 # =====================================================================
 # When off, the bot skips sending signal/TP1 messages to the Discord channel —
