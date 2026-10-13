@@ -113,7 +113,7 @@ export default function HistoryPanel({ lastEvent }) {
             <StatCard label="Avg PnL" value={fmtPct(total.avg_pnl)} color={total.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)'} />
             <StatCard label="Avg MFE" value={`${total.avg_mfe.toFixed(2)}%`} />
             <StatCard label="Avg MAE" value={`${total.avg_mae.toFixed(2)}%`} />
-            <StatCard label="TP / SL / Cancel" value={`${total.tp_hits} / ${total.sl_hits} / ${total.cancelled}`} />
+            <StatCard label="TP / SL after TP1 / SL / Cancel" value={`${total.tp_hits} / ${total.sl_after_tp1_hits ?? 0} / ${total.sl_hits} / ${total.cancelled}`} />
           </div>
         </div>
       )}
@@ -133,7 +133,7 @@ export default function HistoryPanel({ lastEvent }) {
                 <th>Avg PnL</th>
                 <th>Avg MFE</th>
                 <th>Avg MAE</th>
-                <th>TP/SL/Canc</th>
+                <th title="TP2 hit / stopped after TP1 (moved SL, usually still a profit) / SL before TP1 / cancelled">TP/SL·TP1/SL/Canc</th>
               </tr>
             </thead>
             <tbody>
@@ -163,7 +163,7 @@ export default function HistoryPanel({ lastEvent }) {
                   <td>{r.avg_mfe.toFixed(2)}%</td>
                   <td>{r.avg_mae.toFixed(2)}%</td>
                   <td className="mono" style={{ color: 'var(--text-dim)' }}>
-                    {r.tp_hits}/{r.sl_hits}/{r.cancelled}
+                    {r.tp_hits}/{r.sl_after_tp1_hits ?? 0}/{r.sl_hits}/{r.cancelled}
                   </td>
                 </tr>
               ))}
