@@ -53,6 +53,9 @@ from state import (
     load_signals_history,
     save_signals_history,
     add_signal_record,
+    mark_record_filled,
+    close_unfilled_record,
+    UNFILLED_EXIT_TYPE,
     update_signal_record,
     update_signal_mae_mfe,
     update_raw_outcome,
@@ -63,9 +66,10 @@ from state import (
     normalize_timestamp,
     is_before_ts,
 )
-from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price
+from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price, format_price
 from config import ONCHAIN_ENABLED
 import spread
+import pullback as _pb
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
 # separate modules that know nothing about confidence/TP themselves.
@@ -746,6 +750,112 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
 
 # =====================================================================
+# 🎯  PULLBACK (LIMIT) ENTRY — live helpers (see pullback.py / config.py)
+# =====================================================================
+
+def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track: str,
+                         side: str, close_v: float, sl: float,
+                         cfg: Optional[Dict] = None,
+                         records_by_side: Optional[Dict[str, List[dict]]] = None) -> Optional[Dict]:
+    """Where to place the limit order for a fresh signal, or None for "enter
+    at market as usual" (not enough history / depth too shallow / the limit
+    would not sit strictly between SL and the signal price).
+
+    cfg — pullback settings dict (config.pullback_config_snapshot() shape);
+    None reads the live config. records_by_side — the history to measure the
+    average pullback over; None reads signals_history.json (live path), the
+    backtest passes its own dry-run history instead.
+    """
+    cfg = cfg or _cfg.pullback_config_snapshot()
+    if records_by_side is None:
+        slot = load_signals_history().get(ticker, {}).get(tf, {})
+        records_by_side = {"long": slot.get("long", []), "short": slot.get("short", [])}
+
+    sl_dist_pct = abs(close_v - sl) / max(close_v, 1e-12) * 100.0
+    info = _pb.compute_pullback_depth(
+        df, records_by_side, track,
+        n_bars=cfg["expiry_bars"], last_idx=idx,
+        lookback_signals=cfg["lookback_signals"], min_samples=cfg["min_samples"],
+        mult=cfg["mult"], sl_dist_pct=sl_dist_pct,
+        max_sl_fraction=cfg["max_sl_fraction"], min_depth_pct=cfg["min_depth_pct"],
+    )
+    if info is None:
+        return None
+    limit = round_price(_pb.limit_price_for(side, close_v, info["depth_pct"]))
+    ok = (sl < limit < close_v) if side == "long" else (close_v < limit < sl)
+    if not ok:
+        return None
+    info["limit"] = limit
+    return info
+
+
+def fill_pending(state: Dict, track: str, ticker: str, tf: str, fill_ts_ms: int) -> Optional[Dict]:
+    """A pending limit order traded through: turn it into the track's active
+    trade (entry = the limit price; SL / TP1 / TP2 are the absolute levels
+    computed at the signal) and stamp the fill on the history record.
+
+    The new trade gets intrabar_cursor_ms = the fill candle, so bot.py's 1m
+    replay re-checks that very candle against SL right away — a candle that
+    pierced the limit AND the stop is a fill that was immediately stopped out,
+    not a free pass.
+    """
+    key = f"{track}_pending"
+    pend = state.get(key)
+    if not pend:
+        return None
+    side = pend["side"]
+    tf_ms = int(pend["tf_ms"])
+    sig_bar = int(pend["signal_bar_time"])
+    k = max(1, (int(fill_ts_ms) - sig_bar) // tf_ms)
+    state[f"{track}_active_trade"] = {
+        "side": side,
+        "entry": pend["limit"],
+        "sl": pend["sl"],
+        "tp": pend["tp"],
+        "tp1": pend["tp1"],
+        "lev": pend["lev"],
+        # open time of the timeframe bar the fill happened in (chart marker /
+        # TP1 bookkeeping read this the same way they read it for market entries)
+        "bar_opened_time": sig_bar + k * tf_ms,
+        "tp1_hit": False,
+        "tp_raw": pend.get("tp_raw"),
+        "cap_reason": pend.get("cap_reason"),
+        "cap_level": pend.get("cap_level"),
+        "entry_mode": "limit",
+        "signal_price": pend["signal_price"],
+        "pullback_pct": pend.get("pullback_pct"),
+        "filled_ts": int(fill_ts_ms),
+        "intrabar_cursor_ms": int(fill_ts_ms) - int(fill_ts_ms) % 60_000,
+    }
+    state[f"{track}_bars_in_trade"] = 0
+    state[key] = None
+    mark_record_filled(ticker, tf, side, track, pend["limit"], int(fill_ts_ms))
+    logger.info(
+        f"[PULLBACK] {ticker} {tf} {track.upper()}-track {side.upper()} limit FILLED @ {pend['limit']} "
+        f"(signal {pend['signal_price']}, pullback {pend.get('pullback_pct', 0):.2f}%)"
+    )
+    return state[f"{track}_active_trade"]
+
+
+def cancel_pending(state: Dict, track: str, ticker: str, tf: str, reason: str, at_ms: int) -> Optional[Dict]:
+    """A pending limit order did not fill ("expired" or "missed"): drop it,
+    free the track and arm the cooldown exactly like a closed trade would
+    (backtest does the same: next_available_idx = resolution bar + cooldown),
+    so a lingering A-track confirmation can't immediately re-fire the same
+    signal at a worse price."""
+    key = f"{track}_pending"
+    pend = state.get(key)
+    if not pend:
+        return None
+    state[key] = None
+    state[f"{track}_in_long"] = False
+    state[f"{track}_in_short"] = False
+    state[f"last_{track}_{pend['side']}_time"] = int(at_ms)
+    close_unfilled_record(ticker, tf, pend["side"], track, reason)
+    return pend
+
+
+# =====================================================================
 # 🆕 UNIFIED POSITION OPENING (replaces 4 duplicated blocks)
 # =====================================================================
 
@@ -909,6 +1019,78 @@ async def open_position(
                 state[in_short_key] = False
             return None
 
+    # 🆕 PULLBACK (LIMIT) ENTRY — see config.py's PULLBACK section and
+    # pullback.py. With the feature on (live only, never for !scan dry runs)
+    # and enough history to know this track's average pullback, the position
+    # is NOT opened here: a virtual limit order is parked in
+    # state["{track}_pending"] and bot.py's _pending_check() watches the 1m
+    # candles for the fill. SL / TP1 / TP2 are the absolute levels computed
+    # above from the signal price — a fill just gets a better R:R. Everything
+    # else (cooldown bookkeeping, history record, confidence) is identical to a
+    # market entry; the record keeps the SIGNAL price as `entry` so MAE/MFE
+    # (and adaptive TP/SL calibrated from them) stay independent of the entry
+    # mode — the fill price lives in `fill_price` once it happens.
+    pb_plan = None
+    if _cfg.PULLBACK_ENTRY_ENABLED and not dry_run:
+        try:
+            pb_plan = _plan_pullback_entry(df, idx, ticker, timeframe, track, side, close_v, sl)
+        except Exception as e:
+            logger.warning(f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()}: plan failed, entering at market: {e}")
+            pb_plan = None
+
+    if pb_plan is not None:
+        limit = pb_plan["limit"]
+        sig_bar_time = int(df["timestamp"].iloc[idx])
+        tf_ms = sig_bar_time - int(df["timestamp"].iloc[idx - 1])
+        n_bars = int(_cfg.PULLBACK_EXPIRY_BARS)
+        state[f"{track}_pending"] = {
+            "side": side,
+            "signal_price": close_v,
+            "limit": limit,
+            "sl": sl,
+            "tp": tp,
+            "tp1": tp1,
+            "lev": lev,
+            "regime": regime,
+            "pullback_pct": round(pb_plan["depth_pct"], 4),
+            "mean_pullback_pct": round(pb_plan["mean_pct"], 4),
+            "est_fill_rate": round(pb_plan["est_fill_rate"], 3),
+            "n_samples": pb_plan["n"],
+            "depth_capped": pb_plan["capped"],
+            "signal_bar_time": sig_bar_time,
+            "tf_ms": tf_ms,
+            "start_ms": sig_bar_time + tf_ms,                 # the signal bar's close — when the order is placed
+            "expire_ms": sig_bar_time + (1 + n_bars) * tf_ms,  # alive for n_bars bars after that
+            "cursor_ms": None,
+            "tp_raw": cap_info["tp2_raw"],
+            "cap_reason": cap_info["cap_reason"],
+            "cap_level": cap_info["cap_level"],
+        }
+        state[bars_key] = 0
+        if not dry_run:
+            state[f"{track}_{side}_bar"] = idx
+            state[last_bar_key] = idx
+
+        conf, confidence_components = calc_confidence(side == "long")
+        add_signal_record(
+            ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime,
+            track=track, confidence_components=confidence_components,
+            tp_raw=cap_info["tp2_raw"], cap_reason=cap_info["cap_reason"], cap_level=cap_info["cap_level"],
+            extra={"entry_mode": "limit", "limit_price": limit, "pullback_pct": round(pb_plan["depth_pct"], 4), "filled": False},
+        )
+        stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
+        risk_limit = abs(limit - sl)
+        tp_desc += (
+            f" | LIMIT -{pb_plan['depth_pct']:.2f}% from signal ${format_price(close_v)} "
+            f"(avg pullback {pb_plan['mean_pct']:.2f}%, n={pb_plan['n']}, est.fill ~{pb_plan['est_fill_rate']*100:.0f}%, "
+            f"valid {n_bars} bars)"
+        )
+        logger.info(
+            f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()} limit placed @ {limit} "
+            f"(signal {close_v}, depth {pb_plan['depth_pct']:.2f}%, expires in {n_bars} bars)"
+        )
+        return (signal_label + " ⏳LIMIT", limit, regime, lev, sig_bar_time, conf, sl, tp, tp1, risk_limit, stats, tp_desc)
+
     state[trade_key] = {
         "side": side,
         "entry": close_v,
@@ -1034,17 +1216,35 @@ async def check_signals(
             if trade:
                 update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
                                        high=last_high, low=last_low)
-                hit = check_tp_sl_hit(state, last_high, last_low, track, bar_time=current_bar_time,
-                                       ticker=ticker, tf=timeframe)
+                # 🆕 (pullback entry) a limit-entry trade only exists from its fill bar
+                # on (bar_opened_time = that bar's open): a bar that CLOSED before it
+                # says nothing about this position, and the fill bar itself must not
+                # count as a bar held (backtest counts bars_held from the bar AFTER the
+                # fill). Market-entry trades are unaffected.
+                _is_limit = trade.get("entry_mode") == "limit"
+                _opened = int(trade.get("bar_opened_time") or 0)
+                _pre_fill_bar = _is_limit and current_bar_time < _opened
+                _fill_bar = _is_limit and current_bar_time <= _opened
+                hit = None if _pre_fill_bar else check_tp_sl_hit(
+                    state, last_high, last_low, track, bar_time=current_bar_time,
+                    ticker=ticker, tf=timeframe)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
                     close_trade(state, exit_price, hit, ticker, timeframe, track, close_time_ms=current_bar_time)
-                elif is_new_bar:
+                elif is_new_bar and not _fill_bar:
                     bars_key = f"{track}_bars_in_trade"
                     state[bars_key] = state.get(bars_key, 0) + 1
                     if state[bars_key] >= MAX_HOLD_BARS:
                         close_trade(state, last_close, "cancelled", ticker, timeframe, track, close_time_ms=current_bar_time)
                         logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
+            elif state.get(f"{track}_pending"):
+                # 🆕 (pullback entry) a limit order is still waiting for its fill:
+                # the history record is open and measured from the signal price —
+                # keep its MAE/MFE current. Fill / expiry itself is resolved from
+                # 1m candles in bot.py (_pending_check), not here.
+                pend = state[f"{track}_pending"]
+                update_signal_mae_mfe(ticker, timeframe, pend["side"], last_close, track=track,
+                                       high=last_high, low=last_low)
             else:
                 # 🆕 (external review, TP-obstacle stage): no active trade on
                 # this track right now doesn't mean nothing needs updating —
@@ -1550,6 +1750,8 @@ def backtest_history(
     dry_run: bool = False,
     df: Optional[pd.DataFrame] = None,
     compute_confidence: bool = False,
+    pullback: Optional[Dict] = None,
+    hold_reserve_extra: int = 0,
 ):
     """Backtest for accumulating signal history.
 
@@ -1599,6 +1801,27 @@ def backtest_history(
     and is simply omitted from the dict rather than guessed at — a
     consumer checking `"onchain_bias" in components` can tell backtest-
     sourced records apart from live ones for that reason alone.
+
+    pullback — 🆕 (pullback entry) pullback settings dict (same keys as
+    config.pullback_config_snapshot(): mult / expiry_bars / min_samples /
+    lookback_signals / max_sl_fraction / min_depth_pct) to simulate the
+    limit-entry mode on this run. None (the default) = enter at the signal
+    price, exactly as before — including for the startup backtest that
+    populates real history, which must never use it. Only honored together
+    with dry_run=True: the average pullback is measured over the dry run's
+    own isolated history, and a simulated limit-entry run must never be
+    mixed into signals_history.json. Signals that never fill are kept in
+    the dry-run history as exit_type="unfilled" (unfilled_reason "missed" =
+    price reached TP1 first, "expired" = no fill within expiry_bars) and
+    entered trades carry entry_mode/fill_price/pullback_pct; "entry" is
+    always the signal price. SL/TP1/TP2 stay at the same absolute levels a
+    market entry would use, so with/without runs are directly comparable.
+
+    hold_reserve_extra — extra trailing bars reserved at the end of the
+    window on top of MAX_HOLD_BARS (a pullback run reserves its own
+    expiry_bars automatically). Pass the same number to the market-entry
+    run you compare against so both simulate the identical signal bars
+    (see run_pullback_comparison()).
 
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
@@ -1813,7 +2036,11 @@ def backtest_history(
         # below for why that matters. Reserve exactly enough trailing bars
         # for the longest simulation the hold period actually needs, not a
         # number that happened to match an old hardcoded default.
-        for idx in range(start_idx, len(df) - _cfg.MAX_HOLD_BARS):
+        pb_on = pullback is not None and dry_run
+        if pullback is not None and not dry_run:
+            logger.warning("[BACKTEST] pullback simulation ignored: it requires dry_run=True")
+        _tail_reserve = _cfg.MAX_HOLD_BARS + (int(pullback["expiry_bars"]) if pb_on else int(hold_reserve_extra))
+        for idx in range(start_idx, len(df) - _tail_reserve):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
             atr_v = max(float(atr14.iloc[idx]), 1e-8)
@@ -1982,10 +2209,105 @@ def backtest_history(
                 # Now both paths match.
                 tp = tp2
 
-                tp_hit = sl_hit = False
+                # 🆕 (pullback entry) entry_p is the price the position is
+                # actually opened at (the signal price unless a limit order
+                # fills), base_idx the bar the hold period is counted from
+                # (the signal bar, or the fill bar). MAE/MFE below stay
+                # measured from the signal price close_v so they remain
+                # comparable with market-entry history.
+                entry_p = close_v
+                base_idx = idx
+                entry_mode = "market"
+                pb_plan = None
+                fill_f = None
+                pre_closed = False  # stopped out on the fill bar itself
                 max_favorable = max_adverse = 0.0
-                exit_price = close_v
+                _ensure_history_slot(history, ticker, tf)
+
+                if pb_on:
+                    entry_mode = "market"  # fallback when there is no plan
+                    pb_plan = _plan_pullback_entry(
+                        df, idx, ticker, tf, track, side, close_v, sl, cfg=pullback,
+                        records_by_side={"long": history[ticker][tf]["long"], "short": history[ticker][tf]["short"]},
+                    )
+                    if pb_plan is not None:
+                        limit_p = pb_plan["limit"]
+                        n_wait = int(pullback["expiry_bars"])
+                        reason = None
+                        resolve_f = None
+                        for f_ in range(idx + 1, min(idx + n_wait + 1, len(df))):
+                            fh_ = float(df["high"].iloc[f_])
+                            fl_x = float(df["low"].iloc[f_])
+                            # A bar touching TP1 — alone or together with the
+                            # limit — means the move left without us; the
+                            # in-bar order of a single bar can't be proven, so
+                            # it is NOT credited as a fill (see
+                            # pullback.resolve_pending()).
+                            if (fh_ >= tp1) if side == "long" else (fl_x <= tp1):
+                                reason, resolve_f = "missed", f_
+                                break
+                            if (fl_x <= limit_p) if side == "long" else (fh_ >= limit_p):
+                                fill_f = f_
+                                break
+                        if fill_f is None and reason is None:
+                            reason, resolve_f = "expired", min(idx + n_wait, len(df) - 1)
+
+                        # MAE/MFE (from the signal price) over the waiting window
+                        # up to the fill / cancel bar, inclusive
+                        _end = fill_f if fill_f is not None else resolve_f
+                        for f_ in range(idx + 1, _end + 1):
+                            fh_ = float(df["high"].iloc[f_])
+                            fl_x = float(df["low"].iloc[f_])
+                            if side == "long":
+                                max_favorable = max(max_favorable, (fh_ - close_v) / close_v * 100)
+                                max_adverse = max(max_adverse, (close_v - fl_x) / close_v * 100)
+                            else:
+                                max_favorable = max(max_favorable, (close_v - fl_x) / close_v * 100)
+                                max_adverse = max(max_adverse, (fh_ - close_v) / close_v * 100)
+
+                        if fill_f is None:
+                            # never filled: stays in the (dry-run) history as
+                            # a signal, frees the track like a closed trade
+                            next_available_idx[track] = resolve_f + _cfg.COOLDOWN_BARS
+                            history[ticker][tf][side].append({
+                                "entry": round_price(close_v),
+                                "exit": None,
+                                "exit_type": UNFILLED_EXIT_TYPE,
+                                "unfilled_reason": reason,
+                                "bars_held": 0,
+                                "moved_pct": 0.0,
+                                "timestamp": normalize_timestamp(int(df["timestamp"].iloc[idx])),
+                                "max_favorable_pct": round(max_favorable, 4),
+                                "max_adverse_pct": round(max_adverse, 4),
+                                "regime": bt_regime,
+                                "track": track,
+                                "entry_mode": "limit",
+                                "limit_price": limit_p,
+                                "pullback_pct": round(pb_plan["depth_pct"], 4),
+                                "filled": False,
+                            })
+                            signals_found += 1
+                            continue
+
+                        entry_p = limit_p
+                        base_idx = fill_f
+                        entry_mode = "limit"
+                        fh_f = float(df["high"].iloc[fill_f])
+                        fl_f = float(df["low"].iloc[fill_f])
+                        # the fill bar's own low/high are after-the-fact for the
+                        # part of the bar before the fill; the only thing that
+                        # can still decide the trade on this bar is the stop —
+                        # price went through the limit AND the stop.
+                        pre_closed = (fl_f <= sl) if side == "long" else (fh_f >= sl)
+
+                tp_hit = sl_hit = False
+                exit_price = entry_p
                 bars_held = 0
+                if pre_closed:
+                    sl_hit = True
+                    exit_price = sl
+                loop_range = (range(0) if pre_closed else
+                              range(base_idx + 1, min(base_idx + _cfg.MAX_HOLD_BARS + 1, len(df))))
 
                 # 🆕 FIX (external review, P0): backtest used to check only
                 # the ORIGINAL sl/tp2 on every future bar, with no concept
@@ -2017,11 +2339,11 @@ def backtest_history(
                 # (and how often a trade even reaches "cancelled" vs. TP/SL
                 # within the real hold window) didn't represent what live
                 # trading actually does.
-                for future_idx in range(idx + 1, min(idx + _cfg.MAX_HOLD_BARS + 1, len(df))):
+                for future_idx in loop_range:
                     fh = float(df["high"].iloc[future_idx])
                     fl_ = float(df["low"].iloc[future_idx])
                     fc = float(df["close"].iloc[future_idx])
-                    bars_held = future_idx - idx
+                    bars_held = future_idx - base_idx
 
                     if side == "long":
                         favorable = (fh - close_v) / close_v * 100
@@ -2048,7 +2370,7 @@ def backtest_history(
                             # to a later one.
                             if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fh >= tp1 and fh < tp and fl_ <= current_sl:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
+                                current_sl = _tp1_moved_sl(entry_p, tp1, side, fraction=tp1_sl_fraction)
                                 sl_hit = True
                                 exit_price = current_sl
                                 break
@@ -2076,7 +2398,7 @@ def backtest_history(
                                 # we can't know whether the touch happened
                                 # at the start or end of this bar's range.
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
+                                current_sl = _tp1_moved_sl(entry_p, tp1, side, fraction=tp1_sl_fraction)
                                 continue
                         else:
                             if fl_ <= current_sl:
@@ -2103,7 +2425,7 @@ def backtest_history(
                             # fh >= tp1 since shorts profit downward).
                             if _cfg.SAME_BAR_TP1_POLICY == "tp1_first" and fl_ <= tp1 and fl_ > tp and fh >= current_sl:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
+                                current_sl = _tp1_moved_sl(entry_p, tp1, side, fraction=tp1_sl_fraction)
                                 sl_hit = True
                                 exit_price = current_sl
                                 break
@@ -2118,7 +2440,7 @@ def backtest_history(
                                 break
                             if fl_ <= tp1:
                                 tp1_reached = True
-                                current_sl = _tp1_moved_sl(close_v, tp1, side, fraction=tp1_sl_fraction)
+                                current_sl = _tp1_moved_sl(entry_p, tp1, side, fraction=tp1_sl_fraction)
                                 continue
                         else:
                             if fh >= current_sl:
@@ -2131,13 +2453,13 @@ def backtest_history(
                                 break
 
                 if not tp_hit and not sl_hit and bars_held > 0:
-                    exit_price = float(df["close"].iloc[min(idx + bars_held, len(df) - 1)])
+                    exit_price = float(df["close"].iloc[min(base_idx + bars_held, len(df) - 1)])
 
                 # 🆕 See the next_available_idx comment above the outer loop —
                 # this is where the "position" for this track actually
                 # closes in the simulation; block re-entry for this track
                 # until COOLDOWN_BARS past that point, same as live.
-                exit_idx = idx + bars_held
+                exit_idx = base_idx + bars_held
                 next_available_idx[track] = exit_idx + _cfg.COOLDOWN_BARS
 
                 _ensure_history_slot(history, ticker, tf)
@@ -2158,11 +2480,11 @@ def backtest_history(
                 # in at TP1, the other half at wherever it actually closed
                 # (moved SL, TP2, or a force-close price if never resolved).
                 if tp1_reached:
-                    tp1_leg_pct = (tp1 - close_v) / close_v * 100 if side == "long" else (close_v - tp1) / close_v * 100
-                    remainder_leg_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
+                    tp1_leg_pct = (tp1 - entry_p) / entry_p * 100 if side == "long" else (entry_p - tp1) / entry_p * 100
+                    remainder_leg_pct = (exit_price - entry_p) / entry_p * 100 if side == "long" else (entry_p - exit_price) / entry_p * 100
                     moved_pct = (tp1_leg_pct + remainder_leg_pct) / 2
                 else:
-                    moved_pct = (exit_price - close_v) / close_v * 100 if side == "long" else (close_v - exit_price) / close_v * 100
+                    moved_pct = (exit_price - entry_p) / entry_p * 100 if side == "long" else (entry_p - exit_price) / entry_p * 100
 
                 # 🆕 (external review, component-backtest): same shape
                 # calc_confidence() builds live, from the local vars this
@@ -2214,6 +2536,16 @@ def backtest_history(
                     # quietly bias a cross-fraction comparison.
                     "tp1_reached": bool(tp1_reached),
                 })
+                if pb_on:
+                    history[ticker][tf][side][-1]["entry_mode"] = entry_mode
+                    if entry_mode == "limit":
+                        history[ticker][tf][side][-1].update({
+                            "fill_price": round_price(entry_p),
+                            "limit_price": entry_p,
+                            "pullback_pct": round(pb_plan["depth_pct"], 4),
+                            "filled": True,
+                            "fill_bars": int(base_idx - idx),
+                        })
                 history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1
 
@@ -2357,6 +2689,160 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     report["bar_coverage"] = bar_coverage
     return report
 
+async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str],
+                                   num_bars: int = 3000, mults: Optional[tuple] = None) -> Dict:
+    """Compares entering at the signal price against the pullback (limit)
+    entry at several depths, on real historical OHLCV via dry-run
+    backtest_history() calls. Shared by discord_commands.py's !pullsim and
+    web_api.py's /api/pullsim. Never writes to signals_history.json and never
+    touches the live PULLBACK_* settings.
+
+    Variants: "market" (enter at the signal close, today's behavior) and one
+    pullback run per multiplier in `mults` (default 0.5 / 1.0 / 1.5 x the
+    average pullback), all with the live expiry_bars / min_samples /
+    max_sl_fraction / min_depth_pct. Each ticker/tf's history is fetched
+    once and reused for every variant, and every variant simulates the
+    identical signal bars (the market run reserves the same trailing bars).
+
+    Returns:
+        {
+          "expiry_bars": int,
+          "bar_coverage": [{"ticker","tf","requested","got"}, ...],
+          "variants": {
+              "market":  [row, ...],     # one row per track + an "ALL" row
+              "x0.5":    [...], "x1.0": [...], "x1.5": [...],
+          },
+        }
+    row = {track, signals, executed, fills, fill_rate, missed, expired,
+           fallback_market, win_rate, avg_pnl, total_pnl, per_signal_pnl,
+           avg_pullback_pct}
+
+    Reading it: per_signal_pnl is the number to compare across variants —
+    total PnL (%) divided by ALL signals the variant saw, unfilled ones
+    counting as 0 (that is what missing a trade costs). avg_pnl alone only
+    describes the trades that were entered and flatters any variant that
+    skips a lot. Signal sets are not byte-identical across variants (a
+    skipped signal frees its track earlier, a better entry changes how long
+    a trade lives), so treat small differences as noise.
+    """
+    base_cfg = _cfg.pullback_config_snapshot()
+    n_wait = int(base_cfg["expiry_bars"])
+    mults = tuple(mults) if mults else (0.5, 1.0, 1.5)
+
+    variant_names = ["market"] + [f"x{m:g}" for m in mults]
+    buckets: Dict[tuple, list] = {}
+    bar_coverage: List[Dict] = []
+
+    for t in tickers:
+        for f in tfs:
+            try:
+                bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
+            except Exception as e:
+                logger.error(f"run_pullback_comparison: fetch error for {t} {f}: {e}")
+                continue
+            if not bars or len(bars) < 100:
+                continue
+            df_full = parse_ohlcv(bars)
+            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(df_full)})
+
+            runs = [("market", None)] + [(f"x{m:g}", {**base_cfg, "mult": m}) for m in mults]
+            for name, pb_cfg in runs:
+                try:
+                    _count, history, _got = await asyncio.to_thread(
+                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, None, True,
+                        df_full, False, pb_cfg, n_wait if pb_cfg is None else 0,
+                    )
+                except Exception as e:
+                    logger.error(f"run_pullback_comparison: backtest error for {t} {f} {name}: {e}")
+                    continue
+                for side in ("long", "short"):
+                    for rec in history.get(t, {}).get(f, {}).get(side, []):
+                        buckets.setdefault((name, rec.get("track", "?")), []).append(rec)
+                await asyncio.sleep(0.2)  # yield to the event loop between heavy backtests
+
+    def _row(track: str, recs: List[Dict]) -> Dict:
+        executed = [r for r in recs if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled")]
+        limit_recs = [r for r in recs if r.get("entry_mode") == "limit"]
+        fills = [r for r in limit_recs if r.get("filled")]
+        missed = sum(1 for r in recs if r.get("exit_type") == UNFILLED_EXIT_TYPE and r.get("unfilled_reason") == "missed")
+        expired = sum(1 for r in recs if r.get("exit_type") == UNFILLED_EXIT_TYPE and r.get("unfilled_reason") == "expired")
+        fallback = sum(1 for r in recs if r.get("entry_mode") == "market" and r.get("exit_type") != UNFILLED_EXIT_TYPE) \
+            if any("entry_mode" in r for r in recs) else 0
+        total = sum(r.get("moved_pct", 0.0) for r in executed)
+        wins = sum(1 for r in executed if r.get("moved_pct", 0.0) > 0)
+        n_sig = len(recs)
+        return {
+            "track": track,
+            "signals": n_sig,
+            "executed": len(executed),
+            "fills": len(fills),
+            "fill_rate": round(len(fills) / len(limit_recs), 4) if limit_recs else None,
+            "missed": missed,
+            "expired": expired,
+            "fallback_market": fallback,
+            "win_rate": round(wins / len(executed), 4) if executed else 0.0,
+            "avg_pnl": round(total / len(executed), 4) if executed else 0.0,
+            "total_pnl": round(total, 4),
+            "per_signal_pnl": round(total / n_sig, 4) if n_sig else 0.0,
+            "avg_pullback_pct": round(sum(r.get("pullback_pct", 0.0) for r in fills) / len(fills), 4) if fills else None,
+        }
+
+    variants: Dict[str, List[Dict]] = {}
+    for name in variant_names:
+        rows = []
+        all_recs: List[Dict] = []
+        for track in _cfg.TRACKS:
+            recs = buckets.get((name, track), [])
+            if recs:
+                rows.append(_row(track, recs))
+                all_recs.extend(recs)
+        if all_recs:
+            rows.append(_row("ALL", all_recs))
+        variants[name] = rows
+
+    return {"expiry_bars": n_wait, "bar_coverage": bar_coverage, "variants": variants}
+
+
+async def pullback_stats_report(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str]) -> Dict:
+    """The average early pullback per ticker / timeframe / track, measured
+    exactly the way the live limit entry measures it (pullback.py), plus what
+    depth the current settings would place and the share of past signals
+    that reached it. Shared by discord_commands.py's !pullback and
+    web_api.py's GET /api/pullback. Read-only."""
+    cfg = _cfg.pullback_config_snapshot()
+    n_bars = int(cfg["expiry_bars"])
+    history = load_signals_history()
+    rows: List[Dict] = []
+
+    for t in tickers:
+        for f in tfs:
+            bars = await safe_fetch_ohlcv(exchange, t, f, limit=900)
+            if not bars:
+                continue
+            df = parse_ohlcv(bars)
+            slot = history.get(t, {}).get(f, {})
+            recs = {"long": slot.get("long", []), "short": slot.get("short", [])}
+            for track in _cfg.TRACKS:
+                samples = _pb.pullback_samples(df, recs, track, n_bars, len(df) - 2, cfg["lookback_signals"])
+                if not samples:
+                    rows.append({"ticker": t, "tf": f, "track": track, "n": 0, "enough_samples": False})
+                    continue
+                arr = np.asarray(samples, dtype="float64")
+                mean_pct = float(arr.mean())
+                depth = mean_pct * cfg["mult"]
+                rows.append({
+                    "ticker": t, "tf": f, "track": track,
+                    "n": int(len(arr)),
+                    "enough_samples": bool(len(arr) >= cfg["min_samples"]),
+                    "mean_pct": round(mean_pct, 4),
+                    "median_pct": round(float(np.median(arr)), 4),
+                    "never_pulled_back": round(float((arr <= 0).mean()), 4),
+                    "depth_pct": round(depth, 4),
+                    "est_fill_rate": round(float((arr >= depth).mean()), 4),
+                })
+    return {"config": cfg, "rows": rows}
+
+
 # =====================================================================
 # 🔄  HELPER FUNCTIONS
 # =====================================================================
@@ -2408,6 +2894,10 @@ def make_state() -> Dict:
         "last_b_long_time": None,
         "last_b_short_time": None,
         "b_active_trade": None,
+        # 🆕 (pullback entry) virtual limit order waiting for its fill, per track
+        "a_pending": None,
+        "u_pending": None,
+        "b_pending": None,
         "b_trade_history": [],
         "b_bars_in_trade": 0,
         "b_last_closure_notified": False,

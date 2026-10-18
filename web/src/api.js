@@ -105,6 +105,11 @@ export const api = {
     request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runCompSim: ({ ticker, tf, numBars = 3000, minSamples = 30 } = {}) =>
     request('/api/compsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, min_samples: minSamples }) }),
+  setPullbackConfig: (patch) =>
+    request('/api/config/pullback', { method: 'POST', body: JSON.stringify(patch) }),
+  getPullbackStats: () => request('/api/pullback'),
+  runPullSim: ({ ticker, tf, numBars = 3000 } = {}) =>
+    request('/api/pullsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

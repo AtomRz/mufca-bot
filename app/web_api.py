@@ -463,6 +463,9 @@ async def get_status():
                 "a_active_trade": st.get("a_active_trade"),
                 "u_active_trade": st.get("u_active_trade"),
                 "b_active_trade": st.get("b_active_trade"),
+                "a_pending": st.get("a_pending"),
+                "u_pending": st.get("u_pending"),
+                "b_pending": st.get("b_pending"),
                 "last_bar_time": st.get("last_bar_time"),
             }
     return result
@@ -795,6 +798,7 @@ async def get_config():
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
+        "pullback_entry": _cfg.pullback_config_snapshot(),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
@@ -884,6 +888,10 @@ def _any_active_trades() -> bool:
         for tf in TIMEFRAMES:
             st = core.state.get(ticker, {}).get(tf, {})
             if st.get("a_active_trade") or st.get("u_active_trade") or st.get("b_active_trade"):
+                return True
+            # 🆕 (pullback entry) a limit order still waiting for its fill is just as
+            # much "tracked state" as an open position
+            if st.get("a_pending") or st.get("u_pending") or st.get("b_pending"):
                 return True
     return False
 
@@ -1116,6 +1124,76 @@ async def set_intrabar_check(body: IntrabarCheckIn):
     _cfg.save_intrabar_check(_cfg.INTRABAR_CHECK_ENABLED)
     await broadcast_event({"type": "config_changed", "key": "intrabar_check_enabled", "value": _cfg.INTRABAR_CHECK_ENABLED})
     return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": True}
+
+
+class PullbackConfigIn(BaseModel):
+    # Any subset of fields — a partial PATCH, same pattern as BreakoutConfigIn.
+    enabled: Optional[bool] = None
+    mult: Optional[float] = None
+    expiry_bars: Optional[int] = None
+    min_samples: Optional[int] = None
+    lookback_signals: Optional[int] = None
+    max_sl_fraction: Optional[float] = None
+    min_depth_pct: Optional[float] = None
+
+
+@app.post("/api/config/pullback")
+async def set_pullback_config(body: PullbackConfigIn):
+    """Pullback (limit) entry settings, live, no restart — see config.py's
+    PULLBACK section. Turning it OFF only stops NEW signals from waiting for a
+    pullback; limit orders already waiting keep running until they fill or expire."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+    try:
+        cfg = _cfg.apply_pullback_config(updates)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await broadcast_event({"type": "config_changed", "key": "pullback_entry"})
+    return cfg
+
+
+@app.get("/api/pullback")
+async def get_pullback_stats():
+    """The average early pullback per pair / timeframe / track, measured the
+    way the live limit entry measures it, plus the depth the current settings
+    would place and the share of past signals that reached it. Read-only."""
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+    from signals import pullback_stats_report
+    return await pullback_stats_report(exchange, list(_cfg.TICKERS), list(TIMEFRAMES))
+
+
+class PullSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = 3000
+
+
+@app.post("/api/pullsim")
+async def run_pullsim(body: PullSimIn):
+    """Compares entering at the signal price against the pullback (limit)
+    entry at several depths on real historical OHLCV — same computation as the
+    Discord !pullsim command, both call signals.run_pullback_comparison().
+    Never writes to signals_history.json or touches the live settings. Slow
+    (pairs × timeframes × 4 backtests) — show it as a long-running action."""
+    ticker = body.ticker.upper().strip() if body.ticker else None
+    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
+    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in _cfg.TICKERS:
+            raise HTTPException(404, f"{t} is not a tracked pair")
+    for f in scope_tfs:
+        if f not in _cfg.TIMEFRAMES:
+            raise HTTPException(404, f"{f} is not a tracked timeframe")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    from signals import run_pullback_comparison
+    return await run_pullback_comparison(exchange, scope_tickers, scope_tfs, body.num_bars)
 
 
 class UthaIn(BaseModel):

@@ -659,9 +659,85 @@ function CompSimSection({ pairs }) {
   )
 }
 
+function PullSimSection({ pairs }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(3000)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  const run = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setResult(await api.runPullSim({ ticker, tf, numBars }))
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const pct = (v, d = 2) => `${v > 0 ? '+' : ''}${v.toFixed(d)}%`
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Pullback-entry comparison</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
+        Compares entering at the signal price against waiting for a pullback (limit order at 0.5× / 1× / 1.5× the average
+        early pullback) on real historical data. Dry-run — nothing is written to history or changes the live setting.
+        Compare variants on <b>per signal</b>: total PnL ÷ ALL signals, unfilled ones counting as 0.
+      </p>
+      <SimScopeFields
+        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+      />
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
+      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests across pairs × timeframes × 4 variants — this is slow, sit tight…</p>}
+      {result && !loading && (
+        <>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          {Object.entries(result.variants).map(([name, rows]) => (
+            <div key={name} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+                {name === 'market' ? 'market (signal price)' : `pullback ${name}`}
+              </div>
+              {rows.length === 0 ? (
+                <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No signals in this sample.</p>
+              ) : (
+                rows.map((row, i) => (
+                  <div className="row" key={i} style={{ fontSize: 12 }}>
+                    <span className="row-label">track={row.track}</span>
+                    <span className="row-value">
+                      signals={row.signals}
+                      {name !== 'market' && (
+                        <> · fills={row.fills} ({row.fill_rate == null ? 'n/a' : `${(row.fill_rate * 100).toFixed(0)}%`}) · missed={row.missed} · expired={row.expired} · at-market={row.fallback_market}</>
+                      )}
+                      {' '}· win={(row.win_rate * 100).toFixed(0)}% · avg={pct(row.avg_pnl)} · <b>per signal={pct(row.per_signal_pnl, 3)}</b>
+                      {row.signals < 20 && <span style={{ color: 'var(--accent)' }}> ⚠ small sample</span>}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          ))}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            missed = price reached TP1 before pulling back · expired = no fill within the wait window ({result.expiry_bars} bar(s)) ·
+            at-market = not enough history yet, entered at the signal price. Signal sets differ slightly between variants
+            (a skipped signal frees its track earlier), so treat small gaps as noise.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 function SimulateView({ pairs }) {
   return (
     <div>
+      <PullSimSection pairs={pairs} />
       <Tp1SimSection pairs={pairs} />
       <CompSimSection pairs={pairs} />
     </div>

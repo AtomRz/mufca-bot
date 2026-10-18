@@ -21,7 +21,8 @@ from config import (
     ONCHAIN_ENABLED,
 )
 from utils import safe_fetch_ohlcv, parse_ohlcv, format_price
-from signals import check_signals, backtest_history, make_state, _tp1_moved_sl
+from signals import check_signals, backtest_history, make_state, _tp1_moved_sl, fill_pending, cancel_pending
+import pullback as _pb
 from onchain import get_onchain_bias
 import derivatives
 import spread
@@ -85,15 +86,15 @@ def _heal_state():
         for tf in TIMEFRAMES:
             st = state[ticker][tf]
             # If the flag is set but there's no active_trade — clear the flag
-            if (st.get("a_in_long") or st.get("a_in_short")) and not st.get("a_active_trade"):
+            if (st.get("a_in_long") or st.get("a_in_short")) and not st.get("a_active_trade") and not st.get("a_pending"):
                 st["a_in_long"] = False
                 st["a_in_short"] = False
                 logger.warning(f"[HEAL] A-track desync fixed at startup: {ticker} {tf}")
-            if (st.get("u_in_long") or st.get("u_in_short")) and not st.get("u_active_trade"):
+            if (st.get("u_in_long") or st.get("u_in_short")) and not st.get("u_active_trade") and not st.get("u_pending"):
                 st["u_in_long"] = False
                 st["u_in_short"] = False
                 logger.warning(f"[HEAL] U-track desync fixed at startup: {ticker} {tf}")
-            if (st.get("b_in_long") or st.get("b_in_short")) and not st.get("b_active_trade"):
+            if (st.get("b_in_long") or st.get("b_in_short")) and not st.get("b_active_trade") and not st.get("b_pending"):
                 st["b_in_long"] = False
                 st["b_in_short"] = False
                 logger.warning(f"[HEAL] B-track desync fixed at startup: {ticker} {tf}")
@@ -510,6 +511,110 @@ async def _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf)
     trade["intrabar_cursor_ms"] = candles[-1][0]
 
 
+async def _pending_check(exchange, channel, lock, st, track, ticker, tf):
+    """Resolves a virtual limit order (PULLBACK_ENTRY_ENABLED) from 1m candles.
+
+    The order was parked in st["{track}_pending"] by signals.open_position()
+    when the signal bar closed. Each scan this replays the 1m candles since the
+    last check (per-order cursor persisted with the state snapshot) through the
+    pure pullback.resolve_pending():
+        fill    -> signals.fill_pending(): the order becomes the track's
+                   active trade (entry = limit price), TP1/SL tracking takes over;
+        missed  -> price reached TP1 without pulling back: cancelled;
+        expired -> pullback_expiry_bars passed without a fill: cancelled.
+    Runs regardless of INTRABAR_CHECK_ENABLED — a limit order has no
+    closed-bar equivalent that is precise enough to decide a fill.
+    """
+    pend = st.get(f"{track}_pending")
+    if not pend:
+        return
+
+    now_ms = int(time.time() * 1000)
+    tf_ms = int(pend["tf_ms"])
+    sig_bar = int(pend["signal_bar_time"])
+    expire_ms = int(pend["expire_ms"])
+    cursor = int(pend.get("cursor_ms") or pend["start_ms"])
+    cursor -= cursor % 60_000
+
+    candles = await _fetch_intrabar_candles(exchange, ticker, cursor)
+    ev = _pb.resolve_pending(pend["side"], pend["limit"], pend["tp1"], expire_ms, candles) if candles else None
+
+    if ev is None:
+        if candles:
+            pend["cursor_ms"] = candles[-1][0]
+        # The window is over but no 1m candle at/after its end has been seen —
+        # a failing 1m fetch must not silently kill a live order, so retry for
+        # up to one more bar before giving up.
+        if now_ms >= expire_ms + tf_ms:
+            ev = ("expired", expire_ms)
+        else:
+            return
+
+    kind, ts = ev
+    side = pend["side"]
+    track_label = _cfg.TRACK_LABELS[track]
+    limit = pend["limit"]
+
+    if kind == "fill":
+        async with lock:
+            trade = fill_pending(st, track, ticker, tf, ts)
+        if trade is None:
+            return
+        title = f"📥 Limit Filled {ticker} {tf}"
+        text = (
+            f"📥 **Limit Filled [{track_label}-track]** | `{ticker}` `{tf}` | {side.upper()} | "
+            f"Entry: ${format_price(limit)} (signal ${format_price(pend['signal_price'])}, -{pend.get('pullback_pct', 0):.2f}%)\n"
+            f"🛑 SL: ${format_price(pend['sl'])} | 🎯 TP1: ${format_price(pend['tp1'])} | 🏁 TP2: ${format_price(pend['tp'])}"
+        )
+        push_body = f"{side.upper()} @ {format_price(limit)} | SL {format_price(pend['sl'])} | TP1 {format_price(pend['tp1'])}"
+        event_type = "limit_filled"
+    else:
+        # cooldown anchor = open of the bar the order died in, same convention
+        # as the backtest (next_available_idx = resolution bar + cooldown)
+        if kind == "missed":
+            at_ms = ts - ((ts - sig_bar) % tf_ms)
+        else:
+            at_ms = expire_ms - tf_ms
+        async with lock:
+            cancel_pending(st, track, ticker, tf, kind, at_ms)
+        why = ("price reached TP1 without pulling back to the limit" if kind == "missed"
+               else f"no pullback to the limit within {_cfg.PULLBACK_EXPIRY_BARS} bar(s)")
+        title = f"⌛ Limit Not Filled {ticker} {tf}"
+        text = (
+            f"⌛ **Limit Not Filled [{track_label}-track]** | `{ticker}` `{tf}` | {side.upper()} | "
+            f"limit ${format_price(limit)} — {why}. Signal skipped."
+        )
+        push_body = why
+        event_type = "limit_cancelled"
+
+    try:
+        save_bot_state(state)
+    except Exception as snap_err:
+        logger.warning(f"[STATE] immediate snapshot save failed: {snap_err}")
+
+    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+        try:
+            await channel.send(text)
+        except Exception as discord_err:
+            logger.error(f"[DISCORD] Failed to send limit {kind} for {ticker} {tf}: {discord_err}", exc_info=True)
+    try:
+        from web_api import broadcast_event
+        await broadcast_event({
+            "type": event_type, "ticker": ticker, "tf": tf, "track": track, "side": side,
+            "limit": limit, "signal_price": pend["signal_price"], "reason": None if kind == "fill" else kind,
+        })
+    except Exception as ws_err:
+        logger.warning(f"[WS] broadcast failed: {ws_err}")
+    try:
+        import push as _push
+        await asyncio.to_thread(
+            _push.send_push, title=title, body=push_body,
+            data={"type": event_type, "ticker": ticker, "tf": tf, "track": track},
+        )
+    except Exception as push_err:
+        logger.warning(f"[PUSH] send failed: {push_err}")
+
+
 @tasks.loop(seconds=_cfg.SCAN_INTERVAL_SECONDS)
 async def market_scanner():
     """Main scanning loop."""
@@ -794,6 +899,14 @@ async def market_scanner():
                                     st[notified_key] = True
                                 except ValueError:
                                     logger.warning(f"Invalid exit_time format: {last.get('exit_time')}")
+
+                # ── pending limit orders (PULLBACK_ENTRY_ENABLED) ─────────
+                for track in _cfg.TRACKS:
+                    if st.get(f"{track}_pending"):
+                        try:
+                            await _pending_check(exchange, channel, lock, st, track, ticker, tf)
+                        except Exception as pb_err:
+                            logger.warning(f"[PULLBACK] pending check failed for {ticker} {tf} {track}: {pb_err}", exc_info=True)
 
                 # ── TP1 hit check ─────────────────────────────────────────
                 for track in _cfg.TRACKS:

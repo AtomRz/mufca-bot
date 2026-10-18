@@ -782,6 +782,126 @@ def save_intrabar_check(enabled: bool):
 INTRABAR_CHECK_ENABLED = load_intrabar_check()
 
 # =====================================================================
+# 🎯  PULLBACK (LIMIT) ENTRY — wait for the average pullback
+# =====================================================================
+# After a signal fires price often dips against the position for a bar or two
+# before moving the right way. With this ON the bot does not enter at the
+# signal bar's close: it places a virtual LIMIT order at the track's own
+# average early pullback (see pullback.py for exactly how that is measured)
+# and enters only if price comes back to it.
+#
+#   OFF (default) — exactly the old behavior: enter at the signal price.
+#   ON            — per signal, per ticker/timeframe/track:
+#       depth  = PULLBACK_MULT x mean early adverse excursion of past signals,
+#                capped at PULLBACK_MAX_SL_FRACTION x this signal's SL distance
+#       limit  = signal price -/+ depth (long/short)
+#     The order is cancelled if
+#       * PULLBACK_EXPIRY_BARS bars pass without a fill           (expired), or
+#       * price reaches TP1 before filling — the move left (missed).
+#     SL / TP1 / TP2 stay at the SAME absolute levels they had at the signal
+#     price, so a fill gives a strictly better R:R. Not enough history
+#     (PULLBACK_MIN_SAMPLES) or a depth below PULLBACK_MIN_DEPTH_PCT means
+#     "enter at market as usual" for that signal.
+#
+# Validate with `!pullsim` (dry-run on real history) before switching it on —
+# a pullback entry trades a better price for missed runaway moves, and which
+# side wins is an empirical question per track.
+PULLBACK_FILE = os.path.join(DATA_DIR, "pullback_entry.json")
+_PULLBACK_DEFAULTS = {
+    "enabled": False,
+    "mult": 1.0,              # fraction of the average pullback to wait for
+    "expiry_bars": 3,         # bars after the signal bar the order stays alive
+    "min_samples": 12,        # past signals needed (per ticker/tf/track) before trusting the average
+    "lookback_signals": 60,   # most recent N past signals used for the average
+    "max_sl_fraction": 0.5,   # depth never exceeds this share of the signal's SL distance
+    "min_depth_pct": 0.05,    # shallower than this -> not worth waiting, enter at market
+}
+# (lo, hi, caster) — enforced on load AND by the web endpoint
+PULLBACK_BOUNDS = {
+    "mult": (0.1, 3.0, float),
+    "expiry_bars": (1, 12, int),
+    "min_samples": (5, 200, int),
+    "lookback_signals": (10, 500, int),
+    "max_sl_fraction": (0.1, 0.9, float),
+    "min_depth_pct": (0.0, 2.0, float),
+}
+
+def load_pullback_config() -> dict:
+    data = safe_json_load(PULLBACK_FILE, dict(_PULLBACK_DEFAULTS))
+    if not isinstance(data, dict):
+        data = {}
+    out = dict(_PULLBACK_DEFAULTS)
+    out["enabled"] = bool(data.get("enabled", _PULLBACK_DEFAULTS["enabled"]))
+    # a hand-edited / corrupted value falls back per key to the default
+    # instead of poisoning the whole file (same approach as load_chop)
+    for key, (lo, hi, caster) in PULLBACK_BOUNDS.items():
+        try:
+            v = caster(data.get(key, _PULLBACK_DEFAULTS[key]))
+            if lo <= v <= hi:
+                out[key] = v
+        except (TypeError, ValueError):
+            pass
+    return out
+
+def save_pullback_config(data: dict):
+    safe_json_save(PULLBACK_FILE, data)
+
+def pullback_config_snapshot() -> dict:
+    """Current live pullback settings as one dict (same keys as the file)."""
+    return {
+        "enabled": PULLBACK_ENTRY_ENABLED,
+        "mult": PULLBACK_MULT,
+        "expiry_bars": PULLBACK_EXPIRY_BARS,
+        "min_samples": PULLBACK_MIN_SAMPLES,
+        "lookback_signals": PULLBACK_LOOKBACK_SIGNALS,
+        "max_sl_fraction": PULLBACK_MAX_SL_FRACTION,
+        "min_depth_pct": PULLBACK_MIN_DEPTH_PCT,
+    }
+
+def apply_pullback_config(patch: dict) -> dict:
+    """Validates and applies a (partial) pullback settings update — the single
+    entry point for the web endpoint and the Discord command, so both enforce
+    the same bounds. Nothing is changed unless every field in the patch is
+    valid. Returns the full settings dict now in effect. Raises ValueError."""
+    global PULLBACK_ENTRY_ENABLED, PULLBACK_MULT, PULLBACK_EXPIRY_BARS, PULLBACK_MIN_SAMPLES
+    global PULLBACK_LOOKBACK_SIGNALS, PULLBACK_MAX_SL_FRACTION, PULLBACK_MIN_DEPTH_PCT
+    new = pullback_config_snapshot()
+    for key, value in patch.items():
+        if value is None:
+            continue
+        if key == "enabled":
+            new["enabled"] = bool(value)
+        elif key in PULLBACK_BOUNDS:
+            lo, hi, caster = PULLBACK_BOUNDS[key]
+            try:
+                v = caster(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} must be a number")
+            if not (lo <= v <= hi):
+                raise ValueError(f"{key} must be between {lo} and {hi}")
+            new[key] = v
+        else:
+            raise ValueError(f"unknown pullback setting: {key}")
+    PULLBACK_ENTRY_ENABLED = new["enabled"]
+    PULLBACK_MULT = new["mult"]
+    PULLBACK_EXPIRY_BARS = new["expiry_bars"]
+    PULLBACK_MIN_SAMPLES = new["min_samples"]
+    PULLBACK_LOOKBACK_SIGNALS = new["lookback_signals"]
+    PULLBACK_MAX_SL_FRACTION = new["max_sl_fraction"]
+    PULLBACK_MIN_DEPTH_PCT = new["min_depth_pct"]
+    save_pullback_config(new)
+    return new
+
+_pullback = load_pullback_config()
+PULLBACK_ENTRY_ENABLED = _pullback["enabled"]
+PULLBACK_MULT = _pullback["mult"]
+PULLBACK_EXPIRY_BARS = _pullback["expiry_bars"]
+PULLBACK_MIN_SAMPLES = _pullback["min_samples"]
+PULLBACK_LOOKBACK_SIGNALS = _pullback["lookback_signals"]
+PULLBACK_MAX_SL_FRACTION = _pullback["max_sl_fraction"]
+PULLBACK_MIN_DEPTH_PCT = _pullback["min_depth_pct"]
+
+# =====================================================================
 # 🔕  DISCORD NOTIFICATIONS TOGGLE
 # =====================================================================
 # When off, the bot skips sending signal/TP1 messages to the Discord channel —
