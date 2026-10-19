@@ -787,7 +787,9 @@ function PullSimSection({ pairs }) {
           {Object.entries(result.variants).map(([name, rows]) => (
             <div key={name} style={{ marginBottom: 12 }}>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
-                {name === 'market' ? 'market (signal price)' : `pullback ${name}`}
+                {name === 'market'
+                  ? 'market (signal price)'
+                  : `pullback ${name.replace('+sl', '')}${name.endsWith('+sl') ? ' + stop shifted with entry' : ' (stop fixed)'}`}
               </div>
               {rows.length === 0 ? (
                 <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No signals in this sample.</p>

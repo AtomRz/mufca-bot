@@ -93,7 +93,7 @@ async def help_cmd(ctx):
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
-        "`!pullback [on|off|mult|bars|samples|maxsl|min|lookback <value>]` — limit entry at the average pullback: stats + settings",
+        "`!pullback [on|off|mult|bars|samples|maxsl|min|lookback <value>|pool on|off|sl fixed|keep]` — limit entry at the average pullback: stats + settings",
         "`!pullsim [pair] [tf] [bars]` — compare entering at the signal price vs. waiting for the average pullback, on real historical data (dry-run)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
@@ -1912,6 +1912,10 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
       !pullback maxsl 0.5       — depth cap, share of the signal's SL distance
       !pullback min 0.05        — shallower than this % -> enter at market
       !pullback lookback 60     — most recent N signals used for the average
+      !pullback pool on | off   — a track with too few own signals borrows the
+                                  average of all tracks (default on)
+      !pullback sl fixed | keep — stop keeps its absolute level (fixed) or shifts
+                                  with the entry, keeping the signal's SL distance (keep)
     """
     try:
         a = arg.lower()
@@ -1919,6 +1923,21 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             cfg = _cfg.apply_pullback_config({"enabled": a == "on"})
             await ctx.send(f"🎯 Pullback entry: **{'ON' if cfg['enabled'] else 'OFF'}**"
                            + ("" if cfg["enabled"] else " — signals enter at the signal price as before."))
+            return
+        if a == "pool":
+            if value.lower() not in ("on", "off"):
+                await ctx.send("❌ Usage: `!pullback pool on|off`")
+                return
+            cfg = _cfg.apply_pullback_config({"pool_fallback": value.lower() == "on"})
+            await ctx.send(f"✅ pullback pool_fallback = **{'ON' if cfg['pool_fallback'] else 'OFF'}**")
+            return
+        if a == "sl":
+            mode = {"fixed": "fixed", "keep": "keep_distance", "keep_distance": "keep_distance"}.get(value.lower())
+            if mode is None:
+                await ctx.send("❌ Usage: `!pullback sl fixed|keep`")
+                return
+            cfg = _cfg.apply_pullback_config({"sl_mode": mode})
+            await ctx.send(f"✅ pullback sl_mode = **{cfg['sl_mode']}**")
             return
         if a in _PULLBACK_ARG_KEYS:
             if value == "":
@@ -1932,7 +1951,7 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             await ctx.send(f"✅ pullback {_PULLBACK_ARG_KEYS[a]} = **{cfg[_PULLBACK_ARG_KEYS[a]]}**")
             return
         if a:
-            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min` or `lookback`.")
+            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool` or `sl`.")
             return
 
         exchange = core._exchange_ref
@@ -1941,6 +1960,7 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             f"**🎯 Pullback entry: {'ON ✅' if cfg['enabled'] else 'OFF ❌'}**",
             f"mult={cfg['mult']} | bars={cfg['expiry_bars']} | min samples={cfg['min_samples']} | "
             f"lookback={cfg['lookback_signals']} | depth cap={cfg['max_sl_fraction']:.0%} of SL | min depth={cfg['min_depth_pct']}%",
+            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']}",
             "",
         ]
         if exchange is None:
@@ -1952,6 +1972,8 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
                 if r["n"] == 0:
                     continue
                 flag = "" if r["enough_samples"] else " ⚠️ too few samples — would enter at market"
+                if r.get("pooled"):
+                    flag = " 🔀 pooled over all tracks"
                 lines.append(
                     f"• `{r['ticker']}` `{r['tf']}` track={r['track']}: n={r['n']} avg={r['mean_pct']:.2f}% "
                     f"median={r['median_pct']:.2f}% | never dipped: {r['never_pulled_back']:.0%} | "
@@ -2001,7 +2023,7 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
             return
 
     await ctx.send(
-        f"⏳ Running pullback-entry comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 4 variants, "
+        f"⏳ Running pullback-entry comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 6 variants, "
         f"{num_bars} bars each. This is slow — sit tight."
     )
     try:
@@ -2016,7 +2038,9 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
             lines.append("")
 
         for name, rows in result["variants"].items():
-            lines.append(f"**{'market (signal price)' if name == 'market' else 'pullback ' + name}:**")
+            label = ("market (signal price)" if name == "market"
+                     else f"pullback {name.replace('+sl', '')}" + (" + stop shifted with entry" if name.endswith("+sl") else " (stop fixed)"))
+            lines.append(f"**{label}:**")
             if not rows:
                 lines.append("  no signals in this sample.\n")
                 continue
@@ -2038,7 +2062,9 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
         lines.append(
             "per_signal = total PnL ÷ ALL signals (unfilled count as 0) — the number to compare. "
             "missed = price reached TP1 before pulling back; expired = no fill within the wait window; "
-            "at-market = not enough history yet, entered at the signal price. Signal sets differ slightly "
+            "at-market = not enough history yet, entered at the signal price. "
+            + ("Tracks with few own signals borrow the all-track average (pool on). " if result.get("pool_fallback") else "")
+            + "Signal sets differ slightly "
             "between variants, so treat small gaps as noise."
         )
         await _send_chunked(ctx, "\n".join(lines))

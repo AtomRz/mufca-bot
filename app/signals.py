@@ -778,6 +778,7 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
         lookback_signals=cfg["lookback_signals"], min_samples=cfg["min_samples"],
         mult=cfg["mult"], sl_dist_pct=sl_dist_pct,
         max_sl_fraction=cfg["max_sl_fraction"], min_depth_pct=cfg["min_depth_pct"],
+        pool_fallback=bool(cfg.get("pool_fallback", False)),
     )
     if info is None:
         return None
@@ -786,6 +787,14 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
     if not ok:
         return None
     info["limit"] = limit
+    # stop placement after the fill: "fixed" keeps the signal's absolute level,
+    # "keep_distance" shifts it with the entry (same risk per trade as at the
+    # signal price). Shifting only moves it AWAY from the entry's side of the
+    # trade, so the limit stays strictly between price and stop either way.
+    if cfg.get("sl_mode") == "keep_distance":
+        info["sl_eff"] = round_price(_pb.shifted_sl(side, close_v, limit, sl))
+    else:
+        info["sl_eff"] = sl
     return info
 
 
@@ -1047,7 +1056,10 @@ async def open_position(
             "side": side,
             "signal_price": close_v,
             "limit": limit,
-            "sl": sl,
+            "sl": pb_plan["sl_eff"],
+            "sl_signal": sl,
+            "sl_mode": _cfg.PULLBACK_SL_MODE,
+            "pooled": bool(pb_plan.get("pooled")),
             "tp": tp,
             "tp1": tp1,
             "lev": lev,
@@ -1079,10 +1091,12 @@ async def open_position(
             extra={"entry_mode": "limit", "limit_price": limit, "pullback_pct": round(pb_plan["depth_pct"], 4), "filled": False},
         )
         stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
-        risk_limit = abs(limit - sl)
+        risk_limit = abs(limit - pb_plan["sl_eff"])
+        if pb_plan["sl_eff"] != sl:
+            tp_desc += f" | SL shifts with the fill → ${format_price(pb_plan['sl_eff'])}"
         tp_desc += (
             f" | LIMIT -{pb_plan['depth_pct']:.2f}% from signal ${format_price(close_v)} "
-            f"(avg pullback {pb_plan['mean_pct']:.2f}%, n={pb_plan['n']}, est.fill ~{pb_plan['est_fill_rate']*100:.0f}%, "
+            f"(avg pullback {pb_plan['mean_pct']:.2f}%, n={pb_plan['n']}{', pooled over all tracks' if pb_plan.get('pooled') else ''}, est.fill ~{pb_plan['est_fill_rate']*100:.0f}%, "
             f"valid {n_bars} bars)"
         )
         logger.info(
@@ -2291,6 +2305,7 @@ def backtest_history(
 
                         entry_p = limit_p
                         base_idx = fill_f
+                        sl = pb_plan["sl_eff"]  # == signal SL unless sl_mode="keep_distance"
                         entry_mode = "limit"
                         fh_f = float(df["high"].iloc[fill_f])
                         fl_f = float(df["low"].iloc[fill_f])
@@ -2704,20 +2719,23 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     is updated in place: total / done (backtest runs, the unit of work),
     current ("ETH/USDT 4h x1"). Purely informational.
 
-    Variants: "market" (enter at the signal close, today's behavior) and one
+    Variants: "market" (enter at the signal close, today's behavior), one
     pullback run per multiplier in `mults` (default 0.5 / 1.0 / 1.5 x the
-    average pullback), all with the live expiry_bars / min_samples /
-    max_sl_fraction / min_depth_pct. Each ticker/tf's history is fetched
+    average pullback; stop keeps its absolute level) and, for multipliers
+    <= 1, an "xN+sl" twin where the stop shifts with the entry
+    (sl_mode="keep_distance"), all with the live expiry_bars / min_samples /
+    max_sl_fraction / min_depth_pct / pool_fallback. Each ticker/tf's history is fetched
     once and reused for every variant, and every variant simulates the
     identical signal bars (the market run reserves the same trailing bars).
 
     Returns:
         {
-          "expiry_bars": int,
+          "expiry_bars": int, "pool_fallback": bool,
           "bar_coverage": [{"ticker","tf","requested","got"}, ...],
           "variants": {
               "market":  [row, ...],     # one row per track + an "ALL" row
-              "x0.5":    [...], "x1.0": [...], "x1.5": [...],
+              "x0.5": [...], "x1": [...], "x1.5": [...],
+              "x0.5+sl": [...], "x1+sl": [...],
           },
         }
     row = {track, signals, executed, fills, fill_rate, missed, expired,
@@ -2736,11 +2754,18 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     n_wait = int(base_cfg["expiry_bars"])
     mults = tuple(mults) if mults else (0.5, 1.0, 1.5)
 
-    variant_names = ["market"] + [f"x{m:g}" for m in mults]
+    # (name, cfg or None). Plain xN keep the signal's absolute stop; xN+sl
+    # shift the stop with the entry (sl_mode="keep_distance") for the shallower
+    # depths — the variant that answers "is it the tighter stop that hurts?".
+    # pool_fallback follows the live setting for every pullback variant.
+    runs_spec = [("market", None)]
+    runs_spec += [(f"x{m:g}", {**base_cfg, "mult": m, "sl_mode": "fixed"}) for m in mults]
+    runs_spec += [(f"x{m:g}+sl", {**base_cfg, "mult": m, "sl_mode": "keep_distance"}) for m in mults if m <= 1.0]
+    variant_names = [n for n, _ in runs_spec]
     buckets: Dict[tuple, list] = {}
     bar_coverage: List[Dict] = []
 
-    per_pair = len(variant_names)
+    per_pair = len(runs_spec)
     if progress is not None:
         progress.update(total=len(tickers) * len(tfs) * per_pair, done=0, current="")
 
@@ -2766,8 +2791,7 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
             df_full = parse_ohlcv(bars)
             bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(df_full)})
 
-            runs = [("market", None)] + [(f"x{m:g}", {**base_cfg, "mult": m}) for m in mults]
-            for name, pb_cfg in runs:
+            for name, pb_cfg in runs_spec:
                 if progress is not None:
                     progress["current"] = f"{t} {f} {name}"
                 try:
@@ -2825,7 +2849,8 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
             rows.append(_row("ALL", all_recs))
         variants[name] = rows
 
-    return {"expiry_bars": n_wait, "bar_coverage": bar_coverage, "variants": variants}
+    return {"expiry_bars": n_wait, "pool_fallback": bool(base_cfg.get("pool_fallback")),
+            "bar_coverage": bar_coverage, "variants": variants}
 
 
 async def pullback_stats_report(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str]) -> Dict:
@@ -2849,6 +2874,11 @@ async def pullback_stats_report(exchange: ccxt.Exchange, tickers: List[str], tfs
             recs = {"long": slot.get("long", []), "short": slot.get("short", [])}
             for track in _cfg.TRACKS:
                 samples = _pb.pullback_samples(df, recs, track, n_bars, len(df) - 2, cfg["lookback_signals"])
+                pooled = False
+                if len(samples) < cfg["min_samples"] and cfg.get("pool_fallback"):
+                    pool_s = _pb.pullback_samples(df, recs, None, n_bars, len(df) - 2, cfg["lookback_signals"])
+                    if len(pool_s) >= cfg["min_samples"]:
+                        samples, pooled = pool_s, True
                 if not samples:
                     rows.append({"ticker": t, "tf": f, "track": track, "n": 0, "enough_samples": False})
                     continue
@@ -2858,6 +2888,7 @@ async def pullback_stats_report(exchange: ccxt.Exchange, tickers: List[str], tfs
                 rows.append({
                     "ticker": t, "tf": f, "track": track,
                     "n": int(len(arr)),
+                    "pooled": pooled,
                     "enough_samples": bool(len(arr) >= cfg["min_samples"]),
                     "mean_pct": round(mean_pct, 4),
                     "median_pct": round(float(np.median(arr)), 4),

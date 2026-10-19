@@ -30,6 +30,23 @@ The samples are computed straight from OHLCV, so:
   * they are point-in-time safe: a signal only counts once all N of its
     bars are already closed (see `last_idx`).
 
+Pooling across tracks
+---------------------
+A track with fewer than `min_samples` signals of its own on a pair/timeframe
+(typical for A and B, which fire rarely) would never get a limit order at all.
+With `pool_fallback` the average is then measured over the signals of ALL
+tracks of that pair/timeframe instead (a bar that several tracks signalled
+on counts once per side). This borrows U's pullback behaviour for tracks
+whose entries may behave differently — `!pullsim` shows per track whether
+that actually helps; switch it off to keep the strict per-track rule.
+
+Stop placement
+--------------
+`shifted_sl()` implements the "keep_distance" stop mode: the stop moves with
+the better entry so the risk per trade stays what it was at the signal price
+(instead of the stop staying at its absolute level and the entry creeping
+closer to it, which turns every deeper fill into a tighter stop).
+
 This module is pure (no exchange / state / config imports) so it can be unit
 tested and shared by the live path (signals.open_position, bot.py) and the
 backtest (signals.backtest_history).
@@ -106,7 +123,7 @@ def early_adverse_pct(side: str, entry: float, highs: np.ndarray, lows: np.ndarr
 
 def pullback_samples(df: pd.DataFrame,
                      records_by_side: Dict[str, List[dict]],
-                     track: str,
+                     track: Optional[str],
                      n_bars: int,
                      last_idx: int,
                      lookback_signals: int) -> List[float]:
@@ -120,6 +137,9 @@ def pullback_samples(df: pd.DataFrame,
     and 'unfilled' — a signal is a signal whatever happened to the trade);
     synthetic (!sim) records are excluded. The most recent
     `lookback_signals` samples are kept.
+
+    track=None pools every track of the pair/timeframe; a signal bar that
+    more than one track fired on (same side) is counted once.
     """
     if n_bars < 1 or len(df) == 0:
         return []
@@ -128,9 +148,12 @@ def pullback_samples(df: pd.DataFrame,
     lows = df["low"].to_numpy(dtype="float64")
 
     found: List[Tuple[int, float]] = []
+    seen = set()
     for side in ("long", "short"):
         for rec in records_by_side.get(side, []) or []:
-            if rec.get("track", "a") != track or rec.get("synthetic", False):
+            if rec.get("synthetic", False):
+                continue
+            if track is not None and rec.get("track", "a") != track:
                 continue
             entry = rec.get("entry")
             if not entry or entry <= 0:
@@ -141,6 +164,10 @@ def pullback_samples(df: pd.DataFrame,
             j = signal_bar_index(ts_ms, bar_ts)
             if j is None or j + n_bars > last_idx or j + n_bars >= len(df):
                 continue
+            if track is None:
+                if (side, j) in seen:
+                    continue
+                seen.add((side, j))
             found.append((j, early_adverse_pct(side, float(entry), highs, lows, j, n_bars)))
 
     found.sort(key=lambda x: x[0])
@@ -157,7 +184,8 @@ def compute_pullback_depth(df: pd.DataFrame,
                            mult: float,
                            sl_dist_pct: float,
                            max_sl_fraction: float,
-                           min_depth_pct: float) -> Optional[Dict]:
+                           min_depth_pct: float,
+                           pool_fallback: bool = False) -> Optional[Dict]:
     """How deep to place the limit order (in % below/above the signal price).
 
     depth = mult * mean(early adverse excursion of past signals), then capped
@@ -166,12 +194,19 @@ def compute_pullback_depth(df: pd.DataFrame,
 
     Returns None — meaning "enter at market as usual" — when there aren't
     enough past signals (min_samples) or the resulting depth is too shallow
-    to be worth waiting for (min_depth_pct).
+    to be worth waiting for (min_depth_pct). With pool_fallback, a track
+    that has too few signals of its own is measured over all tracks of the
+    pair/timeframe instead (see the module docstring).
 
     Returned dict: depth_pct, mean_pct, n, est_fill_rate (share of the
-    samples whose pullback reached the chosen depth), capped (bool).
+    samples whose pullback reached the chosen depth), capped (bool),
+    pooled (bool — measured over all tracks).
     """
     samples = pullback_samples(df, records_by_side, track, n_bars, last_idx, lookback_signals)
+    pooled = False
+    if len(samples) < min_samples and pool_fallback:
+        samples = pullback_samples(df, records_by_side, None, n_bars, last_idx, lookback_signals)
+        pooled = True
     if len(samples) < min_samples:
         return None
     arr = np.asarray(samples, dtype="float64")
@@ -188,6 +223,7 @@ def compute_pullback_depth(df: pd.DataFrame,
         "n": int(len(arr)),
         "est_fill_rate": float((arr >= depth).mean()),
         "capped": bool(capped),
+        "pooled": pooled,
     }
 
 
@@ -196,6 +232,15 @@ def limit_price_for(side: str, signal_price: float, depth_pct: float) -> float:
     above for a short)."""
     f = depth_pct / 100.0
     return signal_price * (1.0 - f) if side == "long" else signal_price * (1.0 + f)
+
+
+def shifted_sl(side: str, signal_price: float, limit: float, sl: float) -> float:
+    """The "keep_distance" stop: the original stop moved by the same amount
+    the entry improved, so the distance entry -> stop (the risk per trade)
+    equals what it was at the signal price. Long: below the signal stop;
+    short: above it."""
+    gain = (signal_price - limit) if side == "long" else (limit - signal_price)
+    return sl - gain if side == "long" else sl + gain
 
 
 # ---------------------------------------------------------------------

@@ -1135,6 +1135,8 @@ class PullbackConfigIn(BaseModel):
     lookback_signals: Optional[int] = None
     max_sl_fraction: Optional[float] = None
     min_depth_pct: Optional[float] = None
+    pool_fallback: Optional[bool] = None
+    sl_mode: Optional[str] = None
 
 
 @app.post("/api/config/pullback")

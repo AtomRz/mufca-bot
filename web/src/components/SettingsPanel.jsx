@@ -595,6 +595,26 @@ export default function SettingsPanel({ config, onChanged }) {
               busyKey="pb_max_sl_fraction" busy={busy} onSave={(v) => savePullback('max_sl_fraction', v)} />
             <NumberField label="Min depth (%)" hint="0–2 — shallower than this isn't worth waiting for, enter at market" value={pb?.min_depth_pct ?? 0.05} min={0} max={2} step={0.01}
               busyKey="pb_min_depth_pct" busy={busy} onSave={(v) => savePullback('min_depth_pct', v)} />
+            <div className="toggle-row">
+              <span className="row-label" title="A track with fewer than 'Min past signals' of its own (typically A and B) measures the average over all tracks of that pair/timeframe instead of entering at market.">
+                Pool tracks when too few own signals
+              </span>
+              <Toggle
+                checked={pb?.pool_fallback ?? true}
+                disabled={busy === 'pb_pool_fallback'}
+                onChange={(v) => savePullback('pool_fallback', v)}
+              />
+            </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Off: the stop keeps its absolute level (a deeper fill = a tighter stop). On: the stop moves with the entry so the distance entry→stop stays what it was at the signal price.">
+                Shift stop with the entry
+              </span>
+              <Toggle
+                checked={(pb?.sl_mode ?? 'fixed') === 'keep_distance'}
+                disabled={busy === 'pb_sl_mode'}
+                onChange={(v) => savePullback('sl_mode', v ? 'keep_distance' : 'fixed')}
+              />
+            </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               The average pullback is measured per pair / timeframe / track as the largest move against the signal price
               within the wait window, over past signals (signals that never dipped count as 0). Off by default —
