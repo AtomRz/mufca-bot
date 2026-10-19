@@ -583,6 +583,18 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => savePullback('enabled', v)}
               />
             </div>
+            {['a', 'u', 'b'].map((t) => (
+              <div className="toggle-row" key={`pb_track_${t}`}>
+                <span className="row-label" title="Per-track switch (only matters while the main switch is on). Off = this track keeps entering at the signal price. Decide from Insights → Simulate → Pullback-entry comparison, which always evaluates every track.">
+                  ↳ Track {t.toUpperCase()}
+                </span>
+                <Toggle
+                  checked={pb?.tracks?.[t] ?? true}
+                  disabled={busy === 'pb_tracks'}
+                  onChange={(v) => savePullback('tracks', { [t]: v })}
+                />
+              </div>
+            ))}
             <NumberField label="Depth multiplier" hint="0.1–3.0 — fraction of the average pullback to wait for" value={pb?.mult ?? 1} min={0.1} max={3} step={0.1}
               busyKey="pb_mult" busy={busy} onSave={(v) => savePullback('mult', v)} />
             <NumberField label="Wait window (bars)" hint="1–12 — how long the limit order stays alive" value={pb?.expiry_bars ?? 3} min={1} max={12}

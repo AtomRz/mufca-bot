@@ -767,6 +767,8 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
     backtest passes its own dry-run history instead.
     """
     cfg = cfg or _cfg.pullback_config_snapshot()
+    if not (cfg.get("tracks") or {}).get(track, True):
+        return None  # this track is switched off for pullback entries
     if records_by_side is None:
         slot = load_signals_history().get(ticker, {}).get(tf, {})
         records_by_side = {"long": slot.get("long", []), "short": slot.get("short", [])}
@@ -2704,6 +2706,76 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     report["bar_coverage"] = bar_coverage
     return report
 
+def _pullsim_workers(n_jobs: int) -> int:
+    """How many worker processes the pullback comparison may use: all CPU
+    cores by default, capped by the number of jobs. PULLSIM_WORKERS=1
+    forces the old single-process behaviour."""
+    import os
+    try:
+        env = int(os.environ.get("PULLSIM_WORKERS", "0"))
+    except ValueError:
+        env = 0
+    cap = env if env > 0 else (os.cpu_count() or 1)
+    return max(1, min(cap, n_jobs))
+
+
+class _CachingExchange:
+    """Wraps a ccxt exchange so repeated identical fetch_ohlcv() calls (every
+    variant of a comparison fetches the same higher-timeframe candles) hit the
+    network once. Everything else is delegated."""
+    def __init__(self, ex):
+        self._ex = ex
+        self._cache: Dict[tuple, list] = {}
+
+    def fetch_ohlcv(self, symbol, timeframe="1m", since=None, limit=None, params=None):
+        if since is not None or params:
+            return self._ex.fetch_ohlcv(symbol, timeframe, since, limit, params or {})
+        key = (symbol, timeframe, limit)
+        if key not in self._cache:
+            self._cache[key] = self._ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        return self._cache[key]
+
+    def __getattr__(self, name):
+        return getattr(self._ex, name)
+
+
+def _pullback_pair_worker(ticker: str, tf: str, num_bars: int, runs_spec: list,
+                          n_wait: int, tracks: list, exchange=None) -> Dict:
+    """All pullback-comparison variants for ONE pair/timeframe. Module-level and
+    self-contained so it can run in a spawned worker process (exchange=None ->
+    builds its own public-data client) or in a thread (exchange passed)."""
+    out: Dict = {"ticker": ticker, "tf": tf, "coverage": None, "runs": {}}
+    try:
+        if exchange is None:
+            if getattr(_cfg, "MARKET_MODE", "spot") == "futures":
+                exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+            else:
+                exchange = ccxt.gate({"enableRateLimit": True})
+        ex = _CachingExchange(exchange)
+        bars = _fetch_ohlcv_paginated(ex, ticker, tf, num_bars)
+    except Exception as e:
+        logger.error(f"run_pullback_comparison: fetch error for {ticker} {tf}: {e}")
+        return out
+    if not bars or len(bars) < 100:
+        return out
+    df_full = parse_ohlcv(bars)
+    out["coverage"] = {"ticker": ticker, "tf": tf, "requested": num_bars, "got": len(df_full)}
+    for name, pb_cfg in runs_spec:
+        try:
+            _count, history, _got = backtest_history(
+                ex, ticker, tf, num_bars, tuple(tracks), None, True,
+                df_full, False, pb_cfg, n_wait if pb_cfg is None else 0,
+            )
+        except Exception as e:
+            logger.error(f"run_pullback_comparison: backtest error for {ticker} {tf} {name}: {e}")
+            continue
+        recs = []
+        for side in ("long", "short"):
+            recs.extend(history.get(ticker, {}).get(tf, {}).get(side, []))
+        out["runs"][name] = recs
+    return out
+
+
 async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str],
                                    num_bars: int = 3000, mults: Optional[tuple] = None,
                                    progress: Optional[Dict] = None) -> Dict:
@@ -2758,6 +2830,9 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     # shift the stop with the entry (sl_mode="keep_distance") for the shallower
     # depths — the variant that answers "is it the tighter stop that hurts?".
     # pool_fallback follows the live setting for every pullback variant.
+    # the comparison always evaluates every track, whatever the per-track
+    # switches say — that is what the switches are meant to be decided from
+    base_cfg = {**base_cfg, "tracks": {t: True for t in _cfg.TRACKS}}
     runs_spec = [("market", None)]
     runs_spec += [(f"x{m:g}", {**base_cfg, "mult": m, "sl_mode": "fixed"}) for m in mults]
     runs_spec += [(f"x{m:g}+sl", {**base_cfg, "mult": m, "sl_mode": "keep_distance"}) for m in mults if m <= 1.0]
@@ -2775,39 +2850,55 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
             if current is not None:
                 progress["current"] = current
 
-    for t in tickers:
-        for f in tfs:
-            if progress is not None:
-                progress["current"] = f"{t} {f}: fetching history"
-            try:
-                bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
-            except Exception as e:
-                logger.error(f"run_pullback_comparison: fetch error for {t} {f}: {e}")
-                _tick(per_pair)
-                continue
-            if not bars or len(bars) < 100:
-                _tick(per_pair)
-                continue
-            df_full = parse_ohlcv(bars)
-            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(df_full)})
+    jobs = [(t, f) for t in tickers for f in tfs]
+    workers = _pullsim_workers(len(jobs))
 
-            for name, pb_cfg in runs_spec:
-                if progress is not None:
-                    progress["current"] = f"{t} {f} {name}"
-                try:
-                    _count, history, _got = await asyncio.to_thread(
-                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, None, True,
-                        df_full, False, pb_cfg, n_wait if pb_cfg is None else 0,
-                    )
-                except Exception as e:
-                    logger.error(f"run_pullback_comparison: backtest error for {t} {f} {name}: {e}")
-                    _tick()
-                    continue
-                _tick()
-                for side in ("long", "short"):
-                    for rec in history.get(t, {}).get(f, {}).get(side, []):
-                        buckets.setdefault((name, rec.get("track", "?")), []).append(rec)
-                await asyncio.sleep(0.2)  # yield to the event loop between heavy backtests
+    def _absorb(t: str, f: str, out: Dict):
+        """Merge one pair/timeframe's worker output into the shared buckets."""
+        if out.get("coverage"):
+            bar_coverage.append(out["coverage"])
+        for name, recs in (out.get("runs") or {}).items():
+            for rec in recs:
+                buckets.setdefault((name, rec.get("track", "?")), []).append(rec)
+        _tick(per_pair, f"{t} {f} done")
+
+    async def _run_inline(t: str, f: str):
+        out = await asyncio.to_thread(_pullback_pair_worker, t, f, num_bars, runs_spec, n_wait, list(_cfg.TRACKS), exchange)
+        _absorb(t, f, out)
+        await asyncio.sleep(0)
+
+    pool_ok = False
+    if workers > 1 and len(jobs) > 1:
+        # One process per pair/timeframe (all of its variants), so the CPU-bound
+        # backtests run on separate cores instead of fighting over one GIL.
+        # "spawn" (not fork): the bot is a multi-threaded asyncio process and
+        # forking that can deadlock; a spawned child imports signals.py fresh
+        # (config/state are re-read from /app/data) and builds its own exchange.
+        try:
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor
+            loop = asyncio.get_running_loop()
+            if progress is not None:
+                progress["current"] = f"{len(jobs)} pair/timeframe job(s) on {workers} processes"
+            with ProcessPoolExecutor(max_workers=workers, mp_context=_mp.get_context("spawn")) as pool:
+                futs = [
+                    loop.run_in_executor(pool, _pullback_pair_worker, t, f, num_bars, runs_spec, n_wait, list(_cfg.TRACKS), None)
+                    for t, f in jobs
+                ]
+                for fut in asyncio.as_completed(futs):
+                    out = await fut
+                    _absorb(out["ticker"], out["tf"], out)
+            pool_ok = True
+        except Exception as e:
+            logger.warning(f"run_pullback_comparison: process pool unavailable/failed ({e}); falling back to in-process run")
+            buckets.clear()
+            bar_coverage.clear()
+            if progress is not None:
+                progress.update(done=0)
+
+    if not pool_ok:
+        for t, f in jobs:
+            await _run_inline(t, f)
 
     def _row(track: str, recs: List[Dict]) -> Dict:
         executed = [r for r in recs if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled")]

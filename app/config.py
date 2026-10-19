@@ -817,6 +817,9 @@ _PULLBACK_DEFAULTS = {
     "min_depth_pct": 0.05,    # shallower than this -> not worth waiting, enter at market
     "pool_fallback": True,    # a track with < min_samples own signals borrows the average of all tracks
     "sl_mode": "fixed",       # fixed = SL keeps its absolute level; keep_distance = SL shifts with the entry
+    # per-track switch (only matters while "enabled" is on): a track set to
+    # False keeps entering at the signal price. Default all on = old behaviour.
+    "tracks": {"a": True, "u": True, "b": True},
 }
 PULLBACK_SL_MODES = ("fixed", "keep_distance")
 # (lo, hi, caster) — enforced on load AND by the web endpoint
@@ -838,6 +841,11 @@ def load_pullback_config() -> dict:
     out["pool_fallback"] = bool(data.get("pool_fallback", _PULLBACK_DEFAULTS["pool_fallback"]))
     if data.get("sl_mode") in PULLBACK_SL_MODES:
         out["sl_mode"] = data["sl_mode"]
+    out["tracks"] = {t: True for t in TRACKS}
+    if isinstance(data.get("tracks"), dict):
+        for t in TRACKS:
+            if t in data["tracks"]:
+                out["tracks"][t] = bool(data["tracks"][t])
     # a hand-edited / corrupted value falls back per key to the default
     # instead of poisoning the whole file (same approach as load_chop)
     for key, (lo, hi, caster) in PULLBACK_BOUNDS.items():
@@ -864,6 +872,7 @@ def pullback_config_snapshot() -> dict:
         "min_depth_pct": PULLBACK_MIN_DEPTH_PCT,
         "pool_fallback": PULLBACK_POOL_FALLBACK,
         "sl_mode": PULLBACK_SL_MODE,
+        "tracks": dict(PULLBACK_TRACKS),
     }
 
 def apply_pullback_config(patch: dict) -> dict:
@@ -873,7 +882,7 @@ def apply_pullback_config(patch: dict) -> dict:
     valid. Returns the full settings dict now in effect. Raises ValueError."""
     global PULLBACK_ENTRY_ENABLED, PULLBACK_MULT, PULLBACK_EXPIRY_BARS, PULLBACK_MIN_SAMPLES
     global PULLBACK_LOOKBACK_SIGNALS, PULLBACK_MAX_SL_FRACTION, PULLBACK_MIN_DEPTH_PCT
-    global PULLBACK_POOL_FALLBACK, PULLBACK_SL_MODE
+    global PULLBACK_POOL_FALLBACK, PULLBACK_SL_MODE, PULLBACK_TRACKS
     new = pullback_config_snapshot()
     for key, value in patch.items():
         if value is None:
@@ -882,6 +891,15 @@ def apply_pullback_config(patch: dict) -> dict:
             new["enabled"] = bool(value)
         elif key == "pool_fallback":
             new["pool_fallback"] = bool(value)
+        elif key == "tracks":
+            if not isinstance(value, dict):
+                raise ValueError("tracks must be an object like {\"a\": true}")
+            for t, on in value.items():
+                if t not in TRACKS:
+                    raise ValueError(f"unknown track: {t} (expected one of {', '.join(TRACKS)})")
+                if not isinstance(on, bool):
+                    raise ValueError(f"track {t} must be true or false")
+                new["tracks"][t] = on
         elif key == "sl_mode":
             if value not in PULLBACK_SL_MODES:
                 raise ValueError(f"sl_mode must be one of {', '.join(PULLBACK_SL_MODES)}")
@@ -906,6 +924,7 @@ def apply_pullback_config(patch: dict) -> dict:
     PULLBACK_MIN_DEPTH_PCT = new["min_depth_pct"]
     PULLBACK_POOL_FALLBACK = new["pool_fallback"]
     PULLBACK_SL_MODE = new["sl_mode"]
+    PULLBACK_TRACKS = dict(new["tracks"])
     save_pullback_config(new)
     return new
 
@@ -919,6 +938,7 @@ PULLBACK_MAX_SL_FRACTION = _pullback["max_sl_fraction"]
 PULLBACK_MIN_DEPTH_PCT = _pullback["min_depth_pct"]
 PULLBACK_POOL_FALLBACK = _pullback["pool_fallback"]
 PULLBACK_SL_MODE = _pullback["sl_mode"]
+PULLBACK_TRACKS = dict(_pullback["tracks"])
 
 # =====================================================================
 # 🔕  DISCORD NOTIFICATIONS TOGGLE

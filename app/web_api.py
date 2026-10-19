@@ -1137,6 +1137,7 @@ class PullbackConfigIn(BaseModel):
     min_depth_pct: Optional[float] = None
     pool_fallback: Optional[bool] = None
     sl_mode: Optional[str] = None
+    tracks: Optional[dict] = None   # partial, e.g. {"a": true, "u": false}
 
 
 @app.post("/api/config/pullback")

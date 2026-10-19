@@ -93,7 +93,7 @@ async def help_cmd(ctx):
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
-        "`!pullback [on|off|mult|bars|samples|maxsl|min|lookback <value>|pool on|off|sl fixed|keep]` — limit entry at the average pullback: stats + settings",
+        "`!pullback [on|off|mult|bars|samples|maxsl|min|lookback <value>|pool on|off|sl fixed|keep|track a|u|b on|off]` — limit entry at the average pullback: stats + settings",
         "`!pullsim [pair] [tf] [bars]` — compare entering at the signal price vs. waiting for the average pullback, on real historical data (dry-run)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
@@ -1914,6 +1914,7 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
       !pullback lookback 60     — most recent N signals used for the average
       !pullback pool on | off   — a track with too few own signals borrows the
                                   average of all tracks (default on)
+      !pullback track a|u|b on|off — per-track switch (off = that track enters at the signal price)
       !pullback sl fixed | keep — stop keeps its absolute level (fixed) or shifts
                                   with the entry, keeping the signal's SL distance (keep)
     """
@@ -1930,6 +1931,14 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
                 return
             cfg = _cfg.apply_pullback_config({"pool_fallback": value.lower() == "on"})
             await ctx.send(f"✅ pullback pool_fallback = **{'ON' if cfg['pool_fallback'] else 'OFF'}**")
+            return
+        if a == "track":
+            parts = value.split()
+            if len(parts) != 2 or parts[0].lower() not in _cfg.TRACKS or parts[1].lower() not in ("on", "off"):
+                await ctx.send("❌ Usage: `!pullback track <a|u|b> on|off`")
+                return
+            cfg = _cfg.apply_pullback_config({"tracks": {parts[0].lower(): parts[1].lower() == "on"}})
+            await ctx.send(f"✅ pullback track **{parts[0].lower()}**: **{'ON' if cfg['tracks'][parts[0].lower()] else 'OFF (enters at signal price)'}**")
             return
         if a == "sl":
             mode = {"fixed": "fixed", "keep": "keep_distance", "keep_distance": "keep_distance"}.get(value.lower())
@@ -1951,7 +1960,7 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             await ctx.send(f"✅ pullback {_PULLBACK_ARG_KEYS[a]} = **{cfg[_PULLBACK_ARG_KEYS[a]]}**")
             return
         if a:
-            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool` or `sl`.")
+            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool`, `sl` or `track`.")
             return
 
         exchange = core._exchange_ref
@@ -1960,7 +1969,8 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             f"**🎯 Pullback entry: {'ON ✅' if cfg['enabled'] else 'OFF ❌'}**",
             f"mult={cfg['mult']} | bars={cfg['expiry_bars']} | min samples={cfg['min_samples']} | "
             f"lookback={cfg['lookback_signals']} | depth cap={cfg['max_sl_fraction']:.0%} of SL | min depth={cfg['min_depth_pct']}%",
-            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']}",
+            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']} | "
+            "tracks: " + ", ".join(f"{t}={'on' if on else 'off'}" for t, on in cfg["tracks"].items()),
             "",
         ]
         if exchange is None:
