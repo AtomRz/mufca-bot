@@ -2690,12 +2690,19 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     return report
 
 async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str],
-                                   num_bars: int = 3000, mults: Optional[tuple] = None) -> Dict:
+                                   num_bars: int = 3000, mults: Optional[tuple] = None,
+                                   progress: Optional[Dict] = None) -> Dict:
     """Compares entering at the signal price against the pullback (limit)
     entry at several depths, on real historical OHLCV via dry-run
     backtest_history() calls. Shared by discord_commands.py's !pullsim and
     web_api.py's /api/pullsim. Never writes to signals_history.json and never
     touches the live PULLBACK_* settings.
+
+    progress — optional dict the caller can poll while this runs (the web
+    endpoint runs this as a background job, since one HTTP request that
+    stays open for minutes is cut off by Cloudflare Tunnel at ~100 s). It
+    is updated in place: total / done (backtest runs, the unit of work),
+    current ("ETH/USDT 4h x1"). Purely informational.
 
     Variants: "market" (enter at the signal close, today's behavior) and one
     pullback run per multiplier in `mults` (default 0.5 / 1.0 / 1.5 x the
@@ -2733,20 +2740,36 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     buckets: Dict[tuple, list] = {}
     bar_coverage: List[Dict] = []
 
+    per_pair = len(variant_names)
+    if progress is not None:
+        progress.update(total=len(tickers) * len(tfs) * per_pair, done=0, current="")
+
+    def _tick(n: int = 1, current: Optional[str] = None):
+        if progress is not None:
+            progress["done"] = progress.get("done", 0) + n
+            if current is not None:
+                progress["current"] = current
+
     for t in tickers:
         for f in tfs:
+            if progress is not None:
+                progress["current"] = f"{t} {f}: fetching history"
             try:
                 bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
             except Exception as e:
                 logger.error(f"run_pullback_comparison: fetch error for {t} {f}: {e}")
+                _tick(per_pair)
                 continue
             if not bars or len(bars) < 100:
+                _tick(per_pair)
                 continue
             df_full = parse_ohlcv(bars)
             bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(df_full)})
 
             runs = [("market", None)] + [(f"x{m:g}", {**base_cfg, "mult": m}) for m in mults]
             for name, pb_cfg in runs:
+                if progress is not None:
+                    progress["current"] = f"{t} {f} {name}"
                 try:
                     _count, history, _got = await asyncio.to_thread(
                         backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, None, True,
@@ -2754,7 +2777,9 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
                     )
                 except Exception as e:
                     logger.error(f"run_pullback_comparison: backtest error for {t} {f} {name}: {e}")
+                    _tick()
                     continue
+                _tick()
                 for side in ("long", "short"):
                     for rec in history.get(t, {}).get(f, {}).get(side, []):
                         buckets.setdefault((name, rec.get("track", "?")), []).append(rec)

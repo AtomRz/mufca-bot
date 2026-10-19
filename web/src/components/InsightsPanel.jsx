@@ -659,27 +659,89 @@ function CompSimSection({ pairs }) {
   )
 }
 
+// The last pullsim job id is kept in localStorage so a reload (or the Android
+// WebView being killed) while a long run is in progress picks the run up again
+// instead of losing it. Best-effort: storage can be unavailable.
+const PULLSIM_JOB_KEY = 'mufca_pullsim_job'
+const jobStore = {
+  get: () => { try { return localStorage.getItem(PULLSIM_JOB_KEY) } catch (_) { return null } },
+  set: (v) => { try { v ? localStorage.setItem(PULLSIM_JOB_KEY, v) : localStorage.removeItem(PULLSIM_JOB_KEY) } catch (_) {} },
+}
+
 function PullSimSection({ pairs }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
-  const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState(null)
+  const [jobId, setJobId] = useState(() => jobStore.get())
+  const [runNo, setRunNo] = useState(0) // bumps on every Run so polling restarts even for the same job id
+  const [job, setJob] = useState(null) // last status payload from the server
+  const [starting, setStarting] = useState(false)
+  const [attached, setAttached] = useState(false)
   const [error, setError] = useState(null)
 
+  // Poll the background job. A run over all pairs takes minutes — longer than
+  // Cloudflare Tunnel keeps one request open (~100 s) — so the server runs it
+  // as a job and this just asks how it is going.
+  useEffect(() => {
+    if (!jobId) return undefined
+    let stopped = false
+    let timer = null
+    let failures = 0
+    const tick = async () => {
+      try {
+        const st = await api.getPullSimStatus(jobId)
+        if (stopped) return
+        failures = 0
+        setJob(st)
+        if (st.status === 'running') timer = setTimeout(tick, 3000)
+      } catch (e) {
+        if (stopped) return
+        if (/Unknown job/i.test(e.message)) { // the bot restarted since the run was started
+          jobStore.set(null)
+          setJobId(null)
+          setJob(null)
+          setError(e.message)
+          return
+        }
+        failures += 1
+        if (failures >= 10) {
+          setError(`Lost connection to the server: ${e.message}`)
+          return
+        }
+        timer = setTimeout(tick, 3000)
+      }
+    }
+    tick()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [jobId, runNo])
+
   const run = async () => {
-    setLoading(true)
+    setStarting(true)
     setError(null)
+    setJob(null)
+    setAttached(false)
     try {
-      setResult(await api.runPullSim({ ticker, tf, numBars }))
+      const r = await api.startPullSim({ ticker, tf, numBars })
+      jobStore.set(r.job_id)
+      setAttached(!!r.already_running)
+      setJobId(r.job_id)
+      setRunNo((n) => n + 1)
     } catch (e) {
       setError(e.message)
     } finally {
-      setLoading(false)
+      setStarting(false)
     }
   }
 
+  const running = starting || job?.status === 'running' || (!!jobId && !job && !error)
+  const result = job?.status === 'done' ? job.result : null
+  const prog = job?.progress
+  const requestedBars = job?.scope?.num_bars ?? numBars
   const pct = (v, d = 2) => `${v > 0 ? '+' : ''}${v.toFixed(d)}%`
+  const fmtSecs = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${Math.round(s)}s`)
 
   return (
     <div className="panel">
@@ -692,13 +754,36 @@ function PullSimSection({ pairs }) {
       <SimScopeFields
         pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
-        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+        extra={<button onClick={run} disabled={running}>{running ? 'Running…' : 'Run'}</button>}
       />
       {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
-      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests across pairs × timeframes × 4 variants — this is slow, sit tight…</p>}
-      {result && !loading && (
+      {job?.status === 'error' && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {job.error}</p>}
+      {running && (
+        <div style={{ marginBottom: 12 }}>
+          {attached && (
+            <p style={{ fontSize: 12, color: 'var(--accent)', marginBottom: 6 }}>
+              A run was already in progress — showing it instead of starting a second one.
+            </p>
+          )}
+          <p style={{ color: 'var(--text-faint)', fontSize: 13, marginBottom: 6 }}>
+            {prog && prog.total > 0
+              ? `Backtest ${Math.min(prog.done + 1, prog.total)} of ${prog.total}${prog.current ? ` · ${prog.current}` : ''} · ${fmtSecs(job.elapsed_s)} elapsed`
+              : 'Starting…'}
+            {' '}— you can leave this tab, the run continues on the server.
+          </p>
+          {prog && prog.total > 0 && (
+            <div style={{ height: 4, background: 'var(--border-soft)', borderRadius: 2 }}>
+              <div style={{ height: 4, width: `${Math.round((prog.done / prog.total) * 100)}%`, background: 'var(--accent)', borderRadius: 2, transition: 'width .4s' }} />
+            </div>
+          )}
+        </div>
+      )}
+      {result && !running && (
         <>
-          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>
+            {job.scope.tickers.join(', ')} · {job.scope.tfs.join(', ')} · {job.scope.num_bars} bars · finished in {fmtSecs(job.elapsed_s)}
+          </p>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={requestedBars} />
           {Object.entries(result.variants).map(([name, rows]) => (
             <div key={name} style={{ marginBottom: 12 }}>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>

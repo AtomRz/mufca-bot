@@ -1171,13 +1171,7 @@ class PullSimIn(BaseModel):
     num_bars: int = 3000
 
 
-@app.post("/api/pullsim")
-async def run_pullsim(body: PullSimIn):
-    """Compares entering at the signal price against the pullback (limit)
-    entry at several depths on real historical OHLCV — same computation as the
-    Discord !pullsim command, both call signals.run_pullback_comparison().
-    Never writes to signals_history.json or touches the live settings. Slow
-    (pairs × timeframes × 4 backtests) — show it as a long-running action."""
+def _pullsim_scope(body: "PullSimIn"):
     ticker = body.ticker.upper().strip() if body.ticker else None
     scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
     scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
@@ -1187,13 +1181,116 @@ async def run_pullsim(body: PullSimIn):
     for f in scope_tfs:
         if f not in _cfg.TIMEFRAMES:
             raise HTTPException(404, f"{f} is not a tracked timeframe")
-
-    exchange = core._exchange_ref
-    if exchange is None:
+    if core._exchange_ref is None:
         raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+    return scope_tickers, scope_tfs
 
+
+@app.post("/api/pullsim")
+async def run_pullsim(body: PullSimIn):
+    """Blocking variant: compares entering at the signal price against the
+    pullback (limit) entry and returns the whole result in one response —
+    same computation as the Discord !pullsim command (both call
+    signals.run_pullback_comparison()). Never writes to signals_history.json
+    or touches the live settings.
+
+    ⚠️ A run over several pairs takes minutes, and behind Cloudflare Tunnel
+    a request that stays open longer than ~100 s is cut off (error 524) —
+    the result is then lost even though the server finished. The dashboard
+    therefore uses POST /api/pullsim/start + GET /api/pullsim/status below;
+    this endpoint is kept for direct/scripted callers on a short scope."""
+    scope_tickers, scope_tfs = _pullsim_scope(body)
     from signals import run_pullback_comparison
-    return await run_pullback_comparison(exchange, scope_tickers, scope_tfs, body.num_bars)
+    return await run_pullback_comparison(core._exchange_ref, scope_tickers, scope_tfs, body.num_bars)
+
+
+# 🆕 Background pullsim jobs. A run over all pairs outlives a single HTTP
+# request (see above), so it runs as an asyncio task and the dashboard polls
+# its status. Jobs live in memory only: a container restart drops them (the
+# status endpoint then answers 404 and the UI offers to run again). One run
+# at a time — it is CPU-heavy, and a second click should attach to the
+# running job instead of doubling the load.
+_PULLSIM_JOBS: dict = {}
+_PULLSIM_JOBS_KEEP = 5
+
+
+def _pullsim_running_job():
+    for jid, job in _PULLSIM_JOBS.items():
+        if job["status"] == "running":
+            return jid
+    return None
+
+
+async def _pullsim_worker(job_id: str, scope_tickers: list, scope_tfs: list, num_bars: int):
+    job = _PULLSIM_JOBS[job_id]
+    try:
+        from signals import run_pullback_comparison
+        job["result"] = await run_pullback_comparison(
+            core._exchange_ref, scope_tickers, scope_tfs, num_bars, progress=job["progress"],
+        )
+        job["status"] = "done"
+    except Exception as e:
+        logger.error(f"pullsim job {job_id} failed: {e}", exc_info=True)
+        job["error"] = str(e) or e.__class__.__name__
+        job["status"] = "error"
+    finally:
+        job["finished_at"] = time.time()
+
+
+@app.post("/api/pullsim/start")
+async def start_pullsim(body: PullSimIn):
+    """Starts the pullback comparison as a background job and returns right
+    away: {job_id, already_running}. Poll GET /api/pullsim/status?job_id=…
+    for progress and, once status is 'done', the result (same shape as
+    POST /api/pullsim). If a run is already in progress, returns that run's
+    job_id instead of starting a second one."""
+    scope_tickers, scope_tfs = _pullsim_scope(body)
+
+    running = _pullsim_running_job()
+    if running:
+        return {"job_id": running, "already_running": True}
+
+    job_id = secrets.token_hex(8)
+    _PULLSIM_JOBS[job_id] = {
+        "status": "running",
+        "started_at": time.time(),
+        "finished_at": None,
+        "scope": {"tickers": scope_tickers, "tfs": scope_tfs, "num_bars": body.num_bars},
+        "progress": {"total": 0, "done": 0, "current": ""},
+        "result": None,
+        "error": None,
+    }
+    # drop the oldest finished jobs so results don't pile up in memory
+    finished = sorted((j for j in _PULLSIM_JOBS.items() if j[1]["status"] != "running"),
+                      key=lambda kv: kv[1]["started_at"])
+    for jid, _ in finished[:max(0, len(finished) - _PULLSIM_JOBS_KEEP)]:
+        _PULLSIM_JOBS.pop(jid, None)
+
+    asyncio.create_task(_pullsim_worker(job_id, scope_tickers, scope_tfs, body.num_bars))
+    return {"job_id": job_id, "already_running": False}
+
+
+@app.get("/api/pullsim/status")
+async def pullsim_status(job_id: str):
+    """Status of a background pullsim job: {status: running|done|error,
+    progress: {total, done, current}, elapsed_s, scope, result (when done),
+    error (when failed)}. 404 if the job is unknown — e.g. the container
+    restarted since it was started."""
+    job = _PULLSIM_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown job (the bot may have restarted) — run it again")
+    end = job["finished_at"] or time.time()
+    out = {
+        "status": job["status"],
+        "progress": job["progress"],
+        "elapsed_s": round(end - job["started_at"], 1),
+        "scope": job["scope"],
+    }
+    if job["status"] == "done":
+        out["result"] = job["result"]
+    if job["status"] == "error":
+        out["error"] = job["error"]
+    return out
 
 
 class UthaIn(BaseModel):

@@ -108,8 +108,12 @@ export const api = {
   setPullbackConfig: (patch) =>
     request('/api/config/pullback', { method: 'POST', body: JSON.stringify(patch) }),
   getPullbackStats: () => request('/api/pullback'),
-  runPullSim: ({ ticker, tf, numBars = 3000 } = {}) =>
-    request('/api/pullsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
+  // Runs as a background job on the server: one request that stays open for
+  // minutes is cut off by Cloudflare Tunnel at ~100 s, so start it and poll.
+  startPullSim: ({ ticker, tf, numBars = 3000 } = {}) =>
+    request('/api/pullsim/start', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
+  getPullSimStatus: (jobId) =>
+    request(`/api/pullsim/status?job_id=${encodeURIComponent(jobId)}`),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>
