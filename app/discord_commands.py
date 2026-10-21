@@ -1641,7 +1641,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
             # via st, which irrecoverably destroyed active positions and the whole
             # trade history. Now only the needed fields of the existing state are updated.
             if ticker not in core.state or tf not in core.state.get(ticker, {}):
-                state.setdefault(ticker, {})[tf] = make_state()
+                core.state.setdefault(ticker, {})[tf] = make_state()
 
             st = core.state[ticker][tf]
             track_key = "a_active_trade"  # forcerun always operates on the A-track
