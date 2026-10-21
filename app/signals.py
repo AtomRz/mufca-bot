@@ -1230,24 +1230,42 @@ async def check_signals(
         for track in _cfg.TRACKS:
             trade = state.get(f"{track}_active_trade")
             if trade:
-                update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
-                                       high=last_high, low=last_low)
                 # 🆕 (pullback entry) a limit-entry trade only exists from its fill bar
                 # on (bar_opened_time = that bar's open): a bar that CLOSED before it
                 # says nothing about this position, and the fill bar itself must not
                 # count as a bar held (backtest counts bars_held from the bar AFTER the
-                # fill). Market-entry trades are unaffected.
+                # fill).
                 _is_limit = trade.get("entry_mode") == "limit"
                 _opened = int(trade.get("bar_opened_time") or 0)
                 _pre_fill_bar = _is_limit and current_bar_time < _opened
                 _fill_bar = _is_limit and current_bar_time <= _opened
-                hit = None if _pre_fill_bar else check_tp_sl_hit(
+                # 🆕 FIX: a MARKET entry is opened at the CLOSE of the signal bar
+                # (bar_opened_time = that bar's open), but until the next bar
+                # closes, that same signal bar is still "the last closed bar" on
+                # every scan. Its high/low printed BEFORE the entry, so they must
+                # not be tested against TP/SL (a long upper wick would close the
+                # trade as a phantom "tp") nor fed into MAE/MFE (backtest starts
+                # measuring from the bar AFTER the signal bar). Mirrors the
+                # limit-entry handling above.
+                _entry_bar_market = (not _is_limit) and _opened > 0 and current_bar_time <= _opened
+                if not (_pre_fill_bar or _entry_bar_market):
+                    update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
+                                           high=last_high, low=last_low)
+                hit = None if (_pre_fill_bar or _entry_bar_market) else check_tp_sl_hit(
                     state, last_high, last_low, track, bar_time=current_bar_time,
                     ticker=ticker, tf=timeframe)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
                     close_trade(state, exit_price, hit, ticker, timeframe, track, close_time_ms=current_bar_time)
-                elif is_new_bar and not _fill_bar:
+                elif (not _fill_bar and not _entry_bar_market
+                      and trade.get("last_counted_bar") != current_bar_time):
+                    # 🆕 FIX: bars held used to be counted via `is_new_bar`, which only
+                    # flips after the whole function succeeds (last_processed_bar_time
+                    # is committed at the bottom). If anything raised after this loop,
+                    # every retry (~20s) counted the SAME bar again and the MAX_HOLD
+                    # time-stop fired after ~20 scans instead of 20 bars. Counting per
+                    # bar timestamp on the trade itself is idempotent.
+                    trade["last_counted_bar"] = current_bar_time
                     bars_key = f"{track}_bars_in_trade"
                     state[bars_key] = state.get(bars_key, 0) + 1
                     if state[bars_key] >= MAX_HOLD_BARS:
@@ -1259,18 +1277,34 @@ async def check_signals(
                 # keep its MAE/MFE current. Fill / expiry itself is resolved from
                 # 1m candles in bot.py (_pending_check), not here.
                 pend = state[f"{track}_pending"]
-                update_signal_mae_mfe(ticker, timeframe, pend["side"], last_close, track=track,
-                                       high=last_high, low=last_low)
-            else:
+                # 🆕 FIX: the signal bar itself printed before the order existed
+                # (backtest's waiting-window MAE/MFE starts at the next bar).
+                if current_bar_time > int(pend.get("signal_bar_time") or 0):
+                    update_signal_mae_mfe(ticker, timeframe, pend["side"], last_close, track=track,
+                                           high=last_high, low=last_low)
+            elif not dry_run:
+                # 🆕 FIX: `!scan` (dry_run=True, fresh temp_state, so is_new_bar is
+                # always True) used to reach this branch and write to the REAL
+                # signals_history.json, burning one bar of every record's
+                # raw_tracking_bars_remaining per !scan. Dry runs must not touch
+                # persisted history.
                 # 🆕 (external review, TP-obstacle stage): no active trade on
                 # this track right now doesn't mean nothing needs updating —
                 # a just-closed record may still be inside its raw-outcome
                 # observation window (see update_raw_outcome()). Checked for
                 # both sides since we don't know here which side the most
                 # recently closed trade was on.
+                # 🆕 FIX: same idempotency problem as bars_in_trade above — spend a
+                # bar of the observation window at most once per bar timestamp,
+                # even if check_signals is retried before last_processed_bar_time
+                # gets committed.
+                _raw_key = f"{track}_raw_dec_bar"
+                _raw_new_bar = is_new_bar and state.get(_raw_key) != current_bar_time
                 for closed_side in ("long", "short"):
                     update_raw_outcome(ticker, timeframe, closed_side, last_close, track=track,
-                                        high=last_high, low=last_low, is_new_bar=is_new_bar)
+                                        high=last_high, low=last_low, is_new_bar=_raw_new_bar)
+                if _raw_new_bar:
+                    state[_raw_key] = current_bar_time
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -2149,8 +2183,12 @@ def backtest_history(
 
             sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
             sig_a_short = confirm_short_a and filter_short and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
-            sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
-            sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
+            # 🆕 FIX: live applies the MTF-bias gate to U-track too (it sits
+            # inside filter_long/filter_short in check_signals); the backtest
+            # only applied it to A and B, so U's calibration history contained
+            # signals live would have blocked.
+            sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
+            sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
             # 🆕 Track "b" — HTF applied here (not inside filter_long_b/short_b,
             # which are defined before htf_bull_bt/htf_bear_bt exist), same
             # place A-track's HTF check happens.
@@ -2613,10 +2651,23 @@ async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], t
 
     for t in tickers:
         for f in tfs:
+            # 🆕 FIX: fetch each ticker/tf ONCE and reuse the df across all
+            # fractions, as the docstring always claimed (it used to re-fetch,
+            # paginated, once per fraction).
+            try:
+                _bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
+            except Exception as e:
+                logger.error(f"run_tp1_mode_comparison: fetch error for {t} {f}: {e}")
+                continue
+            if not _bars or len(_bars) < 100:
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(_bars or [])})
+                continue
+            df_shared = parse_ohlcv(_bars)
+
             for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
                 try:
                     count, history, bars_fetched = await asyncio.to_thread(
-                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True
+                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True, df_shared
                     )
                 except Exception as e:
                     logger.error(f"run_tp1_mode_comparison: backtest error for {t} {f} {mode_name}: {e}")
