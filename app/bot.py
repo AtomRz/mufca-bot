@@ -356,6 +356,26 @@ async def _apply_tp1(exchange, channel, st, trade, track, ticker, tf,
     return new_sl
 
 
+def _cooldown_anchor_ms(exchange, trade, tf, ts_ms=None):
+    """Open time of the timeframe bar containing ts_ms (default: now).
+
+    🆕 FIX: closes detected from the live ticker / 1m candles used to call
+    close_trade() without close_time_ms, so the cooldown was armed at the
+    WALL-CLOCK moment of the touch — but cooldown_ok() in check_signals compares
+    it against a bar OPEN time, making live cooldowns up to a full bar longer
+    than backtest's (exit bar + COOLDOWN_BARS). Anchoring to the open of the bar
+    the exit happened in matches the closed-bar path and the backtest."""
+    ts = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    try:
+        tf_ms = int(exchange.parse_timeframe(tf) * 1000)
+    except Exception:
+        tf_ms = 3600_000
+    opened = (trade or {}).get("bar_opened_time")
+    if opened is not None and ts >= int(opened):
+        return int(opened) + ((ts - int(opened)) // tf_ms) * tf_ms
+    return ts - (ts % tf_ms)
+
+
 _INTRABAR_TF = "1m"
 _INTRABAR_LIMIT = 1000  # 1m candles per fetch (~16h); a longer backlog is drained over several cycles
 
@@ -504,7 +524,8 @@ async def _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf)
         else:
             _, ts, price, result = ev
             async with lock:
-                close_trade(st, price, result, ticker, tf, track)
+                close_trade(st, price, result, ticker, tf, track,
+                            close_time_ms=_cooldown_anchor_ms(exchange, trade, tf, ts))
             logger.info(f"[INTRABAR] {ticker} {tf} {track.upper()}-track | 1m candle {result.upper()} @ {price}")
             return
 
@@ -738,12 +759,27 @@ async def market_scanner():
                         save_bot_state(state)
                     except Exception as snap_err:
                         logger.warning(f"[STATE] immediate snapshot save failed: {snap_err}")
-                if is_new_bar and signals:
+                # 🆕 FIX: this used to be `if is_new_bar and signals:`. check_signals
+                # only returns a signal when a position/limit order was ACTUALLY
+                # opened, and that can happen on a later scan of the same bar (e.g.
+                # a transient HTF-bias fetch failure blocked the first scan, an
+                # A-track retry opened it on the second) — is_new_bar is already
+                # False by then, so the position opened with no Discord / web /
+                # push notification at all. Non-empty `signals` is the only
+                # condition that matters.
+                if signals:
                     # 🆕 Fetch df for volume info
                     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=100)
                     df = parse_ohlcv(bars) if bars else None
                     for sig_type, price, reg, leverage, bt, conf, sl, tp, tp1, risk, stats, tp_desc in signals:
-                        embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
+                        # 🆕 FIX: build_embed used to sit outside any try — if it
+                        # raised, the whole ticker/tf cycle aborted and, with the
+                        # old is_new_bar gate, the notification was lost for good.
+                        try:
+                            embed = build_embed(ticker, tf, sig_type, price, reg, leverage, conf, sl, tp, tp1, risk, stats, tp_desc, df)
+                        except Exception as embed_err:
+                            logger.error(f"[EMBED] build_embed failed for {ticker} {tf}: {embed_err}", exc_info=True)
+                            embed = None
 
                         # 🆕 FIX BUG-LO007: the Discord send, the WS broadcast,
                         # and push used to be in ONE try block — if
@@ -762,7 +798,7 @@ async def market_scanner():
                         chart_file = None
                         # 🆕 Skip the (expensive, matplotlib) chart render entirely when
                         # nothing will use it — only the Discord embed attaches it.
-                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None and embed is not None:
                             try:
                                 from chart import generate_chart
                                 is_long = "BUY" in sig_type or "LONG" in sig_type
@@ -797,7 +833,7 @@ async def market_scanner():
 
                         # 🆕 discord_notifications toggle (Settings → web) — gateway stays
                         # connected either way, this only skips the channel message itself.
-                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+                        if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None and embed is not None:
                             try:
                                 if chart_file:
                                     await channel.send(embed=embed, file=chart_file)
@@ -831,7 +867,8 @@ async def market_scanner():
                             await asyncio.to_thread(
                                 _push.send_push,
                                 title=f"{sig_type} {ticker} {tf}",
-                                body=f"Entry: {price:.4f} | TP: {tp:.4f} | SL: {sl:.4f}",
+                                # 🆕 FIX: :.4f printed 0.0000 for low-priced pairs
+                                body=f"Entry: {format_price(price)} | TP: {format_price(tp)} | SL: {format_price(sl)}",
                                 data={"type": "signal", "ticker": ticker, "tf": tf},
                             )
                         except Exception as push_err:
@@ -976,12 +1013,14 @@ async def market_scanner():
                             if tp_breached:
                                 from signals import close_trade
                                 async with lock:
-                                    close_trade(st, tp, "tp", ticker, tf, track)
+                                    close_trade(st, tp, "tp", ticker, tf, track,
+                                                close_time_ms=_cooldown_anchor_ms(exchange, trade, tf))
                                 logger.info(f"[TP1-TP2] {ticker} {tf} {track.upper()}-track | live TP2 hit @ {live_price} (tp={tp})")
                             elif sl_breached:
                                 from signals import close_trade
                                 async with lock:
-                                    close_trade(st, sl, "sl", ticker, tf, track)
+                                    close_trade(st, sl, "sl", ticker, tf, track,
+                                                close_time_ms=_cooldown_anchor_ms(exchange, trade, tf))
                                 logger.info(f"[TP1-SL] {ticker} {tf} {track.upper()}-track | post-TP1 SL hit @ live={live_price} (sl={sl})")
                         continue
 
@@ -1018,7 +1057,8 @@ async def market_scanner():
                     elif sl_breached:
                         from signals import close_trade
                         async with lock:
-                            close_trade(st, sl, "sl", ticker, tf, track)
+                            close_trade(st, sl, "sl", ticker, tf, track,
+                                        close_time_ms=_cooldown_anchor_ms(exchange, trade, tf))
                         logger.info(f"[LIVE-SL] {ticker} {tf} {track.upper()}-track | pre-TP1 SL hit @ live={current_price} (sl={sl})")
 
                 await asyncio.sleep(0.5)
@@ -1100,10 +1140,35 @@ async def on_scanner_error(error):
         return
 
     wait = min(10 * (2 ** (_scanner_crash_count - 1)), 300)
+    # 🆕 FIX: this handler runs INSIDE the loop's own task (discord.py awaits
+    # the error callback and then re-raises), so market_scanner.is_running()
+    # is still True here — the old `if not is_running(): restart()` could never
+    # fire and the scanner stayed dead after the first escaped exception. The
+    # restart is now scheduled as a separate task that waits for the crashed
+    # task to finish first.
+    global _scanner_restart_task
+    _scanner_restart_task = asyncio.create_task(_restart_scanner_later(wait))
+
+
+_scanner_restart_task: Optional[asyncio.Task] = None
+
+
+async def _restart_scanner_later(wait: float):
+    """Backoff, then start the scanner loop again once the crashed task is done."""
     await asyncio.sleep(wait)
-    if not market_scanner.is_running():
+    # the failed task finishes right after the error callback returns; give it
+    # a moment instead of racing it
+    for _ in range(50):
+        if not market_scanner.is_running():
+            break
+        await asyncio.sleep(0.1)
+    if market_scanner.is_running():
+        return  # something else already restarted it (or it never died)
+    try:
         logger.info(f"[RECOVERY] Restarting scanner loop (after {wait}s backoff)...")
-        market_scanner.restart()
+        market_scanner.start()
+    except Exception as e:
+        logger.error(f"[RECOVERY] Failed to restart scanner loop: {e}", exc_info=True)
 
 # =====================================================================
 # 🤖  DISCORD COMMANDS
@@ -1118,10 +1183,16 @@ async def on_ready():
     if _startup_completed:
         logger.info("🔄 Reconnect detected — skipping startup sequence.")
         return
-    _startup_completed = True
 
     logger.info(f"✅ {bot.user.name} started! Mode: {MARKET_MODE.upper()} | HTF: {_cfg.HTF_BIAS.upper()} | Pairs: {' | '.join(TICKERS)}")
     await ensure_engine_started()
+    # 🆕 FIX: used to be set BEFORE ensure_engine_started(). If creating the
+    # exchange client failed there (it returns without raising and leaves
+    # _engine_started False so a later call can retry), the next on_ready was
+    # skipped as a "reconnect" and the retry never happened. ensure_engine_started
+    # is idempotent, so a repeated on_ready before this point is harmless.
+    if _engine_started:
+        _startup_completed = True
 
 # 🆕 FIX: Global command error handler
 @bot.event
