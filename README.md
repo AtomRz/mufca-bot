@@ -163,6 +163,8 @@ docker compose up -d
 
 The web dashboard is served on **`http://<host>:8585`** by the same container (built into the image from `web/` — no separate frontend container needed).
 
+> **Hardening (optional env vars, see `.env.example`):** `WEB_TRUST_PROXY_HEADERS=1` makes the login lockout use `CF-Connecting-IP`/`X-Forwarded-For` — set it only when all traffic goes through a reverse proxy or Cloudflare Tunnel and port 8585 is not reachable directly (otherwise those headers are forgeable). `WEB_ENABLE_DOCS=1` re-enables `/docs` and `/openapi.json`, which are off by default.
+
 ### 3. Run locally
 
 ```bash

@@ -80,7 +80,7 @@ export default function HistoryPanel({ lastEvent }) {
     }
     setDeletingIdx(rec.idx)
     try {
-      await api.deleteHistoryRecord(selected.ticker, selected.tf, selected.side, rec.idx, selected.track)
+      await api.deleteHistoryRecord(selected.ticker, selected.tf, selected.side, rec.idx, selected.track, rec.timestamp, rec.entry)
       loadRecords() // row counts/PnL aggregates changed — refresh both tables
       load()
     } catch (e) {

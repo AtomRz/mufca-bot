@@ -471,7 +471,9 @@ def close_unfilled_record(ticker: str, tf: str, side: str, track: str, reason: s
     return True
 
 
-def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Optional[str] = None) -> bool:
+def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Optional[str] = None,
+                         expected_timestamp: Optional[str] = None,
+                         expected_entry: Optional[float] = None) -> bool:
     """Deletes a single record from signals_history.json by its index in the
     raw (unfiltered, chronological) list for ticker/tf/side.
 
@@ -493,11 +495,22 @@ def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Opt
     if ticker not in history or tf not in history[ticker]:
         return False
 
-    records = history[ticker][tf][side]
-    if index < 0 or index >= len(records):
+    records = history[ticker][tf].get(side)
+    if records is None or index < 0 or index >= len(records):
         return False
-    if track is not None and records[index].get("track", "a") != track:
+    rec = records[index]
+    if track is not None and rec.get("track", "a") != track:
         return False
+    # 🆕 fingerprint guard (see web_api.delete_history_record): when the caller
+    # says which timestamp/entry it meant, the record at `index` must match.
+    if expected_timestamp is not None and str(rec.get("timestamp")) != str(expected_timestamp):
+        return False
+    if expected_entry is not None:
+        try:
+            if abs(float(rec.get("entry")) - float(expected_entry)) > 1e-9 * max(1.0, abs(float(expected_entry))):
+                return False
+        except (TypeError, ValueError):
+            return False
 
     removed = records.pop(index)
     save_signals_history(history)
