@@ -1,5 +1,7 @@
 import os
 import json
+import copy
+import math
 import threading
 import logging
 from typing import List, Optional
@@ -31,7 +33,8 @@ CHANNEL_NAME = os.getenv("CHANNEL_NAME", "general")
 # signals_history.json.
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/app/data/firebase-credentials.json")
 
-DATA_DIR = "/app/data"
+# 🆕 DATA_DIR can be overridden (local runs/tests); the Docker default is unchanged.
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =====================================================================
@@ -67,9 +70,12 @@ def safe_json_load(filename: str, default: dict = None) -> dict:
     with lock:
         try:
             with open(filename, "r") as f:
-                return json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
-            return default  # normal scenario — first run, no file yet
+            # normal scenario — first run, no file yet. deepcopy: callers pass
+            # module-level defaults (and mutate what they get back — e.g. TICKERS
+            # used to BE the DEFAULT_TICKERS list object), which must stay pristine.
+            return copy.deepcopy(default)
         except Exception as e:
             # 🆕 FIX: previously ANY error (corrupted JSON, no read permission,
             # disk unavailable) was silently swallowed and returned default —
@@ -78,7 +84,56 @@ def safe_json_load(filename: str, default: dict = None) -> dict:
             # worth knowing about, not something to silently continue past
             # with an empty config.
             logger.error(f"[CONFIG] Failed to load {filename}, using default: {e}")
-            return default
+            return copy.deepcopy(default)
+    # 🆕 FIX: valid JSON of the wrong shape (a list, null, a number — e.g. a
+    # hand-edited file) used to be returned as-is, and every loader that then
+    # did data.get(...) or {**defaults, **data} crashed at IMPORT time, so the
+    # whole bot failed to start. A dict-shaped default means a dict is expected.
+    if isinstance(default, dict) and not isinstance(data, dict):
+        logger.error(f"[CONFIG] {filename} holds {type(data).__name__}, expected an object — using default")
+        return copy.deepcopy(default)
+    return data
+
+
+def _coerce_like(key: str, value, default, source: str):
+    """Coerces one hand-editable config value to the type of its default, or
+    returns the default (and logs) when it can't — so a single bad key doesn't
+    take the whole file, or the bot, down."""
+    try:
+        if isinstance(default, bool):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+                return value.strip().lower() == "true"
+            raise ValueError("not a boolean")
+        if isinstance(default, int):
+            if isinstance(value, bool):
+                raise ValueError("bool is not a number")
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, int):
+                return value
+            raise ValueError("not an integer")
+        if isinstance(default, float):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("not a finite number")
+            return float(value)
+        if isinstance(default, str):
+            if isinstance(value, str):
+                return value
+            raise ValueError("not a string")
+        return value
+    except ValueError as e:
+        logger.error(f"[CONFIG] {source}[{key!r}]={value!r} invalid ({e}) — using default {default!r}")
+        return default
+
+
+def _load_typed(filename: str, defaults: dict) -> dict:
+    """Loads a flat settings file: every key comes from `defaults`, overridden
+    by the file's value only if it has the right type."""
+    data = safe_json_load(filename, defaults)
+    return {k: (_coerce_like(k, data[k], d, os.path.basename(filename)) if k in data else d)
+            for k, d in defaults.items()}
 
 def safe_json_save(filename: str, data: dict):
     lock = get_file_lock(filename)
@@ -124,8 +179,7 @@ ONCHAIN_CACHE_TTL = load_onchain_interval()   # seconds — balance refresh inte
 DERIVATIVES_FILE = os.path.join(DATA_DIR, "derivatives.json")
 
 def load_derivatives_enabled() -> bool:
-    data = safe_json_load(DERIVATIVES_FILE, {"enabled": True})
-    return bool(data.get("enabled", True))
+    return _load_typed(DERIVATIVES_FILE, {"enabled": True})["enabled"]
 
 def save_derivatives_enabled(enabled: bool):
     safe_json_save(DERIVATIVES_FILE, {"enabled": bool(enabled)})
@@ -169,8 +223,23 @@ DEFAULT_TICKERS = ["BTC/USDT", "ETH/USDT"]
 PAIRS_FILE = os.path.join(DATA_DIR, "pairs.json")
 
 def load_tickers() -> List[str]:
-    data = safe_json_load(PAIRS_FILE, {"tickers": DEFAULT_TICKERS})
-    return data.get("tickers", DEFAULT_TICKERS)
+    """🆕 FIX: validate the stored list — non-strings/blank entries are dropped,
+    names normalised to upper case, duplicates removed, and an unusable or
+    empty result falls back to the defaults instead of leaving the bot with
+    nothing (or a non-list) to scan."""
+    data = safe_json_load(PAIRS_FILE, {"tickers": list(DEFAULT_TICKERS)})
+    raw = data.get("tickers")
+    out: List[str] = []
+    if isinstance(raw, list):
+        for t in raw:
+            if isinstance(t, str) and t.strip():
+                t = t.strip().upper()
+                if t not in out:
+                    out.append(t)
+    if not out:
+        logger.error(f"[CONFIG] pairs.json has no usable tickers ({raw!r}) — using defaults {DEFAULT_TICKERS}")
+        return list(DEFAULT_TICKERS)
+    return out
 
 def save_tickers(tickers: List[str]):
     safe_json_save(PAIRS_FILE, {"tickers": tickers})
@@ -205,9 +274,9 @@ DEFAULT_FILTER_TOGGLES = {
 }
 
 def load_filter_toggles() -> dict:
-    data = safe_json_load(FILTERS_FILE, DEFAULT_FILTER_TOGGLES)
-    # in case the file is missing some keys (e.g. after a new filter was added)
-    return {**DEFAULT_FILTER_TOGGLES, **data}
+    # missing keys (a filter added after the file was written) and wrongly
+    # typed values (e.g. "false" as a string — truthy!) fall back to defaults
+    return _load_typed(FILTERS_FILE, DEFAULT_FILTER_TOGGLES)
 
 def save_filter_toggles(toggles: dict):
     safe_json_save(FILTERS_FILE, toggles)
@@ -265,6 +334,13 @@ def load_hurst_window() -> dict:
             result[tf] = int(v)
         except (TypeError, ValueError):
             logger.error(f"[CONFIG] hurst_window.json[{tf!r}]={v!r} is not a valid int — using default {fallback}")
+            result[tf] = fallback
+            continue
+        # 🆕 same bounds the web endpoint enforces (18..300): below 18 the
+        # R/S estimator has a single chunk size and returns a constant 0.5 on
+        # every bar, which silently blocks every signal once the filter is on.
+        if not (18 <= result[tf] <= 300):
+            logger.error(f"[CONFIG] hurst_window.json[{tf!r}]={v!r} outside 18..300 — using default {fallback}")
             result[tf] = fallback
     return result
 
@@ -427,9 +503,8 @@ _BREAKOUT_DEFAULTS = {
 }
 
 def load_breakout_config() -> dict:
-    data = safe_json_load(BREAKOUT_FILE, _BREAKOUT_DEFAULTS)
-    # in case the file is from before this was persisted — fill in any missing keys with defaults
-    return {**_BREAKOUT_DEFAULTS, **data}
+    # missing keys / wrongly typed values fall back to defaults per key
+    return _load_typed(BREAKOUT_FILE, _BREAKOUT_DEFAULTS)
 
 def save_breakout_config(data: dict):
     safe_json_save(BREAKOUT_FILE, data)
@@ -502,10 +577,8 @@ _INDICATOR_DEFAULTS = {
 }
 
 def load_indicators() -> dict:
-    data = safe_json_load(INDICATOR_FILE, _INDICATOR_DEFAULTS)
-    # in case the file is from an older version — fill in any missing keys with defaults
-    merged = {**_INDICATOR_DEFAULTS, **data}
-    return merged
+    # missing keys / wrongly typed values fall back to defaults per key
+    return _load_typed(INDICATOR_FILE, _INDICATOR_DEFAULTS)
 
 def save_indicators(data: dict):
     safe_json_save(INDICATOR_FILE, data)
@@ -564,9 +637,7 @@ _ZONE_DEFAULTS = {
 }
 
 def load_zone_config() -> dict:
-    data = safe_json_load(ZONE_FILE, _ZONE_DEFAULTS)
-    # fill in any keys missing from an older config file with defaults
-    return {**_ZONE_DEFAULTS, **data}
+    return _load_typed(ZONE_FILE, _ZONE_DEFAULTS)
 
 def save_zone_config(data: dict):
     safe_json_save(ZONE_FILE, data)
@@ -597,9 +668,7 @@ _VP_DEFAULTS = {
 }
 
 def load_vp_config() -> dict:
-    data = safe_json_load(VP_FILE, _VP_DEFAULTS)
-    # fill in any keys missing from an older config file with defaults
-    return {**_VP_DEFAULTS, **data}
+    return _load_typed(VP_FILE, _VP_DEFAULTS)
 
 def save_vp_config(data: dict):
     safe_json_save(VP_FILE, data)
@@ -773,8 +842,7 @@ def tp1_sl_label(mode: str) -> str:
 INTRABAR_CHECK_FILE = os.path.join(DATA_DIR, "intrabar_check.json")
 
 def load_intrabar_check() -> bool:
-    data = safe_json_load(INTRABAR_CHECK_FILE, {"enabled": True})
-    return bool(data.get("enabled", True))
+    return _load_typed(INTRABAR_CHECK_FILE, {"enabled": True})["enabled"]
 
 def save_intrabar_check(enabled: bool):
     safe_json_save(INTRABAR_CHECK_FILE, {"enabled": bool(enabled)})
@@ -950,8 +1018,7 @@ PULLBACK_TRACKS = dict(_pullback["tracks"])
 DISCORD_NOTIFICATIONS_FILE = os.path.join(DATA_DIR, "discord_notifications.json")
 
 def load_discord_notifications_enabled() -> bool:
-    data = safe_json_load(DISCORD_NOTIFICATIONS_FILE, {"enabled": True})
-    return bool(data.get("enabled", True))
+    return _load_typed(DISCORD_NOTIFICATIONS_FILE, {"enabled": True})["enabled"]
 
 def save_discord_notifications_enabled(enabled: bool):
     safe_json_save(DISCORD_NOTIFICATIONS_FILE, {"enabled": bool(enabled)})
@@ -1024,7 +1091,15 @@ _COLOR_DEFAULTS = {
 
 def load_colors() -> dict:
     data = safe_json_load(COLORS_FILE, _COLOR_DEFAULTS)
-    return {**_COLOR_DEFAULTS, **data}
+    out = dict(_COLOR_DEFAULTS)
+    for k, v in data.items():
+        # known keys only, and only #RRGGBB (what the web endpoint accepts)
+        if k in _COLOR_DEFAULTS and isinstance(v, str) and len(v) == 7 and v[0] == "#" \
+                and all(c in "0123456789abcdefABCDEF" for c in v[1:]):
+            out[k] = v
+        elif k in _COLOR_DEFAULTS:
+            logger.error(f"[CONFIG] chart_colors.json[{k!r}]={v!r} is not #RRGGBB — using default")
+    return out
 
 def save_colors(data: dict):
     safe_json_save(COLORS_FILE, data)
@@ -1084,22 +1159,40 @@ TP_ADJUST_MAX_PCT = 0.85       # Maximum percentile after adjustment
 TP_CONFIG_FILE = os.path.join(DATA_DIR, "tp_config.json")
 
 def load_tp_config():
-    """Loads the TP config from file."""
+    """Loads the TP config from file.
+
+    🆕 FIX: values are validated (type + range) per key — a hand-edited
+    tp_percentile of 75 instead of 0.75, or a string, used to be loaded
+    verbatim and then blow up (or silently produce nonsense TPs) inside the
+    percentile maths on the first signal."""
     global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
     global TP_HIT_RATE_TARGET, TP_AUTO_ADJUST, TP_CAPTURE_RATE
     global TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT
     data = safe_json_load(TP_CONFIG_FILE, {})
     if not data:
         return
-    TP_PERCENTILE        = data.get("tp_percentile",        TP_PERCENTILE)
-    SAFE_TP_PERCENTILE   = data.get("safe_tp_percentile",   SAFE_TP_PERCENTILE)
-    USE_SAFE_TP          = data.get("use_safe_tp",          USE_SAFE_TP)
-    SIGNAL_HISTORY_LIMIT = data.get("signal_history_limit", SIGNAL_HISTORY_LIMIT)
-    TP_HIT_RATE_TARGET   = data.get("tp_hit_rate_target",   TP_HIT_RATE_TARGET)
-    TP_AUTO_ADJUST       = data.get("tp_auto_adjust",       TP_AUTO_ADJUST)
-    TP_CAPTURE_RATE      = data.get("tp_capture_rate",      TP_CAPTURE_RATE)
-    TP_ADJUST_MIN_PCT    = data.get("tp_adjust_min_pct",    TP_ADJUST_MIN_PCT)
-    TP_ADJUST_MAX_PCT    = data.get("tp_adjust_max_pct",    TP_ADJUST_MAX_PCT)
+
+    def pick(key, default, lo=None, hi=None):
+        if key not in data:
+            return default
+        v = _coerce_like(key, data[key], default, "tp_config.json")
+        if v is not default and lo is not None and not (lo <= v <= hi):
+            logger.error(f"[CONFIG] tp_config.json[{key!r}]={v!r} outside {lo}..{hi} — using default {default!r}")
+            return default
+        return v
+
+    TP_PERCENTILE        = pick("tp_percentile",        TP_PERCENTILE,        0.10, 0.99)
+    SAFE_TP_PERCENTILE   = pick("safe_tp_percentile",   SAFE_TP_PERCENTILE,   0.10, 0.99)
+    USE_SAFE_TP          = pick("use_safe_tp",          USE_SAFE_TP)
+    SIGNAL_HISTORY_LIMIT = pick("signal_history_limit", SIGNAL_HISTORY_LIMIT, 5, 200)
+    TP_HIT_RATE_TARGET   = pick("tp_hit_rate_target",   TP_HIT_RATE_TARGET,   0.01, 0.99)
+    TP_AUTO_ADJUST       = pick("tp_auto_adjust",       TP_AUTO_ADJUST)
+    TP_CAPTURE_RATE      = pick("tp_capture_rate",      TP_CAPTURE_RATE,      0.10, 1.0)
+    TP_ADJUST_MIN_PCT    = pick("tp_adjust_min_pct",    TP_ADJUST_MIN_PCT,    0.05, 0.99)
+    TP_ADJUST_MAX_PCT    = pick("tp_adjust_max_pct",    TP_ADJUST_MAX_PCT,    0.05, 0.99)
+    if TP_ADJUST_MIN_PCT > TP_ADJUST_MAX_PCT:
+        logger.error("[CONFIG] tp_config.json: tp_adjust_min_pct > tp_adjust_max_pct — using defaults for both")
+        TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT = 0.30, 0.85
 
 def save_tp_config():
     """Saves the current TP config to file."""
@@ -1124,8 +1217,7 @@ load_tp_config()
 UT_HA_FILE = os.path.join(DATA_DIR, "ut_ha.json")
 
 def load_ut_ha() -> bool:
-    data = safe_json_load(UT_HA_FILE, {"ut_heikin_ashi": False})
-    return data.get("ut_heikin_ashi", False)
+    return _load_typed(UT_HA_FILE, {"ut_heikin_ashi": False})["ut_heikin_ashi"]
 
 def save_ut_ha(enabled: bool):
     safe_json_save(UT_HA_FILE, {"ut_heikin_ashi": enabled})
@@ -1139,8 +1231,13 @@ HTF_FILE = os.path.join(DATA_DIR, "htf_bias.json")
 HTF_CACHE_TTL_SECONDS = 300
 
 def load_htf() -> str:
-    data = safe_json_load(HTF_FILE, {"htf": "1d"})
-    return data.get("htf", "1d")
+    # same list the web/Discord setters accept — anything else would make every
+    # HTF fetch fail on an unknown timeframe
+    htf = _load_typed(HTF_FILE, {"htf": "1d"})["htf"].strip().lower()
+    if htf not in ("1d", "4h", "2h", "6h", "12h", "1w", "3d"):
+        logger.error(f"[CONFIG] htf_bias.json htf={htf!r} is not a supported timeframe — using 1d")
+        return "1d"
+    return htf
 
 def save_htf(htf: str):
     safe_json_save(HTF_FILE, {"htf": htf})
@@ -1153,8 +1250,11 @@ HTF_BIAS = load_htf()
 MODE_FILE = os.path.join(DATA_DIR, "mode.json")
 
 def load_mode() -> str:
-    data = safe_json_load(MODE_FILE, {"mode": "futures"})
-    return data.get("mode", "futures")
+    mode = _load_typed(MODE_FILE, {"mode": "futures"})["mode"].strip().lower()
+    if mode not in ("spot", "futures"):
+        logger.error(f"[CONFIG] mode.json mode={mode!r} invalid — using futures")
+        return "futures"
+    return mode
 
 def save_mode(mode: str):
     safe_json_save(MODE_FILE, {"mode": mode})
