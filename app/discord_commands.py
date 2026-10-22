@@ -75,6 +75,50 @@ import bot as core  # 🆕 access to bot.py's shared runtime (see explanation ab
 
 logger = logging.getLogger(__name__)
 
+_bg_tasks: set = set()  # strong refs to fire-and-forget tasks (the loop only keeps weak ones)
+
+
+def _cmd_lock(ticker: str, tf: str) -> asyncio.Lock:
+    """The state lock for a ticker/tf. For an untracked pair a throwaway lock is
+    returned instead of registering one — commands like !scan/!tp on a typo'd
+    pair used to leave an orphan entry in core._state_locks every time."""
+    lock = core._state_locks.get(ticker, {}).get(tf)
+    if lock is not None:
+        return lock
+    if ticker in TICKERS:
+        return core._state_locks.setdefault(ticker, {}).setdefault(tf, asyncio.Lock())
+    return asyncio.Lock()
+
+
+def _clamp_bars(n: int) -> int:
+    """Same bounds as the web API's num_bars (300..20000)."""
+    return max(300, min(20000, int(n)))
+
+
+async def _stop_scanner_and_wait(timeout: float = 600.0) -> bool:
+    """Stops the scanner loop and waits until its current iteration has ACTUALLY
+    finished. Loop.stop() is graceful — a scan over several pairs can take far
+    longer than the 1 s the old code slept, and meanwhile it kept writing to
+    signals_history.json and mutating state."""
+    core.market_scanner.stop()
+    waited = 0.0
+    while core.market_scanner.is_running():
+        if waited >= timeout:
+            return False
+        await asyncio.sleep(0.5)
+        waited += 0.5
+    return True
+
+
+async def _resume_scanner_when_stopped():
+    """Restarts the scanner once a pending stop() has taken effect."""
+    while core.market_scanner.is_running():
+        await asyncio.sleep(1)
+    try:
+        core.market_scanner.start()
+    except Exception as e:
+        logger.error(f"Failed to resume scanner: {e}", exc_info=True)
+
 # =====================================================================
 # 💬  DISCORD COMMANDS
 # =====================================================================
@@ -158,9 +202,11 @@ async def status_cmd(ctx):
         f"📚 Adaptive TP: last **{_cfg.SIGNAL_HISTORY_LIMIT}** signals | **{(_cfg.SAFE_TP_PERCENTILE if _cfg.USE_SAFE_TP else _cfg.TP_PERCENTILE)*100:.0f}th** percentile ({'SAFE 🛡️' if _cfg.USE_SAFE_TP else 'AGGRESSIVE ⚡'})\n",
     ]
     exchange = core._exchange_ref
-    for ticker in TICKERS:
+    for ticker in list(TICKERS):  # copy: awaits below can interleave with !add/!remove
         for tf in TIMEFRAMES:
-            st = core.state[ticker][tf]
+            st = core.state.get(ticker, {}).get(tf)
+            if st is None:
+                break  # pair removed while this command was running
             last = st["last_bar_time"]
             # 🆕 FIX: Handle both int and string timestamps
             ts = "no data"
@@ -183,7 +229,7 @@ async def status_cmd(ctx):
             # 🆕 FIX BUG-HI001: removed a double assignment to a_pos.
             # Before: a_pos = f"⚠️{a_flag}" → then a_pos = "—" (overwriting it!)
             # Now: a single assignment with an informative message.
-            async with core._state_locks[ticker][tf]:
+            async with _cmd_lock(ticker, tf):
                 if a_flag and not a_trade and not st.get("a_pending"):
                     logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["a_in_long"] = False   # auto-heal
@@ -229,7 +275,7 @@ async def status_cmd(ctx):
                     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=50)
                     if bars and len(bars) >= 25:
                         df_v = parse_ohlcv(bars)
-                        vol_data = volume_flow_signal_v3(df_v)
+                        vol_data = volume_flow_signal_v3(df_v.iloc[:-1])  # closed bars only (the last row is still forming)
                         vol_flow = vol_data["flow"]
                         vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
                         vol_info = f" | {vol_emoji} {_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
@@ -238,11 +284,9 @@ async def status_cmd(ctx):
 
             lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}** | B: **{b_pos}**{trade_info}{vol_info}")
 
-    msg = "\n".join(lines)
-    if len(msg) > 1900:
-        await ctx.send(msg[:1900] + "\n... (truncated)")
-    else:
-        await ctx.send(msg)
+    # 🆕 FIX: used to cut the message at 1900 chars ("... (truncated)") — with a
+    # few pairs × timeframes the tail pairs simply vanished from !status.
+    await _send_chunked(ctx, "\n".join(lines))
 
 @core.bot.command(name="scan")
 async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
@@ -261,12 +305,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         return
 
     # 🆕 FIX: Use lock during scan command
-    if ticker not in core._state_locks:
-        core._state_locks[ticker] = {}
-    if tf not in core._state_locks.get(ticker, {}):
-        core._state_locks[ticker][tf] = asyncio.Lock()
-
-    async with core._state_locks[ticker][tf]:
+    async with _cmd_lock(ticker, tf):
         # ✅ FIXED: use a temporary state so we don't mutate the real one
         temp_state = make_state()
         try:
@@ -289,7 +328,7 @@ async def scan_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h"):
         vol_info = ""
         try:
             if df is not None and len(df) >= 35:
-                vol_data = volume_flow_signal_v3(df)
+                vol_data = volume_flow_signal_v3(df.iloc[:-1])  # closed bars only
                 vol_flow = vol_data["flow"]
                 vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
                 vol_info = f" | {vol_emoji} Vol:{_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x"
@@ -339,6 +378,12 @@ async def add_cmd(ctx, ticker: str = ""):
         return
 
     async with core._tickers_lock:
+        # 🆕 FIX: re-check under the lock — two concurrent !add (or !add + web
+        # add) both passed the early check while awaiting load_markets and then
+        # appended the same pair twice.
+        if ticker in TICKERS:
+            await ctx.send(f"⚠️ `{ticker}` is already in the list.")
+            return
         TICKERS.append(ticker)
         core.state[ticker] = {tf: make_state() for tf in TIMEFRAMES}
 
@@ -535,28 +580,29 @@ async def mode_cmd(ctx, new_mode: str = ""):
         await ctx.send(f"⚠️ Already in **{_cfg.MARKET_MODE}** mode.")
         return
 
+    # 🆕 FIX: same guard as the web API — switching mode resets every pair's
+    # state, which used to make the bot silently forget an open position.
+    if core.any_active_trades():
+        await ctx.send("❌ Cannot switch market mode while a trade is open or a limit order is pending. Wait for it to close first.")
+        return
+
     _cfg.MARKET_MODE = new_mode  # ← change via the module, not `global`
 
     save_mode(_cfg.MARKET_MODE)
 
+    old_exchange = core._exchange_ref
     if _cfg.MARKET_MODE == "futures":
         exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     else:
         exchange = ccxt.gate({"enableRateLimit": True})
     core._exchange_ref = exchange
+    if old_exchange is not None:  # don't leak the old HTTP session
+        try:
+            await asyncio.to_thread(old_exchange.close)
+        except Exception as e:
+            logger.warning(f"[MODE] Failed to close old exchange session: {e}")
 
-    for ticker in TICKERS:
-        for tf in TIMEFRAMES:
-            st = make_state()
-            try:
-                bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
-                if bars and len(bars) >= 2:
-                    st["last_bar_time"] = int(bars[-2][0])
-                    st["last_processed_bar_time"] = int(bars[-2][0])
-            except Exception:
-                pass
-            async with core._state_locks[ticker][tf]:
-                core.state[ticker][tf] = st
+    await core.reset_states_after_regime_change()
 
     label = "🔵 Spot (Gate.io Spot)" if _cfg.MARKET_MODE == "spot" else "🟠 Futures (Gate.io Perpetual)"
     await ctx.send(f"✅ Switched to **{label}**\n⚠️ Position states have been reset.")
@@ -588,7 +634,7 @@ async def utha_cmd(ctx, arg: str = ""):
 async def htf_cmd(ctx, new_htf: str = ""):
     if not new_htf:
         await ctx.send(f"🧬 Current HTF Bias: **{_cfg.HTF_BIAS.upper()}**\n"
-                       f"Available: `1d`, `4h`, `1h`, `1w`\n"
+                       f"Available: {', '.join(f'`{h}`' for h in ('1d', '4h', '2h', '6h', '12h', '1w', '3d'))}\n"
                        f"To change: `!htf 4h`")
         return
 
@@ -602,25 +648,17 @@ async def htf_cmd(ctx, new_htf: str = ""):
         await ctx.send(f"⚠️ HTF Bias is already **{_cfg.HTF_BIAS.upper()}**.")
         return
 
+    # 🆕 FIX: same guard as the web API (see !mode).
+    if core.any_active_trades():
+        await ctx.send("❌ Cannot change the HTF timeframe while a trade is open or a limit order is pending. Wait for it to close first.")
+        return
+
     old_htf = _cfg.HTF_BIAS
     _cfg.HTF_BIAS = new_htf
     _cfg.save_htf(_cfg.HTF_BIAS)
     clear_htf_cache()
 
-    exchange = core._exchange_ref
-    if exchange:
-        for ticker in TICKERS:
-            for tf in TIMEFRAMES:
-                st = make_state()
-                try:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
-                    if bars and len(bars) >= 2:
-                        st["last_bar_time"] = int(bars[-2][0])
-                        st["last_processed_bar_time"] = int(bars[-2][0])
-                except Exception:
-                    pass
-                async with core._state_locks[ticker][tf]:
-                    core.state[ticker][tf] = st
+    await core.reset_states_after_regime_change()
 
     await ctx.send(f"🧬 HTF Bias changed: **{old_htf.upper()}** → **{_cfg.HTF_BIAS.upper()}**\n"
                    f"⚠️ Position states have been reset.")
@@ -765,7 +803,9 @@ def _history_closed_records(history: dict, ticker: str, tf: str) -> list:
     records = []
     for side in ("long", "short"):
         for rec in slots.get(side, []):
-            if rec.get("exit_type") == "open" or rec.get("synthetic"):
+            # "unfilled" = a pullback limit order that never filled — not a trade
+            # (the web dashboard and !signals exclude it too).
+            if rec.get("exit_type") in ("open", "unfilled") or rec.get("synthetic"):
                 continue
             merged = dict(rec)
             merged["side"] = side
@@ -1053,8 +1093,9 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
         await ctx.send("❌ Not connected to the exchange yet.")
         return
 
+    num_bars = _clamp_bars(num_bars)
     scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
-    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
     for t in scope_tickers:
         if t not in TICKERS:
             await ctx.send(f"❌ `{t}` is not a tracked pair.")
@@ -1158,8 +1199,9 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
         await ctx.send("❌ Not connected to the exchange yet.")
         return
 
+    num_bars = _clamp_bars(num_bars)
     scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
-    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
     for t in scope_tickers:
         if t not in TICKERS:
             await ctx.send(f"❌ `{t}` is not a tracked pair.")
@@ -1169,6 +1211,7 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
             await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
             return
 
+    min_samples = max(1, min(10000, min_samples))
     await ctx.send(
         f"⏳ Running component backtest: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), "
         f"{num_bars} bars each (+ BTC benchmark fetch per pair). This is slow — sit tight."
@@ -1246,12 +1289,7 @@ async def tp_cmd(ctx, ticker: str = "BTC/USDT", tf: str = "1h", side: str = "lon
         return
 
     # 🆕 FIX: Use lock during sim
-    if ticker not in core._state_locks:
-        core._state_locks[ticker] = {}
-    if tf not in core._state_locks.get(ticker, {}):
-        core._state_locks[ticker][tf] = asyncio.Lock()
-
-    async with core._state_locks[ticker][tf]:
+    async with _cmd_lock(ticker, tf):
         try:
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
@@ -1401,7 +1439,12 @@ async def debug_cmd(ctx):
     lines.append(f"• Signal history: **{total_sigs}** records ({total_closed} closed)")
     lines.append(f"• History file: **{'Yes' if os.path.exists(SIGNALS_HISTORY_FILE) else 'No'}**")
 
-    active_count = sum(1 for t in TICKERS for tf in TIMEFRAMES if core.state[t][tf].get("active_trade"))
+    # 🆕 FIX: used to read the legacy "active_trade" key, which only !forcerun
+    # still sets — real A/U/B trades were never counted (always showed 0).
+    active_count = sum(
+        1 for t in list(TICKERS) for tf in TIMEFRAMES for tr in ("a", "u", "b")
+        if core.state.get(t, {}).get(tf, {}).get(f"{tr}_active_trade")
+    )
     lines.append(f"• Active trades: **{active_count}**")
 
     # Volume overview
@@ -1416,7 +1459,7 @@ async def debug_cmd(ctx):
                     bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=50)
                     if bars and len(bars) >= 25:
                         df_d = parse_ohlcv(bars)
-                        vol_data = volume_flow_signal_v3(df_d)
+                        vol_data = volume_flow_signal_v3(df_d.iloc[:-1])  # closed bars only
                         vol_flow = vol_data["flow"]
                         vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
                         lines.append(f"• `{ticker}` `{tf}`: {vol_emoji} {_flow_label(vol_flow)} RV:{vol_data['rel_vol']:.1f}x")
@@ -1444,8 +1487,16 @@ async def reset_cmd(ctx, confirm: str = ""):
     # condition — two sources writing to signals_history.json at the same time.
     scanner_was_running = core.market_scanner.is_running()
     if scanner_was_running:
-        core.market_scanner.stop()
-        await asyncio.sleep(1)  # let the current iteration finish
+        # 🆕 FIX: stop() is graceful and a scan can outlast the old fixed 1 s
+        # sleep — the race this block was written to prevent (scanner writing
+        # history while we delete it) was still possible. Wait for the loop to
+        # really finish; if it can't, delete nothing and let it resume.
+        if not await _stop_scanner_and_wait():
+            _t = asyncio.create_task(_resume_scanner_when_stopped())
+            _bg_tasks.add(_t)
+            _t.add_done_callback(_bg_tasks.discard)
+            await ctx.send("❌ The scanner is still mid-scan after 10 minutes — nothing was deleted. It will resume on its own; try `!reset` again later.")
+            return
 
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)
@@ -1456,9 +1507,9 @@ async def reset_cmd(ctx, confirm: str = ""):
     # u_in_long/u_in_short, a_bars_in_trade, u_bars_in_trade, last_*_bar,
     # *_last_closure_notified.
     # The tracks stayed frozen after !reset. Now it's a full reset via make_state().
-    for ticker in TICKERS:
+    for ticker in list(TICKERS):
         for tf in TIMEFRAMES:
-            core.state[ticker][tf] = make_state()
+            core.state.setdefault(ticker, {})[tf] = make_state()
 
     # 🆕 FIX: Clear on-chain cache on reset
     core._onchain_bias_cache = None
@@ -1474,7 +1525,7 @@ async def reset_cmd(ctx, confirm: str = ""):
         return
 
     total = 0
-    for ticker in TICKERS:
+    for ticker in list(TICKERS):
         for tf in TIMEFRAMES:
             try:
                 count = await asyncio.to_thread(backtest_history, exchange, ticker, tf, 3000)
@@ -1513,12 +1564,7 @@ async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "
         return
 
     # 🆕 FIX: Use lock during sim
-    if ticker not in core._state_locks:
-        core._state_locks[ticker] = {}
-    if tf not in core._state_locks.get(ticker, {}):
-        core._state_locks[ticker][tf] = asyncio.Lock()
-
-    async with core._state_locks[ticker][tf]:
+    async with _cmd_lock(ticker, tf):
         try:
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
@@ -1604,6 +1650,11 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(TIMEFRAMES)}")
         return
 
+    if ticker not in TICKERS:
+        # an untracked pair is never scanned, so a position opened here would never be closed
+        await ctx.send(f"⚠️ `{ticker}` is not a tracked pair. See `!pairs`.")
+        return
+
     await ctx.send(f"Force-running {side.upper()} signal for `{ticker}` `{tf}` (bypassing filters)…")
 
     exchange = core._exchange_ref
@@ -1611,12 +1662,7 @@ async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: st
         await ctx.send("❌ Exchange not initialized")
         return
 
-    if ticker not in core._state_locks:
-        core._state_locks[ticker] = {}
-    if tf not in core._state_locks.get(ticker, {}):
-        core._state_locks[ticker][tf] = asyncio.Lock()
-
-    async with core._state_locks[ticker][tf]:
+    async with _cmd_lock(ticker, tf):
         try:
             bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
             df = parse_ohlcv(bars)
@@ -2021,8 +2067,9 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
         await ctx.send("❌ Not connected to the exchange yet.")
         return
 
+    num_bars = _clamp_bars(num_bars)
     scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
-    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
     for t in scope_tickers:
         if t not in TICKERS:
             await ctx.send(f"❌ `{t}` is not a tracked pair.")
