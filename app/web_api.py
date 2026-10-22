@@ -950,58 +950,16 @@ async def get_config():
 
 
 def _any_active_trades() -> bool:
-    """True if any ticker/tf/track currently has an open position.
-
-    🆕 FIX (external review, P2): _reset_states_after_regime_change() used
-    to unconditionally replace every ticker/tf's state with a fresh
-    make_state() — including a_active_trade/u_active_trade/b_active_trade —
-    with no check for whether a position was actually open. Switching
-    market mode, HTF timeframe, or indicator parameters while a trade was
-    open would silently make the bot "forget" it: no more TP1/moved-SL
-    tracking, no proper close_trade() call, and the persistent snapshot
-    would get overwritten with the blank state on the next save. The
-    position itself doesn't disappear (this is a signal bot, not an
-    execution bot — nothing on the exchange changes), but the bot's own
-    tracking of it does, which corrupts training history for that trade
-    and stops it from ever being reported as closed.
-    """
-    for ticker in _cfg.TICKERS:
-        for tf in TIMEFRAMES:
-            st = core.state.get(ticker, {}).get(tf, {})
-            if st.get("a_active_trade") or st.get("u_active_trade") or st.get("b_active_trade"):
-                return True
-            # 🆕 (pullback entry) a limit order still waiting for its fill is just as
-            # much "tracked state" as an open position
-            if st.get("a_pending") or st.get("u_pending") or st.get("b_pending"):
-                return True
-    return False
+    """True if any ticker/tf/track has an open position or a pending limit
+    order. Shared implementation lives in bot.py so the Discord !mode/!htf
+    commands apply the very same guard (see core.any_active_trades)."""
+    return core.any_active_trades()
 
 
 async def _reset_states_after_regime_change():
-    """Same as what mode_cmd/htf_cmd do after a regime change — otherwise
-    state would end up desynced."""
-    exchange = core._exchange_ref
-    # 🆕 FIX: iterate over a copy and re-check membership after every await —
-    # a pair removed (web/Discord) while the OHLCV fetches below were in
-    # flight used to raise KeyError on core._state_locks[ticker][tf], aborting
-    # the reset half-way AFTER the new mode/HTF/indicators were already saved.
-    for ticker in list(_cfg.TICKERS):
-        for tf in TIMEFRAMES:
-            new_st = make_state()
-            try:
-                if exchange:
-                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
-                    if bars and len(bars) >= 2:
-                        new_st["last_bar_time"] = int(bars[-2][0])
-                        new_st["last_processed_bar_time"] = int(bars[-2][0])
-            except Exception:
-                pass
-            if ticker not in _cfg.TICKERS or ticker not in core.state:
-                break  # removed meanwhile — nothing left to reset for this pair
-            lock = core._state_locks.setdefault(ticker, {}).setdefault(tf, asyncio.Lock())
-            async with lock:
-                if ticker in core.state:
-                    core.state[ticker][tf] = new_st
+    """Same as what !mode/!htf do after a regime change — shared
+    implementation in bot.py (core.reset_states_after_regime_change)."""
+    await core.reset_states_after_regime_change()
 
 
 class ModeIn(BaseModel):

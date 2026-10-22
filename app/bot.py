@@ -118,6 +118,45 @@ def _ensure_locks():
 
 _ensure_locks()
 
+
+def any_active_trades() -> bool:
+    """True if any ticker/tf/track currently has an open position or a pending
+    limit order. Shared by the web API and the Discord !mode/!htf commands —
+    resetting state while one exists makes the bot silently forget the trade
+    (no more TP1/SL tracking, never reported as closed)."""
+    for ticker in list(TICKERS):
+        for tf in TIMEFRAMES:
+            st = state.get(ticker, {}).get(tf, {})
+            for track in ("a", "u", "b"):
+                if st.get(f"{track}_active_trade") or st.get(f"{track}_pending"):
+                    return True
+    return False
+
+
+async def reset_states_after_regime_change():
+    """Fresh state for every tracked ticker/tf after a mode/HTF/indicator
+    change, seeded with the last closed bar so the scanner doesn't treat an old
+    bar as new. Tolerates pairs added/removed while the OHLCV fetches are in
+    flight (iterates a copy, re-checks after every await)."""
+    exchange = _exchange_ref
+    for ticker in list(TICKERS):
+        for tf in TIMEFRAMES:
+            new_st = make_state()
+            try:
+                if exchange:
+                    bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=3)
+                    if bars and len(bars) >= 2:
+                        new_st["last_bar_time"] = int(bars[-2][0])
+                        new_st["last_processed_bar_time"] = int(bars[-2][0])
+            except Exception:
+                pass
+            if ticker not in TICKERS or ticker not in state:
+                break  # removed meanwhile — nothing left to reset for this pair
+            lock = _state_locks.setdefault(ticker, {}).setdefault(tf, asyncio.Lock())
+            async with lock:
+                if ticker in state:
+                    state[ticker][tf] = new_st
+
 # 🆕 FIX: Module-level exchange reference (more robust than task attribute)
 _exchange_ref: Optional[ccxt.Exchange] = None
 
