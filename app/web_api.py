@@ -650,6 +650,10 @@ async def remove_pair(ticker: str, purge_history: bool = False):
     ticker = unquote(ticker).upper().strip()
     if ticker not in _cfg.TICKERS:
         raise HTTPException(404, f"{ticker} is not tracked")
+    # same rule as Discord's !remove — and an empty pairs.json would be replaced
+    # by the defaults on the next start, resurrecting pairs nobody asked for
+    if len(_cfg.TICKERS) == 1:
+        raise HTTPException(409, "Cannot remove the last tracked pair")
     _cfg.TICKERS.remove(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
     # 🆕 FIX: the ticker used to be removed from _cfg.TICKERS but left in

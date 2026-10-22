@@ -30,6 +30,13 @@ _firebase_unavailable_logged = False
 # makes the lazy init atomic across threads.
 _firebase_init_lock = threading.Lock()
 
+# 🆕 FIX: register/unregister (web request thread) and the stale-token cleanup
+# in send_push (asyncio.to_thread worker) are all load -> modify -> save on
+# devices.json. Two of them overlapping meant the later save silently
+# discarded the earlier one's change — e.g. a freshly registered phone erased by
+# a cleanup that had loaded the list a moment before. One lock serialises them.
+_devices_lock = threading.RLock()
+
 
 def _get_firebase_app():
     """Initializes the Firebase Admin SDK exactly once (lazily, on the first real send)."""
@@ -93,37 +100,57 @@ def register_device(token: str, device_name: Optional[str] = None) -> dict:
     duplicate" of the first and delete its token. So the dedup-by-name pass
     below only runs when a real device_name was actually provided.
     """
-    devices = _cfg.load_devices()
     resolved_name = device_name or "Android device"
 
-    stale_tokens = [
-        t for t, info in devices.items()
-        if t != token and device_name and info.get("device_name") == resolved_name
-    ]
-    for t in stale_tokens:
-        devices.pop(t, None)
-    if stale_tokens:
-        logger.info(
-            f"[PUSH] Removed {len(stale_tokens)} stale record(s) for device "
-            f"'{resolved_name}' (new token from the same rotation)"
-        )
+    with _devices_lock:
+        devices = _cfg.load_devices()
 
-    devices[token] = {
-        "device_name": resolved_name,
-        "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    _cfg.save_devices(devices)
+        stale_tokens = [
+            t for t, info in devices.items()
+            if t != token and device_name and isinstance(info, dict) and info.get("device_name") == resolved_name
+        ]
+        for t in stale_tokens:
+            devices.pop(t, None)
+        if stale_tokens:
+            logger.info(
+                f"[PUSH] Removed {len(stale_tokens)} stale record(s) for device "
+                f"'{resolved_name}' (new token from the same rotation)"
+            )
+
+        devices[token] = {
+            "device_name": resolved_name,
+            "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        _cfg.save_devices(devices)
     logger.info(f"[PUSH] Device registered: {device_name or token[:16] + '...'}")
     return devices[token]
 
 
 def unregister_device(token: str) -> bool:
-    devices = _cfg.load_devices()
-    if token not in devices:
-        return False
-    del devices[token]
-    _cfg.save_devices(devices)
+    with _devices_lock:
+        devices = _cfg.load_devices()
+        if token not in devices:
+            return False
+        del devices[token]
+        _cfg.save_devices(devices)
     return True
+
+
+def _is_stale_token_error(exc, messaging) -> bool:
+    """True when FCM says this token will never work again (app uninstalled,
+    token rotated/expired, token from another sender) — as opposed to a
+    transient/server/payload error, which must NOT cost a device its record.
+
+    🆕 FIX: the old check compared exc.code against "UNREGISTERED", but
+    firebase-admin reports an unregistered token as code "NOT_FOUND" (class
+    messaging.UnregisteredError), so no stale token was ever cleaned up and
+    dead devices stayed in devices.json forever, failing on every push.
+    INVALID_ARGUMENT is deliberately not treated as stale on its own: it is
+    also what a bad payload produces, which would wipe every device."""
+    if isinstance(exc, (messaging.UnregisteredError, messaging.SenderIdMismatchError)):
+        return True
+    text = str(exc)
+    return "UNREGISTERED" in text.upper() or "not a valid fcm registration token" in text.lower()
 
 
 def send_push(title: str, body: str, data: Optional[Dict[str, str]] = None) -> Dict:
@@ -183,16 +210,15 @@ def send_push(title: str, body: str, data: Optional[Dict[str, str]] = None) -> D
 
         # Clean up stale tokens (device unsubscribed / uninstalled the app)
         for idx, result in enumerate(response.responses):
-            if not result.success:
-                err = getattr(result.exception, "code", "") or str(result.exception)
-                if "UNREGISTERED" in str(err) or "invalid-registration-token" in str(err).lower():
-                    stale_tokens.append(batch[idx])
+            if not result.success and _is_stale_token_error(result.exception, messaging):
+                stale_tokens.append(batch[idx])
 
     if stale_tokens:
-        devices = _cfg.load_devices()
-        for t in stale_tokens:
-            devices.pop(t, None)
-        _cfg.save_devices(devices)
+        with _devices_lock:
+            devices = _cfg.load_devices()  # re-read under the lock: registrations may have happened meanwhile
+            for t in stale_tokens:
+                devices.pop(t, None)
+            _cfg.save_devices(devices)
         logger.info(f"[PUSH] Removed {len(stale_tokens)} stale token(s)")
 
     logger.info(f"[PUSH] Sent: {total_sent}/{len(tokens)} | title={title!r}")
