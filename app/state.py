@@ -319,16 +319,22 @@ def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
     return None
 
 
-def _find_tracking_record(records: List[Dict], track: str) -> Optional[Dict]:
-    """Finds the most recently CLOSED record for this track that's still
-    within its raw-outcome observation window — see update_raw_outcome()
-    for what that window is and why it exists."""
-    for rec in reversed(records):
-        if (rec.get("exit_type") not in (None, "open")
-                and rec.get("track") == track
-                and rec.get("raw_tracking_bars_remaining", 0) > 0):
-            return rec
-    return None
+def _find_tracking_records(records: List[Dict], track: str) -> List[Dict]:
+    """ALL CLOSED records for this track that are still within their
+    raw-outcome observation window — see update_raw_outcome() for what that
+    window is and why it exists.
+
+    🆕 FIX: this used to return only the most recent one. With COOLDOWN_BARS=2
+    and a window of up to MAX_HOLD_BARS=20, several closed records of the same
+    track/side are routinely inside their window at once; only the newest was
+    serviced, the older ones stalled (and later resumed, measuring far outside
+    their horizon, once the newer one finished)."""
+    return [
+        rec for rec in records
+        if rec.get("exit_type") not in (None, "open")
+        and rec.get("track") == track
+        and rec.get("raw_tracking_bars_remaining", 0) > 0
+    ]
 
 
 def _pct_move(side: str, entry: float, price: float) -> float:
@@ -576,31 +582,33 @@ def update_raw_outcome(ticker: str, tf: str, side: str, current_price: float, tr
         return
 
     records = history[ticker][tf][side]
-    rec = _find_tracking_record(records, track)
-    if rec is None:
+    tracking = _find_tracking_records(records, track)
+    if not tracking:
         return
 
-    entry = rec["entry"]
     fav_price, adv_price = _fav_adv_prices(side, current_price, high, low)
-    favorable, adverse = _fav_adv_pct(side, entry, fav_price, adv_price)
-
-    new_raw_favorable = round(max(float(rec.get("raw_mfe_pct", 0)), favorable), 4)
-    new_raw_adverse = round(max(float(rec.get("raw_mae_pct", 0)), adverse), 4)
-
     changed = False
-    if new_raw_favorable != rec.get("raw_mfe_pct"):
-        rec["raw_mfe_pct"] = new_raw_favorable
-        changed = True
-    if new_raw_adverse != rec.get("raw_mae_pct"):
-        rec["raw_mae_pct"] = new_raw_adverse
-        changed = True
 
-    # Only spend a bar off the observation window on an actual new closed
-    # bar — this function may be called several times within the same
-    # bar (once per scan tick), same as update_signal_mae_mfe already is.
-    if is_new_bar:
-        rec["raw_tracking_bars_remaining"] = max(0, rec.get("raw_tracking_bars_remaining", 0) - 1)
-        changed = True
+    for rec in tracking:
+        entry = rec["entry"]
+        favorable, adverse = _fav_adv_pct(side, entry, fav_price, adv_price)
+
+        new_raw_favorable = round(max(float(rec.get("raw_mfe_pct", 0)), favorable), 4)
+        new_raw_adverse = round(max(float(rec.get("raw_mae_pct", 0)), adverse), 4)
+
+        if new_raw_favorable != rec.get("raw_mfe_pct"):
+            rec["raw_mfe_pct"] = new_raw_favorable
+            changed = True
+        if new_raw_adverse != rec.get("raw_mae_pct"):
+            rec["raw_mae_pct"] = new_raw_adverse
+            changed = True
+
+        # Only spend a bar off the observation window on an actual new closed
+        # bar — this function may be called several times within the same
+        # bar (once per scan tick), same as update_signal_mae_mfe already is.
+        if is_new_bar:
+            rec["raw_tracking_bars_remaining"] = max(0, rec.get("raw_tracking_bars_remaining", 0) - 1)
+            changed = True
 
     if changed:
         save_signals_history(history)

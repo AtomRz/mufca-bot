@@ -1,4 +1,7 @@
 import logging
+import math
+import os
+from functools import lru_cache
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
@@ -25,7 +28,78 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
-def _hurst_rs(returns: np.ndarray) -> float:
+# =====================================================================
+# 📈  HURST EXPONENT — rescaled-range (R/S), Anis–Lloyd bias-corrected
+# =====================================================================
+# 🆕 FIX (2026-10 audit, small-sample bias): the raw R/S slope is NOT centered
+# on 0.5 for a random walk on short windows. For i.i.d. returns the expected
+# R/S grows faster than k**0.5 at small k (Anis & Lloyd, 1976), so the raw
+# estimate came out around 0.58-0.61 on pure noise — i.e. "H - 0.5 >=
+# HURST_MIN_DEVIATION" was already ~0.1 of the way to passing before the
+# market said anything, and the bias differs by window length, so one
+# threshold meant different things on different timeframes/windows.
+# The correction subtracts the slope that i.i.d. noise would have produced
+# over the SAME chunk sizes (E[R/S] from the Anis-Lloyd formula) and
+# re-centers on 0.5: H_AL = 0.5 + slope(log R/S) - slope(log E[R/S]).
+# It removes the bias, NOT the variance: a short window is still a noisy
+# estimate (sd of H is ~0.35 at window 21-23, ~0.14 at 50, ~0.09 at 100),
+# so prefer windows >= 100 where the threshold can actually separate regimes.
+#
+# Set env HURST_BIAS_CORRECTION=0 to get the legacy (uncorrected) estimate
+# back without a code change — the per-timeframe windows and
+# HURST_MIN_DEVIATION already tuned live were calibrated on that estimate.
+HURST_BIAS_CORRECTION = os.environ.get("HURST_BIAS_CORRECTION", "1").strip().lower() not in ("0", "false", "no", "off")
+
+_HURST_MIN_CHUNK = 8
+
+
+def _hurst_sizes(n: int) -> np.ndarray:
+    """Chunk sizes for a window of n returns: 6 log-spaced values from 8 to
+    n // 2, de-duplicated. Shared by the numba and the pandas path — they used
+    to pick sizes through two slightly different float routes (np.geomspace vs.
+    a manual exp/log loop) and disagreed on a chunk size by +-1 at a few
+    window lengths; one function means identical sizes everywhere. Fewer than
+    two distinct sizes (windows < 18) means no slope can be fitted."""
+    max_k = n // 2
+    if max_k < _HURST_MIN_CHUNK:
+        return np.empty(0, dtype=np.int64)
+    log_start = math.log(_HURST_MIN_CHUNK)
+    step = (math.log(max_k) - log_start) / 5.0
+    out = []
+    last = -1
+    for i in range(6):
+        if i == 0:
+            s = _HURST_MIN_CHUNK  # exact endpoints: no exp(log(8)) = 7.999.. -> 7
+        elif i == 5:
+            s = max_k
+        else:
+            s = int(math.exp(log_start + step * i))
+        if s >= _HURST_MIN_CHUNK and s != last:
+            out.append(s)
+            last = s
+    return np.asarray(out, dtype=np.int64)
+
+
+@lru_cache(maxsize=None)
+def _anis_lloyd_expected_rs(k: int) -> float:
+    """E[R/S] of k i.i.d. observations — the original Anis & Lloyd (1976)
+    expression, for R/S built with the POPULATION std (ddof=0), which is what
+    this file uses everywhere. Do NOT multiply by Peters' (k - 0.5) / k: that
+    factor is for the ddof=1 std and would under-state E[R/S] here by ~6% at
+    k=8 (checked against a Monte Carlo of this exact R/S definition)."""
+    s = 0.0
+    for i in range(1, k):
+        s += math.sqrt((k - i) / i)
+    if k <= 340:
+        return math.exp(math.lgamma((k - 1) / 2.0) - math.lgamma(k / 2.0)) / math.sqrt(math.pi) * s
+    return s / math.sqrt(k * math.pi / 2.0)  # large-k form of the same expression
+
+
+def _expected_log_rs(sizes: np.ndarray) -> np.ndarray:
+    return np.array([math.log(_anis_lloyd_expected_rs(int(k))) for k in sizes], dtype=np.float64)
+
+
+def _hurst_rs(returns: np.ndarray, bias_correct: Optional[bool] = None) -> float:
     """Rescaled-range (R/S) Hurst estimate for one window of log-returns.
 
     For several chunk sizes k, split the window into non-overlapping chunks
@@ -34,7 +108,12 @@ def _hurst_rs(returns: np.ndarray) -> float:
     average across chunks. The slope of log(R/S) vs log(k) is the Hurst
     exponent: ~0.5 = random walk, >0.5 = trending/persistent (a move tends
     to keep going), <0.5 = mean-reverting/anti-persistent (a move tends to
-    reverse)."""
+    reverse).
+
+    bias_correct (default: HURST_BIAS_CORRECTION) — apply the Anis–Lloyd
+    correction described above, so pure noise reads ~0.5 at any window."""
+    if bias_correct is None:
+        bias_correct = HURST_BIAS_CORRECTION
     n = len(returns)
     if n < 16:
         return 0.5  # not enough data — neutral, not "trending" or "reverting"
@@ -42,13 +121,14 @@ def _hurst_rs(returns: np.ndarray) -> float:
     if std == 0 or np.isnan(std):
         return 0.5  # flat/no variance — neutral
 
-    max_k = n // 2
-    sizes = sorted(set(int(s) for s in np.geomspace(8, max_k, num=6) if s >= 8))
+    sizes = _hurst_sizes(n)
     if len(sizes) < 2:
         return 0.5
+    log_exp = _expected_log_rs(sizes) if bias_correct else None
 
-    rs_points = []
-    for k in sizes:
+    log_k, log_rs, log_e = [], [], []
+    for idx in range(len(sizes)):
+        k = int(sizes[idx])
         n_chunks = n // k
         if n_chunks < 1:
             continue
@@ -61,14 +141,17 @@ def _hurst_rs(returns: np.ndarray) -> float:
             if s > 0:
                 rs_per_chunk.append(r / s)
         if rs_per_chunk:
-            rs_points.append((k, float(np.mean(rs_per_chunk))))
+            log_k.append(math.log(k))
+            log_rs.append(math.log(float(np.mean(rs_per_chunk))))
+            if bias_correct:
+                log_e.append(float(log_exp[idx]))
 
-    if len(rs_points) < 2:
+    if len(log_k) < 2:
         return 0.5
 
-    log_k = np.log([p[0] for p in rs_points])
-    log_rs = np.log([p[1] for p in rs_points])
-    slope, _ = np.polyfit(log_k, log_rs, 1)
+    slope = float(np.polyfit(log_k, log_rs, 1)[0])
+    if bias_correct:
+        slope = slope - float(np.polyfit(log_k, log_e, 1)[0]) + 0.5
     return float(np.clip(slope, 0.0, 1.0))
 
 
@@ -81,20 +164,11 @@ def _hurst_rs(returns: np.ndarray) -> float:
 # window. Benchmarked at ~2.2s for 3000 bars / window=100 on a single
 # symbol/timeframe — a real cost when this runs on every scan tick for
 # several symbols. The JIT version below computes the whole rolling series
-# in one compiled pass (no per-window Python overhead) and produces NaN
-# placement and results matching `_hurst_rs` almost exactly (verified
-# against thousands of random series and window sizes). 🆕 CORRECTION
-# (2026-09 audit): "almost exactly", not "bit-identical" as this comment
-# used to claim — the two paths pick chunk sizes via slightly different
-# float paths (np.geomspace here vs. a manual exp(log_start + i*step) loop
-# in the numba version below, done that way because numba can't call
-# np.geomspace directly), and at certain max_k values that difference
-# crosses an int() rounding boundary. Stress-tested against max_k 8-5000:
-# 2 mismatches out of ~5000 (e.g. max_k=256 gives chunk size 15 here vs. 16
-# in the numba path), each shifting one chunk size by ±1 and so nudging
-# that bar's Hurst estimate slightly — not a correctness bug, just not
-# literally bit-identical. Benchmarked at ~4ms warm for the same 3000 bars
-# — roughly 500x faster.
+# in one compiled pass (no per-window Python overhead), ~500x faster.
+# Chunk sizes and the Anis–Lloyd expected values are computed once in Python
+# (they depend only on the window length, not on the data) and passed in, so
+# both paths use exactly the same sizes; the two then differ only by
+# floating-point summation order.
 #
 # If numba isn't installed, calculate_hurst() transparently falls back to
 # the pandas/`_hurst_rs` path so the bot still runs, just slower.
@@ -102,7 +176,26 @@ def _hurst_rs(returns: np.ndarray) -> float:
 if _HAS_NUMBA:
 
     @njit(cache=True)
-    def _hurst_window_numba(returns: np.ndarray) -> float:
+    def _ols_slope_numba(x: np.ndarray, y: np.ndarray, m: int) -> float:
+        sx = 0.0
+        sy = 0.0
+        for i in range(m):
+            sx += x[i]
+            sy += y[i]
+        mx = sx / m
+        my = sy / m
+        num = 0.0
+        den = 0.0
+        for i in range(m):
+            dx = x[i] - mx
+            num += dx * (y[i] - my)
+            den += dx * dx
+        if den == 0.0:
+            return np.nan
+        return num / den
+
+    @njit(cache=True)
+    def _hurst_window_numba(returns: np.ndarray, sizes: np.ndarray, log_exp: np.ndarray, correct: bool) -> float:
         """Same R/S Hurst estimate as `_hurst_rs`, compiled for one window."""
         n = returns.shape[0]
         if n < 16:
@@ -122,36 +215,13 @@ if _HAS_NUMBA:
         if std == 0.0 or np.isnan(std):
             return 0.5
 
-        max_k = n // 2
-        if max_k < 8:
-            return 0.5
-
-        log_start = np.log(8.0)
-        log_end = np.log(float(max_k))
-        step = (log_end - log_start) / 5.0
-
-        sizes = np.empty(6, dtype=np.int64)
-        count = 0
-        last = -1
-        for i in range(6):
-            # Exact endpoints avoid float round-trip precision loss through
-            # log/exp (e.g. exp(log(8.0)) landing on 7.999999... -> int() -> 7),
-            # matching np.geomspace(8, max_k, num=6) exactly at i=0 and i=5.
-            if i == 0:
-                s = 8
-            elif i == 5:
-                s = max_k
-            else:
-                s = int(np.exp(log_start + step * i))
-            if s >= 8 and s != last:
-                sizes[count] = s
-                count += 1
-                last = s
+        count = sizes.shape[0]
         if count < 2:
             return 0.5
 
         log_k = np.empty(count, dtype=np.float64)
         log_rs = np.empty(count, dtype=np.float64)
+        log_e = np.empty(count, dtype=np.float64)
         valid_count = 0
 
         for idx in range(count):
@@ -190,29 +260,20 @@ if _HAS_NUMBA:
                 rs_mean = rs_sum / rs_cnt
                 log_k[valid_count] = np.log(float(k))
                 log_rs[valid_count] = np.log(rs_mean)
+                log_e[valid_count] = log_exp[idx]
                 valid_count += 1
 
         if valid_count < 2:
             return 0.5
 
-        sx = 0.0
-        sy = 0.0
-        for i in range(valid_count):
-            sx += log_k[i]
-            sy += log_rs[i]
-        mx = sx / valid_count
-        my = sy / valid_count
-
-        num = 0.0
-        den = 0.0
-        for i in range(valid_count):
-            dx = log_k[i] - mx
-            dy = log_rs[i] - my
-            num += dx * dy
-            den += dx * dx
-        if den == 0.0:
+        slope = _ols_slope_numba(log_k, log_rs, valid_count)
+        if np.isnan(slope):
             return 0.5
-        slope = num / den
+        if correct:
+            slope_e = _ols_slope_numba(log_k, log_e, valid_count)
+            if np.isnan(slope_e):
+                return 0.5
+            slope = slope - slope_e + 0.5
 
         if slope < 0.0:
             slope = 0.0
@@ -221,7 +282,7 @@ if _HAS_NUMBA:
         return slope
 
     @njit(cache=True)
-    def _hurst_rolling_numba(log_ret: np.ndarray, window: int) -> np.ndarray:
+    def _hurst_rolling_numba(log_ret: np.ndarray, window: int, sizes: np.ndarray, log_exp: np.ndarray, correct: bool) -> np.ndarray:
         """Rolling Hurst over the full series, matching pandas'
         `rolling(window).apply(..., raw=True)` semantics: a window is only
         evaluated once it has zero NaNs (default min_periods == window)."""
@@ -238,11 +299,11 @@ if _HAS_NUMBA:
                     break
             if has_nan:
                 continue
-            out[end] = _hurst_window_numba(log_ret[start:end + 1])
+            out[end] = _hurst_window_numba(log_ret[start:end + 1], sizes, log_exp, correct)
         return out
 
 
-def calculate_hurst(df: pd.DataFrame, window: int = 100) -> pd.Series:
+def calculate_hurst(df: pd.DataFrame, window: int = 100, bias_correct: Optional[bool] = None) -> pd.Series:
     """Rolling Hurst exponent from log-returns over `window` bars.
 
     A statistically distinct "second opinion" on market regime, alongside
@@ -256,13 +317,22 @@ def calculate_hurst(df: pd.DataFrame, window: int = 100) -> pd.Series:
     ~0.5 = closest to a random walk (hardest regime to trade profitably in
     either direction). NaN for the first `window` bars while warming up.
 
+    bias_correct — Anis–Lloyd small-sample correction (see the section header
+    above); None uses HURST_BIAS_CORRECTION (default on). Pass False for the
+    legacy estimate.
+
     Uses a numba-JIT rolling implementation when available (~500x faster
     than the pandas/apply path); falls back to pure Python otherwise."""
+    if bias_correct is None:
+        bias_correct = HURST_BIAS_CORRECTION
     log_ret = np.log(df["close"] / df["close"].shift(1))
     if _HAS_NUMBA:
-        values = _hurst_rolling_numba(log_ret.to_numpy(dtype=np.float64), window)
+        sizes = _hurst_sizes(window)
+        values = _hurst_rolling_numba(
+            log_ret.to_numpy(dtype=np.float64), window, sizes, _expected_log_rs(sizes), bool(bias_correct)
+        )
         return pd.Series(values, index=df.index)
-    return log_ret.rolling(window=window).apply(_hurst_rs, raw=True)
+    return log_ret.rolling(window=window).apply(lambda a: _hurst_rs(a, bias_correct), raw=True)
 
 
 def calculate_chop(df: pd.DataFrame, length: int = 14) -> pd.Series:

@@ -74,7 +74,10 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     # 🆕 Volume info (display only, not a filter)
     if df is not None:
         try:
-            vol_info = volume_flow_signal_v3(df)
+            # 🆕 FIX: df is a live fetch whose last row is the still-forming
+            # bar (a few seconds of volume right after the signal bar closes →
+            # "RV: 0.0x"). Show the closed-bar reading, same as signals.py.
+            vol_info = volume_flow_signal_v3(df.iloc[:-1])
             vol_flow = vol_info["flow"]
             vol_emoji = "🟢" if vol_flow == "inflow" else "🔴" if vol_flow == "outflow" else "⚪"
             rel_vol = vol_info["rel_vol"]
