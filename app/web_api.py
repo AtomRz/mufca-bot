@@ -31,7 +31,7 @@ from urllib.parse import unquote
 import ccxt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from starlette.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +84,18 @@ def _get_client_ip(scope) -> str:
     scope['client'], which would show the tunnel/nginx's own address, not the
     visitor's."""
     headers = dict(scope.get("headers") or [])
-    for header_name in (b"cf-connecting-ip", b"x-forwarded-for"):
-        value = headers.get(header_name)
-        if value:
-            return value.decode("utf-8", errors="ignore").split(",")[0].strip()
+    # cf-connecting-ip is overwritten by Cloudflare itself, so a visitor can't forge it.
+    value = headers.get(b"cf-connecting-ip")
+    if value:
+        return value.decode("utf-8", errors="ignore").strip()
+    # 🆕 FIX: X-Forwarded-For used to be read from its FIRST element, which is
+    # whatever the client itself sent — a brute-forcer could put a fresh fake
+    # address in it on every request and never reach the lockout threshold
+    # (and bloat _failed_attempts with junk keys). A reverse proxy appends the
+    # address it actually saw at the END of the list, so take the last element.
+    value = headers.get(b"x-forwarded-for")
+    if value:
+        return value.decode("utf-8", errors="ignore").split(",")[-1].strip()
     client = scope.get("client")
     return client[0] if client else "unknown"
 
@@ -97,8 +105,21 @@ def _is_locked_out(ip: str) -> bool:
     return until is not None and time.time() < until
 
 
+def _prune_lockout_state(now: float):
+    """Drops expired entries so the two dicts can't grow without bound."""
+    for ip in [i for i, until in _locked_until.items() if until <= now]:
+        _locked_until.pop(ip, None)
+        _failed_attempts.pop(ip, None)
+    for ip in [i for i, ts in _failed_attempts.items()
+               if not ts or now - ts[-1] >= _LOCKOUT_WINDOW_SECONDS]:
+        if ip not in _locked_until:
+            _failed_attempts.pop(ip, None)
+
+
 def _record_failed_attempt(ip: str):
     now = time.time()
+    if len(_failed_attempts) > 1000:
+        _prune_lockout_state(now)
     attempts = [t for t in _failed_attempts[ip] if now - t < _LOCKOUT_WINDOW_SECONDS]
     attempts.append(now)
     _failed_attempts[ip] = attempts
@@ -130,6 +151,11 @@ _ws_tickets: dict = {}
 
 
 def _issue_ws_ticket() -> str:
+    # 🆕 FIX: tickets that were issued but never used (page closed before the
+    # socket opened) stayed in the dict forever. Purge expired ones on issue.
+    now = time.time()
+    for t in [t for t, exp in _ws_tickets.items() if exp <= now]:
+        _ws_tickets.pop(t, None)
     ticket = secrets.token_urlsafe(32)
     _ws_tickets[ticket] = time.time() + _WS_TICKET_TTL_SECONDS
     return ticket
@@ -206,7 +232,16 @@ class BasicAuthASGIMiddleware:
             _record_success(ip)
             return await self.app(scope, receive, send)
 
-        _record_failed_attempt(ip)
+        # 🆕 FIX: a request that carried NO credentials at all (the browser's
+        # first probe before the login screen, a stale tab, a health script)
+        # is not a password guess. Counting it meant a few such requests
+        # could lock the owner out of their own dashboard for 15 minutes.
+        # Only requests that actually presented credentials/a ticket count.
+        _presented = bool(auth_header) or (
+            scope["type"] == "websocket" and b"ticket=" in (scope.get("query_string") or b"")
+        )
+        if _presented:
+            _record_failed_attempt(ip)
 
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 4401})
@@ -358,7 +393,7 @@ async def get_components(min_samples: int = 30):
 class Tp1SimIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
-    num_bars: int = 3000
+    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
 
 
 @app.post("/api/tp1sim")
@@ -396,8 +431,8 @@ async def run_tp1sim(body: Tp1SimIn):
 class CompSimIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
-    num_bars: int = 3000
-    min_samples: int = 30
+    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
+    min_samples: int = Field(30, ge=1, le=10000)
 
 
 @app.post("/api/compsim")
@@ -539,6 +574,19 @@ async def add_pair(body: PairIn):
     exchange = core._exchange_ref
     if exchange is None:
         raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    # 🆕 FIX: unlike Discord's !add, this endpoint never checked that the pair
+    # exists on Gate.io — a typo like "FOO/USDT" was persisted to tickers.json
+    # and then failed (silently, in the backtest's except) on every scan until
+    # someone removed it by hand. Same check as !add.
+    try:
+        markets = await asyncio.to_thread(exchange.load_markets)
+    except Exception as e:
+        raise HTTPException(502, f"Could not verify {ticker} on Gate.io: {e}")
+    if ticker not in markets:
+        raise HTTPException(404, f"Pair {ticker} not found on Gate.io")
+    if ticker in _cfg.TICKERS:  # re-check: another request may have added it while we awaited
+        raise HTTPException(409, f"{ticker} is already tracked")
 
     _cfg.TICKERS.append(ticker)
     _cfg.save_tickers(_cfg.TICKERS)
@@ -900,7 +948,11 @@ async def _reset_states_after_regime_change():
     """Same as what mode_cmd/htf_cmd do after a regime change — otherwise
     state would end up desynced."""
     exchange = core._exchange_ref
-    for ticker in _cfg.TICKERS:
+    # 🆕 FIX: iterate over a copy and re-check membership after every await —
+    # a pair removed (web/Discord) while the OHLCV fetches below were in
+    # flight used to raise KeyError on core._state_locks[ticker][tf], aborting
+    # the reset half-way AFTER the new mode/HTF/indicators were already saved.
+    for ticker in list(_cfg.TICKERS):
         for tf in TIMEFRAMES:
             new_st = make_state()
             try:
@@ -911,8 +963,12 @@ async def _reset_states_after_regime_change():
                         new_st["last_processed_bar_time"] = int(bars[-2][0])
             except Exception:
                 pass
-            async with core._state_locks[ticker][tf]:
-                core.state[ticker][tf] = new_st
+            if ticker not in _cfg.TICKERS or ticker not in core.state:
+                break  # removed meanwhile — nothing left to reset for this pair
+            lock = core._state_locks.setdefault(ticker, {}).setdefault(tf, asyncio.Lock())
+            async with lock:
+                if ticker in core.state:
+                    core.state[ticker][tf] = new_st
 
 
 class ModeIn(BaseModel):
@@ -1171,7 +1227,7 @@ async def get_pullback_stats():
 class PullSimIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
-    num_bars: int = 3000
+    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
 
 
 def _pullsim_scope(body: "PullSimIn"):
@@ -1269,7 +1325,11 @@ async def start_pullsim(body: PullSimIn):
     for jid, _ in finished[:max(0, len(finished) - _PULLSIM_JOBS_KEEP)]:
         _PULLSIM_JOBS.pop(jid, None)
 
-    asyncio.create_task(_pullsim_worker(job_id, scope_tickers, scope_tfs, body.num_bars))
+    # 🆕 FIX: keep a strong reference — the event loop only holds weak refs to
+    # tasks, so a fire-and-forget task can be garbage-collected mid-run and the
+    # job would sit at status 'running' forever.
+    _PULLSIM_JOBS[job_id]["task"] = asyncio.create_task(
+        _pullsim_worker(job_id, scope_tickers, scope_tfs, body.num_bars))
     return {"job_id": job_id, "already_running": False}
 
 

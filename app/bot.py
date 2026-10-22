@@ -677,6 +677,13 @@ async def market_scanner():
     notified_ids = _load_closure_notified()
 
     for ticker in list(TICKERS):  # copy the list — guards against mutation via !add/!remove
+        # 🆕 FIX: the copy above is taken once per cycle, so a pair removed
+        # (web/Discord) while earlier pairs were being scanned was still
+        # processed here: derivatives/spread fetches re-populated the caches
+        # that remove just cleared, and the per-TF block below re-created the
+        # state lock of a pair that no longer exists.
+        if ticker not in TICKERS:
+            continue
         # 🆕 Derivatives bias (funding rate + OI) — per-ticker, unlike
         # on-chain, which is one global reading shared across every pair.
         # get_derivatives_bias() does its own TTL caching internally
@@ -702,6 +709,8 @@ async def market_scanner():
         spread_snapshot = await spread.get_spread_snapshot(exchange, ticker)
 
         for tf in TIMEFRAMES:
+            if ticker not in TICKERS or ticker not in state:
+                break  # removed during the awaits above/below — don't resurrect its lock/state
             try:
                 # 🆕 FIX: Use lock to prevent race with commands
                 lock = _state_locks.get(ticker, {}).get(tf)
@@ -722,7 +731,9 @@ async def market_scanner():
                 # relative to commands). All network calls and Discord sends
                 # are moved OUTSIDE the lock.
                 async with lock:
-                    st = state[ticker][tf]
+                    st = state.get(ticker, {}).get(tf)
+                    if st is None:  # removed while we waited for the lock
+                        break
                     signals, bar_time, regime, lev = await check_signals(
                         exchange, ticker, tf, st,
                         onchain_bias=combined_bias,
