@@ -1228,6 +1228,33 @@ async def check_signals(
         last_close = float(df["close"].iloc[-2])
 
         for track in _cfg.TRACKS:
+            # 🆕 (external review, TP-obstacle stage): a just-closed record may
+            # still be inside its raw-outcome observation window (see
+            # update_raw_outcome()). Checked for both sides since we don't know
+            # here which side the most recently closed trade was on.
+            # 🆕 FIX: this used to run ONLY in an `else` branch below — i.e. only
+            # while the track had no active trade and no pending order. A new
+            # trade opening on the same track (COOLDOWN_BARS is just 2) froze every
+            # earlier record's window; it resumed after that trade closed and then
+            # measured price action far outside the record's intended horizon,
+            # inflating raw_mfe_pct/raw_mae_pct. It now runs for every track on
+            # every scan, BEFORE the trade handling below, so a record that closes
+            # during this very scan is picked up from the NEXT bar on (same as
+            # before). Open records are never touched by it.
+            # `!scan` (dry_run=True, fresh temp_state, so is_new_bar is always
+            # True) must not write to the real signals_history.json, which would
+            # burn one bar of every record's window per !scan.
+            # A bar of the window is spent at most once per bar timestamp, even
+            # if check_signals is retried before last_processed_bar_time commits.
+            if not dry_run:
+                _raw_key = f"{track}_raw_dec_bar"
+                _raw_new_bar = is_new_bar and state.get(_raw_key) != current_bar_time
+                for closed_side in ("long", "short"):
+                    update_raw_outcome(ticker, timeframe, closed_side, last_close, track=track,
+                                        high=last_high, low=last_low, is_new_bar=_raw_new_bar)
+                if _raw_new_bar:
+                    state[_raw_key] = current_bar_time
+
             trade = state.get(f"{track}_active_trade")
             if trade:
                 # 🆕 (pullback entry) a limit-entry trade only exists from its fill bar
@@ -1282,29 +1309,6 @@ async def check_signals(
                 if current_bar_time > int(pend.get("signal_bar_time") or 0):
                     update_signal_mae_mfe(ticker, timeframe, pend["side"], last_close, track=track,
                                            high=last_high, low=last_low)
-            elif not dry_run:
-                # 🆕 FIX: `!scan` (dry_run=True, fresh temp_state, so is_new_bar is
-                # always True) used to reach this branch and write to the REAL
-                # signals_history.json, burning one bar of every record's
-                # raw_tracking_bars_remaining per !scan. Dry runs must not touch
-                # persisted history.
-                # 🆕 (external review, TP-obstacle stage): no active trade on
-                # this track right now doesn't mean nothing needs updating —
-                # a just-closed record may still be inside its raw-outcome
-                # observation window (see update_raw_outcome()). Checked for
-                # both sides since we don't know here which side the most
-                # recently closed trade was on.
-                # 🆕 FIX: same idempotency problem as bars_in_trade above — spend a
-                # bar of the observation window at most once per bar timestamp,
-                # even if check_signals is retried before last_processed_bar_time
-                # gets committed.
-                _raw_key = f"{track}_raw_dec_bar"
-                _raw_new_bar = is_new_bar and state.get(_raw_key) != current_bar_time
-                for closed_side in ("long", "short"):
-                    update_raw_outcome(ticker, timeframe, closed_side, last_close, track=track,
-                                        high=last_high, low=last_low, is_new_bar=_raw_new_bar)
-                if _raw_new_bar:
-                    state[_raw_key] = current_bar_time
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1408,7 +1412,15 @@ async def check_signals(
         except Exception as e:
             logger.warning(f"[RELATIVE_STRENGTH] {ticker} {timeframe}: {e}")
 
-        vol_info = volume_flow_signal_v3(df)
+        # 🆕 FIX: df includes the still-forming last bar, but the signal is
+        # evaluated at idx (the last CLOSED bar). volume_flow_signal_v3 reads
+        # iloc[-1] — the forming bar, which right after a bar closes (exactly
+        # when signals open) has only seconds of volume: rel_vol ~0.01 tripped
+        # the `rel_vol < 0.5` branch of volume_leverage_adjustment_v3 and
+        # halved the leverage of practically every signal ("LOW_VOL"), and the
+        # OBV/delta scores were computed off a bar with ~no volume. Evaluate it
+        # on closed bars only, like everything else here.
+        vol_info = volume_flow_signal_v3(df.iloc[:idx + 1])
         vol_lev_reason = "no signal"
 
         # 🆕 FIX (external review, P1 — same reasoning as the backtest
