@@ -35,7 +35,24 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MUFCA Web API")
+import os as _os
+
+
+def _env_flag(name: str) -> bool:
+    return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# 🆕 Interactive API docs (/docs, /redoc, /openapi.json) sit outside the
+# /api/* auth gate and would publish the whole endpoint schema to anyone who
+# can reach the port — off by default, WEB_ENABLE_DOCS=1 turns them back on
+# for development.
+_DOCS_ON = _env_flag("WEB_ENABLE_DOCS")
+app = FastAPI(
+    title="MUFCA Web API",
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
+)
 
 # 🆕 Circular import, same pattern as discord_commands.py: bot.py imports
 # web_api at the very bottom, once bot/state/config are already set up.
@@ -79,23 +96,33 @@ _failed_attempts: dict = defaultdict(list)
 _locked_until: dict = {}
 
 
+# 🆕 Proxy headers (CF-Connecting-IP / X-Forwarded-For) are only meaningful when
+# the app really sits behind a reverse proxy/tunnel that sets them. Without one
+# they are plain client-supplied text, so trusting them lets an attacker pick
+# their own "IP" per request and dodge the lockout. Off by default (LAN use);
+# set WEB_TRUST_PROXY_HEADERS=1 only when ALL traffic comes through such a
+# proxy and port 8585 is not reachable directly.
+_TRUST_PROXY_HEADERS = _env_flag("WEB_TRUST_PROXY_HEADERS")
+
+
 def _get_client_ip(scope) -> str:
-    """The client's real IP behind a Cloudflare Tunnel/reverse proxy — not
-    scope['client'], which would show the tunnel/nginx's own address, not the
-    visitor's."""
-    headers = dict(scope.get("headers") or [])
-    # cf-connecting-ip is overwritten by Cloudflare itself, so a visitor can't forge it.
-    value = headers.get(b"cf-connecting-ip")
-    if value:
-        return value.decode("utf-8", errors="ignore").strip()
-    # 🆕 FIX: X-Forwarded-For used to be read from its FIRST element, which is
-    # whatever the client itself sent — a brute-forcer could put a fresh fake
-    # address in it on every request and never reach the lockout threshold
-    # (and bloat _failed_attempts with junk keys). A reverse proxy appends the
-    # address it actually saw at the END of the list, so take the last element.
-    value = headers.get(b"x-forwarded-for")
-    if value:
-        return value.decode("utf-8", errors="ignore").split(",")[-1].strip()
+    """The address used for lockout accounting.
+
+    Direct/LAN access (default): the socket peer address.
+    Behind Cloudflare/reverse proxy (WEB_TRUST_PROXY_HEADERS=1): the real
+    visitor address from the proxy's headers — scope['client'] would then be
+    the proxy's own address, shared by every visitor."""
+    if _TRUST_PROXY_HEADERS:
+        headers = dict(scope.get("headers") or [])
+        # cf-connecting-ip is overwritten by Cloudflare itself, so a visitor can't forge it.
+        value = headers.get(b"cf-connecting-ip")
+        if value:
+            return value.decode("utf-8", errors="ignore").strip()
+        # A proxy appends the address it actually saw at the END of
+        # X-Forwarded-For; the first element is whatever the client sent.
+        value = headers.get(b"x-forwarded-for")
+        if value:
+            return value.decode("utf-8", errors="ignore").split(",")[-1].strip()
     client = scope.get("client")
     return client[0] if client else "unknown"
 
@@ -818,7 +845,8 @@ async def history_records(ticker: str, tf: str, side: str, track: str = "a", lim
 
 
 @app.delete("/api/history/records")
-async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track: str = "a"):
+async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track: str = "a",
+                                timestamp: Optional[str] = None, entry: Optional[float] = None):
     """Deletes a single closed-trade record from signals_history.json —
     used by the History tab's per-row delete button to clean up duplicate or
     junk entries (e.g. left behind by re-running `!backfill_breakout` after
@@ -828,7 +856,12 @@ async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track
     if side not in ("long", "short"):
         raise HTTPException(400, "side must be 'long' or 'short'")
 
-    ok = delete_signal_record(ticker, tf, side, idx, track=track)
+    # timestamp/entry (sent by the History tab) fingerprint the row the user
+    # actually clicked: if the list shifted since it was loaded (a deletion in
+    # another tab/!delsignals), the index may now point at a different record
+    # of the same track — refuse instead of deleting the wrong one.
+    ok = delete_signal_record(ticker, tf, side, idx, track=track,
+                              expected_timestamp=timestamp, expected_entry=entry)
     if not ok:
         raise HTTPException(404, "Record not found (it may have already been deleted or the list changed — reload and try again)")
     return {"deleted": True}

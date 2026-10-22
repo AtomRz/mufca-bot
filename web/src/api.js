@@ -144,9 +144,13 @@ export const api = {
     request(
       `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}`,
     ),
-  deleteHistoryRecord: (ticker, tf, side, idx, track = 'a') =>
+  // timestamp/entry fingerprint the clicked row so the server refuses the delete
+  // if the list shifted since it was loaded (stale idx would hit another record).
+  deleteHistoryRecord: (ticker, tf, side, idx, track = 'a', timestamp = null, entry = null) =>
     request(
-      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&idx=${idx}&track=${track}`,
+      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&idx=${idx}&track=${track}` +
+        (timestamp != null ? `&timestamp=${encodeURIComponent(timestamp)}` : '') +
+        (entry != null ? `&entry=${encodeURIComponent(entry)}` : ''),
       { method: 'DELETE' },
     ),
   getPulse: (ticker, tf = '1h') =>
