@@ -25,12 +25,27 @@ export function clearAuthToken() {
  * credentials. If WEB_USERNAME/WEB_PASSWORD aren't set on the backend, auth
  * is disabled there and this always succeeds regardless of the values
  * entered — that's intentional. */
+// 🆕 FIX: btoa() only accepts Latin-1 — a password with Cyrillic/emoji threw
+// InvalidCharacterError before the request was even sent, and characters in the
+// 128-255 range were encoded as Latin-1 while the server decodes the header as
+// UTF-8 (so the login failed with "invalid password" for the right password).
+// Encode as UTF-8 bytes first, which is what the backend expects.
+function toBase64Utf8(str) {
+  const bytes = new TextEncoder().encode(str)
+  let bin = ''
+  bytes.forEach((b) => { bin += String.fromCharCode(b) })
+  return btoa(bin)
+}
+
 export async function login(username, password) {
-  const token = btoa(`${username}:${password}`)
+  const token = toBase64Utf8(`${username}:${password}`)
   const res = await fetch(`${BASE}/api/config`, {
     headers: { Authorization: `Basic ${token}` },
   })
   if (res.status === 401) throw new Error('Invalid username or password')
+  // the backend answers 429 (plain text) while this IP is locked out after
+  // repeated failures — say so instead of a generic "Login failed (429)"
+  if (res.status === 429) throw new Error('Too many failed attempts — try again later')
   if (!res.ok) throw new Error(`Login failed (${res.status})`)
   setAuthToken(token)
   return token
@@ -178,7 +193,11 @@ export function connectLive(onEvent, onStatusChange) {
   let ws = null
   let closed = false
   let attempt = 0
+  let connecting = false // 🆕 guards against two overlapping connect() runs
   let timeoutId = null // 🆕 tracked so it can be cleared on a repeated onclose/cleanup
+  let pingId = null
+  let lastRx = Date.now()
+  let sawPong = false // the watchdog only arms once the server proved it answers pings
 
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
 
@@ -198,37 +217,91 @@ export function connectLive(onEvent, onStatusChange) {
     }
   }
 
-  async function connect() {
-    if (closed) return
-    const ticket = await getTicket()
-    if (closed) return // in case logout happened while we were waiting for the ticket
-    const url = `${proto}://${window.location.host}/ws/live${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`
-    ws = new WebSocket(url)
-    ws.onopen = () => {
-      attempt = 0
-      onStatusChange?.('connected')
-    }
-    ws.onmessage = (msg) => {
-      try {
-        onEvent(JSON.parse(msg.data))
-      } catch (_) {}
-    }
-    ws.onclose = () => {
-      onStatusChange?.('disconnected')
-      if (closed) return
-      attempt += 1
-      const delay = Math.min(1000 * 2 ** attempt, 15000)
-      clearTimeout(timeoutId)
-      timeoutId = setTimeout(connect, delay)
-    }
-    ws.onerror = () => ws.close()
+  function stopPing() {
+    clearInterval(pingId)
+    pingId = null
   }
+
+  // 🆕 FIX: a phone that sleeps / switches networks leaves the WebSocket
+  // half-open: no onclose fires for minutes, the badge keeps saying "live" and
+  // no events arrive. Send a ping every 25 s (also keeps proxies from idling the
+  // connection out) and drop the socket if nothing at all was received for 70 s.
+  function startPing() {
+    stopPing()
+    pingId = setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      if (sawPong && Date.now() - lastRx > 70000) {
+        ws.close()
+        return
+      }
+      try { ws.send('ping') } catch (_) {}
+    }, 25000)
+  }
+
+  async function connect() {
+    if (closed || connecting) return
+    connecting = true
+    try {
+      const ticket = await getTicket()
+      if (closed) return // in case logout happened while we were waiting for the ticket
+      const url = `${proto}://${window.location.host}/ws/live${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`
+      const socket = new WebSocket(url)
+      ws = socket
+      socket.onopen = () => {
+        attempt = 0
+        lastRx = Date.now()
+        onStatusChange?.('connected')
+        startPing()
+      }
+      socket.onmessage = (msg) => {
+        lastRx = Date.now()
+        try {
+          const data = JSON.parse(msg.data)
+          if (data && data.type === 'pong') { sawPong = true; return }
+          onEvent(data)
+        } catch (_) {}
+      }
+      socket.onclose = () => {
+        if (ws !== socket) return // a stale socket from before a forced reconnect
+        stopPing()
+        onStatusChange?.('disconnected')
+        if (closed) return
+        attempt += 1
+        const delay = Math.min(1000 * 2 ** attempt, 15000)
+        clearTimeout(timeoutId)
+        timeoutId = setTimeout(connect, delay)
+      }
+      socket.onerror = () => socket.close()
+    } finally {
+      connecting = false
+    }
+  }
+
+  // 🆕 Coming back to the tab / the network returning: don't wait out the
+  // backoff (up to 15 s) — reconnect right away if the socket is not alive, and
+  // probe it with a ping if it looks alive.
+  function wake() {
+    if (closed) return
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      clearTimeout(timeoutId)
+      attempt = 0
+      connect()
+    } else if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send('ping') } catch (_) {}
+    }
+  }
+  const onVisible = () => { if (document.visibilityState === 'visible') wake() }
+  document.addEventListener('visibilitychange', onVisible)
+  window.addEventListener('online', wake)
 
   connect()
 
   return () => {
     closed = true
     clearTimeout(timeoutId)
+    stopPing()
+    document.removeEventListener('visibilitychange', onVisible)
+    window.removeEventListener('online', wake)
     ws?.close()
   }
 }
