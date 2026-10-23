@@ -37,13 +37,31 @@ export default function App() {
 
   // 🆕 CHOP/Trend/Leverage in the top bar now follow the pair/tf selected on
   // the Chart tab, instead of a hardcoded "always the first pair on 1h"
+  // 🆕 FIX: responses used to be applied in arrival order, so a slow reply for
+  // the previously selected pair/tf could land AFTER the reply for the new one
+  // and overwrite it (top bar showing lamps of the wrong pair). Only the most
+  // recent request may set the state.
+  const pulseSeq = useRef(0)
+  const lastPulseAt = useRef(0)
   const loadPulse = useCallback(() => {
     if (!chartTicker) return
-    api.getPulse(chartTicker, chartTf).then(setPulse).catch(() => {})
+    const seq = ++pulseSeq.current
+    lastPulseAt.current = Date.now()
+    api.getPulse(chartTicker, chartTf)
+      .then((p) => { if (seq === pulseSeq.current) setPulse(p) })
+      .catch(() => {})
   }, [chartTicker, chartTf])
 
+  // 🆕 FIX: if the selected pair was removed (web/Discord), keep following it no
+  // longer — the pulse request 404'd silently and the top bar kept showing the
+  // removed pair's stale lamps. Fall back to the first remaining pair.
   useEffect(() => {
-    if (!chartTicker && config?.pairs?.length) setChartTicker(config.pairs[0])
+    const pairs = config?.pairs
+    if (!pairs) return
+    if (!chartTicker || !pairs.includes(chartTicker)) {
+      setChartTicker(pairs[0] ?? null)
+      if (!pairs.length) setPulse(null)
+    }
   }, [config, chartTicker])
 
   useEffect(() => {
@@ -66,14 +84,28 @@ export default function App() {
 
   useEffect(() => {
     if (!authenticated) return
+    let connectedOnce = false
     const disconnect = connectLive(
       (event) => {
         setLastEvent(event)
         setPulseKey((k) => k + 1)
         if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current() }
-        if (event.type === 'scan_tick') loadPulseRef.current()
+        // 🆕 scan_tick arrives every scan (15-180 s) and /api/pulse is heavy
+        // (900 bars + HTF + indicators server-side): don't refresh it from a
+        // hidden tab, and at most every 30 s otherwise.
+        if (event.type === 'scan_tick' && !document.hidden && Date.now() - lastPulseAt.current >= 30000) {
+          loadPulseRef.current()
+        }
       },
-      setConnStatus,
+      (status) => {
+        setConnStatus(status)
+        // 🆕 after a RE-connect, events were missed while offline: resync config
+        // and pulse (an initial config load that failed also gets retried this way)
+        if (status === 'connected') {
+          if (connectedOnce) { loadConfigRef.current(); loadPulseRef.current() }
+          connectedOnce = true
+        }
+      },
     )
     return disconnect
   }, [authenticated])

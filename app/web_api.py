@@ -311,8 +311,11 @@ async def ws_live(websocket: WebSocket):
     _ws_clients.add(websocket)
     try:
         while True:
-            # The client doesn't send anything — just keep the connection alive
-            await websocket.receive_text()
+            # The client only sends keep-alive pings (see connectLive in api.js);
+            # answer them so it can tell a live connection from a half-open one.
+            msg = await websocket.receive_text()
+            if msg == "ping":
+                await websocket.send_text('{"type":"pong"}')
     except WebSocketDisconnect:
         pass
     finally:
