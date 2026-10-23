@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # 💾  CACHE (per-ticker, TTL = config.DERIVATIVES_CACHE_TTL)
 # =====================================================================
 _cache: Dict[str, tuple] = {}  # ticker -> (timestamp, bias_dict)
+# 🆕 FIX: per-ticker refresh lock. The scanner, !derivatives and /api/derivatives
+# can all find the same ticker's cache expired at once; the second fetch compared
+# OI against the baseline the first had JUST written (delta ~0) and overwrote the
+# correct "rising/falling" result in the cache with "flat".
+_ticker_locks: Dict[str, asyncio.Lock] = {}
 
 # 🆕 Previous OI snapshot per ticker, persisted so a restart doesn't lose the
 # baseline and delay OI-delta analysis by a full cache cycle — same reasoning
@@ -93,6 +98,7 @@ def clear_ticker_cache(ticker: str):
     computed against whatever OI happened to be current when the ticker was
     removed rather than the current run — a misleading first reading."""
     _cache.pop(ticker, None)
+    _ticker_locks.pop(ticker, None)
     had_baseline = _oi_baseline.pop(ticker, None) is not None
     if had_baseline:
         safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
@@ -181,6 +187,16 @@ async def _get_oi_delta(exchange, ticker: str) -> Dict:
         _save_oi_baseline_throttled()
         return {"delta_pct": 0.0, "direction": "neutral", "note": "first_run"}
 
+    # 🆕 FIX: the thresholds assume the delta spans about one refresh interval.
+    # After a long gap (bot stopped, restart with an old baseline file, interval
+    # raised) the delta covers hours and fires a false "rising/falling" — treat an
+    # old baseline as a fresh start instead.
+    age = now - float(baseline.get("ts") or 0)
+    if age > max(900, 3 * _cfg.DERIVATIVES_CACHE_TTL):
+        _oi_baseline[ticker] = {"oi": curr_oi, "ts": now}
+        _save_oi_baseline_throttled()
+        return {"delta_pct": 0.0, "direction": "neutral", "note": "first_run"}
+
     prev_oi = baseline["oi"]
     delta_pct = (curr_oi - prev_oi) / prev_oi if prev_oi else 0.0
 
@@ -219,6 +235,15 @@ async def get_derivatives_bias(exchange, ticker: str) -> Optional[Dict]:
     if cached and (time.time() - cached[0]) < _cfg.DERIVATIVES_CACHE_TTL:
         return cached[1]
 
+    lock = _ticker_locks.setdefault(ticker, asyncio.Lock())
+    async with lock:
+        cached = _cache.get(ticker)
+        if cached and (time.time() - cached[0]) < _cfg.DERIVATIVES_CACHE_TTL:
+            return cached[1]
+        return await _compute_derivatives_bias(exchange, ticker)
+
+
+async def _compute_derivatives_bias(exchange, ticker: str) -> Dict:
     funding_rate, oi_delta = await asyncio.gather(
         _fetch_funding_rate(exchange, ticker),
         _get_oi_delta(exchange, ticker),
@@ -294,7 +319,21 @@ async def get_derivatives_bias(exchange, ticker: str) -> Optional[Dict]:
         "funding_rate": funding_rate,
         "oi_delta_pct": oi_delta.get("delta_pct", 0.0),
         "oi_direction": oi_delta.get("direction", "unknown"),
+        "oi_note": oi_delta.get("note", "ok"),
     }
+
+    # 🆕 FIX: when BOTH inputs failed, the neutral result used to be cached for a
+    # whole TTL — one API hiccup hid funding/OI for that long. Return it, but let
+    # the next caller retry.
+    if funding_rate is None and oi_delta.get("note") in ("fetch_failed", "error"):
+        logger.warning(f"[DERIVATIVES] {ticker}: funding and OI both unavailable — not cached")
+        return result
+
+    # ticker removed while we were awaiting: don't leave its cache behind
+    if ticker not in _cfg.TICKERS:
+        _cache.pop(ticker, None)
+        _oi_baseline.pop(ticker, None)
+        return result
 
     _cache[ticker] = (time.time(), result)
     logger.info(f"[DERIVATIVES] {ticker}: bias_long={bias_long:+d} short={bias_short:+d} | lev_delta={lev_delta:+d} | {result['summary']}")
@@ -348,13 +387,22 @@ def combine_biases(onchain_bias: Optional[Dict], derivatives_bias: Optional[Dict
     combined["lev_delta"] = max(-2, min(2, onchain_bias.get("lev_delta", 0) + derivatives_bias.get("lev_delta", 0)))
     onchain_summary = onchain_bias.get("summary", "")
     derivatives_summary = derivatives_bias.get("summary", "")
-    combined["summary"] = " | ".join(s for s in (onchain_summary, derivatives_summary) if s and "neutral" not in s.lower())
+    # 🆕 FIX: used to drop a whole summary if the word "neutral" appeared anywhere
+    # in it (e.g. "F&G 50 (Neutral) | ETH outflow ..."), hiding real reasons.
+    # Only the standalone "all neutral" placeholders are dropped now.
+    _placeholders = ("📊 On-chain neutral", "📉 Derivatives neutral")
+    parts = []
+    for summ in (onchain_summary, derivatives_summary):
+        if summ and not summ.startswith(_placeholders):
+            parts.append(summ)
+    combined["summary"] = " | ".join(parts)
     if not combined["summary"]:
         combined["summary"] = "📊 On-chain + derivatives neutral."
     combined["derivatives"] = {
         "funding_rate": derivatives_bias.get("funding_rate"),
         "oi_delta_pct": derivatives_bias.get("oi_delta_pct"),
         "oi_direction": derivatives_bias.get("oi_direction"),
+        "oi_note": derivatives_bias.get("oi_note"),
     }
     return combined
 
@@ -368,7 +416,13 @@ def format_derivatives_report(bias: Optional[Dict]) -> str:
     oi_dir = bias.get("oi_direction", "unknown")
     lines = ["**📉 Derivatives (Futures)**", ""]
     lines.append(f"**Funding Rate:** `{fr*100:+.4f}%`" if fr is not None else "**Funding Rate:** unavailable")
-    lines.append(f"**Open Interest:** {oi_dir} (`{oi_pct*100:+.1f}%` since last check)")
+    oi_note = bias.get("oi_note")
+    if oi_note == "first_run":
+        lines.append("**Open Interest:** _baseline just set — change available on the next refresh_")
+    elif oi_note in ("fetch_failed", "error"):
+        lines.append("**Open Interest:** unavailable")
+    else:
+        lines.append(f"**Open Interest:** {oi_dir} (`{oi_pct*100:+.1f}%` since last check)")
     lines.append("")
     lines.append(f"**Summary:** {bias.get('summary', '—')}")
     return "\n".join(lines)
