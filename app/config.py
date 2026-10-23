@@ -311,7 +311,7 @@ ENABLE_SPREAD_FILTER     = _filter_toggles["spread"]
 # below are a reasonable starting point (from that testing), not a tuned
 # value for every pair — adjust per pair/TF via the web Settings panel.
 HURST_WINDOW_FILE = os.path.join(DATA_DIR, "hurst_window.json")
-_HURST_WINDOW_DEFAULTS = {"1h": 29, "4h": 23}
+_HURST_WINDOW_DEFAULTS = {"1h": 221, "4h": 140}
 
 def load_hurst_window() -> dict:
     """🆕 FIX (2026-09 audit, point 4): validate the loaded shape instead of
