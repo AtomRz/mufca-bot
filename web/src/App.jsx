@@ -229,6 +229,7 @@ export default function App() {
         {tab === 'chart' && (
           <ChartPanel
             pairs={config?.pairs}
+            timeframes={config?.timeframes}
             lastEvent={lastEvent}
             colors={config?.colors}
             ticker={chartTicker}
