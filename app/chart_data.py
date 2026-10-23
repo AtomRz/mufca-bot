@@ -30,6 +30,7 @@ from market_structure import detect_demand_supply_zones, zone_absolute_index
 # UI lamps match EXACTLY the logic that actually decides whether a trade
 # opens or not (no separate "own" copy of the conditions).
 from signals import (
+    _hurst_passes,
     crossover,
     crossunder,
     crossover2,
@@ -53,7 +54,10 @@ def _series_to_list(s: pd.Series, limit: int) -> List[Optional[float]]:
     tail = s.tail(limit)
     out = []
     for v in tail.values:
-        if v is None or (isinstance(v, float) and np.isnan(v)):
+        # 🆕 FIX: only NaN was mapped to None — ±inf (e.g. a ratio over a zero
+        # volume bar) went through as Infinity, which is not valid JSON and
+        # makes the dashboard's JSON.parse reject the WHOLE chart response.
+        if v is None or (isinstance(v, (float, np.floating)) and not np.isfinite(v)):
             out.append(None)
         else:
             out.append(round(float(v), 8))
@@ -98,13 +102,26 @@ async def get_chart_data(
     mfi_os, mfi_ob = run_kmeans_mfi(mfi_s, training_size=config.MFI_TRAINING)
 
     bb_u, bb_m, bb_l = calc_bollinger_bands(df["close"], period=config.BB_PERIOD, std_mult=config.BB_STDDEV)
-    sr = calc_support_resistance(df, pivot_window=config.SR_PIVOT_WINDOW, max_levels=config.SR_MAX_LEVELS)
+    # 🆕 FIX: the levels on the chart were computed with the still-forming bar
+    # included, while the scanner (market_structure.get_market_structure) uses
+    # closed bars only. A pivot "confirmed" by a few seconds of a partial candle
+    # could show up on the chart and vanish a minute later, and the levels the
+    # chart drew could differ from the ones actually used for signals.
+    # Same inputs as the live snapshot now: closed bars, last close as reference.
+    sr = calc_support_resistance(
+        df.iloc[:-1],
+        pivot_window=config.SR_PIVOT_WINDOW,
+        max_levels=config.SR_MAX_LEVELS,
+        ref_price=float(df["close"].iloc[-2]),
+    )
 
     # 🆕 Volume Profile (POC / Value Area) — see chart.calc_volume_profile()
     # for the TPO-style approximation used since only OHLCV is available.
     vp = None
     if config.VP_ENABLED:
-        vp_window = df.tail(min(config.VP_LOOKBACK, len(df)))
+        # closed bars only — same window the live snapshot profiles
+        confirmed_df = df.iloc[:-1]
+        vp_window = confirmed_df.tail(min(config.VP_LOOKBACK, len(confirmed_df)))
         vp = calc_volume_profile(vp_window, bins=config.VP_BINS, value_area_pct=config.VP_VALUE_AREA_PCT)
         if not config.VP_SHOW_HISTOGRAM:
             vp["bins"] = []
@@ -345,22 +362,13 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     hurst_s = calculate_hurst(df, window=config.HURST_WINDOW.get(tf, 100))
     hurst_v = float(hurst_s.iloc[idx])
     hurst_valid = not np.isnan(hurst_v)
-    # NOTE: NaN (still warming up) must read as "fail" here, matching
-    # check_signals()'s hurst_ok logic exactly. Previously NaN read as
-    # "pass" (`(not hurst_valid) or ...`), so the dashboard lamp could show
-    # green while ENABLE_HURST_FILTER was silently blocking the live
-    # signal — same warm-up window, opposite verdict. Keep both in sync.
-    #
-    # 🆕 Mode-aware, mirrors signals.py's hurst_ok exactly (trending_only
-    # rejects mean-reverting H < 0.5 too, not just the near-0.5 random-walk
-    # band) — this lamp must agree with what the live filter actually
-    # decides, or it becomes actively misleading rather than just unhelpful.
-    if not hurst_valid:
-        hurst_ok = False
-    elif config.HURST_MODE == "trending_only":
-        hurst_ok = (hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
-    else:
-        hurst_ok = abs(hurst_v - 0.5) >= config.HURST_MIN_DEVIATION
+    # 🆕 FIX: this used to re-implement the pass/fail rule inline (NaN -> fail,
+    # trending_only vs symmetric) next to signals._hurst_passes, which both the
+    # scanner and the backtester use — a second copy that had to be kept in sync
+    # by hand, and a lamp that disagrees with the live filter is worse than no
+    # lamp. Call the shared function so they cannot drift apart. NaN (still
+    # warming up) fails closed there, same as in check_signals().
+    hurst_ok = bool(_hurst_passes(hurst_v, config.HURST_MODE, config.HURST_MIN_DEVIATION))
 
     hh10_prev = float(df["high"].iloc[max(0, idx - 10):idx].max())
     ll10_prev = float(df["low"].iloc[max(0, idx - 10):idx].min())
