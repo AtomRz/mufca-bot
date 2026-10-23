@@ -114,10 +114,17 @@ def early_adverse_pct(side: str, entry: float, highs: np.ndarray, lows: np.ndarr
     j+1 .. j+n_bars (>= 0; 0 means price never went against the signal
     price in that window)."""
     lo, hi = j + 1, j + n_bars + 1
+    # 🆕 FIX: np.min/np.max propagate NaN, and max(0.0, nan) is 0.0 — a single
+    # NaN candle in the window silently turned the whole sample into "no pullback"
+    # (and dragged the mean/fill-rate estimate). NaN-aware reductions; a window
+    # with no valid candle at all is reported as nan so the caller can skip it.
+    window = lows[lo:hi] if side == "long" else highs[lo:hi]
+    if window.size == 0 or not np.isfinite(window).any():
+        return float("nan")
     if side == "long":
-        worst = float(np.min(lows[lo:hi]))
+        worst = float(np.nanmin(window))
         return max(0.0, (entry - worst) / entry * 100.0)
-    worst = float(np.max(highs[lo:hi]))
+    worst = float(np.nanmax(window))
     return max(0.0, (worst - entry) / entry * 100.0)
 
 
@@ -155,8 +162,14 @@ def pullback_samples(df: pd.DataFrame,
                 continue
             if track is not None and rec.get("track", "a") != track:
                 continue
-            entry = rec.get("entry")
-            if not entry or entry <= 0:
+            # 🆕 FIX: a hand-edited / legacy record with a non-numeric entry
+            # raised TypeError here and took the whole pullback calculation
+            # (and with it the signal) down.
+            try:
+                entry = float(rec.get("entry"))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(entry) or entry <= 0:
                 continue
             ts_ms = _record_ts_ms(rec.get("timestamp"))
             if ts_ms is None:
@@ -168,7 +181,10 @@ def pullback_samples(df: pd.DataFrame,
                 if (side, j) in seen:
                     continue
                 seen.add((side, j))
-            found.append((j, early_adverse_pct(side, float(entry), highs, lows, j, n_bars)))
+            adv = early_adverse_pct(side, entry, highs, lows, j, n_bars)
+            if not np.isfinite(adv):
+                continue
+            found.append((j, adv))
 
     found.sort(key=lambda x: x[0])
     return [v for _, v in found[-lookback_signals:]]
@@ -202,6 +218,11 @@ def compute_pullback_depth(df: pd.DataFrame,
     samples whose pullback reached the chosen depth), capped (bool),
     pooled (bool — measured over all tracks).
     """
+    # 🆕 FIX: a NaN/inf input (e.g. a zero-distance SL producing nan) used to
+    # slip through every comparison below and come out as depth_pct=nan, i.e. a
+    # limit order at price nan. Non-finite knobs mean "no limit order".
+    if not all(np.isfinite(x) for x in (mult, sl_dist_pct, max_sl_fraction, min_depth_pct)):
+        return None
     samples = pullback_samples(df, records_by_side, track, n_bars, last_idx, lookback_signals)
     pooled = False
     if len(samples) < min_samples and pool_fallback:
