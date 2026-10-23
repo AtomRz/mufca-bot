@@ -1,5 +1,13 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import { api } from '../api'
+
+// 🆕 FIX: App keeps `lastEvent` alive across tab switches, but this panel is
+// unmounted on every switch — so on coming back its effect ran again on the
+// SAME old event: a TP1 banner that had been dismissed (or was hours old) popped
+// up again, and the "Latest signal" card disappeared as soon as the next
+// scan_tick replaced lastEvent. What the panel has already handled, and what it
+// should keep showing, lives at module level so it survives the remount.
+const persisted = { seenEvent: null, tp1Banner: null, latestSignal: null }
 
 function fmtPrice(v) {
   if (v === undefined || v === null) return '—'
@@ -56,7 +64,7 @@ function PendingCard({ pending, label }) {
       <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, marginTop: 2 }}>
         <span><span style={{ color: 'var(--text-faint)' }}>Limit </span><span className="mono">{fmtPrice(pending.limit)}</span></span>
         <span><span style={{ color: 'var(--text-faint)' }}>Signal </span><span className="mono">{fmtPrice(pending.signal_price)}</span></span>
-        <span><span style={{ color: 'var(--text-faint)' }}>Pullback </span><span className="mono">{pending.pullback_pct}%</span></span>
+        <span><span style={{ color: 'var(--text-faint)' }}>Pullback </span><span className="mono">{pending.pullback_pct != null ? `${pending.pullback_pct}%` : '—'}</span></span>
         <span><span style={{ color: 'var(--text-faint)' }}>TP1 </span><span className="mono">{fmtPrice(pending.tp1)}</span></span>
         <span><span style={{ color: 'var(--text-faint)' }}>SL </span><span className="mono" style={{ color: 'var(--short)' }}>{fmtPrice(pending.sl)}</span></span>
         {pending.expire_ms && (
@@ -71,31 +79,50 @@ function PendingCard({ pending, label }) {
 export default function StatusPanel({ lastEvent }) {
   const [status, setStatus] = useState(null)
   const [error, setError] = useState(null)
-  const [tp1Banner, setTp1Banner] = useState(null)
+  const [tp1Banner, setTp1BannerState] = useState(persisted.tp1Banner)
+  const [latestSignal, setLatestSignal] = useState(persisted.latestSignal)
+  const statusSeq = useRef(0)
+
+  const setTp1Banner = (v) => { persisted.tp1Banner = v; setTp1BannerState(v) }
+
+  // 🆕 FIX: only the newest request may set the state (a slow reply from the
+  // interval poll could land after a fresher one triggered by an event), and a
+  // successful load clears an earlier error — it used to be sticky: one failed
+  // poll (a phone switching networks) replaced the whole panel with an error
+  // banner until the page was reloaded, even though later polls succeeded.
+  const loadStatus = () => {
+    const seq = ++statusSeq.current
+    return api.getStatus()
+      .then((d) => { if (seq === statusSeq.current) { setStatus(d); setError(null) } })
+      .catch((e) => { if (seq === statusSeq.current) setError(e.message) })
+  }
 
   useEffect(() => {
-    const load = () => api.getStatus().then(setStatus).catch((e) => setError(e.message))
-    load()
-    const id = setInterval(load, 30000)
+    loadStatus()
+    const id = setInterval(() => { if (!document.hidden) loadStatus() }, 30000)
     return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // scanner tick or new signal — refresh right away instead of waiting for the interval
   useEffect(() => {
-    if (!lastEvent) return
+    if (!lastEvent || lastEvent === persisted.seenEvent) return
+    persisted.seenEvent = lastEvent
     if (['scan_tick', 'signal', 'tp1_hit', 'limit_filled', 'limit_cancelled'].includes(lastEvent.type)) {
-      api.getStatus().then(setStatus).catch(() => {})
+      if (!document.hidden) loadStatus()
     }
     if (lastEvent.type === 'tp1_hit') setTp1Banner(lastEvent)
+    if (lastEvent.type === 'signal') { persisted.latestSignal = lastEvent; setLatestSignal(lastEvent) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent])
 
-  if (error) return <div className="error-banner">{error}</div>
-  if (!status) return <div className="empty-state">Loading…</div>
+  if (!status) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">Loading…</div>
 
   const pairs = Object.entries(status.pairs || {})
 
   return (
     <div>
+      {error && <div className="error-banner">{error}</div>}
       {tp1Banner && (
         <div className="panel" style={{ borderColor: 'var(--accent)' }}>
           <h3 className="panel-title" style={{ color: 'var(--accent)' }}>🎯 TP1 Hit</h3>
@@ -153,19 +180,19 @@ export default function StatusPanel({ lastEvent }) {
         </div>
       ))}
 
-      {lastEvent?.type === 'signal' && (
+      {latestSignal && (
         <div className="panel">
           <h3 className="panel-title">Latest signal</h3>
           <div className="row">
-            <span className="row-label">{lastEvent.ticker} · {lastEvent.tf}</span>
-            <span className={`tag ${lastEvent.sig_type?.includes('SHORT') ? 'short' : 'long'}`}>
-              {lastEvent.sig_type}
+            <span className="row-label">{latestSignal.ticker} · {latestSignal.tf}</span>
+            <span className={`tag ${latestSignal.sig_type?.includes('SHORT') ? 'short' : 'long'}`}>
+              {latestSignal.sig_type}
             </span>
           </div>
           <div className="row">
             <span className="row-label">Entry / TP / SL</span>
             <span className="row-value">
-              {lastEvent.price} / {lastEvent.tp} / {lastEvent.sl}
+              {latestSignal.price} / {latestSignal.tp} / {latestSignal.sl}
             </span>
           </div>
         </div>
