@@ -108,8 +108,14 @@ def calc_support_resistance(
     df: pd.DataFrame,
     pivot_window: int = 10,
     max_levels: int = 4,
+    ref_price: Optional[float] = None,
 ) -> Dict:
-    """Return legacy S/R plus touch-enriched level dictionaries."""
+    """Return legacy S/R plus touch-enriched level dictionaries.
+
+    ref_price: price the levels are measured against. Default (None) keeps the
+    historical behaviour: the second-to-last close, i.e. the last CLOSED bar of
+    a df whose final row is still forming. Pass it explicitly when handing in a
+    df that already excludes the forming bar."""
     if len(df) < max(5, pivot_window * 2 + 2):
         return {
             "support": [],
@@ -122,7 +128,10 @@ def calc_support_resistance(
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    last_close = _safe_float(close.iloc[-2] if len(close) >= 2 else close.iloc[-1])
+    if ref_price is not None:
+        last_close = _safe_float(ref_price)
+    else:
+        last_close = _safe_float(close.iloc[-2] if len(close) >= 2 else close.iloc[-1])
     w = max(1, int(pivot_window))
     supports: List[float] = []
     resistances: List[float] = []
@@ -196,10 +205,19 @@ def _merge_zones(zones: List[Dict], max_zones: int) -> List[Dict]:
                 new_high = max(existing["high"], zone["high"])
                 existing["low"] = new_low
                 existing["high"] = new_high
+                # 🆕 FIX: mid/state/distance were left as the first zone's —
+                # _nearest_zone() and the zone-distance readout use "mid", so a
+                # merged zone kept pointing at its old centre, and "state" could
+                # say "fresh" while "fresh" (AND-ed below) said False.
+                existing["mid"] = round_price((new_low + new_high) / 2.0)
+                _sev = {"fresh": 0, "tested": 1, "weakened": 2}
+                if _sev.get(zone.get("state"), 0) > _sev.get(existing.get("state"), 0):
+                    existing["state"] = zone["state"]
+                existing["distance_pct"] = min(existing["distance_pct"], zone["distance_pct"])
                 existing["score"] = max(existing["score"], zone["score"])
                 existing["touches"] = max(existing["touches"], zone["touches"])
                 existing["age"] = min(existing["age"], zone["age"])
-                existing["fresh"] = existing["fresh"] and zone["fresh"]
+                existing["fresh"] = existing["state"] == "fresh"
                 existing["retests"] = max(existing["retests"], zone["retests"])
                 existing["volume_ratio"] = max(existing["volume_ratio"], zone["volume_ratio"])
                 existing["displacement_atr"] = max(existing["displacement_atr"], zone["displacement_atr"])
@@ -219,28 +237,37 @@ def _zone_state(
     side: str,
     confirmed: pd.DataFrame,
     created_idx: int,
+    skip_bars: int = 0,
 ) -> Tuple[str, int, int]:
-    """Classify a zone using bars after creation only."""
+    """Classify a zone using bars after creation only.
+
+    skip_bars = the zone's own displacement window (impulse_bars). Those bars
+    are what MADE the zone: the first one opens inside the base, so its range
+    always overlaps it. Counting that as a retest made practically every zone
+    "tested" the moment it was created, and a zone price never came back to
+    could never read "fresh". Breaks are still checked on every later bar;
+    retests are only counted after the displacement window."""
     if created_idx >= len(confirmed) - 1:
         return "fresh", 0, 0
 
     later = confirmed.iloc[created_idx + 1:]
     retests = 0
     broken = False
-    for row in later.itertuples():
+    for k, row in enumerate(later.itertuples()):
         high = _safe_float(row.high)
         low = _safe_float(row.low)
+        countable = k >= skip_bars
         if side == "demand":
             if low <= zone_low:
                 broken = True
-            if low <= zone_high and high >= zone_low:
+            if countable and low <= zone_high and high >= zone_low:
                 retests += 1
             if _safe_float(row.close) < zone_low:
                 broken = True
         else:
             if high >= zone_high:
                 broken = True
-            if high >= zone_low and low <= zone_high:
+            if countable and high >= zone_low and low <= zone_high:
                 retests += 1
             if _safe_float(row.close) > zone_high:
                 broken = True
@@ -332,7 +359,7 @@ def detect_demand_supply_zones(
             if vol_ratio < min_volume_ratio:
                 return
             state, retests, age = _zone_state(
-                base_low, base_high, side, confirmed, i
+                base_low, base_high, side, confirmed, i, skip_bars=impulse_bars
             )
             if state == "broken":
                 return
@@ -538,7 +565,7 @@ class MarketStructure:
     zone_context: Dict = field(default_factory=dict)
 
 
-_ms_cache: Dict[Tuple[str, str], Tuple[int, "MarketStructure"]] = {}
+_ms_cache: Dict[Tuple[str, str], Tuple[tuple, "MarketStructure"]] = {}
 _ms_cache_lock = threading.Lock()
 
 
@@ -560,9 +587,24 @@ def get_market_structure(
 
     bar_time = int(df["timestamp"].iloc[-2])
     cache_key = (ticker, timeframe)
+    # 🆕 FIX: the snapshot used to be reused for the whole bar keyed on bar_time
+    # alone — so a VP/zone/S-R setting changed from the web UI had no effect on
+    # signals until the next bar (clear_market_structure_cache() is never
+    # called), and a backtest slice ending on the same bar_time but with a
+    # different amount of history could be served to the live scan. The
+    # fingerprint covers both: same bar, same df length, same settings.
+    fingerprint = (
+        bar_time, len(df),
+        _cfg.VP_ENABLED, _cfg.VP_BINS, _cfg.VP_LOOKBACK, _cfg.VP_VALUE_AREA_PCT,
+        _cfg.SR_PIVOT_WINDOW, _cfg.SR_MAX_LEVELS,
+        _cfg.ZONE_ENABLED, _cfg.ZONE_ATR_PERIOD, _cfg.ZONE_LOOKBACK, _cfg.ZONE_BASE_BARS,
+        _cfg.ZONE_IMPULSE_BARS, _cfg.ZONE_MAX_ZONES, _cfg.ZONE_MAX_BASE_ATR,
+        _cfg.ZONE_MIN_DISPLACEMENT_ATR, _cfg.ZONE_MIN_VOLUME_RATIO,
+        sr_df is not None and len(sr_df) > len(df),
+    )
     with _ms_cache_lock:
         cached = _ms_cache.get(cache_key)
-        if cached is not None and cached[0] == bar_time:
+        if cached is not None and cached[0] == fingerprint:
             return cached[1]
 
     last_close = _safe_float(df["close"].iloc[-2])
@@ -578,10 +620,14 @@ def get_market_structure(
         )
 
     sr_source = sr_df if sr_df is not None and len(sr_df) > len(df) else df
+    # 🆕 FIX: pivots were searched in a df whose last row is the still-forming
+    # candle, so the newest pivot candidate was "confirmed" by a few seconds of
+    # a partial bar. Search closed bars only, measured against the last close.
     sr = calc_support_resistance(
-        sr_source,
+        sr_source.iloc[:-1],
         pivot_window=_cfg.SR_PIVOT_WINDOW,
         max_levels=_cfg.SR_MAX_LEVELS,
+        ref_price=_safe_float(sr_source["close"].iloc[-2]),
     )
 
     zones: Dict[str, List[Dict]] = {"demand": [], "supply": []}
@@ -617,5 +663,5 @@ def get_market_structure(
     )
 
     with _ms_cache_lock:
-        _ms_cache[cache_key] = (bar_time, snapshot)
+        _ms_cache[cache_key] = (fingerprint, snapshot)
     return snapshot
