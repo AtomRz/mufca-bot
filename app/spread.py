@@ -24,6 +24,7 @@ starts from an already-populated per-pair baseline instead of a cold start.
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, List, Optional
 
@@ -36,7 +37,39 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # 💾  ROLLING HISTORY (per-ticker, capped at SPREAD_HISTORY_MAX_SAMPLES)
 # =====================================================================
-_history: Dict[str, List[float]] = safe_json_load(_cfg.SPREAD_HISTORY_FILE, {})
+def _sanitize_history(raw) -> Dict[str, List[float]]:
+    """🆕 FIX: spread_history.json was trusted as-is. A hand-edited or
+    half-written file with a non-list value or a non-numeric/NaN sample made
+    sorted() in _rolling_median raise TypeError on every scan for that ticker.
+    Keep only lists of finite, non-negative numbers."""
+    out: Dict[str, List[float]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for tkr, vals in raw.items():
+        if not isinstance(vals, list):
+            continue
+        clean = []
+        for v in vals:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f) and f >= 0:
+                clean.append(f)
+        out[str(tkr)] = clean[-_cfg.SPREAD_HISTORY_MAX_SAMPLES:]
+    return out
+
+
+_history: Dict[str, List[float]] = _sanitize_history(safe_json_load(_cfg.SPREAD_HISTORY_FILE, {}))
+
+# 🆕 FIX: get_spread_snapshot() is also called by !spread and by the web
+# dashboard's /api/spread (polled), and every call used to append a sample.
+# A dashboard left open filled the 500-sample window with near-identical
+# readings within minutes, evicting the real history and pulling the median
+# toward whatever the book looked like while the page was open. Samples are now
+# rate-limited per ticker.
+_SAMPLE_MIN_INTERVAL_S = 10.0  # below the shortest scan interval (15 s), so scanner samples are never skipped
+_last_sample_ts: Dict[str, float] = {}
 
 _history_last_saved = 0.0
 _history_dirty = False
@@ -66,6 +99,7 @@ def clear_ticker_cache(ticker: str):
     """Drops one ticker's spread history (use with !remove) — otherwise a
     later !add re-add's rolling median starts from stale pre-removal data
     instead of a clean warm-up."""
+    _last_sample_ts.pop(ticker, None)
     had_history = _history.pop(ticker, None) is not None
     if had_history:
         safe_json_save(_cfg.SPREAD_HISTORY_FILE, _history)
@@ -153,15 +187,33 @@ async def get_spread_snapshot(exchange, ticker: str) -> Optional[Dict]:
     if best_bid <= 0 or best_ask <= 0:
         return None
 
+    # 🆕 FIX: a crossed book (bid > ask — happens in the instant between two
+    # snapshot halves) gave a NEGATIVE spread that was recorded into the history
+    # and dragged the median down. Treat it as no data.
+    if best_ask < best_bid:
+        return None
+
     mid = (best_bid + best_ask) / 2.0
     spread_pct = (best_ask - best_bid) / mid
 
-    _record(ticker, spread_pct)
+    # 🆕 FIX: the median used to be computed AFTER appending the current sample,
+    # so the reading was judged against a baseline that already contained itself
+    # (it dampens exactly the outliers the anomaly gate looks for). Baseline first.
+    rolling_median = _rolling_median(ticker)
+    sample_count = len(_history.get(ticker, []))
+
+    now = time.time()
+    # skip recording if the pair was removed while we awaited the book (would
+    # resurrect the history !remove just cleared) or if we sampled very recently
+    if ticker in _cfg.TICKERS and now - _last_sample_ts.get(ticker, 0.0) >= _SAMPLE_MIN_INTERVAL_S:
+        _record(ticker, spread_pct)
+        _last_sample_ts[ticker] = now
+        sample_count = len(_history.get(ticker, []))
 
     return {
         "spread_pct": spread_pct,
-        "rolling_median": _rolling_median(ticker),
-        "sample_count": len(_history.get(ticker, [])),
+        "rolling_median": rolling_median,
+        "sample_count": sample_count,
         "bid": best_bid,
         "ask": best_ask,
     }
