@@ -41,6 +41,7 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
 # 💾  CACHE
 # =====================================================================
 _cache: Dict[str, Tuple[float, Any]] = {}   # key -> (timestamp, data)
+_bias_lock = asyncio.Lock()
 
 # 🆕 FIX: baseline balances used to live in a plain in-memory dict and were lost
 # on every container restart, forcing a fresh "first_run" and delaying flow
@@ -163,7 +164,10 @@ async def get_exchange_balances() -> Dict[str, Optional[float]]:
     for name, result in zip(EXCHANGE_ETH_ADDRESSES.keys(), results):
         balances[name] = result if not isinstance(result, Exception) else None
 
-    _cache_set("eth_balances", balances)
+    # 🆕 FIX: an all-None result (Etherscan down / rate-limited) was cached for the
+    # whole TTL, so one bad moment froze "N/A" for up to an hour.
+    if any(v is not None for v in balances.values()):
+        _cache_set("eth_balances", balances)
     logger.info(f"[ONCHAIN] ETH balances fetched: { {k: f'{v:.0f}' if v is not None else 'N/A' for k, v in balances.items()} }")
     return balances
 
@@ -193,6 +197,21 @@ async def get_eth_flow_delta() -> Dict:
     global _prev_balances_ts
     curr_balances = await get_exchange_balances()
     now = time.time()
+
+    # 🆕 FIX: when Etherscan returned nothing for every exchange, the code below
+    # carried on: delta 0, note "ok", and — worse — the baseline TIMESTAMP was
+    # moved to now although no balance had been refreshed, so the next window
+    # looked short against a delta that really spanned several cycles (false
+    # "large" flows). Report an honest failure and leave the baseline alone.
+    if all(v is None for v in curr_balances.values()):
+        logger.warning("[ONCHAIN] No exchange balance could be fetched — baseline left untouched")
+        return {
+            "delta_eth": 0.0,
+            "flow": "neutral",
+            "strength": "weak",
+            "per_exchange": {},
+            "note": "fetch_failed",
+        }
 
     # 🆕 FIX: this used to only check "is the dict empty?" — if the baseline
     # was loaded from disk but every value in it was None (e.g. the container
@@ -244,10 +263,19 @@ async def get_eth_flow_delta() -> Dict:
     # cycle (expected), but for the next one too (the baseline was already
     # corrupted). Now we only update the baseline for exchanges where a real
     # new value actually came back.
+    # The timestamp only moves when every exchange that has a baseline was
+    # refreshed. If one failed, its baseline is now older than the others', and
+    # keeping the older timestamp makes the thresholds scale up (more
+    # conservative) instead of treating a multi-cycle delta as a one-cycle one.
+    fully_refreshed = all(
+        curr_balances.get(n) is not None
+        for n in EXCHANGE_ETH_ADDRESSES if _prev_balances.get(n) is not None
+    )
     for name, curr in curr_balances.items():
         if curr is not None:
             _prev_balances[name] = curr
-    _prev_balances_ts = now
+    if fully_refreshed:
+        _prev_balances_ts = now
     safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
     safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
 
@@ -317,9 +345,15 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    val = int(data.get("data", [{}])[0].get("value", 0))
-                    lbl = data.get("data", [{}])[0].get("value_classification",
-                                                         _fg_label_from_value(val))
+                    # 🆕 FIX: a missing "value" used to default to 0 — i.e. a
+                    # genuine-looking "Extreme Fear" that boosted long bias
+                    # and TP/SL multipliers. Missing/out-of-range = failure,
+                    # fall through to the next source.
+                    item = (data.get("data") or [{}])[0]
+                    val = int(item["value"])
+                    if not (0 <= val <= 100):
+                        raise ValueError(f"F&G value out of range: {val}")
+                    lbl = item.get("value_classification") or _fg_label_from_value(val)
                     logger.info(f"[ONCHAIN] F&G from CoinGecko: {val} ({lbl})")
                     return val, lbl
                 else:
@@ -388,9 +422,15 @@ async def get_coingecko_data() -> Dict:
         "error": None,
     }
 
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # 1. Global market data (dominance)
+    # 🆕 FIX: the three requests used to share one try/except, so a failure in the
+    # FIRST one (e.g. an HTML 502 page from CoinGecko -> resp.json() raises)
+    # skipped everything after it — including the Fear & Greed lookup, which then
+    # silently stayed at the default 50 although alternative.me was reachable.
+    # Each step now fails on its own.
+    errors = []
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # 1. Global market data (dominance)
+        try:
             async with session.get(
                 f"{base}/global",
                 timeout=aiohttp.ClientTimeout(total=10)
@@ -400,12 +440,20 @@ async def get_coingecko_data() -> Dict:
                 # might not be a dict with the expected structure — .get() on
                 # a non-dict would raise.
                 if resp.status == 200 and isinstance(data, dict):
-                    mcp = data.get("data", {}).get("market_cap_percentage", {})
-                    result["btc_dominance"] = round(mcp.get("btc", 50.0), 2)
+                    mcp = (data.get("data") or {}).get("market_cap_percentage") or {}
+                    btc_dom = mcp.get("btc")
+                    if isinstance(btc_dom, (int, float)) and 0 < btc_dom < 100:
+                        result["btc_dominance"] = round(float(btc_dom), 2)
+                    else:
+                        logger.warning("[ONCHAIN] CoinGecko /global had no usable BTC dominance, using default")
                 else:
                     logger.warning(f"[ONCHAIN] CoinGecko /global status={resp.status}, using default dominance")
+        except Exception as e:
+            errors.append(f"global: {e}")
+            logger.warning(f"[ONCHAIN] CoinGecko /global failed: {e}")
 
-            # 2. ETH + BTC volume/price change
+        # 2. ETH + BTC volume/price change
+        try:
             async with session.get(
                 f"{base}/coins/markets"
                 "?vs_currency=usd&ids=bitcoin,ethereum&order=market_cap_desc",
@@ -427,22 +475,30 @@ async def get_coingecko_data() -> Dict:
                     # only available via /coins/{id}/market_chart (volume)
                     # with a manual delta computation. Keeping total_volume
                     # for reference for now, but volume_change = N/A.
-                    if coin["id"] == "ethereum":
+                    if not isinstance(coin, dict):
+                        continue
+                    if coin.get("id") == "ethereum":
                         result["eth_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
                         result["eth_volume_change_24h"] = None  # unavailable without extra requests
-                    elif coin["id"] == "bitcoin":
+                    elif coin.get("id") == "bitcoin":
                         result["btc_total_volume_24h"] = coin.get("total_volume", 0.0) or 0.0
                         result["btc_volume_change_24h"] = None  # unavailable without extra requests
+        except Exception as e:
+            errors.append(f"markets: {e}")
+            logger.warning(f"[ONCHAIN] CoinGecko /coins/markets failed: {e}")
 
-            # 3. Fear & Greed Index
-            # Source chain: CoinGecko → alternative.me → default 50
+        # 3. Fear & Greed Index
+        # Source chain: CoinGecko → alternative.me → default 50
+        try:
             fg_value, fg_label = await _fetch_fear_greed(session)
             result["fear_and_greed"] = fg_value
             result["fg_label"] = fg_label
+        except Exception as e:
+            errors.append(f"fear_greed: {e}")
+            logger.warning(f"[ONCHAIN] Fear & Greed failed: {e}")
 
-    except Exception as e:
-        result["error"] = str(e)
-        logger.warning(f"[ONCHAIN] CoinGecko/FNG error: {e}")
+    if errors:
+        result["error"] = "; ".join(errors)
 
     _cache_set("coingecko", result)
     logger.info(f"[ONCHAIN] CoinGecko: F&G={result['fear_and_greed']} ({result['fg_label']}) | BTC.dom={result['btc_dominance']}%")
@@ -469,7 +525,19 @@ async def get_onchain_bias() -> Dict:
     cached = _cache_get("onchain_bias")
     if cached is not None:
         return cached
+    # 🆕 FIX: serialise the refresh. The scanner and a manual !onchain can both
+    # find the cache expired at the same moment; the second run then compared
+    # fresh balances against the baseline the first run had JUST updated
+    # (delta ~0, window < 5 min) and overwrote the correct result in the cache
+    # with a neutral one.
+    async with _bias_lock:
+        cached = _cache_get("onchain_bias")
+        if cached is not None:
+            return cached
+        return await _compute_onchain_bias()
 
+
+async def _compute_onchain_bias() -> Dict:
     # Run in parallel
     flow_data, cg_data = await asyncio.gather(
         get_eth_flow_delta(),
@@ -612,7 +680,10 @@ async def get_onchain_bias() -> Dict:
         "flow_strength":  strength,
     }
 
-    _cache_set("onchain_bias", result)
+    # a failed balance fetch is reported but not cached, so the next caller
+    # retries instead of serving "neutral" for a whole TTL
+    if flow_data.get("note") != "fetch_failed":
+        _cache_set("onchain_bias", result)
     logger.info(f"[ONCHAIN] Bias: long={bias_long:+d} short={bias_short:+d} | lev_delta={lev_delta:+d} | {summary}")
     return result
 
@@ -651,6 +722,8 @@ def format_onchain_report(bias: Dict) -> str:
 
     if note == "first_run":
         lines.append("  _(first run — delta will be available on the next cycle)_")
+    elif note == "fetch_failed":
+        lines.append("  _(Etherscan returned no exchange balances — baseline kept, flow unknown this cycle)_")
     elif note == "error":
         lines.append("  _(failed to fetch exchange balances — showing the last known result)_")
     else:
