@@ -10,6 +10,7 @@ All source comments and strings are ASCII-only.
 import asyncio
 import io
 import logging
+import threading
 from typing import Optional, Tuple, Dict, List
 
 import matplotlib
@@ -167,7 +168,7 @@ def _draw_zones(
             )
 
 
-def build_chart(
+def _build_chart_impl(
     df: pd.DataFrame,
     symbol: str,
     timeframe: str,
@@ -189,12 +190,12 @@ def build_chart(
     volume_profile: Optional[Dict] = None,
     demand_supply_zones: Optional[Dict[str, List[Dict]]] = None,
 ) -> io.BytesIO:
-    """Build the chart PNG and return it as a BytesIO object."""
+    """Build the chart PNG and return it as a BytesIO object (see build_chart)."""
     original_display_len = len(df)
     display_start = max(0, original_display_len - limit)
     df = df.tail(limit).copy().reset_index(drop=True)
     n = len(df)
-    has_mfi = mfi is not None and len(mfi) >= limit
+    has_mfi = mfi is not None and len(mfi) >= n
 
     T = THEME
     fig = plt.figure(figsize=(14, 9 if has_mfi else 8), facecolor=T["bg"])
@@ -233,18 +234,26 @@ def build_chart(
         period=_cfg_value("BB_PERIOD", 20),
         std_mult=_cfg_value("BB_STDDEV", 2.0),
     )
-    bb_u = _bb_u_full.tail(limit).values
-    bb_m = _bb_m_full.tail(limit).values
-    bb_l = _bb_l_full.tail(limit).values
+    # 🆕 FIX: tails use n (the bars actually displayed), not `limit`: on a pair
+    # with fewer bars than `limit` the series came out longer than x and
+    # matplotlib raised a shape-mismatch ValueError.
+    bb_u = _bb_u_full.tail(n).values
+    bb_m = _bb_m_full.tail(n).values
+    bb_l = _bb_l_full.tail(n).values
     ax_c.fill_between(x, bb_l, bb_u, alpha=0.06, color=T["bb_fill"], zorder=1)
     ax_c.plot(x, bb_u, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
     ax_c.plot(x, bb_m, color=T["bb_mid"], linewidth=0.8, alpha=0.6, linestyle="--", zorder=2)
     ax_c.plot(x, bb_l, color=T["bb_band"], linewidth=0.8, alpha=0.7, zorder=2)
 
+    # 🆕 FIX: closed bars only, measured against the last close — the same
+    # inputs as the live market-structure snapshot (and the web chart). With the
+    # forming bar included a pivot confirmed by a few seconds of a partial
+    # candle could be drawn here and then disappear.
     sr = calc_support_resistance(
-        full,
+        full.iloc[:-1] if len(full) > 1 else full,
         pivot_window=_cfg_value("SR_PIVOT_WINDOW", 10),
         max_levels=_cfg_value("SR_MAX_LEVELS", 4),
+        ref_price=float(full["close"].iloc[-2]) if len(full) > 1 else None,
     )
     x_start = -0.5
     x_end = n - 0.5
@@ -281,12 +290,12 @@ def build_chart(
             bbox=dict(facecolor=T["bg2"], edgecolor="none", pad=1, alpha=0.7), zorder=8,
         )
 
-    if frama is not None and len(frama) >= limit:
-        fs = frama.tail(limit).values
+    if frama is not None and len(frama) >= n:
+        fs = frama.tail(n).values
         ax_c.plot(x, fs, color=T["frama"], linewidth=1.4, zorder=4, label="FRAMA")
         if frama_upper is not None and frama_lower is not None:
-            fu = frama_upper.tail(limit).values
-            fl = frama_lower.tail(limit).values
+            fu = frama_upper.tail(n).values
+            fl = frama_lower.tail(n).values
             ax_c.fill_between(x, fl, fu, alpha=0.08, color=T["frama"], zorder=1)
             ax_c.plot(x, fu, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
             ax_c.plot(x, fl, color=T["frama"], linewidth=0.5, alpha=0.4, zorder=2)
@@ -417,7 +426,7 @@ def build_chart(
     ax_v.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, _: f"{val / 1e3:.0f}K" if val >= 1000 else f"{val:.0f}"))
 
     if ax_m is not None and mfi is not None:
-        mfi_vals = mfi.tail(limit).values
+        mfi_vals = mfi.tail(n).values
         ax_m.plot(x, mfi_vals, color=T["mfi_line"], linewidth=1.0, zorder=3)
         ax_m.axhline(mfi_ob, color=T["mfi_ob"], linewidth=0.6, linestyle="--", alpha=0.7)
         ax_m.axhline(mfi_os, color=T["mfi_os"], linewidth=0.6, linestyle="--", alpha=0.7)
@@ -442,6 +451,25 @@ def build_chart(
     return buf
 
 
+# 🆕 FIX: matplotlib's pyplot keeps global state (current figure, figure
+# registry) and is not thread-safe, but build_chart runs in worker threads
+# (asyncio.to_thread) — two !chart commands at once could draw into each
+# other's figure. Renders are serialised. Also, an exception between
+# plt.figure() and plt.close() used to leave the figure open forever (a slow
+# memory leak in a long-running bot); since only one render exists at a time
+# here, closing everything in `finally` is safe.
+_render_lock = threading.Lock()
+
+
+def build_chart(*args, **kwargs) -> io.BytesIO:
+    """Thread-safe entry point: see _build_chart_impl for the arguments."""
+    with _render_lock:
+        try:
+            return _build_chart_impl(*args, **kwargs)
+        finally:
+            plt.close("all")
+
+
 async def generate_chart(
     exchange,
     symbol: str,
@@ -453,7 +481,11 @@ async def generate_chart(
     from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe
     from indicators import calculate_frama, calculate_mfi, run_kmeans_mfi
 
-    fetch_limit = max(limit + 250, 300)
+    # 🆕 FIX: the S/R pivot search and the MFI K-means levels depend on how deep
+    # the fetched history is. The scanner (and the web chart) use >= 900 bars;
+    # this fetched only limit+250 (300 by default), so the Discord image showed
+    # different support/resistance and MFI thresholds than the bot trades on.
+    fetch_limit = max(limit + 250, 300, _cfg_value("SR_MIN_LOOKBACK", 900), _cfg_value("MFI_TRAINING", 800) + 100)
     bars = await safe_fetch_ohlcv(exchange, symbol, timeframe, limit=fetch_limit)
     df = parse_ohlcv(bars)
     if not validate_dataframe(df, min_rows=50):
@@ -517,10 +549,18 @@ async def generate_chart(
                 closest_i = int(np.argmin(np.abs(ts_arr - float(entry_time_ms))))
                 bar_interval_ms = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 0.0
                 actual_diff = abs(ts_arr[closest_i] - float(entry_time_ms))
-                if bar_interval_ms > 0 and actual_diff <= bar_interval_ms * 1.5:
+                # 🆕 FIX: if the entry bar isn't found, or is older than the
+                # displayed window, the marker used to be drawn anyway — on the
+                # second-to-last bar (not found) or clamped onto the first bar
+                # (outside the window): a confident arrow in the wrong place.
+                # Draw it only when the real bar is visible.
+                if bar_interval_ms > 0 and actual_diff <= bar_interval_ms * 1.5 and closest_i >= display_start:
                     signal_bar_offset = closest_i - len(df)
+                else:
+                    signal_side = None
             except Exception as exc:
                 logger.warning("Failed to resolve entry_time_ms: %s", exc)
+                signal_side = None
         else:
             signal_bar_offset = state_snapshot.get("signal_bar_offset", -2)
 
