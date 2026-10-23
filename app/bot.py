@@ -699,6 +699,11 @@ async def market_scanner():
         try:
             _onchain_bias_cache = await get_onchain_bias()
             _onchain_last_fetch = now_ts
+            if _onchain_bias_cache.get("flow_data", {}).get("note") == "fetch_failed":
+                # 🆕 Etherscan gave nothing: don't wait a full interval for the
+                # next attempt (and don't hammer it every scan either) — retry
+                # in ~5 minutes (or at the normal interval if that is shorter).
+                _onchain_last_fetch = now_ts - max(0, _cfg.ONCHAIN_CACHE_TTL - 300)
             # On the first run — clear the onchain_bias cache so the next
             # hourly cycle recomputes the real delta (the baseline is already
             # saved in _prev_balances)

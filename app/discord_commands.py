@@ -1769,6 +1769,11 @@ async def onchain_cmd(ctx):
             await msg.edit(content=report + "\n\n⏳ _ETH flow delta will be available in ~1 hour (first run)._")
             return
 
+        if bias.get("flow_data", {}).get("note") == "fetch_failed":
+            # don't replace the scanner's cached bias with an "unknown" reading
+            await msg.edit(content=format_onchain_report(bias))
+            return
+
         core._onchain_bias_cache = bias
         core._onchain_last_fetch = time.time()
         report = format_onchain_report(bias)
