@@ -26,6 +26,7 @@ vanished from Status/the chart (see state.save_bot_state).
 
 import asyncio
 import logging
+import os
 import signal
 
 from bot import bot, ensure_engine_started
@@ -33,7 +34,13 @@ from config import DISCORD_TOKEN, DISCORD_ENABLED
 
 logger = logging.getLogger(__name__)
 
-WEB_API_PORT = 8585
+WEB_API_PORT = int(os.getenv("WEB_API_PORT", "8585"))
+WEB_API_HOST = os.getenv("WEB_API_HOST", "0.0.0.0")
+
+# 🆕 kept so shutdown can ask uvicorn to exit gracefully (should_exit) instead
+# of cancelling serve() mid-request, which dropped open WebSocket/HTTP clients
+# without a proper close.
+_web_server = None
 
 
 async def _run_web_api():
@@ -42,41 +49,70 @@ async def _run_web_api():
     from web_api import app as fastapi_app  # imported here: web_api does `import bot as core`,
                                              # bot must already be fully loaded by this point
 
+    global _web_server
     config = uvicorn.Config(
         fastapi_app,
-        host="0.0.0.0",
+        host=WEB_API_HOST,
         port=WEB_API_PORT,
         log_level="info",
         loop="none",  # already inside a running loop — don't let uvicorn create its own
     )
     server = uvicorn.Server(config)
-    logger.info(f"[WEB] Starting web API on 0.0.0.0:{WEB_API_PORT}")
+    _web_server = server
+    logger.info(f"[WEB] Starting web API on {WEB_API_HOST}:{WEB_API_PORT}")
     await server.serve()
 
 
 def _flush_state_to_disk():
     """Forces a save of everything that's accumulated in memory but hasn't
-    made it to disk yet."""
-    try:
-        from state import load_signals_history, save_signals_history, save_bot_state
-        import bot as _bot_module
+    made it to disk yet.
 
-        history = load_signals_history()  # this is the same dict already cached in memory
-        save_signals_history(history)     # forces it to write to disk
-        logger.info("[SHUTDOWN] signals_history.json flushed to disk")
+    🆕 FIX: all steps used to share one try/except, so if the first one failed
+    (e.g. signals_history.json), the position snapshot — the one that actually
+    keeps open trades alive across a restart — was never written. Each step is
+    now independent."""
+    def _step(label, fn):
+        try:
+            fn()
+            logger.info(f"[SHUTDOWN] {label} flushed to disk")
+        except Exception as e:
+            logger.error(f"[SHUTDOWN] Failed to flush {label}: {e}", exc_info=True)
 
-        save_bot_state(_bot_module.state)  # snapshot of active positions — survives a restart
-        logger.info("[SHUTDOWN] bot_state_snapshot.json flushed to disk")
+    import bot as _bot_module
+    from state import load_signals_history, save_signals_history, save_bot_state
+    import derivatives
+    import spread
 
-        import derivatives
-        derivatives.flush_oi_baseline()  # throttled OI baseline writes — force the last one out
-        logger.info("[SHUTDOWN] derivatives OI baseline flushed to disk")
+    # position snapshot first: it's the most valuable and the cheapest
+    _step("bot_state_snapshot.json", lambda: save_bot_state(_bot_module.state))
+    # same dict already cached in memory; saving forces a write
+    _step("signals_history.json", lambda: save_signals_history(load_signals_history()))
+    _step("derivatives OI baseline", derivatives.flush_oi_baseline)
+    _step("spread history", spread.flush_spread_history)
 
-        import spread
-        spread.flush_spread_history()  # throttled spread history writes — force the last one out
-        logger.info("[SHUTDOWN] spread history flushed to disk")
-    except Exception as e:
-        logger.error(f"[SHUTDOWN] Failed to flush state: {e}", exc_info=True)
+
+async def _stop_scanner(timeout: float = 5.0):
+    """🆕 FIX: the scanner used to keep running while (and after) state was
+    flushed, so a trade opened or closed in that window was missing from the
+    snapshot — after the restart it was either lost or announced twice. Stop
+    the scanner first (Loop.stop() is graceful: the current iteration
+    finishes), but only wait a few seconds: `docker stop` gives 10 s in total
+    before SIGKILL, and the flush must still fit in it."""
+    import bot as _bot_module
+    restart = getattr(_bot_module, "_scanner_restart_task", None)
+    if restart is not None and not restart.done():
+        restart.cancel()  # a pending crash-recovery restart must not revive the loop
+    scanner = _bot_module.market_scanner
+    if not scanner.is_running():
+        return
+    scanner.stop()
+    deadline = asyncio.get_running_loop().time() + timeout
+    while scanner.is_running() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.1)
+    if scanner.is_running():
+        logger.warning("[SHUTDOWN] Scanner iteration did not finish in time — cancelling it")
+        scanner.cancel()
+        await asyncio.sleep(0.2)
 
 
 async def _main():
@@ -88,7 +124,12 @@ async def _main():
         stop_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _request_shutdown, sig.name)
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig.name)
+        except NotImplementedError:
+            # Windows' event loop has no add_signal_handler — fall back to the
+            # plain signal module (still routes into the same stop_event).
+            signal.signal(sig, lambda *_a, _n=sig.name: loop.call_soon_threadsafe(_request_shutdown, _n))
 
     tasks_to_wait = {asyncio.create_task(stop_event.wait(), name="stop-event")}
 
@@ -100,7 +141,15 @@ async def _main():
         logger.info("[STARTUP] Discord disabled (no token or DISCORD_ENABLED=false) — running scanner + web dashboard only.")
         # on_ready never fires without a gateway connection, so kick off the
         # scanner/backtest engine directly here instead.
-        asyncio.create_task(ensure_engine_started())
+        # 🆕 FIX: the task object was dropped, so it could be garbage-collected
+        # mid-run and an exception inside it was never reported.
+        engine_task = asyncio.create_task(ensure_engine_started(), name="engine-start")
+
+        def _log_engine_start(t: asyncio.Task):
+            if not t.cancelled() and t.exception() is not None:
+                logger.error(f"[STARTUP] Engine start failed: {t.exception()}", exc_info=t.exception())
+
+        engine_task.add_done_callback(_log_engine_start)
 
     web_task = asyncio.create_task(_run_web_api(), name="web-api")
     tasks_to_wait.add(web_task)
@@ -128,13 +177,22 @@ async def _main():
         else:
             logger.warning(f"[SHUTDOWN] Task '{task.get_name()}' finished unexpectedly (no error) — shutting down.")
 
+    await _stop_scanner()
     _flush_state_to_disk()
+
+    if _web_server is not None:
+        _web_server.should_exit = True  # graceful uvicorn shutdown
 
     if bot_task is not None:
         logger.info("[SHUTDOWN] Closing Discord connection...")
         if not bot.is_closed():
             await bot.close()
 
+    if not web_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(web_task), timeout=3.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
     for task in filter(None, (bot_task, web_task)):
         if not task.done():
             task.cancel()
