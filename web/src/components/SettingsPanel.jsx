@@ -4,7 +4,7 @@ import { api } from '../api'
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
 const FILTER_TOGGLES = [
-  { key: 'frama', label: 'FRAMA trend + slope' },
+  { key: 'frama', label: 'FRAMA trend', hint: 'Direction of the FRAMA channel only. The FRAMA slope check (SLOPE lamp) is always applied and cannot be switched off.' },
   { key: 'chop', label: 'CHOP' },
   { key: 'atr', label: 'ATR' },
   { key: 'htf', label: 'HTF bias' },
