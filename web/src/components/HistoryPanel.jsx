@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api'
 
 function winrateColor(wr) {
@@ -17,8 +17,14 @@ function StatCard({ label, value, color }) {
 }
 
 function fmtPct(v) {
-  if (v === undefined || v === null) return '—'
+  if (v === undefined || v === null || !Number.isFinite(v)) return '—'
   return `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+}
+
+// 🆕 a missing/non-finite aggregate used to throw "toFixed of null" and blank the
+// whole History tab (the error boundary swallows the panel)
+function num2(v) {
+  return Number.isFinite(v) ? v.toFixed(2) : '—'
 }
 
 function fmtDate(ts) {
@@ -44,54 +50,89 @@ export default function HistoryPanel({ lastEvent }) {
   const [error, setError] = useState(null)
   const [selected, setSelected] = useState(null) // {ticker, tf, side, track}
   const [records, setRecords] = useState(null)
+  const [recordsError, setRecordsError] = useState(null)
   const [deletingIdx, setDeletingIdx] = useState(null)
+  const [confirmIdx, setConfirmIdx] = useState(null) // row waiting for the second "sure?" click
+  const [deleteError, setDeleteError] = useState(null)
+  const recordsSeq = useRef(0)
+  const confirmTimer = useRef(null)
 
   const load = useCallback(() => {
-    api.getHistorySummary().then(setSummary).catch((e) => setError(e.message))
+    api
+      .getHistorySummary()
+      .then((d) => { setSummary(d); setError(null) }) // 🆕 a later success clears an earlier error
+      .catch((e) => setError(e.message))
   }, [])
 
   useEffect(() => {
     load()
-    const id = setInterval(load, 60000)
+    // 🆕 no point polling while the tab is in the background
+    const id = setInterval(() => { if (!document.hidden) load() }, 60000)
     return () => clearInterval(id)
   }, [load])
 
-  // a signal just closed — refresh the summary
-  useEffect(() => {
-    if (lastEvent?.type === 'signal') load()
-  }, [lastEvent, load])
-
   const loadRecords = useCallback(() => {
     if (!selected) return
+    // 🆕 FIX: clicking through rows quickly let a slow response for the PREVIOUS
+    // row land after the current one and replace its trades (under the wrong
+    // title). Only the latest request may set the state.
+    const seq = ++recordsSeq.current
     api
       .getHistoryRecords(selected.ticker, selected.tf, selected.side, selected.track, 30)
-      .then((d) => setRecords(d.records))
-      .catch(() => setRecords([]))
+      .then((d) => { if (seq === recordsSeq.current) { setRecords(d.records); setRecordsError(null) } })
+      // 🆕 a failed request used to show "No closed trades for this combination"
+      // — indistinguishable from a really empty list
+      .catch((e) => { if (seq === recordsSeq.current) setRecordsError(e.message) })
   }, [selected])
 
+  // 🆕 FIX: switching to another row kept showing the previous row's trades
+  // (and never showed "Loading…") until the new response arrived
   useEffect(() => {
+    setRecords(null)
+    setRecordsError(null)
+    setConfirmIdx(null)
+    setDeleteError(null)
     loadRecords()
   }, [loadRecords])
 
+  // a signal just closed — refresh the summary, and the open trades list too
+  useEffect(() => {
+    if (lastEvent?.type === 'signal') { load(); loadRecords() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastEvent])
+
+  useEffect(() => () => clearTimeout(confirmTimer.current), [])
+
+  // 🆕 FIX: window.confirm()/alert() are silently swallowed by an Android
+  // WebView whose client doesn't implement onJsConfirm/onJsAlert (confirm()
+  // then always returns false, so the delete button did nothing). Confirmation
+  // is now inline: first click arms the button ("sure?"), second click deletes;
+  // it disarms itself after 4 s. Errors show in the panel instead of alert().
   const handleDelete = async (rec) => {
     if (!selected) return
-    if (!window.confirm(`Delete this ${selected.ticker} ${selected.tf} ${selected.side} trade (${fmtDate(rec.timestamp)}, entry ${rec.entry})? This cannot be undone.`)) {
+    if (confirmIdx !== rec.idx) {
+      setConfirmIdx(rec.idx)
+      clearTimeout(confirmTimer.current)
+      confirmTimer.current = setTimeout(() => setConfirmIdx(null), 4000)
       return
     }
+    clearTimeout(confirmTimer.current)
+    setConfirmIdx(null)
+    setDeleteError(null)
     setDeletingIdx(rec.idx)
     try {
       await api.deleteHistoryRecord(selected.ticker, selected.tf, selected.side, rec.idx, selected.track, rec.timestamp, rec.entry)
       loadRecords() // row counts/PnL aggregates changed — refresh both tables
       load()
     } catch (e) {
-      alert(`Failed to delete record: ${e.message}`)
+      setDeleteError(`Failed to delete record: ${e.message}`)
+      loadRecords() // the usual reason is a stale list — show the current one
     } finally {
       setDeletingIdx(null)
     }
   }
 
-  if (error) return <div className="error-banner">{error}</div>
-  if (!summary) return <div className="empty-state">Loading…</div>
+  if (!summary) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">Loading…</div>
 
   const { rows, total } = summary
 
@@ -104,6 +145,7 @@ export default function HistoryPanel({ lastEvent }) {
 
   return (
     <div>
+      {error && <div className="error-banner">{error}</div>}
       {total && (
         <div className="panel">
           <h3 className="panel-title">Overall (all pairs)</h3>
@@ -111,8 +153,8 @@ export default function HistoryPanel({ lastEvent }) {
             <StatCard label="Win Rate" value={`${Math.round(total.win_rate * 100)}%`} color={winrateColor(total.win_rate)} />
             <StatCard label="Signals" value={total.count} />
             <StatCard label="Avg PnL" value={fmtPct(total.avg_pnl)} color={total.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)'} />
-            <StatCard label="Avg MFE" value={`${total.avg_mfe.toFixed(2)}%`} />
-            <StatCard label="Avg MAE" value={`${total.avg_mae.toFixed(2)}%`} />
+            <StatCard label="Avg MFE" value={`${num2(total.avg_mfe)}%`} />
+            <StatCard label="Avg MAE" value={`${num2(total.avg_mae)}%`} />
             <StatCard label="TP / SL after TP1 / SL / Cancel" value={`${total.tp_hits} / ${total.sl_after_tp1_hits ?? 0} / ${total.sl_hits} / ${total.cancelled}`} />
           </div>
         </div>
@@ -160,8 +202,8 @@ export default function HistoryPanel({ lastEvent }) {
                     <span style={{ color: winrateColor(r.win_rate) }}>{Math.round(r.win_rate * 100)}%</span>
                   </td>
                   <td style={{ color: r.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)' }}>{fmtPct(r.avg_pnl)}</td>
-                  <td>{r.avg_mfe.toFixed(2)}%</td>
-                  <td>{r.avg_mae.toFixed(2)}%</td>
+                  <td>{num2(r.avg_mfe)}%</td>
+                  <td>{num2(r.avg_mae)}%</td>
                   <td className="mono" style={{ color: 'var(--text-dim)' }}>
                     {r.tp_hits}/{r.sl_after_tp1_hits ?? 0}/{r.sl_hits}/{r.cancelled}
                   </td>
@@ -177,7 +219,9 @@ export default function HistoryPanel({ lastEvent }) {
           <h3 className="panel-title">
             {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : selected.track === 'u' ? 'UT Bot' : selected.track === 'b' ? 'Breakout' : selected.track} — recent trades
           </h3>
-          {!records && <div className="empty-state">Loading…</div>}
+          {recordsError && <div className="error-banner">{recordsError}</div>}
+          {deleteError && <div className="error-banner">{deleteError}</div>}
+          {!records && !recordsError && <div className="empty-state">Loading…</div>}
           {records && records.length === 0 && <div className="empty-state">No closed trades for this combination.</div>}
           {records && records.length > 0 && (
             <div className="table-wrap">
@@ -202,8 +246,8 @@ export default function HistoryPanel({ lastEvent }) {
                       <td>{rec.entry}</td>
                       <td>{rec.exit ?? '—'}</td>
                       <td style={{ color: rec.moved_pct >= 0 ? 'var(--long)' : 'var(--short)' }}>{fmtPct(rec.moved_pct)}</td>
-                      <td>{(rec.max_favorable_pct ?? 0).toFixed(2)}%</td>
-                      <td>{(rec.max_adverse_pct ?? 0).toFixed(2)}%</td>
+                      <td>{num2(rec.max_favorable_pct ?? 0)}%</td>
+                      <td>{num2(rec.max_adverse_pct ?? 0)}%</td>
                       <td>
                         <span className={`tag ${rec.exit_type === 'tp' ? 'long' : rec.exit_type === 'sl' ? 'short' : rec.exit_type === 'sl_after_tp1' ? 'long' : 'flat'}`}>
                           {rec.exit_type === 'sl_after_tp1' ? 'SL (post-TP1)' : rec.exit_type}
@@ -215,11 +259,12 @@ export default function HistoryPanel({ lastEvent }) {
                       <td>
                         <button
                           className="row-delete-btn"
-                          title="Delete this record"
+                          title={confirmIdx === rec.idx ? 'Click again to delete — this cannot be undone' : 'Delete this record'}
                           onClick={() => handleDelete(rec)}
                           disabled={deletingIdx === rec.idx}
+                          style={confirmIdx === rec.idx ? { color: 'var(--short)', fontWeight: 700 } : undefined}
                         >
-                          {deletingIdx === rec.idx ? '…' : '×'}
+                          {deletingIdx === rec.idx ? '…' : confirmIdx === rec.idx ? 'sure?' : '×'}
                         </button>
                       </td>
                     </tr>
