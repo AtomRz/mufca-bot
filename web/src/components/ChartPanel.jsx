@@ -40,7 +40,7 @@ function toLineData(times, values) {
   return out
 }
 
-export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTickerChange, onTfChange, onLoadingChange }) {
+export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticker, tf, onTickerChange, onTfChange, onLoadingChange }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
@@ -92,14 +92,33 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load])
 
+  // 🆕 FIX: this effect used to list `load` in its dependencies. `load` gets a
+  // new identity whenever the pair/tf/track/bars selection changes, so changing
+  // the selection re-ran this effect against the SAME old lastEvent and fired a
+  // second identical /api/chart request next to the one the effect above had
+  // just made (the heavy one: 900 bars + indicators + zones). Keep the latest
+  // `load` in a ref and let only a NEW event trigger this effect.
+  const loadRef = useRef(load)
+  useEffect(() => { loadRef.current = load }, [load])
+
   // scanner tick / new signal for this same pair/tf — pull fresh data
   useEffect(() => {
     if (!lastEvent || !ticker) return
-    if (lastEvent.type === 'scan_tick') load()
-    if (lastEvent.type === 'signal' && lastEvent.ticker === ticker && lastEvent.tf === tf) load()
+    // 🆕 nothing to redraw while the tab/app is in the background; the
+    // visibilitychange handler below catches up when it comes back
+    if (document.hidden) return
+    if (lastEvent.type === 'scan_tick') loadRef.current()
+    if (lastEvent.type === 'signal' && lastEvent.ticker === ticker && lastEvent.tf === tf) loadRef.current()
     // colors/indicators/volume-profile settings changed — reread data (MFI thresholds, VP bins etc. may have changed)
-    if (lastEvent.type === 'config_changed') load()
-  }, [lastEvent, ticker, tf, load])
+    if (lastEvent.type === 'config_changed') loadRef.current()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastEvent])
+
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') loadRef.current() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
 
   // 🆕 Draws the volume-profile histogram AND demand/supply zone labels on
   // a canvas overlaid on top of the chart (lightweight-charts v4 has no
@@ -461,6 +480,10 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
         priceLineVisible: false,
         lastValueVisible: false,
         crosshairMarkerVisible: false,
+        // 🆕 zones/levels are context, not data: a far-away supply zone or S/R
+        // band used to stretch the price scale and squash the candles into a
+        // thin strip. null = "exclude this series from autoscale".
+        autoscaleInfoProvider: () => null,
       })
       // startTime lets a zone begin partway through the chart instead of
       // spanning its full width (unlike S/R and Volume Profile, which are
@@ -569,7 +592,7 @@ export default function ChartPanel({ pairs, lastEvent, colors, ticker, tf, onTic
           ))}
         </div>
         <div className="seg">
-          {TIMEFRAMES.map((t) => (
+          {(timeframes && timeframes.length ? timeframes : TIMEFRAMES).map((t) => (
             <button key={t} className={tf === t ? 'active' : ''} onClick={() => onTfChange?.(t)}>
               {t}
             </button>
