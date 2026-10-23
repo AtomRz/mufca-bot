@@ -422,10 +422,22 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
         "andean": {"kind": "signal", "state": and_lamp},
         "ut_bot": {"kind": "signal", "state": ut_lamp},
         "filters": {
+            # 🆕 The FRAMA lamp used to fold the slope check into itself
+            # (direction AND slope). In check_signals() only the direction is
+            # toggleable (ENABLE_FRAMA_FILTER) — the slope condition applies
+            # ALWAYS — so with the toggle off the lamp read "disabled" while
+            # the slope was still silently blocking signals. Split in two, each
+            # mirroring its real rule.
             "frama": {
                 "enabled": config.ENABLE_FRAMA_FILTER,
-                "pass_long": frama_bull and slope_long,
-                "pass_short": frama_bear and slope_short,
+                "pass_long": frama_bull,
+                "pass_short": frama_bear,
+            },
+            "slope": {
+                "enabled": True,  # a hard condition in filter_long/filter_short, not toggleable
+                "pass_long": slope_long,
+                "pass_short": slope_short,
+                "value": round(frama_slope, 8),
             },
             "chop": {
                 "enabled": config.ENABLE_CHOP_FILTER,

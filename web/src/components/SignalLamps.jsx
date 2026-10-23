@@ -4,6 +4,7 @@ import React, { useMemo } from 'react'
 const SIGNAL_LABELS = { mfi: 'MFI', andean: 'AND', ut_bot: 'UT' }
 const FILTER_LABELS = {
   frama: 'FRAMA',
+  slope: 'SLOPE',
   chop: 'CHOP',
   atr: 'ATR',
   htf: 'HTF',
