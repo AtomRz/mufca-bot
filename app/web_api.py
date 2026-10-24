@@ -897,6 +897,7 @@ async def get_config():
         "derivatives_interval_options": list(_cfg.DERIVATIVES_INTERVAL_OPTIONS),
         "chop_threshold": CHOP_THRESHOLD,
         "hurst_window": _cfg.HURST_WINDOW,
+        "hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION,
         "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
         "hurst_mode": _cfg.HURST_MODE,
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
@@ -1178,6 +1179,26 @@ async def set_intrabar_check(body: IntrabarCheckIn):
     _cfg.save_intrabar_check(_cfg.INTRABAR_CHECK_ENABLED)
     await broadcast_event({"type": "config_changed", "key": "intrabar_check_enabled", "value": _cfg.INTRABAR_CHECK_ENABLED})
     return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": True}
+
+
+class HurstBiasCorrectionIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/hurst-bias-correction")
+async def set_hurst_bias_correction(body: HurstBiasCorrectionIn):
+    """Turns the Anis-Lloyd small-sample correction of the Hurst estimate on or
+    off live (no restart). OFF restores the legacy uncorrected estimate that
+    older tuned windows / min deviation were calibrated on. Read at call time
+    by indicators.calculate_hurst, so the next scan and chart request use it.
+    See config.HURST_BIAS_CORRECTION."""
+    if body.enabled == _cfg.HURST_BIAS_CORRECTION:
+        return {"hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION, "changed": False}
+
+    _cfg.HURST_BIAS_CORRECTION = body.enabled
+    _cfg.save_hurst_bias_correction(_cfg.HURST_BIAS_CORRECTION)
+    await broadcast_event({"type": "config_changed", "key": "hurst_bias_correction", "value": _cfg.HURST_BIAS_CORRECTION})
+    return {"hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION, "changed": True}
 
 
 class PullbackConfigIn(BaseModel):

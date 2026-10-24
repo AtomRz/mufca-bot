@@ -850,6 +850,27 @@ def save_intrabar_check(enabled: bool):
 INTRABAR_CHECK_ENABLED = load_intrabar_check()
 
 # =====================================================================
+# 📈  HURST ANIS-LLOYD BIAS CORRECTION
+# =====================================================================
+# ON  (default) — the R/S Hurst estimate is Anis-Lloyd bias-corrected, so pure
+#                 noise reads ~0.5 at any window (see indicators.py header).
+# OFF           — legacy uncorrected estimate (noise reads ~0.58-0.61); the
+#                 windows / HURST_MIN_DEVIATION tuned before the correction
+#                 were calibrated on it.
+# First-boot default comes from env HURST_BIAS_CORRECTION; after the first
+# toggle in the web Settings the persisted value wins.
+HURST_BIAS_CORRECTION_FILE = os.path.join(DATA_DIR, "hurst_bias_correction.json")
+
+def load_hurst_bias_correction() -> bool:
+    env_default = os.environ.get("HURST_BIAS_CORRECTION", "1").strip().lower() not in ("0", "false", "no", "off")
+    return bool(_load_typed(HURST_BIAS_CORRECTION_FILE, {"enabled": env_default})["enabled"])
+
+def save_hurst_bias_correction(enabled: bool):
+    safe_json_save(HURST_BIAS_CORRECTION_FILE, {"enabled": bool(enabled)})
+
+HURST_BIAS_CORRECTION = load_hurst_bias_correction()
+
+# =====================================================================
 # 🎯  PULLBACK (LIMIT) ENTRY — wait for the average pullback
 # =====================================================================
 # After a signal fires price often dips against the position for a bar or two

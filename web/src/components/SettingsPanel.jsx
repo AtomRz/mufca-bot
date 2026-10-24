@@ -403,6 +403,16 @@ export default function SettingsPanel({ config, onChanged }) {
                 <option value="symmetric">Symmetric (trend + mean-rev)</option>
               </select>
             </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Anis-Lloyd small-sample correction of the R/S Hurst estimate. On: pure noise reads ~0.5 at any window. Off: legacy uncorrected estimate (noise reads ~0.58-0.61) that older windows / Min Deviation were tuned on. Applies from the next scan.">
+                Anis-Lloyd correction
+              </span>
+              <Toggle
+                checked={config.hurst_bias_correction ?? true}
+                disabled={busy === 'hurst_bias_correction'}
+                onChange={(v) => run('hurst_bias_correction', () => api.setHurstBiasCorrection(v))}
+              />
+            </div>
             <NumberField
               label="Min Deviation from 0.5" hint="0–0.5 — higher = stricter, fewer but more selective signals"
               value={config.hurst_min_deviation} min={0} max={0.5} step={0.01}

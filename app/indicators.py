@@ -45,10 +45,15 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # estimate (sd of H is ~0.35 at window 21-23, ~0.14 at 50, ~0.09 at 100),
 # so prefer windows >= 100 where the threshold can actually separate regimes.
 #
-# Set env HURST_BIAS_CORRECTION=0 to get the legacy (uncorrected) estimate
-# back without a code change — the per-timeframe windows and
-# HURST_MIN_DEVIATION already tuned live were calibrated on that estimate.
-HURST_BIAS_CORRECTION = os.environ.get("HURST_BIAS_CORRECTION", "1").strip().lower() not in ("0", "false", "no", "off")
+# Web Settings -> Hurst Filter -> "Anis-Lloyd bias correction" toggle (or env
+# HURST_BIAS_CORRECTION=0 as the first-boot default) gives the legacy
+# (uncorrected) estimate back without a code change — the per-timeframe
+# windows and HURST_MIN_DEVIATION already tuned live were calibrated on that
+# estimate. The flag lives in config.HURST_BIAS_CORRECTION (persisted, live
+# switchable) and is read at call time, NOT imported by value here.
+def _bias_correction_enabled() -> bool:
+    import config as _cfg
+    return bool(_cfg.HURST_BIAS_CORRECTION)
 
 _HURST_MIN_CHUNK = 8
 
@@ -110,10 +115,10 @@ def _hurst_rs(returns: np.ndarray, bias_correct: Optional[bool] = None) -> float
     to keep going), <0.5 = mean-reverting/anti-persistent (a move tends to
     reverse).
 
-    bias_correct (default: HURST_BIAS_CORRECTION) — apply the Anis–Lloyd
+    bias_correct (default: config.HURST_BIAS_CORRECTION) — apply the Anis–Lloyd
     correction described above, so pure noise reads ~0.5 at any window."""
     if bias_correct is None:
-        bias_correct = HURST_BIAS_CORRECTION
+        bias_correct = _bias_correction_enabled()
     n = len(returns)
     if n < 16:
         return 0.5  # not enough data — neutral, not "trending" or "reverting"
@@ -318,13 +323,13 @@ def calculate_hurst(df: pd.DataFrame, window: int = 100, bias_correct: Optional[
     either direction). NaN for the first `window` bars while warming up.
 
     bias_correct — Anis–Lloyd small-sample correction (see the section header
-    above); None uses HURST_BIAS_CORRECTION (default on). Pass False for the
+    above); None uses config.HURST_BIAS_CORRECTION (default on). Pass False for the
     legacy estimate.
 
     Uses a numba-JIT rolling implementation when available (~500x faster
     than the pandas/apply path); falls back to pure Python otherwise."""
     if bias_correct is None:
-        bias_correct = HURST_BIAS_CORRECTION
+        bias_correct = _bias_correction_enabled()
     log_ret = np.log(df["close"] / df["close"].shift(1))
     if _HAS_NUMBA:
         sizes = _hurst_sizes(window)

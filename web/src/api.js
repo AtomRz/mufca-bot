@@ -100,6 +100,8 @@ export const api = {
     request('/api/config/tp1-sl-mode', { method: 'POST', body: JSON.stringify({ tp1_sl_mode: tp1SlMode }) }),
   setIntrabarCheck: (enabled) =>
     request('/api/config/intrabar-check', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setHurstBiasCorrection: (enabled) =>
+    request('/api/config/hurst-bias-correction', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setDiscordNotifications: (enabled) =>
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setScanInterval: (seconds) =>
