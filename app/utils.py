@@ -34,8 +34,12 @@ async def safe_fetch_ohlcv(
             )
         except ccxt.RateLimitExceeded:
             wait = 2 ** attempt
-            logger.warning(f"Rate limit for {ticker} {timeframe}, waiting {wait}s")
-            await asyncio.sleep(wait)
+            if attempt < retries - 1:
+                logger.warning(f"Rate limit for {ticker} {timeframe}, waiting {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                # 🆕 no point sleeping after the last attempt — the loop ends anyway
+                logger.error(f"Rate limit for {ticker} {timeframe}: giving up after {retries} attempts")
         except ccxt.BadSymbol:
             logger.error(f"Bad symbol: {ticker}")
             return []
@@ -53,12 +57,16 @@ async def safe_fetch_ohlcv(
 # =====================================================================
 def parse_ohlcv(bars: List[List[float]]) -> pd.DataFrame:
     """Converts OHLCV bars into a DataFrame."""
+    cols = ["timestamp", "open", "high", "low", "close", "volume"]
     if not bars:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-    return pd.DataFrame(
-        bars,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(bars, columns=cols)
+    # 🆕 FIX: a None in any field made the column object-dtype, and later
+    # arithmetic/rolling calls raised TypeError instead of being caught by
+    # validate_dataframe(). Coerce to numeric so a bad value becomes NaN and is
+    # rejected there.
+    df[cols[1:]] = df[cols[1:]].apply(pd.to_numeric, errors="coerce")
+    return df
 
 # =====================================================================
 # 🔍  DATA VALIDATION
@@ -89,7 +97,12 @@ def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
     represent what it claims to."""
     if df.empty or len(df) < min_rows:
         return False
-    if df[["open", "high", "low", "close"]].isna().any().any():
+    ohlc = df[["open", "high", "low", "close"]]
+    # 🆕 FIX: isna() let ±inf through, and a zero/negative price breaks every
+    # percentage calculation (division by price). Both are rejected now.
+    if not np.isfinite(ohlc.to_numpy(dtype=float)).all():
+        return False
+    if (ohlc <= 0).any().any():
         return False
     ts = df["timestamp"]
     if not ts.is_monotonic_increasing:
@@ -100,8 +113,12 @@ def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
         return False
     if (df["low"] > df[["open", "close"]].min(axis=1)).any():
         return False
-    if "volume" in df.columns and (df["volume"] < 0).any():
-        return False
+    if "volume" in df.columns:
+        vol = df["volume"].to_numpy(dtype=float)
+        # 🆕 FIX: NaN volume compared False with "< 0", so it leaked into
+        # volume delta / MFI / VP. Reject NaN/inf and negatives.
+        if not np.isfinite(vol).all() or (vol < 0).any():
+            return False
     return True
 
 # =====================================================================
@@ -119,9 +136,13 @@ def round_price(x: float, sig_figs: int = 6) -> float:
     or garbage percentages in _pct_move() and the whole adaptive TP/SL
     calibration pipeline. Significant-figure rounding keeps consistent
     relative precision regardless of price magnitude."""
+    from math import log10, floor, isfinite
     if x == 0:
         return 0.0
-    from math import log10, floor
+    if not isfinite(x):
+        # 🆕 FIX: floor(log10(nan)) raised ValueError and inf raised
+        # OverflowError — a single bad price took down the caller.
+        return x
     d = sig_figs - int(floor(log10(abs(x)))) - 1
     return round(x, d)
 
