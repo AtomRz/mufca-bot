@@ -1476,14 +1476,14 @@ async def check_signals(
         # bar, so it lags exactly like CHOP/FRAMA do.
         filter_long_b = (
             (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
+            and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bull)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
             and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
         )
         filter_short_b = (
             (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
+            and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bear)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
             and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
@@ -2207,8 +2207,8 @@ def backtest_history(
             # 🆕 Track "b" — HTF applied here (not inside filter_long_b/short_b,
             # which are defined before htf_bull_bt/htf_bear_bt exist), same
             # place A-track's HTF check happens.
-            sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt) and b_warmed_up_bt
-            sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt) and b_warmed_up_bt
+            sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bull_bt) and b_warmed_up_bt
+            sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bear_bt) and b_warmed_up_bt
 
             # 🆕 (external review, component-backtest): market_structure/
             # relative_strength for THIS bar, computed at most once (lazily,

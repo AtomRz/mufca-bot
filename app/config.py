@@ -884,6 +884,19 @@ def save_hurst_apply_to_breakout(enabled: bool):
 
 HURST_APPLY_TO_BREAKOUT = load_hurst_apply_to_breakout()
 
+# Whether the HTF bias (ENABLE_MTF_BIAS) also gates the Breakout (B) track.
+# Default OFF: a squeeze breakout can be the first move of a new trend, which
+# the higher-timeframe bias only confirms later. A and U are unaffected.
+HTF_APPLY_TO_BREAKOUT_FILE = os.path.join(DATA_DIR, "htf_breakout.json")
+
+def load_htf_apply_to_breakout() -> bool:
+    return bool(_load_typed(HTF_APPLY_TO_BREAKOUT_FILE, {"enabled": False})["enabled"])
+
+def save_htf_apply_to_breakout(enabled: bool):
+    safe_json_save(HTF_APPLY_TO_BREAKOUT_FILE, {"enabled": bool(enabled)})
+
+HTF_APPLY_TO_BREAKOUT = load_htf_apply_to_breakout()
+
 # =====================================================================
 # 🎯  PULLBACK (LIMIT) ENTRY — wait for the average pullback
 # =====================================================================
