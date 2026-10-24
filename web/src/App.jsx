@@ -240,7 +240,7 @@ export default function App() {
           />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
-        {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} />}
+        {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}

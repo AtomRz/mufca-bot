@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { api } from '../api'
 
 // 🆕 Merged tab (external review follow-up): Onchain and Spread used to be
@@ -16,6 +16,77 @@ function fmtAge(lastFetch) {
   if (mins < 60) return `${mins}m ago`
   const hrs = Math.floor(mins / 60)
   return `${hrs}h ${mins % 60}m ago`
+}
+
+// 🆕 Shared polling hook for the read-only views below. They each had their own
+// copy of the same fetch pattern with the same problems:
+//  * errors were sticky — one failed poll replaced the whole view with
+//    "Failed to load" until the page was reloaded (later successes never cleared it);
+//  * responses were applied in arrival order, so a slow reply for the previously
+//    selected pair could overwrite the current one;
+//  * switching pair kept showing the previous pair's numbers (and error) until
+//    the new reply arrived;
+//  * the scan_tick effect also fired on mount for the event left over from
+//    before (a duplicate request), and polling went on in a hidden tab.
+// `enabled=false` pauses it (e.g. until a pair is selected); `key` changes reset
+// the data; a NEW scan_tick triggers a refresh at most every `minGapMs`.
+function usePolled(fetcher, key, intervalMs, lastEvent, { enabled = true, minGapMs = 30000 } = {}) {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+  const seq = useRef(0)
+  const lastAt = useRef(0)
+  const fetchRef = useRef(fetcher)
+  fetchRef.current = fetcher
+  const seenEvent = useRef(lastEvent) // the event present at mount is not "new"
+
+  const load = useCallback(() => {
+    const mine = ++seq.current
+    lastAt.current = Date.now()
+    return fetchRef.current()
+      .then((d) => { if (mine === seq.current) { setData(d); setError(null) } })
+      .catch((e) => { if (mine === seq.current) setError(e.message) })
+  }, [])
+
+  useEffect(() => {
+    seq.current += 1 // drop anything still in flight for the previous key
+    setData(null)
+    setError(null)
+    if (!enabled) return undefined
+    load()
+    const id = setInterval(() => { if (!document.hidden) load() }, intervalMs)
+    const onVisible = () => { if (document.visibilityState === 'visible') load() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, enabled, intervalMs])
+
+  useEffect(() => {
+    if (!lastEvent || lastEvent === seenEvent.current) return
+    seenEvent.current = lastEvent
+    if (lastEvent.type === 'scan_tick' && enabled && !document.hidden && Date.now() - lastAt.current >= minGapMs) load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastEvent])
+
+  return { data, error }
+}
+
+// 🆕 null-safe number formatting: one missing field used to throw
+// "toFixed of null" and the error boundary blanked the whole tab.
+const f2 = (v) => (Number.isFinite(v) ? v.toFixed(2) : '—')
+const pctSigned = (v, d = 2) => (Number.isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(d)}%` : '—')
+const pctWhole = (v) => (Number.isFinite(v) ? `${(v * 100).toFixed(0)}%` : '—')
+
+// the pair selection must follow the live pair list (a removed pair would 404 forever)
+function useSelectedPair(pairs) {
+  const [ticker, setTicker] = useState(null)
+  useEffect(() => {
+    if (!pairs) return
+    if (!ticker || !pairs.includes(ticker)) setTicker(pairs[0] ?? null)
+  }, [pairs, ticker])
+  return [ticker, setTicker]
 }
 
 function BiasBar({ label, value }) {
@@ -64,39 +135,12 @@ function MultRow({ label, long, short }) {
 // OnchainPanel.jsx, just renamed to a sub-view instead of a whole tab.
 // =====================================================================
 function BiasView({ lastEvent, pairs }) {
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-  const [derivTicker, setDerivTicker] = useState(null)
-  const [deriv, setDeriv] = useState(null)
-  const [derivError, setDerivError] = useState(null)
-
-  useEffect(() => {
-    const load = () => api.getOnchain().then(setData).catch((e) => setError(e.message))
-    load()
-    const id = setInterval(load, 60000)
-    return () => clearInterval(id)
-  }, [])
-
-  useEffect(() => {
-    if (!derivTicker && pairs?.length) setDerivTicker(pairs[0])
-  }, [pairs, derivTicker])
-
-  useEffect(() => {
-    if (!derivTicker) return
-    const load = () => api.getDerivatives(derivTicker).then(setDeriv).catch((e) => setDerivError(e.message))
-    load()
-    const id = setInterval(load, 60000)
-    return () => clearInterval(id)
-  }, [derivTicker])
-
-  useEffect(() => {
-    if (lastEvent?.type === 'scan_tick') {
-      api.getOnchain().then(setData).catch(() => {})
-      if (derivTicker) {
-        api.getDerivatives(derivTicker).then(setDeriv).catch(() => {})
-      }
-    }
-  }, [lastEvent, derivTicker])
+  const [derivTicker, setDerivTicker] = useSelectedPair(pairs)
+  const { data, error: loadError } = usePolled(() => api.getOnchain(), 'onchain', 60000, lastEvent)
+  const { data: deriv, error: derivError } = usePolled(
+    () => api.getDerivatives(derivTicker), derivTicker, 60000, lastEvent, { enabled: !!derivTicker },
+  )
+  const error = data ? null : loadError // with data on screen a failed refresh must not hide it
 
   if (error) {
     return <div className="panel"><p style={{ color: 'var(--short)' }}>Failed to load: {error}</p></div>
@@ -156,9 +200,19 @@ function BiasView({ lastEvent, pairs }) {
           </span>
         </div>
         <div className="row">
-          <span className="row-label">Delta (1h)</span>
+          <span className="row-label" title="Change in exchange ETH balances since the previous refresh (the window follows the on-chain interval in Settings)">Delta (since last refresh)</span>
           <span className="row-value">{flow.delta_eth != null ? `${flow.delta_eth > 0 ? '+' : ''}${Math.round(flow.delta_eth).toLocaleString()} ETH` : '—'}</span>
         </div>
+        {flow.note === 'fetch_failed' && (
+          <p style={{ fontSize: 12, color: 'var(--accent)', margin: '6px 0' }}>
+            ⚠ Etherscan returned no balances this cycle — flow is unknown (not zero); the baseline is kept and it retries shortly.
+          </p>
+        )}
+        {flow.note === 'first_run' && (
+          <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '6px 0' }}>
+            Baseline just recorded — the first real delta appears on the next refresh.
+          </p>
+        )}
         <div className="row">
           <span className="row-label">Strength</span>
           <span className="row-value">{flow.strength || '—'}</span>
@@ -199,7 +253,7 @@ function BiasView({ lastEvent, pairs }) {
         </p>
       </div>
 
-      <DerivativesSection pairs={pairs} ticker={derivTicker} onTickerChange={setDerivTicker} deriv={deriv} error={derivError} />
+      <DerivativesSection pairs={pairs} ticker={derivTicker} onTickerChange={setDerivTicker} deriv={deriv} error={deriv ? null : derivError} />
     </div>
   )
 }
@@ -247,8 +301,10 @@ function DerivativesSection({ pairs, ticker, onTickerChange, deriv, error }) {
           <div className="row">
             <span className="row-label">Open interest</span>
             <span className={`tag ${deriv.bias.oi_direction === 'rising' ? 'long' : deriv.bias.oi_direction === 'falling' ? 'short' : 'flat'}`}>
-              {deriv.bias.oi_direction === 'rising' ? '📈 Rising' : deriv.bias.oi_direction === 'falling' ? '📉 Falling' : '⚪ Flat'}
-              {deriv.bias.oi_delta_pct != null ? ` (${deriv.bias.oi_delta_pct > 0 ? '+' : ''}${(deriv.bias.oi_delta_pct * 100).toFixed(1)}%)` : ''}
+              {deriv.bias.oi_note === 'first_run' || deriv.bias.oi_note === 'fetch_failed' || deriv.bias.oi_note === 'error'
+                ? (deriv.bias.oi_note === 'first_run' ? '⚪ Baseline just set' : '⚪ Unavailable')
+                : deriv.bias.oi_direction === 'rising' ? '📈 Rising' : deriv.bias.oi_direction === 'falling' ? '📉 Falling' : '⚪ Flat'}
+              {deriv.bias.oi_note === 'ok' && deriv.bias.oi_delta_pct != null ? ` (${deriv.bias.oi_delta_pct > 0 ? '+' : ''}${(deriv.bias.oi_delta_pct * 100).toFixed(1)}%)` : ''}
             </span>
           </div>
           <BiasBar label="Long bias" value={deriv.bias.bias_long ?? 0} />
@@ -271,29 +327,13 @@ function DerivativesSection({ pairs, ticker, onTickerChange, deriv, error }) {
 // 📏  SPREAD — ported unchanged from the old SpreadPanel.jsx.
 // =====================================================================
 function SpreadView({ lastEvent, pairs }) {
-  const [ticker, setTicker] = useState(null)
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    if (!ticker && pairs?.length) setTicker(pairs[0])
-  }, [pairs, ticker])
-
-  useEffect(() => {
-    if (!ticker) return
-    const load = () => api.getSpread(ticker).then(setData).catch((e) => setError(e.message))
-    load()
-    // Spread moves faster than funding/OI/on-chain data, so it's polled on
-    // a shorter interval than the rest of this tab.
-    const id = setInterval(load, 20000)
-    return () => clearInterval(id)
-  }, [ticker])
-
-  useEffect(() => {
-    if (lastEvent?.type === 'scan_tick' && ticker) {
-      api.getSpread(ticker).then(setData).catch(() => {})
-    }
-  }, [lastEvent, ticker])
+  const [ticker, setTicker] = useSelectedPair(pairs)
+  // Spread moves faster than funding/OI/on-chain data, so it's polled on a
+  // shorter interval than the rest of this tab.
+  const { data, error: loadError } = usePolled(
+    () => api.getSpread(ticker), ticker, 20000, lastEvent, { enabled: !!ticker, minGapMs: 15000 },
+  )
+  const error = data ? null : loadError
 
   const filterOn = data?.filter_enabled
   const snap = data?.snapshot
@@ -402,13 +442,13 @@ function ComponentRow({ row, minSamples }) {
         )}
       </span>
       <span className="row-value" style={{ textAlign: 'right', fontSize: 12, lineHeight: 1.6 }}>
-        <div>n={row.n} · win_rate={(row.win_rate * 100).toFixed(0)}% · avg_mfe={row.avg_mfe.toFixed(2)}%</div>
+        <div>n={row.n} · win_rate={pctWhole(row.win_rate)} · avg_mfe={f2(row.avg_mfe)}%</div>
         <div style={{ color: 'var(--text-dim)' }}>
           {row.avg_raw_mfe != null
-            ? `raw_mfe=${row.avg_raw_mfe.toFixed(2)}% (n=${row.raw_mfe_n})`
+            ? `raw_mfe=${f2(row.avg_raw_mfe)}% (n=${row.raw_mfe_n})`
             : 'raw_mfe=n/a yet'}
           {'  '}
-          [{Object.entries(row.exit_counts).map(([et, c]) => `${et}=${c}`).join(' ')}]
+          [{Object.entries(row.exit_counts || {}).map(([et, c]) => `${et}=${c}`).join(' ')}]
         </div>
       </span>
     </div>
@@ -416,24 +456,10 @@ function ComponentRow({ row, minSamples }) {
 }
 
 function ComponentsView({ lastEvent }) {
-  const [report, setReport] = useState(null)
-  const [error, setError] = useState(null)
   const minSamples = 30
-
-  useEffect(() => {
-    const load = () => api.getComponents(minSamples).then(setReport).catch((e) => setError(e.message))
-    load()
-    // This only changes when a trade closes, not every scan tick — a slow
-    // poll is enough, no need for spread's 20s cadence here.
-    const id = setInterval(load, 60000)
-    return () => clearInterval(id)
-  }, [])
-
-  useEffect(() => {
-    if (lastEvent?.type === 'scan_tick') {
-      api.getComponents(minSamples).then(setReport).catch(() => {})
-    }
-  }, [lastEvent])
+  // This only changes when a trade closes, not every scan tick — a slow poll is enough.
+  const { data: report, error: loadError } = usePolled(() => api.getComponents(minSamples), 'components', 60000, lastEvent)
+  const error = report ? null : loadError
 
   if (error) {
     return <div className="panel"><p style={{ color: 'var(--short)' }}>Failed to load: {error}</p></div>
@@ -489,7 +515,14 @@ function ComponentsView({ lastEvent }) {
 // =====================================================================
 const SIM_TIMEFRAMES = ['1h', '4h'] // matches config.py's TIMEFRAMES — small, fixed list, not worth a round trip
 
-function SimScopeFields({ pairs, ticker, setTicker, tf, setTf, numBars, setNumBars, extra }) {
+const SIM_MIN_BARS = 300 // matches the server's bound (num_bars: 300..20000)
+const SIM_MAX_BARS = 20000
+const barsError = (n) =>
+  Number.isFinite(n) && n >= SIM_MIN_BARS && n <= SIM_MAX_BARS && Number.isInteger(n)
+    ? null
+    : `Bars must be a whole number between ${SIM_MIN_BARS} and ${SIM_MAX_BARS}`
+
+function SimScopeFields({ pairs, timeframes, ticker, setTicker, tf, setTf, numBars, setNumBars, extra }) {
   return (
     <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
       <div>
@@ -503,12 +536,12 @@ function SimScopeFields({ pairs, ticker, setTicker, tf, setTf, numBars, setNumBa
         <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Timeframe</label>
         <select value={tf} onChange={(e) => setTf(e.target.value)}>
           <option value="">All timeframes</option>
-          {SIM_TIMEFRAMES.map((f) => <option key={f} value={f}>{f}</option>)}
+          {(timeframes && timeframes.length ? timeframes : SIM_TIMEFRAMES).map((f) => <option key={f} value={f}>{f}</option>)}
         </select>
       </div>
       <div>
         <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Bars</label>
-        <input type="number" value={numBars} min={100} step={500}
+        <input type="number" value={numBars} min={SIM_MIN_BARS} max={SIM_MAX_BARS} step={500}
                onChange={(e) => setNumBars(Number(e.target.value))} style={{ width: 90 }} />
       </div>
       {extra}
@@ -527,20 +560,24 @@ function BarCoverageWarning({ coverage, requested }) {
   )
 }
 
-function Tp1SimSection({ pairs }) {
+function Tp1SimSection({ pairs, timeframes }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
+  const [ranBars, setRanBars] = useState(numBars) // bars of the run that produced `result`, not of the input now
   const [error, setError] = useState(null)
 
   const run = async () => {
+    const bad = barsError(numBars)
+    if (bad) { setError(bad); return }
     setLoading(true)
     setError(null)
     try {
       const r = await api.runTp1Sim({ ticker, tf, numBars })
       setResult(r)
+      setRanBars(numBars)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -556,7 +593,7 @@ function Tp1SimSection({ pairs }) {
         Dry-run — nothing is written to history or changes the live setting.
       </p>
       <SimScopeFields
-        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
         extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
       />
@@ -564,7 +601,7 @@ function Tp1SimSection({ pairs }) {
       {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests across pairs × timeframes × 4 modes — this is slow, sit tight…</p>}
       {result && !loading && (
         <>
-          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
           {Object.entries(result.modes).map(([modeName, rows]) => (
             <div key={modeName} style={{ marginBottom: 12 }}>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{modeName}</div>
@@ -575,7 +612,7 @@ function Tp1SimSection({ pairs }) {
                   <div className="row" key={i} style={{ fontSize: 12 }}>
                     <span className="row-label">track={row.track} regime={row.regime}</span>
                     <span className="row-value">
-                      n={row.n}{row.n_timeout ? ` (${row.n_timeout} timed-out)` : ''} · win_rate={(row.win_rate * 100).toFixed(0)}% · avg_pnl={row.avg_pnl > 0 ? '+' : ''}{row.avg_pnl.toFixed(2)}%
+                      n={row.n}{row.n_timeout ? ` (${row.n_timeout} timed-out)` : ''} · win_rate={pctWhole(row.win_rate)} · avg_pnl={pctSigned(row.avg_pnl)}
                       {row.n < 5 && <span style={{ color: 'var(--accent)' }}> ⚠ tiny sample</span>}
                     </span>
                   </div>
@@ -594,21 +631,25 @@ function Tp1SimSection({ pairs }) {
   )
 }
 
-function CompSimSection({ pairs }) {
+function CompSimSection({ pairs, timeframes }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
   const [minSamples, setMinSamples] = useState(30)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
+  const [ranBars, setRanBars] = useState(numBars)
   const [error, setError] = useState(null)
 
   const run = async () => {
+    const bad = barsError(numBars)
+    if (bad) { setError(bad); return }
     setLoading(true)
     setError(null)
     try {
       const r = await api.runCompSim({ ticker, tf, numBars, minSamples })
       setResult(r)
+      setRanBars(numBars)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -624,7 +665,7 @@ function CompSimSection({ pairs }) {
         instead of waiting for the live bot to accumulate enough closed signals. Dry-run — nothing written to history.
       </p>
       <SimScopeFields
-        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
         extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
       />
@@ -633,7 +674,7 @@ function CompSimSection({ pairs }) {
       {result && !loading && (
         <>
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>{result.total_closed} closed records simulated.</p>
-          <BarCoverageWarning coverage={result.bar_coverage} requested={numBars} />
+          <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
           {['relative_strength', 'volume_profile'].map((compName) => {
             const rows = result.components[compName] || []
             return (
@@ -668,7 +709,7 @@ const jobStore = {
   set: (v) => { try { v ? localStorage.setItem(PULLSIM_JOB_KEY, v) : localStorage.removeItem(PULLSIM_JOB_KEY) } catch (_) {} },
 }
 
-function PullSimSection({ pairs }) {
+function PullSimSection({ pairs, timeframes }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
@@ -719,6 +760,8 @@ function PullSimSection({ pairs }) {
   }, [jobId, runNo])
 
   const run = async () => {
+    const bad = barsError(numBars)
+    if (bad) { setError(bad); return }
     setStarting(true)
     setError(null)
     setJob(null)
@@ -736,11 +779,13 @@ function PullSimSection({ pairs }) {
     }
   }
 
-  const running = starting || job?.status === 'running' || (!!jobId && !job && !error)
+  // 🆕 FIX: with a lost connection `job` still held status 'running', so the
+  // button stayed on "Running…" (disabled) forever next to the error. An error ends the wait.
+  const running = starting || (job?.status === 'running' && !error) || (!!jobId && !job && !error)
   const result = job?.status === 'done' ? job.result : null
   const prog = job?.progress
   const requestedBars = job?.scope?.num_bars ?? numBars
-  const pct = (v, d = 2) => `${v > 0 ? '+' : ''}${v.toFixed(d)}%`
+  const pct = pctSigned
   const fmtSecs = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${Math.round(s)}s`)
 
   return (
@@ -752,7 +797,7 @@ function PullSimSection({ pairs }) {
         Compare variants on <b>per signal</b>: total PnL ÷ ALL signals, unfilled ones counting as 0.
       </p>
       <SimScopeFields
-        pairs={pairs} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
         extra={<button onClick={run} disabled={running}>{running ? 'Running…' : 'Run'}</button>}
       />
@@ -800,9 +845,9 @@ function PullSimSection({ pairs }) {
                     <span className="row-value">
                       signals={row.signals}
                       {name !== 'market' && (
-                        <> · fills={row.fills} ({row.fill_rate == null ? 'n/a' : `${(row.fill_rate * 100).toFixed(0)}%`}) · missed={row.missed} · expired={row.expired} · at-market={row.fallback_market}</>
+                        <> · fills={row.fills} ({row.fill_rate == null ? 'n/a' : pctWhole(row.fill_rate)}) · missed={row.missed} · expired={row.expired} · at-market={row.fallback_market}</>
                       )}
-                      {' '}· win={(row.win_rate * 100).toFixed(0)}% · avg={pct(row.avg_pnl)} · <b>per signal={pct(row.per_signal_pnl, 3)}</b>
+                      {' '}· win={pctWhole(row.win_rate)} · avg={pct(row.avg_pnl)} · <b>per signal={pct(row.per_signal_pnl, 3)}</b>
                       {row.signals < 20 && <span style={{ color: 'var(--accent)' }}> ⚠ small sample</span>}
                     </span>
                   </div>
@@ -821,12 +866,12 @@ function PullSimSection({ pairs }) {
   )
 }
 
-function SimulateView({ pairs }) {
+function SimulateView({ pairs, timeframes }) {
   return (
     <div>
-      <PullSimSection pairs={pairs} />
-      <Tp1SimSection pairs={pairs} />
-      <CompSimSection pairs={pairs} />
+      <PullSimSection pairs={pairs} timeframes={timeframes} />
+      <Tp1SimSection pairs={pairs} timeframes={timeframes} />
+      <CompSimSection pairs={pairs} timeframes={timeframes} />
     </div>
   )
 }
@@ -841,7 +886,7 @@ const VIEWS = [
   { id: 'simulate', label: 'Simulate' },
 ]
 
-export default function InsightsPanel({ lastEvent, pairs }) {
+export default function InsightsPanel({ lastEvent, pairs, timeframes }) {
   const [view, setView] = useState('bias')
 
   return (
@@ -857,7 +902,7 @@ export default function InsightsPanel({ lastEvent, pairs }) {
       {view === 'bias' && <BiasView lastEvent={lastEvent} pairs={pairs} />}
       {view === 'spread' && <SpreadView lastEvent={lastEvent} pairs={pairs} />}
       {view === 'components' && <ComponentsView lastEvent={lastEvent} />}
-      {view === 'simulate' && <SimulateView pairs={pairs} />}
+      {view === 'simulate' && <SimulateView pairs={pairs} timeframes={timeframes} />}
     </div>
   )
 }
