@@ -413,6 +413,16 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => run('hurst_bias_correction', () => api.setHurstBiasCorrection(v))}
               />
             </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Also apply the Hurst filter to the Breakout (B) track. Off by default: on a breakout bar the Hurst window is still mostly the flat squeeze, so it lags and tends to block the very breakouts B exists to catch. A and U tracks are always gated when the Hurst filter is on.">
+                Apply to Breakout track
+              </span>
+              <Toggle
+                checked={config.hurst_apply_to_breakout ?? false}
+                disabled={busy === 'hurst_breakout'}
+                onChange={(v) => run('hurst_breakout', () => api.setHurstBreakout(v))}
+              />
+            </div>
             <NumberField
               label="Min Deviation from 0.5" hint="0–0.5 — higher = stricter, fewer but more selective signals"
               value={config.hurst_min_deviation} min={0} max={0.5} step={0.01}

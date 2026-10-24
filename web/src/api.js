@@ -102,6 +102,8 @@ export const api = {
     request('/api/config/intrabar-check', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setHurstBiasCorrection: (enabled) =>
     request('/api/config/hurst-bias-correction', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setHurstBreakout: (enabled) =>
+    request('/api/config/hurst-breakout', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setDiscordNotifications: (enabled) =>
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setScanInterval: (seconds) =>
