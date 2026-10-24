@@ -240,6 +240,16 @@ export default function SettingsPanel({ config, onChanged }) {
                 ))}
               </select>
             </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Also apply the HTF Bias filter to the Breakout (B) track. Off by default: a squeeze breakout is often the first move of a new trend, which the higher-timeframe bias only confirms later. A and U tracks are always gated when HTF Bias is on.">
+                HTF Bias applies to Breakout
+              </span>
+              <Toggle
+                checked={config.htf_apply_to_breakout ?? false}
+                disabled={busy === 'htf_breakout'}
+                onChange={(v) => run('htf_breakout', () => api.setHtfBreakout(v))}
+              />
+            </div>
             <div className="field">
               <label title="Where to move SL after closing 50% at TP1">SL after TP1</label>
               <select

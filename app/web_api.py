@@ -899,6 +899,7 @@ async def get_config():
         "hurst_window": _cfg.HURST_WINDOW,
         "hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION,
         "hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT,
+        "htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT,
         "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
         "hurst_mode": _cfg.HURST_MODE,
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
@@ -1218,6 +1219,24 @@ async def set_hurst_breakout(body: HurstBreakoutIn):
     _cfg.save_hurst_apply_to_breakout(_cfg.HURST_APPLY_TO_BREAKOUT)
     await broadcast_event({"type": "config_changed", "key": "hurst_apply_to_breakout", "value": _cfg.HURST_APPLY_TO_BREAKOUT})
     return {"hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT, "changed": True}
+
+
+class HtfBreakoutIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/htf-breakout")
+async def set_htf_breakout(body: HtfBreakoutIn):
+    """Whether the HTF bias filter also gates the Breakout (B) track. Only has
+    an effect while the HTF bias filter itself is enabled. See
+    config.HTF_APPLY_TO_BREAKOUT."""
+    if body.enabled == _cfg.HTF_APPLY_TO_BREAKOUT:
+        return {"htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT, "changed": False}
+
+    _cfg.HTF_APPLY_TO_BREAKOUT = body.enabled
+    _cfg.save_htf_apply_to_breakout(_cfg.HTF_APPLY_TO_BREAKOUT)
+    await broadcast_event({"type": "config_changed", "key": "htf_apply_to_breakout", "value": _cfg.HTF_APPLY_TO_BREAKOUT})
+    return {"htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT, "changed": True}
 
 
 class PullbackConfigIn(BaseModel):
