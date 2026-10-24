@@ -1468,22 +1468,25 @@ async def check_signals(
         # as the breakout starts, and FRAMA's slope is exactly what lags in
         # this pattern — gating on either would block the track from ever
         # catching what it exists to catch. ATR bounds, HTF bias,
-        # fake-break/liquidity-sweep, Hurst, and spread filters still apply;
-        # those catch different failure modes (thin execution, manipulation
-        # wicks) a strong squeeze breakout is not automatically immune to.
+        # fake-break/liquidity-sweep and spread filters still apply; those
+        # catch different failure modes (thin execution, manipulation wicks)
+        # a strong squeeze breakout is not automatically immune to. Hurst
+        # applies only if config.HURST_APPLY_TO_BREAKOUT is on (default off):
+        # its rolling window is still mostly the flat squeeze on the breakout
+        # bar, so it lags exactly like CHOP/FRAMA do.
         filter_long_b = (
             (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-            and hurst_ok
+            and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
         )
         filter_short_b = (
             (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
             and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
             and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
             and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-            and hurst_ok
+            and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
         )
 
         mfi_bull_sig = crossover(mfi, level_os, idx)
@@ -2168,13 +2171,13 @@ def backtest_history(
                 (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
                 and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
+                and (not _cfg.ENABLE_HURST_FILTER or not _cfg.HURST_APPLY_TO_BREAKOUT or hurst_ok)
             )
             filter_short_b = (
                 (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
                 and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
                 and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
+                and (not _cfg.ENABLE_HURST_FILTER or not _cfg.HURST_APPLY_TO_BREAKOUT or hurst_ok)
             )
 
             mfi_bull_sig = crossover(mfi, level_os, idx)

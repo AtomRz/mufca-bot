@@ -870,6 +870,20 @@ def save_hurst_bias_correction(enabled: bool):
 
 HURST_BIAS_CORRECTION = load_hurst_bias_correction()
 
+# Whether the Hurst regime filter (ENABLE_HURST_FILTER) also gates the
+# Breakout (B) track. Default OFF: the Hurst window on a breakout bar is still
+# mostly the flat pre-breakout squeeze (H ~ 0.5 or lower), so it lags exactly
+# like CHOP/FRAMA, which B already skips. A and U are unaffected by this flag.
+HURST_APPLY_TO_BREAKOUT_FILE = os.path.join(DATA_DIR, "hurst_breakout.json")
+
+def load_hurst_apply_to_breakout() -> bool:
+    return bool(_load_typed(HURST_APPLY_TO_BREAKOUT_FILE, {"enabled": False})["enabled"])
+
+def save_hurst_apply_to_breakout(enabled: bool):
+    safe_json_save(HURST_APPLY_TO_BREAKOUT_FILE, {"enabled": bool(enabled)})
+
+HURST_APPLY_TO_BREAKOUT = load_hurst_apply_to_breakout()
+
 # =====================================================================
 # 🎯  PULLBACK (LIMIT) ENTRY — wait for the average pullback
 # =====================================================================

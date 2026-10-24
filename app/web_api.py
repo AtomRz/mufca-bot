@@ -898,6 +898,7 @@ async def get_config():
         "chop_threshold": CHOP_THRESHOLD,
         "hurst_window": _cfg.HURST_WINDOW,
         "hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION,
+        "hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT,
         "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
         "hurst_mode": _cfg.HURST_MODE,
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
@@ -1199,6 +1200,24 @@ async def set_hurst_bias_correction(body: HurstBiasCorrectionIn):
     _cfg.save_hurst_bias_correction(_cfg.HURST_BIAS_CORRECTION)
     await broadcast_event({"type": "config_changed", "key": "hurst_bias_correction", "value": _cfg.HURST_BIAS_CORRECTION})
     return {"hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION, "changed": True}
+
+
+class HurstBreakoutIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/hurst-breakout")
+async def set_hurst_breakout(body: HurstBreakoutIn):
+    """Whether the Hurst filter also gates the Breakout (B) track. Only has an
+    effect while the Hurst filter itself is enabled. See
+    config.HURST_APPLY_TO_BREAKOUT."""
+    if body.enabled == _cfg.HURST_APPLY_TO_BREAKOUT:
+        return {"hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT, "changed": False}
+
+    _cfg.HURST_APPLY_TO_BREAKOUT = body.enabled
+    _cfg.save_hurst_apply_to_breakout(_cfg.HURST_APPLY_TO_BREAKOUT)
+    await broadcast_event({"type": "config_changed", "key": "hurst_apply_to_breakout", "value": _cfg.HURST_APPLY_TO_BREAKOUT})
+    return {"hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT, "changed": True}
 
 
 class PullbackConfigIn(BaseModel):
