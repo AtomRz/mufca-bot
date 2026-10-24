@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
@@ -95,6 +95,11 @@ function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, on
         min={min}
         max={max}
         step={step}
+        // 🆕 FIX: defaultValue is only read on mount, so after a change made
+        // elsewhere (another client, a WS config_changed refresh, or a value the
+        // server clamped) the field kept showing the old number and the next
+        // blur could silently write it back. key={value} remounts it on change.
+        key={value}
         defaultValue={value}
         disabled={busy === busyKey}
         onBlur={(e) => {
@@ -120,6 +125,15 @@ function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, on
 
 function ColorField({ label, value, onSave }) {
   const [draft, setDraft] = useState(value)
+  const timer = useRef(null)
+  // 🆕 FIX: the draft was initialised once and never followed the saved value
+  // (config changed from another client, or the server rejected/normalised it).
+  useEffect(() => { setDraft(value) }, [value])
+  useEffect(() => () => clearTimeout(timer.current), [])
+  const commit = (v) => {
+    clearTimeout(timer.current)
+    if (v !== value) onSave(v)
+  }
   return (
     <div className="toggle-row">
       <span className="row-label">{label}</span>
@@ -128,8 +142,17 @@ function ColorField({ label, value, onSave }) {
         <input
           type="color"
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={(e) => { if (e.target.value !== value) onSave(e.target.value) }}
+          onChange={(e) => {
+            const v = e.target.value
+            setDraft(v)
+            // 🆕 FIX: saving only on blur never fired in some mobile pickers
+            // (the dialog closes without blurring the input), so the colour was
+            // silently lost. Save shortly after the last change as well; blur
+            // still saves immediately.
+            clearTimeout(timer.current)
+            timer.current = setTimeout(() => commit(v), 800)
+          }}
+          onBlur={(e) => commit(e.target.value)}
           style={{ width: 32, height: 24, padding: 0, border: '1px solid var(--border)', borderRadius: 4, background: 'none', cursor: 'pointer' }}
         />
       </span>
@@ -143,6 +166,9 @@ export default function SettingsPanel({ config, onChanged }) {
   const [newPair, setNewPair] = useState('')
   const [chopDraft, setChopDraft] = useState({})
   const [hurstWindowDraft, setHurstWindowDraft] = useState({})
+  // 🆕 inline two-step removal instead of window.confirm(): an Android WebView
+  // without onJsConfirm makes confirm() return false, so the "×" did nothing.
+  const [removing, setRemoving] = useState(null)
 
   // 🆕 FIX: if config was updated FROM OUTSIDE (a WS config_changed event
   // from another client — e.g. the Android app changed CHOP while the web
@@ -150,6 +176,7 @@ export default function SettingsPanel({ config, onChanged }) {
   // the user once started typing, not the actual current value from the server.
   useEffect(() => {
     setChopDraft({})
+    setHurstWindowDraft({}) // 🆕 was never cleared, so it kept showing a stale number
   }, [config])
 
   if (!config) return <div className="empty-state">Loading…</div>
@@ -160,8 +187,10 @@ export default function SettingsPanel({ config, onChanged }) {
     try {
       await fn()
       onChanged()
+      return true
     } catch (e) {
       setError(e.message)
+      return false
     } finally {
       setBusy(null)
     }
@@ -345,7 +374,12 @@ export default function SettingsPanel({ config, onChanged }) {
                   <button
                     className="btn"
                     disabled={busy === `chop_${tf}`}
-                    onClick={() => run(`chop_${tf}`, () => api.setChop(tf, parseFloat(chopValue(tf))))}
+                    onClick={() => {
+                      const v = parseFloat(chopValue(tf))
+                      // 🆕 an empty/invalid field used to send NaN (JSON null) and surface a raw 422
+                      if (!Number.isFinite(v)) { setError(`CHOP ${tf}: enter a number between 20 and 90`); return }
+                      run(`chop_${tf}`, () => api.setChop(tf, v))
+                    }}
                   >
                     Save
                   </button>
@@ -369,21 +403,12 @@ export default function SettingsPanel({ config, onChanged }) {
                 <option value="symmetric">Symmetric (trend + mean-rev)</option>
               </select>
             </div>
-            <div className="field">
-              <label title="Reject unless the Hurst exponent clears 0.5 by at least this much. Higher = stricter, fewer but more selective signals.">
-                Min Deviation from 0.5
-              </label>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input
-                  type="number"
-                  min={0}
-                  max={0.5}
-                  step={0.01}
-                  defaultValue={config.hurst_min_deviation}
-                  onBlur={(e) => run('hurst_min_dev', () => api.setHurstConfig({ hurst_min_deviation: parseFloat(e.target.value) }))}
-                />
-              </div>
-            </div>
+            <NumberField
+              label="Min Deviation from 0.5" hint="0–0.5 — higher = stricter, fewer but more selective signals"
+              value={config.hurst_min_deviation} min={0} max={0.5} step={0.01}
+              busyKey="hurst_min_dev" busy={busy}
+              onSave={(v) => run('hurst_min_dev', () => api.setHurstConfig({ hurst_min_deviation: v }))}
+            />
             {Object.keys(config.hurst_window).map((tf) => (
               <div className="field" key={tf}>
                 <label title="Bars used for the rolling R/S estimate. The optimal value is pair/TF-specific, not universal — adjust it here and watch A/U Win Rate after a batch of trades closes.">
@@ -401,7 +426,11 @@ export default function SettingsPanel({ config, onChanged }) {
                   <button
                     className="btn"
                     disabled={busy === `hurst_window_${tf}`}
-                    onClick={() => run(`hurst_window_${tf}`, () => api.setHurstWindow(tf, parseInt(hurstWindowValue(tf), 10)))}
+                    onClick={() => {
+                      const v = parseInt(hurstWindowValue(tf), 10)
+                      if (!Number.isFinite(v)) { setError(`Hurst window ${tf}: enter a whole number between 18 and 300`); return }
+                      run(`hurst_window_${tf}`, () => api.setHurstWindow(tf, v))
+                    }}
                   >
                     Save
                   </button>
@@ -462,17 +491,7 @@ export default function SettingsPanel({ config, onChanged }) {
                   {p}
                   <button
                     title="Remove pair"
-                    onClick={() => {
-                      if (!window.confirm(`Stop tracking ${p}?`)) return
-                      // Equivalent of Discord's !remove vs !delsignals: can
-                      // stop scanning while keeping the accumulated adaptive
-                      // TP/SL statistics (in case the pair comes back), or
-                      // fully wipe its signal history.
-                      const purge = window.confirm(
-                        `Also delete accumulated signal history for ${p}? This cannot be undone.\n\nOK — delete history\nCancel — keep history (in case you re-add ${p} later)`
-                      )
-                      run(`rm_${p}`, () => api.removePair(p, purge))
-                    }}
+                    onClick={() => setRemoving(removing === p ? null : p)}
                     disabled={busy === `rm_${p}`}
                   >
                     ×
@@ -480,6 +499,32 @@ export default function SettingsPanel({ config, onChanged }) {
                 </span>
               ))}
             </div>
+            {removing && config.pairs.includes(removing) && (
+              <div className="panel" style={{ marginTop: 10, borderColor: 'var(--short)' }}>
+                <p style={{ margin: '0 0 8px', fontSize: 13 }}>
+                  Stop tracking <b>{removing}</b>? Keep its accumulated signal history in case you re-add it later,
+                  or delete the history too (cannot be undone).
+                </p>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    className="btn"
+                    disabled={busy === `rm_${removing}`}
+                    onClick={() => { const p = removing; setRemoving(null); run(`rm_${p}`, () => api.removePair(p, false)) }}
+                  >
+                    Remove, keep history
+                  </button>
+                  <button
+                    className="btn"
+                    style={{ color: 'var(--short)' }}
+                    disabled={busy === `rm_${removing}`}
+                    onClick={() => { const p = removing; setRemoving(null); run(`rm_${p}`, () => api.removePair(p, true)) }}
+                  >
+                    Remove + delete history
+                  </button>
+                  <button className="btn" onClick={() => setRemoving(null)}>Cancel</button>
+                </div>
+              </div>
+            )}
             <div className="add-pair-form">
               <input
                 placeholder="DOGE/USDT"
@@ -487,14 +532,14 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(e) => setNewPair(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && newPair.trim()) {
-                    run('add_pair', () => api.addPair(newPair.trim())).then(() => setNewPair(''))
+                    run('add_pair', () => api.addPair(newPair.trim())).then((ok) => { if (ok) setNewPair('') })
                   }
                 }}
               />
               <button
                 className="btn primary"
                 disabled={!newPair.trim() || busy === 'add_pair'}
-                onClick={() => run('add_pair', () => api.addPair(newPair.trim())).then(() => setNewPair(''))}
+                onClick={() => run('add_pair', () => api.addPair(newPair.trim())).then((ok) => { if (ok) setNewPair('') })}
               >
                 Add
               </button>
