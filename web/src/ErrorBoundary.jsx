@@ -27,6 +27,11 @@ export default class ErrorBoundary extends React.Component {
               Something went wrong rendering the dashboard. This is usually a transient
               rendering glitch — reloading fixes it.
             </p>
+            {this.state.error && (
+              <p style={{ color: 'var(--text-faint)', fontSize: 11, marginBottom: 16, wordBreak: 'break-word', fontFamily: 'var(--font-mono, monospace)' }}>
+                {String(this.state.error.message || this.state.error).slice(0, 200)}
+              </p>
+            )}
             <button className="btn primary" style={{ width: '100%' }} onClick={() => window.location.reload()}>
               Reload
             </button>
