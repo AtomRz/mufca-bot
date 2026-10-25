@@ -756,7 +756,8 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track: str,
                          side: str, close_v: float, sl: float,
                          cfg: Optional[Dict] = None,
-                         records_by_side: Optional[Dict[str, List[dict]]] = None) -> Optional[Dict]:
+                         records_by_side: Optional[Dict[str, List[dict]]] = None,
+                         tp1: Optional[float] = None) -> Optional[Dict]:
     """Where to place the limit order for a fresh signal, or None for "enter
     at market as usual" (not enough history / depth too shallow / the limit
     would not sit strictly between SL and the signal price).
@@ -765,6 +766,11 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
     None reads the live config. records_by_side — the history to measure the
     average pullback over; None reads signals_history.json (live path), the
     backtest passes its own dry-run history instead.
+
+    tp1 — this signal's TP1 price. Only the depth_mode="optimize" setting
+    needs it (the depth is chosen by replaying past price paths against this
+    signal's TP1 / SL distances); without it that mode falls back to the
+    average-based depth.
     """
     cfg = cfg or _cfg.pullback_config_snapshot()
     if not (cfg.get("tracks") or {}).get(track, True):
@@ -774,6 +780,12 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
         records_by_side = {"long": slot.get("long", []), "short": slot.get("short", [])}
 
     sl_dist_pct = abs(close_v - sl) / max(close_v, 1e-12) * 100.0
+    tp1_dist_pct = None
+    if tp1 is not None:
+        try:
+            tp1_dist_pct = abs(float(tp1) - close_v) / max(close_v, 1e-12) * 100.0
+        except (TypeError, ValueError):
+            tp1_dist_pct = None
     info = _pb.compute_pullback_depth(
         df, records_by_side, track,
         n_bars=cfg["expiry_bars"], last_idx=idx,
@@ -781,6 +793,10 @@ def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track
         mult=cfg["mult"], sl_dist_pct=sl_dist_pct,
         max_sl_fraction=cfg["max_sl_fraction"], min_depth_pct=cfg["min_depth_pct"],
         pool_fallback=bool(cfg.get("pool_fallback", False)),
+        depth_mode=cfg.get("depth_mode", "mean"),
+        tp1_dist_pct=tp1_dist_pct,
+        hold_bars=int(_cfg.MAX_HOLD_BARS),
+        keep_distance=(cfg.get("sl_mode") == "keep_distance"),
     )
     if info is None:
         return None
@@ -1044,7 +1060,7 @@ async def open_position(
     pb_plan = None
     if _cfg.PULLBACK_ENTRY_ENABLED and not dry_run:
         try:
-            pb_plan = _plan_pullback_entry(df, idx, ticker, timeframe, track, side, close_v, sl)
+            pb_plan = _plan_pullback_entry(df, idx, ticker, timeframe, track, side, close_v, sl, tp1=tp1)
         except Exception as e:
             logger.warning(f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()}: plan failed, entering at market: {e}")
             pb_plan = None
@@ -1101,6 +1117,11 @@ async def open_position(
             f"(avg pullback {pb_plan['mean_pct']:.2f}%, n={pb_plan['n']}{', pooled over all tracks' if pb_plan.get('pooled') else ''}, est.fill ~{pb_plan['est_fill_rate']*100:.0f}%, "
             f"valid {n_bars} bars)"
         )
+        if pb_plan.get("mode") == "optimize":
+            tp_desc += (
+                f" | depth optimized on history: exp. {pb_plan['exp_pnl_pct']:+.2f}% per signal "
+                f"vs {pb_plan['market_pnl_pct']:+.2f}% at market"
+            )
         logger.info(
             f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()} limit placed @ {limit} "
             f"(signal {close_v}, depth {pb_plan['depth_pct']:.2f}%, expires in {n_bars} bars)"
@@ -2298,6 +2319,7 @@ def backtest_history(
                     pb_plan = _plan_pullback_entry(
                         df, idx, ticker, tf, track, side, close_v, sl, cfg=pullback,
                         records_by_side={"long": history[ticker][tf]["long"], "short": history[ticker][tf]["short"]},
+                        tp1=tp1,
                     )
                     if pb_plan is not None:
                         limit_p = pb_plan["limit"]
@@ -2861,7 +2883,9 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     pullback run per multiplier in `mults` (default 0.5 / 1.0 / 1.5 x the
     average pullback; stop keeps its absolute level) and, for multipliers
     <= 1, an "xN+sl" twin where the stop shifts with the entry
-    (sl_mode="keep_distance"), all with the live expiry_bars / min_samples /
+    (sl_mode="keep_distance"), plus "opt" / "opt+sl": the depth chosen from the
+    track's own history (depth_mode="optimize", see pullback.py) with a fixed /
+    shifted stop, all with the live expiry_bars / min_samples /
     max_sl_fraction / min_depth_pct / pool_fallback. Each ticker/tf's history is fetched
     once and reused for every variant, and every variant simulates the
     identical signal bars (the market run reserves the same trailing bars).
@@ -2874,6 +2898,7 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
               "market":  [row, ...],     # one row per track + an "ALL" row
               "x0.5": [...], "x1": [...], "x1.5": [...],
               "x0.5+sl": [...], "x1+sl": [...],
+              "opt": [...], "opt+sl": [...],
           },
         }
     row = {track, signals, executed, fills, fill_rate, missed, expired,
@@ -2900,8 +2925,11 @@ async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     # switches say — that is what the switches are meant to be decided from
     base_cfg = {**base_cfg, "tracks": {t: True for t in _cfg.TRACKS}}
     runs_spec = [("market", None)]
-    runs_spec += [(f"x{m:g}", {**base_cfg, "mult": m, "sl_mode": "fixed"}) for m in mults]
-    runs_spec += [(f"x{m:g}+sl", {**base_cfg, "mult": m, "sl_mode": "keep_distance"}) for m in mults if m <= 1.0]
+    runs_spec += [(f"x{m:g}", {**base_cfg, "mult": m, "sl_mode": "fixed", "depth_mode": "mean"}) for m in mults]
+    runs_spec += [(f"x{m:g}+sl", {**base_cfg, "mult": m, "sl_mode": "keep_distance", "depth_mode": "mean"}) for m in mults if m <= 1.0]
+    # depth chosen from history instead of the average (mult plays no role)
+    runs_spec += [("opt", {**base_cfg, "sl_mode": "fixed", "depth_mode": "optimize"}),
+                  ("opt+sl", {**base_cfg, "sl_mode": "keep_distance", "depth_mode": "optimize"})]
     variant_names = [n for n, _ in runs_spec]
     buckets: Dict[tuple, list] = {}
     bar_coverage: List[Dict] = []

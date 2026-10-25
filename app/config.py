@@ -919,6 +919,17 @@ HTF_APPLY_TO_BREAKOUT = load_htf_apply_to_breakout()
 #     (PULLBACK_MIN_SAMPLES) or a depth below PULLBACK_MIN_DEPTH_PCT means
 #     "enter at market as usual" for that signal.
 #
+# depth_mode picks HOW the depth above is chosen:
+#   "mean"     — depth = PULLBACK_MULT x the average early pullback (above).
+#   "optimize" — the depth that would have paid best on this track's own
+#                history: past price paths are replayed against this signal's
+#                TP1 / SL distances for a grid of depths, missed and expired
+#                signals counting as 0, and "enter at market" wins when no
+#                depth beats it. PULLBACK_MULT is ignored; the depth cap, the
+#                minimum depth, the sample settings and sl_mode still apply.
+#                Needs PULLBACK_EXPIRY_BARS + MAX_HOLD_BARS closed bars after a
+#                past signal before it counts (see pullback.py).
+#
 # Validate with `!pullsim` (dry-run on real history) before switching it on —
 # a pullback entry trades a better price for missed runaway moves, and which
 # side wins is an empirical question per track.
@@ -933,11 +944,13 @@ _PULLBACK_DEFAULTS = {
     "min_depth_pct": 0.05,    # shallower than this -> not worth waiting, enter at market
     "pool_fallback": True,    # a track with < min_samples own signals borrows the average of all tracks
     "sl_mode": "fixed",       # fixed = SL keeps its absolute level; keep_distance = SL shifts with the entry
+    "depth_mode": "mean",     # mean = mult x average pullback; optimize = best depth on the track's own history
     # per-track switch (only matters while "enabled" is on): a track set to
     # False keeps entering at the signal price. Default all on = old behaviour.
     "tracks": {"a": True, "u": True, "b": True},
 }
 PULLBACK_SL_MODES = ("fixed", "keep_distance")
+PULLBACK_DEPTH_MODES = ("mean", "optimize")
 # (lo, hi, caster) — enforced on load AND by the web endpoint
 PULLBACK_BOUNDS = {
     "mult": (0.1, 3.0, float),
@@ -957,6 +970,8 @@ def load_pullback_config() -> dict:
     out["pool_fallback"] = bool(data.get("pool_fallback", _PULLBACK_DEFAULTS["pool_fallback"]))
     if data.get("sl_mode") in PULLBACK_SL_MODES:
         out["sl_mode"] = data["sl_mode"]
+    if data.get("depth_mode") in PULLBACK_DEPTH_MODES:
+        out["depth_mode"] = data["depth_mode"]
     out["tracks"] = {t: True for t in TRACKS}
     if isinstance(data.get("tracks"), dict):
         for t in TRACKS:
@@ -988,6 +1003,7 @@ def pullback_config_snapshot() -> dict:
         "min_depth_pct": PULLBACK_MIN_DEPTH_PCT,
         "pool_fallback": PULLBACK_POOL_FALLBACK,
         "sl_mode": PULLBACK_SL_MODE,
+        "depth_mode": PULLBACK_DEPTH_MODE,
         "tracks": dict(PULLBACK_TRACKS),
     }
 
@@ -998,7 +1014,7 @@ def apply_pullback_config(patch: dict) -> dict:
     valid. Returns the full settings dict now in effect. Raises ValueError."""
     global PULLBACK_ENTRY_ENABLED, PULLBACK_MULT, PULLBACK_EXPIRY_BARS, PULLBACK_MIN_SAMPLES
     global PULLBACK_LOOKBACK_SIGNALS, PULLBACK_MAX_SL_FRACTION, PULLBACK_MIN_DEPTH_PCT
-    global PULLBACK_POOL_FALLBACK, PULLBACK_SL_MODE, PULLBACK_TRACKS
+    global PULLBACK_POOL_FALLBACK, PULLBACK_SL_MODE, PULLBACK_DEPTH_MODE, PULLBACK_TRACKS
     new = pullback_config_snapshot()
     for key, value in patch.items():
         if value is None:
@@ -1020,6 +1036,10 @@ def apply_pullback_config(patch: dict) -> dict:
             if value not in PULLBACK_SL_MODES:
                 raise ValueError(f"sl_mode must be one of {', '.join(PULLBACK_SL_MODES)}")
             new["sl_mode"] = value
+        elif key == "depth_mode":
+            if value not in PULLBACK_DEPTH_MODES:
+                raise ValueError(f"depth_mode must be one of {', '.join(PULLBACK_DEPTH_MODES)}")
+            new["depth_mode"] = value
         elif key in PULLBACK_BOUNDS:
             lo, hi, caster = PULLBACK_BOUNDS[key]
             try:
@@ -1040,6 +1060,7 @@ def apply_pullback_config(patch: dict) -> dict:
     PULLBACK_MIN_DEPTH_PCT = new["min_depth_pct"]
     PULLBACK_POOL_FALLBACK = new["pool_fallback"]
     PULLBACK_SL_MODE = new["sl_mode"]
+    PULLBACK_DEPTH_MODE = new["depth_mode"]
     PULLBACK_TRACKS = dict(new["tracks"])
     save_pullback_config(new)
     return new
@@ -1054,6 +1075,7 @@ PULLBACK_MAX_SL_FRACTION = _pullback["max_sl_fraction"]
 PULLBACK_MIN_DEPTH_PCT = _pullback["min_depth_pct"]
 PULLBACK_POOL_FALLBACK = _pullback["pool_fallback"]
 PULLBACK_SL_MODE = _pullback["sl_mode"]
+PULLBACK_DEPTH_MODE = _pullback["depth_mode"]
 PULLBACK_TRACKS = dict(_pullback["tracks"])
 
 # =====================================================================

@@ -793,7 +793,7 @@ function PullSimSection({ pairs, timeframes }) {
       <h3 className="panel-title">Pullback-entry comparison</h3>
       <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
         Compares entering at the signal price against waiting for a pullback (limit order at 0.5× / 1× / 1.5× the average
-        early pullback) on real historical data. Dry-run — nothing is written to history or changes the live setting.
+        early pullback, or at the depth chosen from each track's own history) on real historical data. Dry-run — nothing is written to history or changes the live setting.
         Compare variants on <b>per signal</b>: total PnL ÷ ALL signals, unfilled ones counting as 0.
       </p>
       <SimScopeFields
@@ -834,7 +834,7 @@ function PullSimSection({ pairs, timeframes }) {
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
                 {name === 'market'
                   ? 'market (signal price)'
-                  : `pullback ${name.replace('+sl', '')}${name.endsWith('+sl') ? ' + stop shifted with entry' : ' (stop fixed)'}`}
+                  : `pullback ${name.startsWith('opt') ? 'depth chosen from history' : name.replace('+sl', '')}${name.endsWith('+sl') ? ' + stop shifted with entry' : ' (stop fixed)'}`}
               </div>
               {rows.length === 0 ? (
                 <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No signals in this sample.</p>

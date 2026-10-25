@@ -702,6 +702,16 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => savePullback('sl_mode', v ? 'keep_distance' : 'fixed')}
               />
             </div>
+            <div className="toggle-row">
+              <span className="row-label" title="Off: depth = multiplier × the average pullback. On: the depth that would have paid best on this track's own history (missed and expired signals count as 0); enters at market when no depth beats it. The multiplier is ignored in this mode.">
+                Choose depth from history
+              </span>
+              <Toggle
+                checked={(pb?.depth_mode ?? 'mean') === 'optimize'}
+                disabled={busy === 'pb_depth_mode'}
+                onChange={(v) => savePullback('depth_mode', v ? 'optimize' : 'mean')}
+              />
+            </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               The average pullback is measured per pair / timeframe / track as the largest move against the signal price
               within the wait window, over past signals (signals that never dipped count as 0). Off by default —
