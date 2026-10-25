@@ -52,30 +52,6 @@ function TradeCard({ trade, label }) {
   )
 }
 
-// A virtual limit order (pullback entry) that is waiting for its fill.
-function PendingCard({ pending, label }) {
-  if (!pending) return null
-  return (
-    <div style={{ padding: '6px 0', borderBottom: '1px solid var(--border-soft)' }}>
-      <div className="row" style={{ borderBottom: 'none', padding: '2px 0' }}>
-        <span className="row-label">{label} <span style={{ color: 'var(--accent)' }}>⏳ limit waiting</span></span>
-        <span className={`tag ${pending.side}`}>{pending.side}</span>
-      </div>
-      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, marginTop: 2 }}>
-        <span><span style={{ color: 'var(--text-faint)' }}>Limit </span><span className="mono">{fmtPrice(pending.limit)}</span></span>
-        <span><span style={{ color: 'var(--text-faint)' }}>Signal </span><span className="mono">{fmtPrice(pending.signal_price)}</span></span>
-        <span><span style={{ color: 'var(--text-faint)' }}>Pullback </span><span className="mono">{pending.pullback_pct != null ? `${pending.pullback_pct}%` : '—'}</span></span>
-        <span><span style={{ color: 'var(--text-faint)' }}>TP1 </span><span className="mono">{fmtPrice(pending.tp1)}</span></span>
-        <span><span style={{ color: 'var(--text-faint)' }}>SL </span><span className="mono" style={{ color: 'var(--short)' }}>{fmtPrice(pending.sl)}</span></span>
-        {pending.expire_ms && (
-          <span><span style={{ color: 'var(--text-faint)' }}>Expires </span>
-            <span className="mono">{new Date(pending.expire_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></span>
-        )}
-      </div>
-    </div>
-  )
-}
-
 export default function StatusPanel({ lastEvent }) {
   const [status, setStatus] = useState(null)
   const [error, setError] = useState(null)
@@ -108,7 +84,7 @@ export default function StatusPanel({ lastEvent }) {
   useEffect(() => {
     if (!lastEvent || lastEvent === persisted.seenEvent) return
     persisted.seenEvent = lastEvent
-    if (['scan_tick', 'signal', 'tp1_hit', 'limit_filled', 'limit_cancelled'].includes(lastEvent.type)) {
+    if (['scan_tick', 'signal', 'tp1_hit'].includes(lastEvent.type)) {
       if (!document.hidden) loadStatus()
     }
     if (lastEvent.type === 'tp1_hit') setTp1Banner(lastEvent)
@@ -172,9 +148,6 @@ export default function StatusPanel({ lastEvent }) {
               <TradeCard trade={data.a_active_trade} label="Andean (A)" />
               <TradeCard trade={data.u_active_trade} label="UT Bot (U)" />
               <TradeCard trade={data.b_active_trade} label="Breakout (B)" />
-              <PendingCard pending={data.a_pending} label="Andean (A)" />
-              <PendingCard pending={data.u_pending} label="UT Bot (U)" />
-              <PendingCard pending={data.b_pending} label="Breakout (B)" />
             </div>
           ))}
         </div>

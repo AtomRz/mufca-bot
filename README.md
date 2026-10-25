@@ -50,7 +50,6 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
 - **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Status, Chart, History, and Insights tabs (all live-updated over WebSocket) — Insights groups on-chain/derivatives bias, order book spread, confidence-component analysis, and the historical-experiment tools (`!tp1sim`/`!compsim` equivalents) under one tab with a sub-nav — plus a Settings panel to edit market mode, HTF bias, CHOP thresholds, adaptive TP, SL-after-TP1 mode, Discord notification toggle, scan/on-chain refresh intervals, all indicator parameters (FRAMA/MFI/Andean/UT Bot), Volume Profile, demand/supply zones, and chart colors — no redeploy needed
 - **Signal & filter lamps** — top-bar indicator showing live MFI/Andean/UT Bot signal state plus every filter's pass/block direction (including an R:R lamp), computed with the exact same functions the scanner itself uses, so the lamps never disagree with what actually opens a trade
 - **Android push notifications** — Firebase Cloud Messaging, device registration/dedup via the web dashboard's Settings panel or the Android app, test-push endpoint to verify the full server → Firebase → device pipeline
-- **Pullback entry (limit order, opt-in)** — after a signal fires, price often dips against the position for a bar or two before moving the right way. With this switched on, the bot doesn't enter at the signal bar's close: it parks a *virtual limit order* at the track's own **average early pullback** and enters only if price comes back to it. Per signal and per pair/timeframe/track, the depth is `mult × the mean largest move against the signal price within the wait window` over past signals (signals that never dipped count as 0 — they are exactly the ones a limit order would miss), capped at a share of this signal's SL distance so the entry can never sit next to the stop. SL / TP1 / TP2 keep the **same absolute levels** computed at the signal price, so a fill simply gets a better R:R. The order is cancelled if the wait window (default 3 bars) passes without a fill (`expired`), or if price reaches TP1 first (`missed` — the move left without us; a single 1m candle touching both the limit and TP1 is treated as missed, never as a fill). Fills and cancellations are resolved from 1m candles and notified via Discord / web / push. The average is measured straight from OHLCV (not from `max_adverse_pct`, which covers the whole life of a trade), so it is independent of the TP/SL/entry mode and works on all existing history; with too few past signals the signal simply enters at market as before — unless **pool across tracks** is on (default): a track with fewer than `min_samples` own signals (typically A and B) then borrows the average measured over *all* tracks of that pair/timeframe. **Stop placement** is selectable: `fixed` (default — the stop keeps its absolute level, so a deeper fill means a tighter stop) or `keep_distance` (the stop shifts with the entry, keeping the signal's SL distance); `!pullsim` compares both. Each track (A / U / B) has its own on/off switch, so pullback entry can be limited to the tracks where `!pullsim` shows it helps; the comparison itself always evaluates every track. History records keep the **signal price** as `entry` (so MAE/MFE and adaptive TP/SL stay independent of the entry mode) and carry `fill_price`/`pullback_pct`; PnL is measured from the real fill; never-filled signals stay in history as `exit_type="unfilled"` and are ignored by every TP/SL/hit-rate calibration. **Off by default — validate with `!pullsim` (Insights → Simulate) first**: a pullback entry trades a better price for missed runaway moves, and which side wins is an empirical question per track
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.5 (configurable via `MIN_RR`) or SL already hit by bar
 - **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording (saved immediately on every change, not throttled), force-close after N bars
 - **Startup backtest** — auto-populates signal history from 3000 bars, using the same adaptive TP logic as live signals (`calculate_combined_tp`) so backtest and live are trained on the same distribution
@@ -100,7 +99,6 @@ mufca-bot/
 │   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
 │   ├── derivatives.py         # Gate.io funding rate + open interest bias (futures only)
 │   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
-│   ├── pullback.py            # Pullback (limit) entry — average-pullback measurement + pure 1m-candle limit resolution
 │   ├── push.py               # Android push notifications (Firebase Cloud Messaging)
 │   ├── chart.py              # Candlestick chart (PNG) generation for Discord `!chart`
 │   ├── chart_data.py         # Same indicator data as chart.py, as JSON for the web dashboard
@@ -211,7 +209,6 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `chop_threshold.json` | Per-timeframe CHOP thresholds |
 | `filter_toggles.json` | Per-filter on/off state — FRAMA, CHOP, ATR, HTF, fake breakout, liquidity sweep, Hurst, order book spread (editable from the web dashboard) |
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
-| `pullback_entry.json` | Pullback (limit) entry: on/off, depth multiplier, wait window, min past signals, signals averaged, depth cap, min depth, pool across tracks, stop mode (editable from the web dashboard or `!pullback`) |
 | `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven / quarter / half (default) / three-quarter of the way to TP1 (editable from the web dashboard) |
 | `discord_notifications.json` | Discord channel notifications on/off (editable from the web dashboard; independent of `DISCORD_ENABLED` — see "Running without Discord" above) |
 | `scan_interval.json` | Scanner poll interval — 15/30/60/180s (editable from the web dashboard) |
@@ -273,11 +270,6 @@ volumes:
 | `!chop` | Show CHOP thresholds per timeframe |
 | `!chop 1h 55` | Set CHOP threshold for 1h (default: 55) |
 | `!chop 4h 61.8` | Set CHOP threshold for 4h (default: 61.8) |
-| `!pullback` | Pullback-entry settings + the measured average pullback per pair / timeframe / track |
-| `!pullback on` \| `!pullback off` | Enable / disable waiting for the average pullback (live, no restart; only affects new signals) |
-| `!pullback track a\|u\|b on\|off` | Per-track switch for the pullback entry (off = that track enters at the signal price) |
-| `!pullback pool on\|off` \| `!pullback sl fixed\|keep` | Pool the average across tracks when a track has too few own signals / keep the stop's absolute level (`fixed`) or shift it with the entry (`keep`) |
-| `!pullback mult\|bars\|samples\|maxsl\|min\|lookback <value>` | Tune depth multiplier / wait window (bars) / min past signals / depth cap (share of SL) / min depth % / signals averaged |
 
 ### 🎯 Adaptive TP
 
@@ -322,7 +314,6 @@ Dry-run — replay real historical OHLCV instead of waiting on live signals to a
 |---|---|
 | `!compsim [pair] [tf] [bars] [min_n]` | `!components`, sourced from a backtest instead of live history — reconstructs `relative_strength`/`volume_profile` point-in-time at each simulated entry |
 | `!tp1sim [pair] [tf] [bars]` | Compares breakeven/quarter/half/three-quarter SL-after-TP1 on real historical data, split by track/regime, with timed-out (reached TP1, never resolved within `MAX_HOLD_BARS`) trades tracked separately so a looser SL isn't silently under-counted relative to a tighter one |
-| `!pullsim [pair] [tf] [bars]` | Compares entering at the signal price against the pullback (limit) entry at 0.5× / 1× / 1.5× the average pullback (plus 0.5× / 1× with the stop shifted along with the entry) on real historical data — fill rate, missed/expired counts, win rate and `per_signal` PnL (total PnL ÷ ALL signals, unfilled counting as 0 — the number to compare). Dry-run: nothing written to history, live settings untouched. Runs pair/timeframe jobs on all CPU cores in parallel (`PULLSIM_WORKERS=N` env var to limit, `1` = single process) |
 
 ### 🧪 Testing
 
@@ -368,7 +359,7 @@ Changing market mode, HTF bias, or any indicator parameter resets active positio
 
 **Top bar:** live connection status, market mode, HTF bias, CHOP/trend/suggested-leverage pulse for the pair selected on the Chart tab, and a row of signal/filter lamps (MFI, Andean, UT Bot, plus every filter's pass/block state — including R:R) computed with the exact same logic the scanner uses to decide whether a trade actually opens.
 
-**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `components`, `tp1sim` (POST), `compsim` (POST), `pullback` (GET average-pullback stats), `pullsim` (POST — blocking, short scopes only), `pullsim/start` (POST) + `pullsim/status` (GET) — the same comparison as a background job the dashboard polls, because a request that stays open longer than ~100 s is cut off by Cloudflare Tunnel, `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`breakout`/`pullback`/`volume-profile`/`zones`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `limit_filled`, `limit_cancelled`, `scan_tick`, and `config_changed` events.
+**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `components`, `tp1sim` (POST), `compsim` (POST), `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`breakout`/`volume-profile`/`zones`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `limit_filled`, `limit_cancelled`, `scan_tick`, and `config_changed` events.
 
 ---
 
