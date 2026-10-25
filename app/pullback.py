@@ -40,6 +40,24 @@ on counts once per side). This borrows U's pullback behaviour for tracks
 whose entries may behave differently — `!pullsim` shows per track whether
 that actually helps; switch it off to keep the strict per-track rule.
 
+Depth selection modes
+---------------------
+"mean" places the limit at mult x the average pullback above. Its weakness is
+that the average mixes two very different kinds of signal: the ones that
+later lose usually dip hard and early, the ones that win dip less. Every
+signal gets the same limit order, and a deeper limit costs nothing on the
+losers (they trade through it anyway) but makes more winners leave without
+us. The average therefore tends to be deeper than what pays.
+
+"optimize" skips the average. For the signal at hand it replays every past
+signal's price path (OHLCV only, so no feedback from how those signals were
+really traded) against this signal's own TP1 / SL distances for a grid of
+depths and keeps the depth with the best expected PnL per signal. A signal
+that is missed or expires counts as 0, so the price of waiting is paid
+inside the objective. If no depth beats entering at market, the answer is
+"market". The objective is a simplified TP1-vs-SL expectancy (no TP2 leg, no
+fees); `!pullsim` runs the full backtest and stays the judge.
+
 Stop placement
 --------------
 `shifted_sl()` implements the "keep_distance" stop mode: the stop moves with
@@ -128,33 +146,27 @@ def early_adverse_pct(side: str, entry: float, highs: np.ndarray, lows: np.ndarr
     return max(0.0, (worst - entry) / entry * 100.0)
 
 
-def pullback_samples(df: pd.DataFrame,
-                     records_by_side: Dict[str, List[dict]],
-                     track: Optional[str],
-                     n_bars: int,
-                     last_idx: int,
-                     lookback_signals: int) -> List[float]:
-    """Early-adverse excursions (%), one per past signal of `track`.
-
-    last_idx — index of the most recent CLOSED bar usable as information
-    (live: the signal bar, len(df)-2; backtest: idx). A past signal counts
-    only if its whole N-bar window ends at or before last_idx.
+def signal_points(df: pd.DataFrame,
+                  records_by_side: Dict[str, List[dict]],
+                  track: Optional[str],
+                  horizon: int,
+                  last_idx: int) -> List[Tuple[int, str, float]]:
+    """(signal bar index, side, signal price) of every past signal of `track`
+    whose `horizon` bars after the signal bar are all closed by `last_idx`,
+    oldest first. Shared by pullback_samples() (horizon = wait window) and the
+    depth optimizer (horizon = wait window + hold period).
 
     Both sides and every exit_type are included (incl. 'open', 'cancelled'
     and 'unfilled' — a signal is a signal whatever happened to the trade);
-    synthetic (!sim) records are excluded. The most recent
-    `lookback_signals` samples are kept.
+    synthetic (!sim) records are excluded.
 
     track=None pools every track of the pair/timeframe; a signal bar that
     more than one track fired on (same side) is counted once.
     """
-    if n_bars < 1 or len(df) == 0:
+    if horizon < 1 or len(df) == 0:
         return []
     bar_ts = df["timestamp"].to_numpy(dtype="int64")
-    highs = df["high"].to_numpy(dtype="float64")
-    lows = df["low"].to_numpy(dtype="float64")
-
-    found: List[Tuple[int, float]] = []
+    found: List[Tuple[int, str, float]] = []
     seen = set()
     for side in ("long", "short"):
         for rec in records_by_side.get(side, []) or []:
@@ -175,19 +187,216 @@ def pullback_samples(df: pd.DataFrame,
             if ts_ms is None:
                 continue
             j = signal_bar_index(ts_ms, bar_ts)
-            if j is None or j + n_bars > last_idx or j + n_bars >= len(df):
+            if j is None or j + horizon > last_idx or j + horizon >= len(df):
                 continue
             if track is None:
                 if (side, j) in seen:
                     continue
                 seen.add((side, j))
-            adv = early_adverse_pct(side, entry, highs, lows, j, n_bars)
-            if not np.isfinite(adv):
-                continue
-            found.append((j, adv))
+            found.append((j, side, entry))
 
     found.sort(key=lambda x: x[0])
-    return [v for _, v in found[-lookback_signals:]]
+    return found
+
+
+def pullback_samples(df: pd.DataFrame,
+                     records_by_side: Dict[str, List[dict]],
+                     track: Optional[str],
+                     n_bars: int,
+                     last_idx: int,
+                     lookback_signals: int) -> List[float]:
+    """Early-adverse excursions (%), one per past signal of `track`.
+
+    last_idx — index of the most recent CLOSED bar usable as information
+    (live: the signal bar, len(df)-2; backtest: idx). A past signal counts
+    only if its whole N-bar window ends at or before last_idx. Which signals
+    count (sides, exit types, synthetic, pooling) — see signal_points().
+    The most recent `lookback_signals` samples are kept.
+    """
+    if n_bars < 1 or len(df) == 0:
+        return []
+    highs = df["high"].to_numpy(dtype="float64")
+    lows = df["low"].to_numpy(dtype="float64")
+
+    out: List[float] = []
+    for j, side, entry in signal_points(df, records_by_side, track, n_bars, last_idx):
+        adv = early_adverse_pct(side, entry, highs, lows, j, n_bars)
+        if not np.isfinite(adv):
+            continue
+        out.append(adv)
+    return out[-lookback_signals:]
+
+
+# ---------------------------------------------------------------------
+# depth optimizer: choose the depth from history instead of the average
+# ---------------------------------------------------------------------
+
+# Candidate limit depths tried between min_depth_pct and the SL cap (the
+# "enter at market" alternative is always evaluated on top of these).
+OPT_GRID_POINTS = 12
+# The best limit depth must beat entering at market by more than this many
+# percentage points of PnL per signal, otherwise the optimizer says "market".
+OPT_MIN_EDGE_PCT = 0.0
+
+
+def _signed_paths(side: str, entry: float, highs: np.ndarray, lows: np.ndarray,
+                  closes: np.ndarray, j: int, n_bars: int
+                  ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """The price path over bars j+1 .. j+n_bars after a past signal, as signed
+    returns relative to the signal price where POSITIVE always means in favour
+    of the position: (best excursion per bar, worst excursion per bar, close
+    per bar). Long and short become mirror images, so one simulator serves
+    both. None when the window is incomplete or holds a non-finite candle
+    (such a sample is skipped rather than guessed at)."""
+    lo, hi = j + 1, j + n_bars + 1
+    h, l, c = highs[lo:hi], lows[lo:hi], closes[lo:hi]
+    if h.size < n_bars or not (np.isfinite(h).all() and np.isfinite(l).all() and np.isfinite(c).all()):
+        return None
+    if side == "long":
+        return h / entry - 1.0, l / entry - 1.0, c / entry - 1.0
+    return 1.0 - l / entry, 1.0 - h / entry, 1.0 - c / entry
+
+
+def _history_paths(df: pd.DataFrame,
+                   records_by_side: Dict[str, List[dict]],
+                   track: Optional[str],
+                   n_bars: int,
+                   hold_bars: int,
+                   last_idx: int,
+                   lookback_signals: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
+    """(best, worst, close, is_long) price paths of the most recent
+    `lookback_signals` past signals, each followed for n_bars + hold_bars bars.
+
+    A past signal counts only once that whole horizon is closed (see
+    signal_points) — the outcome of a signal is simply not known earlier, and
+    using it before that would be look-ahead. The paths come straight from
+    OHLCV, so they are independent of how those signals were actually traded
+    (no feedback loop from the entry mode, TP or SL policy)."""
+    horizon = n_bars + hold_bars
+    highs = df["high"].to_numpy(dtype="float64")
+    lows = df["low"].to_numpy(dtype="float64")
+    closes = df["close"].to_numpy(dtype="float64")
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = []
+    for j, side, entry in reversed(signal_points(df, records_by_side, track, horizon, last_idx)):
+        path = _signed_paths(side, entry, highs, lows, closes, j, horizon)
+        if path is None:
+            continue
+        out.append((path[0], path[1], path[2], side == "long"))
+        if len(out) >= lookback_signals:
+            break
+    out.reverse()
+    return out
+
+
+def _simulate_depths(fav: np.ndarray, adv: np.ndarray, cl: np.ndarray, n_bars: int,
+                     tp1: float, sl: float, depths: np.ndarray, is_long: bool,
+                     keep_distance: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """What one past signal would have paid for each candidate limit depth.
+
+    fav / adv / cl — the signed path from _signed_paths(); tp1 / sl — the
+    TP1 and SL distances as fractions of the signal price; depths — fractions
+    of the signal price, depths[i] == 0 meaning "enter at the signal close".
+
+    Rules, identical to the backtest's limit-entry logic:
+      * the order lives n_bars bars; a bar that reaches TP1 before the fill,
+        or in the same bar as the fill, means "missed" (the move left);
+      * after the fill the stop is checked from the fill bar itself, stop
+        first when a bar touches both stop and TP1;
+      * TP1 stays at its absolute level; the stop either keeps its absolute
+        level or shifts with the entry (keep_distance);
+      * the trade is a TP1 win, an SL loss, or — when neither happens within
+        the path — marked to the last close.
+    A signal that is missed / expires pays 0 (what skipping a trade costs).
+    Returns (PnL in % of the fill price, filled flag) per depth.
+    """
+    width = fav.size
+    never = width + 1
+    hit = np.flatnonzero(fav >= tp1)
+    tp_bar = int(hit[0]) + 1 if hit.size else never
+    # worst excursion seen so far inside the wait window (non-increasing),
+    # negated so it is non-decreasing and searchsorted can find the first fill
+    neg_run_worst = -np.minimum.accumulate(adv[:n_bars])
+    pnl = np.zeros(depths.size)
+    filled = np.zeros(depths.size, dtype=bool)
+    for i, d in enumerate(depths):
+        if d > 0.0:
+            fill_bar = int(np.searchsorted(neg_run_worst, d, side="left")) + 1
+            if fill_bar > n_bars or tp_bar <= fill_bar:
+                continue  # expired / missed -> no trade
+            stop_x = -(sl + d) if keep_distance else -sl
+            first = fill_bar
+        else:
+            stop_x = -sl
+            first = 1
+        stops = np.flatnonzero(adv[first - 1:] <= stop_x)
+        stop_bar = first + int(stops[0]) if stops.size else never
+        if stop_bar <= tp_bar and stop_bar <= width:
+            exit_x = stop_x
+        elif tp_bar <= width:
+            exit_x = tp1
+        else:
+            exit_x = float(cl[-1])
+        fill_den = (1.0 - d) if is_long else (1.0 + d)
+        pnl[i] = (exit_x + d) / fill_den * 100.0
+        filled[i] = True
+    return pnl, filled
+
+
+def _best_depth(paths: List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]],
+                n_bars: int,
+                tp1_dist_pct: float,
+                sl_dist_pct: float,
+                max_sl_fraction: float,
+                min_depth_pct: float,
+                keep_distance: bool) -> Optional[Dict]:
+    """Picks the limit depth with the best expected PnL per signal over the
+    given history paths, or None when no limit depth beats entering at market.
+
+    The depth grid runs from min_depth_pct to the same SL-fraction cap the
+    average-based depth obeys. The PnL curve over the grid is lightly smoothed
+    ([1, 2, 1] weights) before the argmax so a single lucky sample cannot pull
+    the depth to a spike."""
+    cap = max(0.0, max_sl_fraction) * max(0.0, sl_dist_pct)
+    lo = max(min_depth_pct, 1e-6)
+    if cap < lo:
+        return None
+    grid = np.linspace(lo, cap, OPT_GRID_POINTS) if cap > lo else np.array([lo])
+    depths = np.concatenate(([0.0], grid)) / 100.0
+    tp1 = tp1_dist_pct / 100.0
+    sl = sl_dist_pct / 100.0
+
+    pnl_sum = np.zeros(depths.size)
+    fills = np.zeros(depths.size)
+    pullbacks: List[float] = []
+    for fav, adv, cl, is_long in paths:
+        p, f = _simulate_depths(fav, adv, cl, n_bars, tp1, sl, depths, is_long, keep_distance)
+        pnl_sum += p
+        fills += f
+        pullbacks.append(max(0.0, -float(adv[:n_bars].min())) * 100.0)
+    n = len(paths)
+    curve = pnl_sum / n
+    fill_rate = fills / n
+
+    limit_curve = curve[1:]
+    if limit_curve.size >= 3:
+        padded = np.concatenate(([limit_curve[0]], limit_curve, [limit_curve[-1]]))
+        smooth = 0.25 * padded[:-2] + 0.5 * padded[1:-1] + 0.25 * padded[2:]
+    else:
+        smooth = limit_curve
+    k = int(np.argmax(smooth))
+    market_pnl = float(curve[0])
+    if float(smooth[k]) <= market_pnl + OPT_MIN_EDGE_PCT:
+        return None
+    return {
+        "depth_pct": float(grid[k]),
+        "mean_pct": float(np.mean(pullbacks)),
+        "n": int(n),
+        "est_fill_rate": float(fill_rate[1 + k]),
+        "capped": bool(grid.size > 1 and k == grid.size - 1),
+        "mode": "optimize",
+        "exp_pnl_pct": float(curve[1 + k]),
+        "market_pnl_pct": market_pnl,
+    }
 
 
 def compute_pullback_depth(df: pd.DataFrame,
@@ -201,12 +410,28 @@ def compute_pullback_depth(df: pd.DataFrame,
                            sl_dist_pct: float,
                            max_sl_fraction: float,
                            min_depth_pct: float,
-                           pool_fallback: bool = False) -> Optional[Dict]:
+                           pool_fallback: bool = False,
+                           depth_mode: str = "mean",
+                           tp1_dist_pct: Optional[float] = None,
+                           hold_bars: int = 0,
+                           keep_distance: bool = False) -> Optional[Dict]:
     """How deep to place the limit order (in % below/above the signal price).
 
-    depth = mult * mean(early adverse excursion of past signals), then capped
-    at max_sl_fraction * (this signal's SL distance) so the entry can never
-    end up right next to the stop.
+    depth_mode="mean" (default): depth = mult * mean(early adverse excursion
+    of past signals), then capped at max_sl_fraction * (this signal's SL
+    distance) so the entry can never end up right next to the stop.
+
+    depth_mode="optimize": the depth is the one that would have paid best on
+    the track's own history. Every past signal's price path (from OHLCV) is
+    replayed against this signal's TP1 / SL distances for a grid of depths,
+    counting missed and expired signals as 0, and the depth with the highest
+    expected PnL per signal wins — provided it beats entering at market, else
+    the answer is None (market). `mult` is not used in this mode. It needs
+    tp1_dist_pct (> 0), hold_bars (>= 1) and sl_dist_pct (> 0); when any is
+    missing it quietly falls back to "mean". keep_distance must match the
+    sl_mode the order will actually be placed with. Only signals whose whole
+    wait + hold horizon is already closed are used (no look-ahead), so the
+    sample ends hold_bars further back than in "mean" mode.
 
     Returns None — meaning "enter at market as usual" — when there aren't
     enough past signals (min_samples) or the resulting depth is too shallow
@@ -216,13 +441,30 @@ def compute_pullback_depth(df: pd.DataFrame,
 
     Returned dict: depth_pct, mean_pct, n, est_fill_rate (share of the
     samples whose pullback reached the chosen depth), capped (bool),
-    pooled (bool — measured over all tracks).
+    pooled (bool — measured over all tracks), mode ("mean" | "optimize"),
+    and in optimize mode also exp_pnl_pct / market_pnl_pct (expected PnL per
+    signal at the chosen depth vs entering at market, in %).
     """
     # 🆕 FIX: a NaN/inf input (e.g. a zero-distance SL producing nan) used to
     # slip through every comparison below and come out as depth_pct=nan, i.e. a
     # limit order at price nan. Non-finite knobs mean "no limit order".
     if not all(np.isfinite(x) for x in (mult, sl_dist_pct, max_sl_fraction, min_depth_pct)):
         return None
+    if (depth_mode == "optimize" and tp1_dist_pct is not None and np.isfinite(tp1_dist_pct)
+            and tp1_dist_pct > 0 and hold_bars >= 1 and sl_dist_pct > 0 and len(df) > 0):
+        paths = _history_paths(df, records_by_side, track, n_bars, hold_bars, last_idx, lookback_signals)
+        pooled = False
+        if len(paths) < min_samples and pool_fallback:
+            paths = _history_paths(df, records_by_side, None, n_bars, hold_bars, last_idx, lookback_signals)
+            pooled = True
+        if len(paths) < min_samples:
+            return None
+        best = _best_depth(paths, n_bars, float(tp1_dist_pct), sl_dist_pct,
+                           max_sl_fraction, min_depth_pct, keep_distance)
+        if best is None:
+            return None
+        best["pooled"] = pooled
+        return best
     samples = pullback_samples(df, records_by_side, track, n_bars, last_idx, lookback_signals)
     pooled = False
     if len(samples) < min_samples and pool_fallback:
@@ -245,6 +487,7 @@ def compute_pullback_depth(df: pd.DataFrame,
         "est_fill_rate": float((arr >= depth).mean()),
         "capped": bool(capped),
         "pooled": pooled,
+        "mode": "mean",
     }
 
 

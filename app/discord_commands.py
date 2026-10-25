@@ -1968,6 +1968,10 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
       !pullback track a|u|b on|off — per-track switch (off = that track enters at the signal price)
       !pullback sl fixed | keep — stop keeps its absolute level (fixed) or shifts
                                   with the entry, keeping the signal's SL distance (keep)
+      !pullback depth mean | opt — how the depth is chosen: mult x the average pullback
+                                  (mean), or the depth that paid best on the track's own
+                                  history, falling back to market when none beats it (opt;
+                                  `mult` is ignored in this mode)
     """
     try:
         a = arg.lower()
@@ -1999,6 +2003,15 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             cfg = _cfg.apply_pullback_config({"sl_mode": mode})
             await ctx.send(f"✅ pullback sl_mode = **{cfg['sl_mode']}**")
             return
+        if a == "depth":
+            mode = {"mean": "mean", "opt": "optimize", "optimize": "optimize"}.get(value.lower())
+            if mode is None:
+                await ctx.send("❌ Usage: `!pullback depth mean|opt`")
+                return
+            cfg = _cfg.apply_pullback_config({"depth_mode": mode})
+            await ctx.send(f"✅ pullback depth_mode = **{cfg['depth_mode']}**"
+                           + (" — depth is chosen from each track's own history (mult is ignored)." if mode == "optimize" else ""))
+            return
         if a in _PULLBACK_ARG_KEYS:
             if value == "":
                 await ctx.send(f"❌ Usage: `!pullback {a} <value>`")
@@ -2011,7 +2024,7 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             await ctx.send(f"✅ pullback {_PULLBACK_ARG_KEYS[a]} = **{cfg[_PULLBACK_ARG_KEYS[a]]}**")
             return
         if a:
-            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool`, `sl` or `track`.")
+            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool`, `sl`, `depth` or `track`.")
             return
 
         exchange = core._exchange_ref
@@ -2020,10 +2033,14 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
             f"**🎯 Pullback entry: {'ON ✅' if cfg['enabled'] else 'OFF ❌'}**",
             f"mult={cfg['mult']} | bars={cfg['expiry_bars']} | min samples={cfg['min_samples']} | "
             f"lookback={cfg['lookback_signals']} | depth cap={cfg['max_sl_fraction']:.0%} of SL | min depth={cfg['min_depth_pct']}%",
-            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']} | "
+            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']} | depth={cfg['depth_mode']} | "
             "tracks: " + ", ".join(f"{t}={'on' if on else 'off'}" for t, on in cfg["tracks"].items()),
             "",
         ]
+        if cfg["depth_mode"] == "optimize":
+            lines.append("ℹ️ depth=optimize: the live depth is chosen per signal from the track's own history, so the "
+                         "`limit depth` / `est. fill` figures below (average x mult) are only a reference.")
+            lines.append("")
         if exchange is None:
             lines.append("⚠️ Not connected to the exchange yet — stats unavailable.")
         else:
@@ -2054,9 +2071,10 @@ async def pullback_cmd(ctx, arg: str = "", value: str = ""):
 async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
     """
     Dry-run comparison of "enter at the signal price" against the pullback
-    (limit) entry at 0.5x / 1.0x / 1.5x the average pullback, on real
-    historical OHLCV (run_pullback_comparison). Nothing is written to
-    signals_history.json and no live setting changes.
+    (limit) entry at 0.5x / 1.0x / 1.5x the average pullback and at the depth
+    chosen from history ("opt" variants), on real historical OHLCV
+    (run_pullback_comparison). Nothing is written to signals_history.json
+    and no live setting changes.
 
     Usage: !pullsim [ticker] [tf] [num_bars]
       no args             — every tracked pair x timeframe, 3000 bars
@@ -2085,7 +2103,7 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
             return
 
     await ctx.send(
-        f"⏳ Running pullback-entry comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 6 variants, "
+        f"⏳ Running pullback-entry comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 8 variants, "
         f"{num_bars} bars each. This is slow — sit tight."
     )
     try:
@@ -2100,8 +2118,9 @@ async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000)
             lines.append("")
 
         for name, rows in result["variants"].items():
+            base_name = ("depth chosen from history" if name.startswith("opt") else name.replace('+sl', ''))
             label = ("market (signal price)" if name == "market"
-                     else f"pullback {name.replace('+sl', '')}" + (" + stop shifted with entry" if name.endswith("+sl") else " (stop fixed)"))
+                     else f"pullback {base_name}" + (" + stop shifted with entry" if name.endswith("+sl") else " (stop fixed)"))
             lines.append(f"**{label}:**")
             if not rows:
                 lines.append("  no signals in this sample.\n")

@@ -1250,6 +1250,7 @@ class PullbackConfigIn(BaseModel):
     min_depth_pct: Optional[float] = None
     pool_fallback: Optional[bool] = None
     sl_mode: Optional[str] = None
+    depth_mode: Optional[str] = None  # "mean" | "optimize"
     tracks: Optional[dict] = None   # partial, e.g. {"a": true, "u": false}
 
 
