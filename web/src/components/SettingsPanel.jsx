@@ -204,8 +204,6 @@ export default function SettingsPanel({ config, onChanged }) {
 
   const saveIndicator = (field, value) => run(`ind_${field}`, () => api.setIndicators({ [field]: value }))
   const saveBreakout = (field, value) => run(`brk_${field}`, () => api.setBreakoutConfig({ [field]: value }))
-  const pb = config.pullback_entry
-  const savePullback = (field, value) => run(`pb_${field}`, () => api.setPullbackConfig({ [field]: value }))
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
   const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
   const saveZones = (field, value) => run(`zones_${field}`, () => api.setZones({ [field]: value }))
@@ -643,80 +641,6 @@ export default function SettingsPanel({ config, onChanged }) {
               Deliberately skips CHOP and FRAMA-direction filtering; ATR bounds, HTF bias, fake-break/liquidity-sweep,
               Hurst, and spread filters still apply. Not backtestable retroactively past a config change — new values
               only affect signals generated after saving.
-            </p>
-          </div>
-
-          <div className="panel">
-            <h3 className="panel-title">Pullback Entry (limit order)</h3>
-            <div className="toggle-row">
-              <span className="row-label" title="After a signal fires, wait for the track's own average early pullback and enter there with a virtual limit order instead of at the signal price. SL/TP1/TP2 keep the same absolute levels, so a fill gives a better R:R. Cancelled if the wait window passes without a fill, or if price reaches TP1 first.">
-                Wait for the average pullback
-              </span>
-              <Toggle
-                checked={pb?.enabled ?? false}
-                disabled={busy === 'pb_enabled'}
-                onChange={(v) => savePullback('enabled', v)}
-              />
-            </div>
-            {['a', 'u', 'b'].map((t) => (
-              <div className="toggle-row" key={`pb_track_${t}`}>
-                <span className="row-label" title="Per-track switch (only matters while the main switch is on). Off = this track keeps entering at the signal price. Decide from Insights → Simulate → Pullback-entry comparison, which always evaluates every track.">
-                  ↳ Track {t.toUpperCase()}
-                </span>
-                <Toggle
-                  checked={pb?.tracks?.[t] ?? true}
-                  disabled={busy === 'pb_tracks'}
-                  onChange={(v) => savePullback('tracks', { [t]: v })}
-                />
-              </div>
-            ))}
-            <NumberField label="Depth multiplier" hint="0.1–3.0 — fraction of the average pullback to wait for" value={pb?.mult ?? 1} min={0.1} max={3} step={0.1}
-              busyKey="pb_mult" busy={busy} onSave={(v) => savePullback('mult', v)} />
-            <NumberField label="Wait window (bars)" hint="1–12 — how long the limit order stays alive" value={pb?.expiry_bars ?? 3} min={1} max={12}
-              busyKey="pb_expiry_bars" busy={busy} onSave={(v) => savePullback('expiry_bars', v)} />
-            <NumberField label="Min past signals" hint="5–200 — below this the signal enters at market" value={pb?.min_samples ?? 12} min={5} max={200}
-              busyKey="pb_min_samples" busy={busy} onSave={(v) => savePullback('min_samples', v)} />
-            <NumberField label="Signals averaged" hint="10–500 — most recent N per pair/timeframe/track" value={pb?.lookback_signals ?? 60} min={10} max={500}
-              busyKey="pb_lookback_signals" busy={busy} onSave={(v) => savePullback('lookback_signals', v)} />
-            <NumberField label="Depth cap (share of SL distance)" hint="0.1–0.9 — the limit never sits closer than this to the stop" value={pb?.max_sl_fraction ?? 0.5} min={0.1} max={0.9} step={0.05}
-              busyKey="pb_max_sl_fraction" busy={busy} onSave={(v) => savePullback('max_sl_fraction', v)} />
-            <NumberField label="Min depth (%)" hint="0–2 — shallower than this isn't worth waiting for, enter at market" value={pb?.min_depth_pct ?? 0.05} min={0} max={2} step={0.01}
-              busyKey="pb_min_depth_pct" busy={busy} onSave={(v) => savePullback('min_depth_pct', v)} />
-            <div className="toggle-row">
-              <span className="row-label" title="A track with fewer than 'Min past signals' of its own (typically A and B) measures the average over all tracks of that pair/timeframe instead of entering at market.">
-                Pool tracks when too few own signals
-              </span>
-              <Toggle
-                checked={pb?.pool_fallback ?? true}
-                disabled={busy === 'pb_pool_fallback'}
-                onChange={(v) => savePullback('pool_fallback', v)}
-              />
-            </div>
-            <div className="toggle-row">
-              <span className="row-label" title="Off: the stop keeps its absolute level (a deeper fill = a tighter stop). On: the stop moves with the entry so the distance entry→stop stays what it was at the signal price.">
-                Shift stop with the entry
-              </span>
-              <Toggle
-                checked={(pb?.sl_mode ?? 'fixed') === 'keep_distance'}
-                disabled={busy === 'pb_sl_mode'}
-                onChange={(v) => savePullback('sl_mode', v ? 'keep_distance' : 'fixed')}
-              />
-            </div>
-            <div className="toggle-row">
-              <span className="row-label" title="Off: depth = multiplier × the average pullback. On: the depth that would have paid best on this track's own history (missed and expired signals count as 0); enters at market when no depth beats it. The multiplier is ignored in this mode.">
-                Choose depth from history
-              </span>
-              <Toggle
-                checked={(pb?.depth_mode ?? 'mean') === 'optimize'}
-                disabled={busy === 'pb_depth_mode'}
-                onChange={(v) => savePullback('depth_mode', v ? 'optimize' : 'mean')}
-              />
-            </div>
-            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              The average pullback is measured per pair / timeframe / track as the largest move against the signal price
-              within the wait window, over past signals (signals that never dipped count as 0). Off by default —
-              validate it first on Insights → Simulate → "Pullback-entry comparison". Turning it off only affects new
-              signals; limit orders already waiting keep running until they fill or expire.
             </p>
           </div>
 

@@ -53,7 +53,6 @@ from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest,
-    run_pullback_comparison, pullback_stats_report,
 )
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full
 import derivatives
@@ -137,8 +136,6 @@ async def help_cmd(ctx):
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
-        "`!pullback [on|off|mult|bars|samples|maxsl|min|lookback <value>|pool on|off|sl fixed|keep|track a|u|b on|off]` — limit entry at the average pullback: stats + settings",
-        "`!pullsim [pair] [tf] [bars]` — compare entering at the signal price vs. waiting for the average pullback, on real historical data (dry-run)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
@@ -230,7 +227,7 @@ async def status_cmd(ctx):
             # Before: a_pos = f"⚠️{a_flag}" → then a_pos = "—" (overwriting it!)
             # Now: a single assignment with an informative message.
             async with _cmd_lock(ticker, tf):
-                if a_flag and not a_trade and not st.get("a_pending"):
+                if a_flag and not a_trade:
                     logger.warning(f"[STATE] A-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["a_in_long"] = False   # auto-heal
                     core.state[ticker][tf]["a_in_short"] = False
@@ -239,7 +236,7 @@ async def status_cmd(ctx):
                     a_pos = a_flag or "—"
 
                 # 🆕 FIX BUG-HI001: same fix for the U-track
-                if u_flag and not u_trade and not st.get("u_pending"):
+                if u_flag and not u_trade:
                     logger.warning(f"[STATE] U-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["u_in_long"] = False   # auto-heal
                     core.state[ticker][tf]["u_in_short"] = False
@@ -248,7 +245,7 @@ async def status_cmd(ctx):
                     u_pos = u_flag or "—"
 
                 # 🆕 Same fix for the B-track (Breakout)
-                if b_flag and not b_trade and not st.get("b_pending"):
+                if b_flag and not b_trade:
                     logger.warning(f"[STATE] B-track desync fixed for {ticker} {tf}")
                     core.state[ticker][tf]["b_in_long"] = False   # auto-heal
                     core.state[ticker][tf]["b_in_short"] = False
@@ -262,11 +259,6 @@ async def status_cmd(ctx):
                 trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${format_price(u_trade['entry'])}"
             if b_trade:
                 trade_info += f" | 🎯[B] {b_trade['side'].upper()} @ ${format_price(b_trade['entry'])}"
-            # 🆕 (pullback entry) virtual limit orders still waiting for their fill
-            for _t, _lbl in (("a", "A"), ("u", "U"), ("b", "B")):
-                _p = st.get(f"{_t}_pending")
-                if _p:
-                    trade_info += f" | ⏳[{_lbl}] {_p['side'].upper()} limit ${format_price(_p['limit'])}"
 
             # 🆕 Volume info
             vol_info = ""
@@ -803,8 +795,7 @@ def _history_closed_records(history: dict, ticker: str, tf: str) -> list:
     records = []
     for side in ("long", "short"):
         for rec in slots.get(side, []):
-            # "unfilled" = a pullback limit order that never filled — not a trade
-            # (the web dashboard and !signals exclude it too).
+            # "unfilled" = legacy record from the removed limit-entry feature
             if rec.get("exit_type") in ("open", "unfilled") or rec.get("synthetic"):
                 continue
             merged = dict(rec)
@@ -1930,8 +1921,9 @@ async def spread_cmd(ctx, ticker: str = "BTC/USDT", action: str = "", confirm: s
 
 
 # =====================================================================
-# 🎯  PULLBACK (LIMIT) ENTRY
+# 🛠  SHARED HELPERS
 # =====================================================================
+
 
 async def _send_chunked(ctx, msg: str):
     while msg:
@@ -1940,215 +1932,3 @@ async def _send_chunked(ctx, msg: str):
             chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
         await ctx.send(chunk)
         msg = msg[len(chunk):].lstrip("\n")
-
-
-_PULLBACK_ARG_KEYS = {
-    "mult": "mult", "bars": "expiry_bars", "samples": "min_samples",
-    "maxsl": "max_sl_fraction", "min": "min_depth_pct", "lookback": "lookback_signals",
-}
-
-
-@core.bot.command(name="pullback")
-async def pullback_cmd(ctx, arg: str = "", value: str = ""):
-    """
-    Limit entry at the average pullback (see config.py's PULLBACK section and
-    pullback.py).
-
-      !pullback                 — current settings + the measured average
-                                  pullback per pair / timeframe / track
-      !pullback on | off        — enable / disable (live, no restart)
-      !pullback mult 1.0        — fraction of the average pullback to wait for
-      !pullback bars 3          — bars the limit order stays alive
-      !pullback samples 12      — past signals required before trusting the average
-      !pullback maxsl 0.5       — depth cap, share of the signal's SL distance
-      !pullback min 0.05        — shallower than this % -> enter at market
-      !pullback lookback 60     — most recent N signals used for the average
-      !pullback pool on | off   — a track with too few own signals borrows the
-                                  average of all tracks (default on)
-      !pullback track a|u|b on|off — per-track switch (off = that track enters at the signal price)
-      !pullback sl fixed | keep — stop keeps its absolute level (fixed) or shifts
-                                  with the entry, keeping the signal's SL distance (keep)
-      !pullback depth mean | opt — how the depth is chosen: mult x the average pullback
-                                  (mean), or the depth that paid best on the track's own
-                                  history, falling back to market when none beats it (opt;
-                                  `mult` is ignored in this mode)
-    """
-    try:
-        a = arg.lower()
-        if a in ("on", "off"):
-            cfg = _cfg.apply_pullback_config({"enabled": a == "on"})
-            await ctx.send(f"🎯 Pullback entry: **{'ON' if cfg['enabled'] else 'OFF'}**"
-                           + ("" if cfg["enabled"] else " — signals enter at the signal price as before."))
-            return
-        if a == "pool":
-            if value.lower() not in ("on", "off"):
-                await ctx.send("❌ Usage: `!pullback pool on|off`")
-                return
-            cfg = _cfg.apply_pullback_config({"pool_fallback": value.lower() == "on"})
-            await ctx.send(f"✅ pullback pool_fallback = **{'ON' if cfg['pool_fallback'] else 'OFF'}**")
-            return
-        if a == "track":
-            parts = value.split()
-            if len(parts) != 2 or parts[0].lower() not in _cfg.TRACKS or parts[1].lower() not in ("on", "off"):
-                await ctx.send("❌ Usage: `!pullback track <a|u|b> on|off`")
-                return
-            cfg = _cfg.apply_pullback_config({"tracks": {parts[0].lower(): parts[1].lower() == "on"}})
-            await ctx.send(f"✅ pullback track **{parts[0].lower()}**: **{'ON' if cfg['tracks'][parts[0].lower()] else 'OFF (enters at signal price)'}**")
-            return
-        if a == "sl":
-            mode = {"fixed": "fixed", "keep": "keep_distance", "keep_distance": "keep_distance"}.get(value.lower())
-            if mode is None:
-                await ctx.send("❌ Usage: `!pullback sl fixed|keep`")
-                return
-            cfg = _cfg.apply_pullback_config({"sl_mode": mode})
-            await ctx.send(f"✅ pullback sl_mode = **{cfg['sl_mode']}**")
-            return
-        if a == "depth":
-            mode = {"mean": "mean", "opt": "optimize", "optimize": "optimize"}.get(value.lower())
-            if mode is None:
-                await ctx.send("❌ Usage: `!pullback depth mean|opt`")
-                return
-            cfg = _cfg.apply_pullback_config({"depth_mode": mode})
-            await ctx.send(f"✅ pullback depth_mode = **{cfg['depth_mode']}**"
-                           + (" — depth is chosen from each track's own history (mult is ignored)." if mode == "optimize" else ""))
-            return
-        if a in _PULLBACK_ARG_KEYS:
-            if value == "":
-                await ctx.send(f"❌ Usage: `!pullback {a} <value>`")
-                return
-            try:
-                cfg = _cfg.apply_pullback_config({_PULLBACK_ARG_KEYS[a]: value})
-            except ValueError as e:
-                await ctx.send(f"❌ {e}")
-                return
-            await ctx.send(f"✅ pullback {_PULLBACK_ARG_KEYS[a]} = **{cfg[_PULLBACK_ARG_KEYS[a]]}**")
-            return
-        if a:
-            await ctx.send("❌ Unknown option. Use `on`, `off`, `mult`, `bars`, `samples`, `maxsl`, `min`, `lookback`, `pool`, `sl`, `depth` or `track`.")
-            return
-
-        exchange = core._exchange_ref
-        cfg = _cfg.pullback_config_snapshot()
-        lines = [
-            f"**🎯 Pullback entry: {'ON ✅' if cfg['enabled'] else 'OFF ❌'}**",
-            f"mult={cfg['mult']} | bars={cfg['expiry_bars']} | min samples={cfg['min_samples']} | "
-            f"lookback={cfg['lookback_signals']} | depth cap={cfg['max_sl_fraction']:.0%} of SL | min depth={cfg['min_depth_pct']}%",
-            f"pool across tracks={'on' if cfg['pool_fallback'] else 'off'} | stop={cfg['sl_mode']} | depth={cfg['depth_mode']} | "
-            "tracks: " + ", ".join(f"{t}={'on' if on else 'off'}" for t, on in cfg["tracks"].items()),
-            "",
-        ]
-        if cfg["depth_mode"] == "optimize":
-            lines.append("ℹ️ depth=optimize: the live depth is chosen per signal from the track's own history, so the "
-                         "`limit depth` / `est. fill` figures below (average x mult) are only a reference.")
-            lines.append("")
-        if exchange is None:
-            lines.append("⚠️ Not connected to the exchange yet — stats unavailable.")
-        else:
-            report = await pullback_stats_report(exchange, list(TICKERS), list(TIMEFRAMES))
-            lines.append("Average early pullback (max move against the signal price within the wait window), per past signal:")
-            for r in report["rows"]:
-                if r["n"] == 0:
-                    continue
-                flag = "" if r["enough_samples"] else " ⚠️ too few samples — would enter at market"
-                if r.get("pooled"):
-                    flag = " 🔀 pooled over all tracks"
-                lines.append(
-                    f"• `{r['ticker']}` `{r['tf']}` track={r['track']}: n={r['n']} avg={r['mean_pct']:.2f}% "
-                    f"median={r['median_pct']:.2f}% | never dipped: {r['never_pulled_back']:.0%} | "
-                    f"limit depth={r['depth_pct']:.2f}% → est. fill {r['est_fill_rate']:.0%}{flag}"
-                )
-            if len(lines) <= 3:
-                lines.append("No signal history to measure yet.")
-        lines.append("")
-        lines.append("Validate with `!pullsim` before switching on.")
-        await _send_chunked(ctx, "\n".join(lines))
-    except Exception as e:
-        logger.error(f"pullback command error: {e}", exc_info=True)
-        await ctx.send(f"❌ Error: {e}")
-
-
-@core.bot.command(name="pullsim", aliases=["pullcompare"])
-async def pullsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
-    """
-    Dry-run comparison of "enter at the signal price" against the pullback
-    (limit) entry at 0.5x / 1.0x / 1.5x the average pullback and at the depth
-    chosen from history ("opt" variants), on real historical OHLCV
-    (run_pullback_comparison). Nothing is written to signals_history.json
-    and no live setting changes.
-
-    Usage: !pullsim [ticker] [tf] [num_bars]
-      no args             — every tracked pair x timeframe, 3000 bars
-      !pullsim ETH/USDT 4h
-      !pullsim ETH/USDT 4h 1500
-
-    Compare variants on `per_signal` — total PnL divided by ALL signals,
-    unfilled ones counting as 0. `avg` alone only describes the trades that
-    were entered and flatters any variant that skips a lot.
-    """
-    exchange = core._exchange_ref
-    if exchange is None:
-        await ctx.send("❌ Not connected to the exchange yet.")
-        return
-
-    num_bars = _clamp_bars(num_bars)
-    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
-    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
-    for t in scope_tickers:
-        if t not in TICKERS:
-            await ctx.send(f"❌ `{t}` is not a tracked pair.")
-            return
-    for f in scope_tfs:
-        if f not in TIMEFRAMES:
-            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
-            return
-
-    await ctx.send(
-        f"⏳ Running pullback-entry comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 8 variants, "
-        f"{num_bars} bars each. This is slow — sit tight."
-    )
-    try:
-        result = await run_pullback_comparison(exchange, scope_tickers, scope_tfs, num_bars)
-        lines = [f"**🧪 Pullback-entry comparison** (dry-run, {num_bars} bars requested, wait window {result['expiry_bars']} bar(s) — nothing written to history)\n"]
-
-        short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
-        if short_pairs:
-            lines.append("⚠️ Bars requested vs. received:")
-            for c in short_pairs:
-                lines.append(f"  {c['ticker']} {c['tf']}: requested {c['requested']}, got {c['got']}")
-            lines.append("")
-
-        for name, rows in result["variants"].items():
-            base_name = ("depth chosen from history" if name.startswith("opt") else name.replace('+sl', ''))
-            label = ("market (signal price)" if name == "market"
-                     else f"pullback {base_name}" + (" + stop shifted with entry" if name.endswith("+sl") else " (stop fixed)"))
-            lines.append(f"**{label}:**")
-            if not rows:
-                lines.append("  no signals in this sample.\n")
-                continue
-            for r in rows:
-                flag = "" if r["signals"] >= 20 else " ⚠️ small sample"
-                if name == "market":
-                    lines.append(
-                        f"  track={r['track']}: signals={r['signals']} win={r['win_rate']:.0%} "
-                        f"avg={r['avg_pnl']:+.2f}% per_signal={r['per_signal_pnl']:+.3f}%{flag}"
-                    )
-                else:
-                    fr = "n/a" if r["fill_rate"] is None else f"{r['fill_rate']:.0%}"
-                    lines.append(
-                        f"  track={r['track']}: signals={r['signals']} fills={r['fills']} (fill rate {fr}) "
-                        f"missed={r['missed']} expired={r['expired']} at-market={r['fallback_market']} | "
-                        f"win={r['win_rate']:.0%} avg={r['avg_pnl']:+.2f}% per_signal={r['per_signal_pnl']:+.3f}%{flag}"
-                    )
-            lines.append("")
-        lines.append(
-            "per_signal = total PnL ÷ ALL signals (unfilled count as 0) — the number to compare. "
-            "missed = price reached TP1 before pulling back; expired = no fill within the wait window; "
-            "at-market = not enough history yet, entered at the signal price. "
-            + ("Tracks with few own signals borrow the all-track average (pool on). " if result.get("pool_fallback") else "")
-            + "Signal sets differ slightly "
-            "between variants, so treat small gaps as noise."
-        )
-        await _send_chunked(ctx, "\n".join(lines))
-    except Exception as e:
-        logger.error(f"pullsim command error: {e}", exc_info=True)
-        await ctx.send(f"❌ Error: {e}")

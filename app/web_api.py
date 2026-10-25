@@ -528,9 +528,6 @@ async def get_status():
                 "a_active_trade": st.get("a_active_trade"),
                 "u_active_trade": st.get("u_active_trade"),
                 "b_active_trade": st.get("b_active_trade"),
-                "a_pending": st.get("a_pending"),
-                "u_pending": st.get("u_pending"),
-                "b_pending": st.get("b_pending"),
                 "last_bar_time": st.get("last_bar_time"),
             }
     return result
@@ -886,7 +883,6 @@ async def get_config():
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
-        "pullback_entry": _cfg.pullback_config_snapshot(),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
@@ -960,8 +956,7 @@ async def get_config():
 
 
 def _any_active_trades() -> bool:
-    """True if any ticker/tf/track has an open position or a pending limit
-    order. Shared implementation lives in bot.py so the Discord !mode/!htf
+    """True if any ticker/tf/track has an open position. Shared implementation lives in bot.py so the Discord !mode/!htf
     commands apply the very same guard (see core.any_active_trades)."""
     return core.any_active_trades()
 
@@ -1237,181 +1232,6 @@ async def set_htf_breakout(body: HtfBreakoutIn):
     _cfg.save_htf_apply_to_breakout(_cfg.HTF_APPLY_TO_BREAKOUT)
     await broadcast_event({"type": "config_changed", "key": "htf_apply_to_breakout", "value": _cfg.HTF_APPLY_TO_BREAKOUT})
     return {"htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT, "changed": True}
-
-
-class PullbackConfigIn(BaseModel):
-    # Any subset of fields — a partial PATCH, same pattern as BreakoutConfigIn.
-    enabled: Optional[bool] = None
-    mult: Optional[float] = None
-    expiry_bars: Optional[int] = None
-    min_samples: Optional[int] = None
-    lookback_signals: Optional[int] = None
-    max_sl_fraction: Optional[float] = None
-    min_depth_pct: Optional[float] = None
-    pool_fallback: Optional[bool] = None
-    sl_mode: Optional[str] = None
-    depth_mode: Optional[str] = None  # "mean" | "optimize"
-    tracks: Optional[dict] = None   # partial, e.g. {"a": true, "u": false}
-
-
-@app.post("/api/config/pullback")
-async def set_pullback_config(body: PullbackConfigIn):
-    """Pullback (limit) entry settings, live, no restart — see config.py's
-    PULLBACK section. Turning it OFF only stops NEW signals from waiting for a
-    pullback; limit orders already waiting keep running until they fill or expire."""
-    updates = body.model_dump(exclude_none=True)
-    if not updates:
-        raise HTTPException(400, "At least one field is required")
-    try:
-        cfg = _cfg.apply_pullback_config(updates)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    await broadcast_event({"type": "config_changed", "key": "pullback_entry"})
-    return cfg
-
-
-@app.get("/api/pullback")
-async def get_pullback_stats():
-    """The average early pullback per pair / timeframe / track, measured the
-    way the live limit entry measures it, plus the depth the current settings
-    would place and the share of past signals that reached it. Read-only."""
-    exchange = core._exchange_ref
-    if exchange is None:
-        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
-    from signals import pullback_stats_report
-    return await pullback_stats_report(exchange, list(_cfg.TICKERS), list(TIMEFRAMES))
-
-
-class PullSimIn(BaseModel):
-    ticker: Optional[str] = None
-    tf: Optional[str] = None
-    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
-
-
-def _pullsim_scope(body: "PullSimIn"):
-    ticker = body.ticker.upper().strip() if body.ticker else None
-    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
-    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
-    for t in scope_tickers:
-        if t not in _cfg.TICKERS:
-            raise HTTPException(404, f"{t} is not a tracked pair")
-    for f in scope_tfs:
-        if f not in _cfg.TIMEFRAMES:
-            raise HTTPException(404, f"{f} is not a tracked timeframe")
-    if core._exchange_ref is None:
-        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
-    return scope_tickers, scope_tfs
-
-
-@app.post("/api/pullsim")
-async def run_pullsim(body: PullSimIn):
-    """Blocking variant: compares entering at the signal price against the
-    pullback (limit) entry and returns the whole result in one response —
-    same computation as the Discord !pullsim command (both call
-    signals.run_pullback_comparison()). Never writes to signals_history.json
-    or touches the live settings.
-
-    ⚠️ A run over several pairs takes minutes, and behind Cloudflare Tunnel
-    a request that stays open longer than ~100 s is cut off (error 524) —
-    the result is then lost even though the server finished. The dashboard
-    therefore uses POST /api/pullsim/start + GET /api/pullsim/status below;
-    this endpoint is kept for direct/scripted callers on a short scope."""
-    scope_tickers, scope_tfs = _pullsim_scope(body)
-    from signals import run_pullback_comparison
-    return await run_pullback_comparison(core._exchange_ref, scope_tickers, scope_tfs, body.num_bars)
-
-
-# 🆕 Background pullsim jobs. A run over all pairs outlives a single HTTP
-# request (see above), so it runs as an asyncio task and the dashboard polls
-# its status. Jobs live in memory only: a container restart drops them (the
-# status endpoint then answers 404 and the UI offers to run again). One run
-# at a time — it is CPU-heavy, and a second click should attach to the
-# running job instead of doubling the load.
-_PULLSIM_JOBS: dict = {}
-_PULLSIM_JOBS_KEEP = 5
-
-
-def _pullsim_running_job():
-    for jid, job in _PULLSIM_JOBS.items():
-        if job["status"] == "running":
-            return jid
-    return None
-
-
-async def _pullsim_worker(job_id: str, scope_tickers: list, scope_tfs: list, num_bars: int):
-    job = _PULLSIM_JOBS[job_id]
-    try:
-        from signals import run_pullback_comparison
-        job["result"] = await run_pullback_comparison(
-            core._exchange_ref, scope_tickers, scope_tfs, num_bars, progress=job["progress"],
-        )
-        job["status"] = "done"
-    except Exception as e:
-        logger.error(f"pullsim job {job_id} failed: {e}", exc_info=True)
-        job["error"] = str(e) or e.__class__.__name__
-        job["status"] = "error"
-    finally:
-        job["finished_at"] = time.time()
-
-
-@app.post("/api/pullsim/start")
-async def start_pullsim(body: PullSimIn):
-    """Starts the pullback comparison as a background job and returns right
-    away: {job_id, already_running}. Poll GET /api/pullsim/status?job_id=…
-    for progress and, once status is 'done', the result (same shape as
-    POST /api/pullsim). If a run is already in progress, returns that run's
-    job_id instead of starting a second one."""
-    scope_tickers, scope_tfs = _pullsim_scope(body)
-
-    running = _pullsim_running_job()
-    if running:
-        return {"job_id": running, "already_running": True}
-
-    job_id = secrets.token_hex(8)
-    _PULLSIM_JOBS[job_id] = {
-        "status": "running",
-        "started_at": time.time(),
-        "finished_at": None,
-        "scope": {"tickers": scope_tickers, "tfs": scope_tfs, "num_bars": body.num_bars},
-        "progress": {"total": 0, "done": 0, "current": ""},
-        "result": None,
-        "error": None,
-    }
-    # drop the oldest finished jobs so results don't pile up in memory
-    finished = sorted((j for j in _PULLSIM_JOBS.items() if j[1]["status"] != "running"),
-                      key=lambda kv: kv[1]["started_at"])
-    for jid, _ in finished[:max(0, len(finished) - _PULLSIM_JOBS_KEEP)]:
-        _PULLSIM_JOBS.pop(jid, None)
-
-    # 🆕 FIX: keep a strong reference — the event loop only holds weak refs to
-    # tasks, so a fire-and-forget task can be garbage-collected mid-run and the
-    # job would sit at status 'running' forever.
-    _PULLSIM_JOBS[job_id]["task"] = asyncio.create_task(
-        _pullsim_worker(job_id, scope_tickers, scope_tfs, body.num_bars))
-    return {"job_id": job_id, "already_running": False}
-
-
-@app.get("/api/pullsim/status")
-async def pullsim_status(job_id: str):
-    """Status of a background pullsim job: {status: running|done|error,
-    progress: {total, done, current}, elapsed_s, scope, result (when done),
-    error (when failed)}. 404 if the job is unknown — e.g. the container
-    restarted since it was started."""
-    job = _PULLSIM_JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(404, "Unknown job (the bot may have restarted) — run it again")
-    end = job["finished_at"] or time.time()
-    out = {
-        "status": job["status"],
-        "progress": job["progress"],
-        "elapsed_s": round(end - job["started_at"], 1),
-        "scope": job["scope"],
-    }
-    if job["status"] == "done":
-        out["result"] = job["result"]
-    if job["status"] == "error":
-        out["error"] = job["error"]
-    return out
 
 
 class UthaIn(BaseModel):

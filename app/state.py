@@ -90,21 +90,9 @@ def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
                     matches_active = (
                         active is not None
                         and active.get("side") == side
-                        # A limit-entry trade's record carries the SIGNAL price as
-                        # `entry` (stats are measured from it); the trade dict's own
-                        # `entry` is the fill price, the signal price is kept in
-                        # `signal_price`. Market-entry trades have no signal_price.
-                        and _same_price(active.get("signal_price", active.get("entry")), rec.get("entry"))
+                        and _same_price(active.get("entry"), rec.get("entry"))
                     )
-                    # 🆕 A virtual limit order that is still waiting for its fill
-                    # (PULLBACK_ENTRY_ENABLED) has an open record but no active trade yet.
-                    pending = state.get(ticker, {}).get(tf, {}).get(f"{track}_pending")
-                    matches_pending = (
-                        pending is not None
-                        and pending.get("side") == side
-                        and _same_price(pending.get("signal_price"), rec.get("entry"))
-                    )
-                    if not (matches_active or matches_pending):
+                    if not matches_active:
                         rec["exit_type"] = "cancelled"
                         rec["exit"] = None
                         changed = True
@@ -289,9 +277,7 @@ def add_signal_record(
         "cap_reason": cap_reason,
         "cap_level": cap_level,
     }
-    # 🆕 (pullback entry) optional additive fields — entry_mode/limit_price/
-    # pullback_pct for a signal placed as a limit order. Older records simply
-    # don't have them.
+    # optional additive fields supplied by the caller
     if extra:
         record.update(extra)
 
@@ -395,11 +381,7 @@ def update_signal_record(
     rec["exit_type"] = exit_type
     rec["bars_held"] = bars_held
     rec["tp1_hit"] = bool(tp1_hit)
-    # 🆕 (pullback entry) rec["entry"] is always the SIGNAL price — MAE/MFE (and
-    # through them adaptive TP/SL) are measured from it so they stay independent
-    # of the entry mode. A limit-entry trade's real PnL is measured from the
-    # price it actually filled at; market-entry records have no fill_price.
-    entry = rec.get("fill_price") or rec["entry"]
+    entry = rec["entry"]
 
     # 🆕 (external review, TP-obstacle stage): seed the raw-outcome
     # tracking fields at close — see update_raw_outcome()'s docstring for
@@ -424,51 +406,6 @@ def update_signal_record(
     save_signals_history(history)
     logger.info(f"[SIGNAL] CLOSED {side} signal for {ticker} {tf} | Track: {track} | PnL: {rec['moved_pct']:.2f}% | "
                 f"TP1 hit: {tp1_hit} | Regime: {rec.get('regime', 'unknown')}")
-
-
-UNFILLED_EXIT_TYPE = "unfilled"
-
-
-def mark_record_filled(ticker: str, tf: str, side: str, track: str,
-                       fill_price: float, fill_ts_ms: int) -> bool:
-    """A pending limit order filled: remember the real entry price on the
-    still-open record. rec["entry"] (the signal price) is left untouched —
-    see update_signal_record()."""
-    history = load_signals_history()
-    if ticker not in history or tf not in history[ticker]:
-        return False
-    rec = _find_open_record(history[ticker][tf][side], track)
-    if rec is None:
-        logger.warning(f"[PULLBACK] No open record to mark filled: {ticker} {tf} {side} track={track}")
-        return False
-    rec["filled"] = True
-    rec["fill_price"] = round_price(fill_price)
-    rec["fill_ts"] = normalize_timestamp(fill_ts_ms)
-    save_signals_history(history)
-    return True
-
-
-def close_unfilled_record(ticker: str, tf: str, side: str, track: str, reason: str) -> bool:
-    """A pending limit order never filled ("expired" / "missed"). The record
-    stays in history — it is still a real signal and is what the average
-    pullback is measured over — but with exit_type "unfilled", which every
-    TP/SL/hit-rate calibration and every history/stat view ignores (they only
-    count tp / sl / sl_after_tp1 / cancelled)."""
-    history = load_signals_history()
-    if ticker not in history or tf not in history[ticker]:
-        return False
-    rec = _find_open_record(history[ticker][tf][side], track)
-    if rec is None:
-        return False
-    rec["exit_type"] = UNFILLED_EXIT_TYPE
-    rec["unfilled_reason"] = reason
-    rec["filled"] = False
-    rec["exit"] = None
-    rec["bars_held"] = 0
-    rec["moved_pct"] = 0.0
-    save_signals_history(history)
-    logger.info(f"[PULLBACK] Limit order not filled ({reason}): {ticker} {tf} {side} track={track} signal@{rec.get('entry')}")
-    return True
 
 
 def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Optional[str] = None,
@@ -1281,7 +1218,8 @@ def _iter_closed_records(history: Dict):
         for tf, sides in tfs.items():
             for side, records in sides.items():
                 for rec in records:
-                    if rec.get("exit_type") not in (None, "open", UNFILLED_EXIT_TYPE) and not rec.get("synthetic", False):
+                    # "unfilled" = legacy record from the removed limit-entry feature
+                    if rec.get("exit_type") not in (None, "open", "unfilled") and not rec.get("synthetic", False):
                         yield ticker, tf, side, rec
 
 

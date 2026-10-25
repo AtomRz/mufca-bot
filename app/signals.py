@@ -53,9 +53,6 @@ from state import (
     load_signals_history,
     save_signals_history,
     add_signal_record,
-    mark_record_filled,
-    close_unfilled_record,
-    UNFILLED_EXIT_TYPE,
     update_signal_record,
     update_signal_mae_mfe,
     update_raw_outcome,
@@ -69,7 +66,6 @@ from state import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price, format_price
 from config import ONCHAIN_ENABLED
 import spread
-import pullback as _pb
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
 # separate modules that know nothing about confidence/TP themselves.
@@ -750,139 +746,6 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
 
 # =====================================================================
-# 🎯  PULLBACK (LIMIT) ENTRY — live helpers (see pullback.py / config.py)
-# =====================================================================
-
-def _plan_pullback_entry(df: pd.DataFrame, idx: int, ticker: str, tf: str, track: str,
-                         side: str, close_v: float, sl: float,
-                         cfg: Optional[Dict] = None,
-                         records_by_side: Optional[Dict[str, List[dict]]] = None,
-                         tp1: Optional[float] = None) -> Optional[Dict]:
-    """Where to place the limit order for a fresh signal, or None for "enter
-    at market as usual" (not enough history / depth too shallow / the limit
-    would not sit strictly between SL and the signal price).
-
-    cfg — pullback settings dict (config.pullback_config_snapshot() shape);
-    None reads the live config. records_by_side — the history to measure the
-    average pullback over; None reads signals_history.json (live path), the
-    backtest passes its own dry-run history instead.
-
-    tp1 — this signal's TP1 price. Only the depth_mode="optimize" setting
-    needs it (the depth is chosen by replaying past price paths against this
-    signal's TP1 / SL distances); without it that mode falls back to the
-    average-based depth.
-    """
-    cfg = cfg or _cfg.pullback_config_snapshot()
-    if not (cfg.get("tracks") or {}).get(track, True):
-        return None  # this track is switched off for pullback entries
-    if records_by_side is None:
-        slot = load_signals_history().get(ticker, {}).get(tf, {})
-        records_by_side = {"long": slot.get("long", []), "short": slot.get("short", [])}
-
-    sl_dist_pct = abs(close_v - sl) / max(close_v, 1e-12) * 100.0
-    tp1_dist_pct = None
-    if tp1 is not None:
-        try:
-            tp1_dist_pct = abs(float(tp1) - close_v) / max(close_v, 1e-12) * 100.0
-        except (TypeError, ValueError):
-            tp1_dist_pct = None
-    info = _pb.compute_pullback_depth(
-        df, records_by_side, track,
-        n_bars=cfg["expiry_bars"], last_idx=idx,
-        lookback_signals=cfg["lookback_signals"], min_samples=cfg["min_samples"],
-        mult=cfg["mult"], sl_dist_pct=sl_dist_pct,
-        max_sl_fraction=cfg["max_sl_fraction"], min_depth_pct=cfg["min_depth_pct"],
-        pool_fallback=bool(cfg.get("pool_fallback", False)),
-        depth_mode=cfg.get("depth_mode", "mean"),
-        tp1_dist_pct=tp1_dist_pct,
-        hold_bars=int(_cfg.MAX_HOLD_BARS),
-        keep_distance=(cfg.get("sl_mode") == "keep_distance"),
-    )
-    if info is None:
-        return None
-    limit = round_price(_pb.limit_price_for(side, close_v, info["depth_pct"]))
-    ok = (sl < limit < close_v) if side == "long" else (close_v < limit < sl)
-    if not ok:
-        return None
-    info["limit"] = limit
-    # stop placement after the fill: "fixed" keeps the signal's absolute level,
-    # "keep_distance" shifts it with the entry (same risk per trade as at the
-    # signal price). Shifting only moves it AWAY from the entry's side of the
-    # trade, so the limit stays strictly between price and stop either way.
-    if cfg.get("sl_mode") == "keep_distance":
-        info["sl_eff"] = round_price(_pb.shifted_sl(side, close_v, limit, sl))
-    else:
-        info["sl_eff"] = sl
-    return info
-
-
-def fill_pending(state: Dict, track: str, ticker: str, tf: str, fill_ts_ms: int) -> Optional[Dict]:
-    """A pending limit order traded through: turn it into the track's active
-    trade (entry = the limit price; SL / TP1 / TP2 are the absolute levels
-    computed at the signal) and stamp the fill on the history record.
-
-    The new trade gets intrabar_cursor_ms = the fill candle, so bot.py's 1m
-    replay re-checks that very candle against SL right away — a candle that
-    pierced the limit AND the stop is a fill that was immediately stopped out,
-    not a free pass.
-    """
-    key = f"{track}_pending"
-    pend = state.get(key)
-    if not pend:
-        return None
-    side = pend["side"]
-    tf_ms = int(pend["tf_ms"])
-    sig_bar = int(pend["signal_bar_time"])
-    k = max(1, (int(fill_ts_ms) - sig_bar) // tf_ms)
-    state[f"{track}_active_trade"] = {
-        "side": side,
-        "entry": pend["limit"],
-        "sl": pend["sl"],
-        "tp": pend["tp"],
-        "tp1": pend["tp1"],
-        "lev": pend["lev"],
-        # open time of the timeframe bar the fill happened in (chart marker /
-        # TP1 bookkeeping read this the same way they read it for market entries)
-        "bar_opened_time": sig_bar + k * tf_ms,
-        "tp1_hit": False,
-        "tp_raw": pend.get("tp_raw"),
-        "cap_reason": pend.get("cap_reason"),
-        "cap_level": pend.get("cap_level"),
-        "entry_mode": "limit",
-        "signal_price": pend["signal_price"],
-        "pullback_pct": pend.get("pullback_pct"),
-        "filled_ts": int(fill_ts_ms),
-        "intrabar_cursor_ms": int(fill_ts_ms) - int(fill_ts_ms) % 60_000,
-    }
-    state[f"{track}_bars_in_trade"] = 0
-    state[key] = None
-    mark_record_filled(ticker, tf, side, track, pend["limit"], int(fill_ts_ms))
-    logger.info(
-        f"[PULLBACK] {ticker} {tf} {track.upper()}-track {side.upper()} limit FILLED @ {pend['limit']} "
-        f"(signal {pend['signal_price']}, pullback {pend.get('pullback_pct', 0):.2f}%)"
-    )
-    return state[f"{track}_active_trade"]
-
-
-def cancel_pending(state: Dict, track: str, ticker: str, tf: str, reason: str, at_ms: int) -> Optional[Dict]:
-    """A pending limit order did not fill ("expired" or "missed"): drop it,
-    free the track and arm the cooldown exactly like a closed trade would
-    (backtest does the same: next_available_idx = resolution bar + cooldown),
-    so a lingering A-track confirmation can't immediately re-fire the same
-    signal at a worse price."""
-    key = f"{track}_pending"
-    pend = state.get(key)
-    if not pend:
-        return None
-    state[key] = None
-    state[f"{track}_in_long"] = False
-    state[f"{track}_in_short"] = False
-    state[f"last_{track}_{pend['side']}_time"] = int(at_ms)
-    close_unfilled_record(ticker, tf, pend["side"], track, reason)
-    return pend
-
-
-# =====================================================================
 # 🆕 UNIFIED POSITION OPENING (replaces 4 duplicated blocks)
 # =====================================================================
 
@@ -1046,88 +909,6 @@ async def open_position(
                 state[in_short_key] = False
             return None
 
-    # 🆕 PULLBACK (LIMIT) ENTRY — see config.py's PULLBACK section and
-    # pullback.py. With the feature on (live only, never for !scan dry runs)
-    # and enough history to know this track's average pullback, the position
-    # is NOT opened here: a virtual limit order is parked in
-    # state["{track}_pending"] and bot.py's _pending_check() watches the 1m
-    # candles for the fill. SL / TP1 / TP2 are the absolute levels computed
-    # above from the signal price — a fill just gets a better R:R. Everything
-    # else (cooldown bookkeeping, history record, confidence) is identical to a
-    # market entry; the record keeps the SIGNAL price as `entry` so MAE/MFE
-    # (and adaptive TP/SL calibrated from them) stay independent of the entry
-    # mode — the fill price lives in `fill_price` once it happens.
-    pb_plan = None
-    if _cfg.PULLBACK_ENTRY_ENABLED and not dry_run:
-        try:
-            pb_plan = _plan_pullback_entry(df, idx, ticker, timeframe, track, side, close_v, sl, tp1=tp1)
-        except Exception as e:
-            logger.warning(f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()}: plan failed, entering at market: {e}")
-            pb_plan = None
-
-    if pb_plan is not None:
-        limit = pb_plan["limit"]
-        sig_bar_time = int(df["timestamp"].iloc[idx])
-        tf_ms = sig_bar_time - int(df["timestamp"].iloc[idx - 1])
-        n_bars = int(_cfg.PULLBACK_EXPIRY_BARS)
-        state[f"{track}_pending"] = {
-            "side": side,
-            "signal_price": close_v,
-            "limit": limit,
-            "sl": pb_plan["sl_eff"],
-            "sl_signal": sl,
-            "sl_mode": _cfg.PULLBACK_SL_MODE,
-            "pooled": bool(pb_plan.get("pooled")),
-            "tp": tp,
-            "tp1": tp1,
-            "lev": lev,
-            "regime": regime,
-            "pullback_pct": round(pb_plan["depth_pct"], 4),
-            "mean_pullback_pct": round(pb_plan["mean_pct"], 4),
-            "est_fill_rate": round(pb_plan["est_fill_rate"], 3),
-            "n_samples": pb_plan["n"],
-            "depth_capped": pb_plan["capped"],
-            "signal_bar_time": sig_bar_time,
-            "tf_ms": tf_ms,
-            "start_ms": sig_bar_time + tf_ms,                 # the signal bar's close — when the order is placed
-            "expire_ms": sig_bar_time + (1 + n_bars) * tf_ms,  # alive for n_bars bars after that
-            "cursor_ms": None,
-            "tp_raw": cap_info["tp2_raw"],
-            "cap_reason": cap_info["cap_reason"],
-            "cap_level": cap_info["cap_level"],
-        }
-        state[bars_key] = 0
-        if not dry_run:
-            state[f"{track}_{side}_bar"] = idx
-            state[last_bar_key] = idx
-
-        conf, confidence_components = calc_confidence(side == "long")
-        add_signal_record(
-            ticker, timeframe, side, close_v, datetime.now(timezone.utc).isoformat(), regime,
-            track=track, confidence_components=confidence_components,
-            tp_raw=cap_info["tp2_raw"], cap_reason=cap_info["cap_reason"], cap_level=cap_info["cap_level"],
-            extra={"entry_mode": "limit", "limit_price": limit, "pullback_pct": round(pb_plan["depth_pct"], 4), "filled": False},
-        )
-        stats = get_signal_stats(ticker, timeframe, side, regime, track=track)
-        risk_limit = abs(limit - pb_plan["sl_eff"])
-        if pb_plan["sl_eff"] != sl:
-            tp_desc += f" | SL shifts with the fill → ${format_price(pb_plan['sl_eff'])}"
-        tp_desc += (
-            f" | LIMIT -{pb_plan['depth_pct']:.2f}% from signal ${format_price(close_v)} "
-            f"(avg pullback {pb_plan['mean_pct']:.2f}%, n={pb_plan['n']}{', pooled over all tracks' if pb_plan.get('pooled') else ''}, est.fill ~{pb_plan['est_fill_rate']*100:.0f}%, "
-            f"valid {n_bars} bars)"
-        )
-        if pb_plan.get("mode") == "optimize":
-            tp_desc += (
-                f" | depth optimized on history: exp. {pb_plan['exp_pnl_pct']:+.2f}% per signal "
-                f"vs {pb_plan['market_pnl_pct']:+.2f}% at market"
-            )
-        logger.info(
-            f"[PULLBACK] {ticker} {timeframe} {track_label}-{side.upper()} limit placed @ {limit} "
-            f"(signal {close_v}, depth {pb_plan['depth_pct']:.2f}%, expires in {n_bars} bars)"
-        )
-        return (signal_label + " ⏳LIMIT", limit, regime, lev, sig_bar_time, conf, sl, tp, tp1, risk_limit, stats, tp_desc)
-
     state[trade_key] = {
         "side": side,
         "entry": close_v,
@@ -1278,34 +1059,25 @@ async def check_signals(
 
             trade = state.get(f"{track}_active_trade")
             if trade:
-                # 🆕 (pullback entry) a limit-entry trade only exists from its fill bar
-                # on (bar_opened_time = that bar's open): a bar that CLOSED before it
-                # says nothing about this position, and the fill bar itself must not
-                # count as a bar held (backtest counts bars_held from the bar AFTER the
-                # fill).
-                _is_limit = trade.get("entry_mode") == "limit"
                 _opened = int(trade.get("bar_opened_time") or 0)
-                _pre_fill_bar = _is_limit and current_bar_time < _opened
-                _fill_bar = _is_limit and current_bar_time <= _opened
                 # 🆕 FIX: a MARKET entry is opened at the CLOSE of the signal bar
                 # (bar_opened_time = that bar's open), but until the next bar
                 # closes, that same signal bar is still "the last closed bar" on
                 # every scan. Its high/low printed BEFORE the entry, so they must
                 # not be tested against TP/SL (a long upper wick would close the
                 # trade as a phantom "tp") nor fed into MAE/MFE (backtest starts
-                # measuring from the bar AFTER the signal bar). Mirrors the
-                # limit-entry handling above.
-                _entry_bar_market = (not _is_limit) and _opened > 0 and current_bar_time <= _opened
-                if not (_pre_fill_bar or _entry_bar_market):
+                # measuring from the bar AFTER the signal bar).
+                _entry_bar_market = _opened > 0 and current_bar_time <= _opened
+                if not _entry_bar_market:
                     update_signal_mae_mfe(ticker, timeframe, trade["side"], last_close, track=track,
                                            high=last_high, low=last_low)
-                hit = None if (_pre_fill_bar or _entry_bar_market) else check_tp_sl_hit(
+                hit = None if _entry_bar_market else check_tp_sl_hit(
                     state, last_high, last_low, track, bar_time=current_bar_time,
                     ticker=ticker, tf=timeframe)
                 if hit:
                     exit_price = trade["sl"] if hit == "sl" else trade["tp"]
                     close_trade(state, exit_price, hit, ticker, timeframe, track, close_time_ms=current_bar_time)
-                elif (not _fill_bar and not _entry_bar_market
+                elif (not _entry_bar_market
                       and trade.get("last_counted_bar") != current_bar_time):
                     # 🆕 FIX: bars held used to be counted via `is_new_bar`, which only
                     # flips after the whole function succeeds (last_processed_bar_time
@@ -1319,17 +1091,6 @@ async def check_signals(
                     if state[bars_key] >= MAX_HOLD_BARS:
                         close_trade(state, last_close, "cancelled", ticker, timeframe, track, close_time_ms=current_bar_time)
                         logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
-            elif state.get(f"{track}_pending"):
-                # 🆕 (pullback entry) a limit order is still waiting for its fill:
-                # the history record is open and measured from the signal price —
-                # keep its MAE/MFE current. Fill / expiry itself is resolved from
-                # 1m candles in bot.py (_pending_check), not here.
-                pend = state[f"{track}_pending"]
-                # 🆕 FIX: the signal bar itself printed before the order existed
-                # (backtest's waiting-window MAE/MFE starts at the next bar).
-                if current_bar_time > int(pend.get("signal_bar_time") or 0):
-                    update_signal_mae_mfe(ticker, timeframe, pend["side"], last_close, track=track,
-                                           high=last_high, low=last_low)
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1836,8 +1597,6 @@ def backtest_history(
     dry_run: bool = False,
     df: Optional[pd.DataFrame] = None,
     compute_confidence: bool = False,
-    pullback: Optional[Dict] = None,
-    hold_reserve_extra: int = 0,
 ):
     """Backtest for accumulating signal history.
 
@@ -1887,27 +1646,6 @@ def backtest_history(
     and is simply omitted from the dict rather than guessed at — a
     consumer checking `"onchain_bias" in components` can tell backtest-
     sourced records apart from live ones for that reason alone.
-
-    pullback — 🆕 (pullback entry) pullback settings dict (same keys as
-    config.pullback_config_snapshot(): mult / expiry_bars / min_samples /
-    lookback_signals / max_sl_fraction / min_depth_pct) to simulate the
-    limit-entry mode on this run. None (the default) = enter at the signal
-    price, exactly as before — including for the startup backtest that
-    populates real history, which must never use it. Only honored together
-    with dry_run=True: the average pullback is measured over the dry run's
-    own isolated history, and a simulated limit-entry run must never be
-    mixed into signals_history.json. Signals that never fill are kept in
-    the dry-run history as exit_type="unfilled" (unfilled_reason "missed" =
-    price reached TP1 first, "expired" = no fill within expiry_bars) and
-    entered trades carry entry_mode/fill_price/pullback_pct; "entry" is
-    always the signal price. SL/TP1/TP2 stay at the same absolute levels a
-    market entry would use, so with/without runs are directly comparable.
-
-    hold_reserve_extra — extra trailing bars reserved at the end of the
-    window on top of MAX_HOLD_BARS (a pullback run reserves its own
-    expiry_bars automatically). Pass the same number to the market-entry
-    run you compare against so both simulate the identical signal bars
-    (see run_pullback_comparison()).
 
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
@@ -2122,10 +1860,7 @@ def backtest_history(
         # below for why that matters. Reserve exactly enough trailing bars
         # for the longest simulation the hold period actually needs, not a
         # number that happened to match an old hardcoded default.
-        pb_on = pullback is not None and dry_run
-        if pullback is not None and not dry_run:
-            logger.warning("[BACKTEST] pullback simulation ignored: it requires dry_run=True")
-        _tail_reserve = _cfg.MAX_HOLD_BARS + (int(pullback["expiry_bars"]) if pb_on else int(hold_reserve_extra))
+        _tail_reserve = _cfg.MAX_HOLD_BARS
         for idx in range(start_idx, len(df) - _tail_reserve):
             close_v = float(df["close"].iloc[idx])
             open_v = float(df["open"].iloc[idx])
@@ -2299,107 +2034,15 @@ def backtest_history(
                 # Now both paths match.
                 tp = tp2
 
-                # 🆕 (pullback entry) entry_p is the price the position is
-                # actually opened at (the signal price unless a limit order
-                # fills), base_idx the bar the hold period is counted from
-                # (the signal bar, or the fill bar). MAE/MFE below stay
-                # measured from the signal price close_v so they remain
-                # comparable with market-entry history.
                 entry_p = close_v
                 base_idx = idx
-                entry_mode = "market"
-                pb_plan = None
-                fill_f = None
-                pre_closed = False  # stopped out on the fill bar itself
                 max_favorable = max_adverse = 0.0
                 _ensure_history_slot(history, ticker, tf)
-
-                if pb_on:
-                    entry_mode = "market"  # fallback when there is no plan
-                    pb_plan = _plan_pullback_entry(
-                        df, idx, ticker, tf, track, side, close_v, sl, cfg=pullback,
-                        records_by_side={"long": history[ticker][tf]["long"], "short": history[ticker][tf]["short"]},
-                        tp1=tp1,
-                    )
-                    if pb_plan is not None:
-                        limit_p = pb_plan["limit"]
-                        n_wait = int(pullback["expiry_bars"])
-                        reason = None
-                        resolve_f = None
-                        for f_ in range(idx + 1, min(idx + n_wait + 1, len(df))):
-                            fh_ = float(df["high"].iloc[f_])
-                            fl_x = float(df["low"].iloc[f_])
-                            # A bar touching TP1 — alone or together with the
-                            # limit — means the move left without us; the
-                            # in-bar order of a single bar can't be proven, so
-                            # it is NOT credited as a fill (see
-                            # pullback.resolve_pending()).
-                            if (fh_ >= tp1) if side == "long" else (fl_x <= tp1):
-                                reason, resolve_f = "missed", f_
-                                break
-                            if (fl_x <= limit_p) if side == "long" else (fh_ >= limit_p):
-                                fill_f = f_
-                                break
-                        if fill_f is None and reason is None:
-                            reason, resolve_f = "expired", min(idx + n_wait, len(df) - 1)
-
-                        # MAE/MFE (from the signal price) over the waiting window
-                        # up to the fill / cancel bar, inclusive
-                        _end = fill_f if fill_f is not None else resolve_f
-                        for f_ in range(idx + 1, _end + 1):
-                            fh_ = float(df["high"].iloc[f_])
-                            fl_x = float(df["low"].iloc[f_])
-                            if side == "long":
-                                max_favorable = max(max_favorable, (fh_ - close_v) / close_v * 100)
-                                max_adverse = max(max_adverse, (close_v - fl_x) / close_v * 100)
-                            else:
-                                max_favorable = max(max_favorable, (close_v - fl_x) / close_v * 100)
-                                max_adverse = max(max_adverse, (fh_ - close_v) / close_v * 100)
-
-                        if fill_f is None:
-                            # never filled: stays in the (dry-run) history as
-                            # a signal, frees the track like a closed trade
-                            next_available_idx[track] = resolve_f + _cfg.COOLDOWN_BARS
-                            history[ticker][tf][side].append({
-                                "entry": round_price(close_v),
-                                "exit": None,
-                                "exit_type": UNFILLED_EXIT_TYPE,
-                                "unfilled_reason": reason,
-                                "bars_held": 0,
-                                "moved_pct": 0.0,
-                                "timestamp": normalize_timestamp(int(df["timestamp"].iloc[idx])),
-                                "max_favorable_pct": round(max_favorable, 4),
-                                "max_adverse_pct": round(max_adverse, 4),
-                                "regime": bt_regime,
-                                "track": track,
-                                "entry_mode": "limit",
-                                "limit_price": limit_p,
-                                "pullback_pct": round(pb_plan["depth_pct"], 4),
-                                "filled": False,
-                            })
-                            signals_found += 1
-                            continue
-
-                        entry_p = limit_p
-                        base_idx = fill_f
-                        sl = pb_plan["sl_eff"]  # == signal SL unless sl_mode="keep_distance"
-                        entry_mode = "limit"
-                        fh_f = float(df["high"].iloc[fill_f])
-                        fl_f = float(df["low"].iloc[fill_f])
-                        # the fill bar's own low/high are after-the-fact for the
-                        # part of the bar before the fill; the only thing that
-                        # can still decide the trade on this bar is the stop —
-                        # price went through the limit AND the stop.
-                        pre_closed = (fl_f <= sl) if side == "long" else (fh_f >= sl)
 
                 tp_hit = sl_hit = False
                 exit_price = entry_p
                 bars_held = 0
-                if pre_closed:
-                    sl_hit = True
-                    exit_price = sl
-                loop_range = (range(0) if pre_closed else
-                              range(base_idx + 1, min(base_idx + _cfg.MAX_HOLD_BARS + 1, len(df))))
+                loop_range = range(base_idx + 1, min(base_idx + _cfg.MAX_HOLD_BARS + 1, len(df)))
 
                 # 🆕 FIX (external review, P0): backtest used to check only
                 # the ORIGINAL sl/tp2 on every future bar, with no concept
@@ -2628,16 +2271,6 @@ def backtest_history(
                     # quietly bias a cross-fraction comparison.
                     "tp1_reached": bool(tp1_reached),
                 })
-                if pb_on:
-                    history[ticker][tf][side][-1]["entry_mode"] = entry_mode
-                    if entry_mode == "limit":
-                        history[ticker][tf][side][-1].update({
-                            "fill_price": round_price(entry_p),
-                            "limit_price": entry_p,
-                            "pullback_pct": round(pb_plan["depth_pct"], 4),
-                            "filled": True,
-                            "fill_bars": int(base_idx - idx),
-                        })
                 history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
                 signals_found += 1
 
@@ -2794,296 +2427,6 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     report["bar_coverage"] = bar_coverage
     return report
 
-def _pullsim_workers(n_jobs: int) -> int:
-    """How many worker processes the pullback comparison may use: all CPU
-    cores by default, capped by the number of jobs. PULLSIM_WORKERS=1
-    forces the old single-process behaviour."""
-    import os
-    try:
-        env = int(os.environ.get("PULLSIM_WORKERS", "0"))
-    except ValueError:
-        env = 0
-    cap = env if env > 0 else (os.cpu_count() or 1)
-    return max(1, min(cap, n_jobs))
-
-
-class _CachingExchange:
-    """Wraps a ccxt exchange so repeated identical fetch_ohlcv() calls (every
-    variant of a comparison fetches the same higher-timeframe candles) hit the
-    network once. Everything else is delegated."""
-    def __init__(self, ex):
-        self._ex = ex
-        self._cache: Dict[tuple, list] = {}
-
-    def fetch_ohlcv(self, symbol, timeframe="1m", since=None, limit=None, params=None):
-        if since is not None or params:
-            return self._ex.fetch_ohlcv(symbol, timeframe, since, limit, params or {})
-        key = (symbol, timeframe, limit)
-        if key not in self._cache:
-            self._cache[key] = self._ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-        return self._cache[key]
-
-    def __getattr__(self, name):
-        return getattr(self._ex, name)
-
-
-def _pullback_pair_worker(ticker: str, tf: str, num_bars: int, runs_spec: list,
-                          n_wait: int, tracks: list, exchange=None) -> Dict:
-    """All pullback-comparison variants for ONE pair/timeframe. Module-level and
-    self-contained so it can run in a spawned worker process (exchange=None ->
-    builds its own public-data client) or in a thread (exchange passed)."""
-    out: Dict = {"ticker": ticker, "tf": tf, "coverage": None, "runs": {}}
-    try:
-        if exchange is None:
-            if getattr(_cfg, "MARKET_MODE", "spot") == "futures":
-                exchange = ccxt.gate({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-            else:
-                exchange = ccxt.gate({"enableRateLimit": True})
-        ex = _CachingExchange(exchange)
-        bars = _fetch_ohlcv_paginated(ex, ticker, tf, num_bars)
-    except Exception as e:
-        logger.error(f"run_pullback_comparison: fetch error for {ticker} {tf}: {e}")
-        return out
-    if not bars or len(bars) < 100:
-        return out
-    df_full = parse_ohlcv(bars)
-    out["coverage"] = {"ticker": ticker, "tf": tf, "requested": num_bars, "got": len(df_full)}
-    for name, pb_cfg in runs_spec:
-        try:
-            _count, history, _got = backtest_history(
-                ex, ticker, tf, num_bars, tuple(tracks), None, True,
-                df_full, False, pb_cfg, n_wait if pb_cfg is None else 0,
-            )
-        except Exception as e:
-            logger.error(f"run_pullback_comparison: backtest error for {ticker} {tf} {name}: {e}")
-            continue
-        recs = []
-        for side in ("long", "short"):
-            recs.extend(history.get(ticker, {}).get(tf, {}).get(side, []))
-        out["runs"][name] = recs
-    return out
-
-
-async def run_pullback_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str],
-                                   num_bars: int = 3000, mults: Optional[tuple] = None,
-                                   progress: Optional[Dict] = None) -> Dict:
-    """Compares entering at the signal price against the pullback (limit)
-    entry at several depths, on real historical OHLCV via dry-run
-    backtest_history() calls. Shared by discord_commands.py's !pullsim and
-    web_api.py's /api/pullsim. Never writes to signals_history.json and never
-    touches the live PULLBACK_* settings.
-
-    progress — optional dict the caller can poll while this runs (the web
-    endpoint runs this as a background job, since one HTTP request that
-    stays open for minutes is cut off by Cloudflare Tunnel at ~100 s). It
-    is updated in place: total / done (backtest runs, the unit of work),
-    current ("ETH/USDT 4h x1"). Purely informational.
-
-    Variants: "market" (enter at the signal close, today's behavior), one
-    pullback run per multiplier in `mults` (default 0.5 / 1.0 / 1.5 x the
-    average pullback; stop keeps its absolute level) and, for multipliers
-    <= 1, an "xN+sl" twin where the stop shifts with the entry
-    (sl_mode="keep_distance"), plus "opt" / "opt+sl": the depth chosen from the
-    track's own history (depth_mode="optimize", see pullback.py) with a fixed /
-    shifted stop, all with the live expiry_bars / min_samples /
-    max_sl_fraction / min_depth_pct / pool_fallback. Each ticker/tf's history is fetched
-    once and reused for every variant, and every variant simulates the
-    identical signal bars (the market run reserves the same trailing bars).
-
-    Returns:
-        {
-          "expiry_bars": int, "pool_fallback": bool,
-          "bar_coverage": [{"ticker","tf","requested","got"}, ...],
-          "variants": {
-              "market":  [row, ...],     # one row per track + an "ALL" row
-              "x0.5": [...], "x1": [...], "x1.5": [...],
-              "x0.5+sl": [...], "x1+sl": [...],
-              "opt": [...], "opt+sl": [...],
-          },
-        }
-    row = {track, signals, executed, fills, fill_rate, missed, expired,
-           fallback_market, win_rate, avg_pnl, total_pnl, per_signal_pnl,
-           avg_pullback_pct}
-
-    Reading it: per_signal_pnl is the number to compare across variants —
-    total PnL (%) divided by ALL signals the variant saw, unfilled ones
-    counting as 0 (that is what missing a trade costs). avg_pnl alone only
-    describes the trades that were entered and flatters any variant that
-    skips a lot. Signal sets are not byte-identical across variants (a
-    skipped signal frees its track earlier, a better entry changes how long
-    a trade lives), so treat small differences as noise.
-    """
-    base_cfg = _cfg.pullback_config_snapshot()
-    n_wait = int(base_cfg["expiry_bars"])
-    mults = tuple(mults) if mults else (0.5, 1.0, 1.5)
-
-    # (name, cfg or None). Plain xN keep the signal's absolute stop; xN+sl
-    # shift the stop with the entry (sl_mode="keep_distance") for the shallower
-    # depths — the variant that answers "is it the tighter stop that hurts?".
-    # pool_fallback follows the live setting for every pullback variant.
-    # the comparison always evaluates every track, whatever the per-track
-    # switches say — that is what the switches are meant to be decided from
-    base_cfg = {**base_cfg, "tracks": {t: True for t in _cfg.TRACKS}}
-    runs_spec = [("market", None)]
-    runs_spec += [(f"x{m:g}", {**base_cfg, "mult": m, "sl_mode": "fixed", "depth_mode": "mean"}) for m in mults]
-    runs_spec += [(f"x{m:g}+sl", {**base_cfg, "mult": m, "sl_mode": "keep_distance", "depth_mode": "mean"}) for m in mults if m <= 1.0]
-    # depth chosen from history instead of the average (mult plays no role)
-    runs_spec += [("opt", {**base_cfg, "sl_mode": "fixed", "depth_mode": "optimize"}),
-                  ("opt+sl", {**base_cfg, "sl_mode": "keep_distance", "depth_mode": "optimize"})]
-    variant_names = [n for n, _ in runs_spec]
-    buckets: Dict[tuple, list] = {}
-    bar_coverage: List[Dict] = []
-
-    per_pair = len(runs_spec)
-    if progress is not None:
-        progress.update(total=len(tickers) * len(tfs) * per_pair, done=0, current="")
-
-    def _tick(n: int = 1, current: Optional[str] = None):
-        if progress is not None:
-            progress["done"] = progress.get("done", 0) + n
-            if current is not None:
-                progress["current"] = current
-
-    jobs = [(t, f) for t in tickers for f in tfs]
-    workers = _pullsim_workers(len(jobs))
-
-    def _absorb(t: str, f: str, out: Dict):
-        """Merge one pair/timeframe's worker output into the shared buckets."""
-        if out.get("coverage"):
-            bar_coverage.append(out["coverage"])
-        for name, recs in (out.get("runs") or {}).items():
-            for rec in recs:
-                buckets.setdefault((name, rec.get("track", "?")), []).append(rec)
-        _tick(per_pair, f"{t} {f} done")
-
-    async def _run_inline(t: str, f: str):
-        out = await asyncio.to_thread(_pullback_pair_worker, t, f, num_bars, runs_spec, n_wait, list(_cfg.TRACKS), exchange)
-        _absorb(t, f, out)
-        await asyncio.sleep(0)
-
-    pool_ok = False
-    if workers > 1 and len(jobs) > 1:
-        # One process per pair/timeframe (all of its variants), so the CPU-bound
-        # backtests run on separate cores instead of fighting over one GIL.
-        # "spawn" (not fork): the bot is a multi-threaded asyncio process and
-        # forking that can deadlock; a spawned child imports signals.py fresh
-        # (config/state are re-read from /app/data) and builds its own exchange.
-        try:
-            import multiprocessing as _mp
-            from concurrent.futures import ProcessPoolExecutor
-            loop = asyncio.get_running_loop()
-            if progress is not None:
-                progress["current"] = f"{len(jobs)} pair/timeframe job(s) on {workers} processes"
-            with ProcessPoolExecutor(max_workers=workers, mp_context=_mp.get_context("spawn")) as pool:
-                futs = [
-                    loop.run_in_executor(pool, _pullback_pair_worker, t, f, num_bars, runs_spec, n_wait, list(_cfg.TRACKS), None)
-                    for t, f in jobs
-                ]
-                for fut in asyncio.as_completed(futs):
-                    out = await fut
-                    _absorb(out["ticker"], out["tf"], out)
-            pool_ok = True
-        except Exception as e:
-            logger.warning(f"run_pullback_comparison: process pool unavailable/failed ({e}); falling back to in-process run")
-            buckets.clear()
-            bar_coverage.clear()
-            if progress is not None:
-                progress.update(done=0)
-
-    if not pool_ok:
-        for t, f in jobs:
-            await _run_inline(t, f)
-
-    def _row(track: str, recs: List[Dict]) -> Dict:
-        executed = [r for r in recs if r.get("exit_type") in ("tp", "sl", "sl_after_tp1", "cancelled")]
-        limit_recs = [r for r in recs if r.get("entry_mode") == "limit"]
-        fills = [r for r in limit_recs if r.get("filled")]
-        missed = sum(1 for r in recs if r.get("exit_type") == UNFILLED_EXIT_TYPE and r.get("unfilled_reason") == "missed")
-        expired = sum(1 for r in recs if r.get("exit_type") == UNFILLED_EXIT_TYPE and r.get("unfilled_reason") == "expired")
-        fallback = sum(1 for r in recs if r.get("entry_mode") == "market" and r.get("exit_type") != UNFILLED_EXIT_TYPE) \
-            if any("entry_mode" in r for r in recs) else 0
-        total = sum(r.get("moved_pct", 0.0) for r in executed)
-        wins = sum(1 for r in executed if r.get("moved_pct", 0.0) > 0)
-        n_sig = len(recs)
-        return {
-            "track": track,
-            "signals": n_sig,
-            "executed": len(executed),
-            "fills": len(fills),
-            "fill_rate": round(len(fills) / len(limit_recs), 4) if limit_recs else None,
-            "missed": missed,
-            "expired": expired,
-            "fallback_market": fallback,
-            "win_rate": round(wins / len(executed), 4) if executed else 0.0,
-            "avg_pnl": round(total / len(executed), 4) if executed else 0.0,
-            "total_pnl": round(total, 4),
-            "per_signal_pnl": round(total / n_sig, 4) if n_sig else 0.0,
-            "avg_pullback_pct": round(sum(r.get("pullback_pct", 0.0) for r in fills) / len(fills), 4) if fills else None,
-        }
-
-    variants: Dict[str, List[Dict]] = {}
-    for name in variant_names:
-        rows = []
-        all_recs: List[Dict] = []
-        for track in _cfg.TRACKS:
-            recs = buckets.get((name, track), [])
-            if recs:
-                rows.append(_row(track, recs))
-                all_recs.extend(recs)
-        if all_recs:
-            rows.append(_row("ALL", all_recs))
-        variants[name] = rows
-
-    return {"expiry_bars": n_wait, "pool_fallback": bool(base_cfg.get("pool_fallback")),
-            "bar_coverage": bar_coverage, "variants": variants}
-
-
-async def pullback_stats_report(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str]) -> Dict:
-    """The average early pullback per ticker / timeframe / track, measured
-    exactly the way the live limit entry measures it (pullback.py), plus what
-    depth the current settings would place and the share of past signals
-    that reached it. Shared by discord_commands.py's !pullback and
-    web_api.py's GET /api/pullback. Read-only."""
-    cfg = _cfg.pullback_config_snapshot()
-    n_bars = int(cfg["expiry_bars"])
-    history = load_signals_history()
-    rows: List[Dict] = []
-
-    for t in tickers:
-        for f in tfs:
-            bars = await safe_fetch_ohlcv(exchange, t, f, limit=900)
-            if not bars:
-                continue
-            df = parse_ohlcv(bars)
-            slot = history.get(t, {}).get(f, {})
-            recs = {"long": slot.get("long", []), "short": slot.get("short", [])}
-            for track in _cfg.TRACKS:
-                samples = _pb.pullback_samples(df, recs, track, n_bars, len(df) - 2, cfg["lookback_signals"])
-                pooled = False
-                if len(samples) < cfg["min_samples"] and cfg.get("pool_fallback"):
-                    pool_s = _pb.pullback_samples(df, recs, None, n_bars, len(df) - 2, cfg["lookback_signals"])
-                    if len(pool_s) >= cfg["min_samples"]:
-                        samples, pooled = pool_s, True
-                if not samples:
-                    rows.append({"ticker": t, "tf": f, "track": track, "n": 0, "enough_samples": False})
-                    continue
-                arr = np.asarray(samples, dtype="float64")
-                mean_pct = float(arr.mean())
-                depth = mean_pct * cfg["mult"]
-                rows.append({
-                    "ticker": t, "tf": f, "track": track,
-                    "n": int(len(arr)),
-                    "pooled": pooled,
-                    "enough_samples": bool(len(arr) >= cfg["min_samples"]),
-                    "mean_pct": round(mean_pct, 4),
-                    "median_pct": round(float(np.median(arr)), 4),
-                    "never_pulled_back": round(float((arr <= 0).mean()), 4),
-                    "depth_pct": round(depth, 4),
-                    "est_fill_rate": round(float((arr >= depth).mean()), 4),
-                })
-    return {"config": cfg, "rows": rows}
-
-
 # =====================================================================
 # 🔄  HELPER FUNCTIONS
 # =====================================================================
@@ -3135,10 +2478,6 @@ def make_state() -> Dict:
         "last_b_long_time": None,
         "last_b_short_time": None,
         "b_active_trade": None,
-        # 🆕 (pullback entry) virtual limit order waiting for its fill, per track
-        "a_pending": None,
-        "u_pending": None,
-        "b_pending": None,
         "b_trade_history": [],
         "b_bars_in_trade": 0,
         "b_last_closure_notified": False,
