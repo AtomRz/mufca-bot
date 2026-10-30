@@ -65,6 +65,7 @@ from state import load_signals_history, save_signals_history, delete_signal_reco
 import push as _push
 import derivatives
 import spread
+import shock_guard
 
 
 # =====================================================================
@@ -518,6 +519,11 @@ async def get_status():
         "scan_stats": core.scan_stats,
         "market_mode": _cfg.MARKET_MODE,
         "htf_bias": _cfg.HTF_BIAS,
+        # 🆕 Why the bot may be quiet: active market shocks (shock_guard) and an
+        # active exchange-wallet anomaly (onchain). Empty/None when all is normal.
+        "market_shocks": shock_guard.get_active_shocks(),
+        "onchain_anomaly": (core._onchain_bias_cache or {}).get("anomaly"),
+        "shock_blocks_entries": bool(_cfg.SHOCK_GUARD_BLOCK_ENTRIES),
         "pairs": {},
     }
     for ticker in _cfg.TICKERS:
