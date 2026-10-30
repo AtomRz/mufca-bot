@@ -108,6 +108,8 @@ export const api = {
     request('/api/config/htf-breakout', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setDiscordNotifications: (enabled) =>
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setShockGuardBlock: (enabled) =>
+    request('/api/config/shock-guard-block', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setScanInterval: (seconds) =>
     request('/api/config/scan-interval', { method: 'POST', body: JSON.stringify({ seconds }) }),
   setOnchainInterval: (seconds) =>

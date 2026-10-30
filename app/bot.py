@@ -25,6 +25,7 @@ from signals import check_signals, backtest_history, make_state, _tp1_moved_sl
 from onchain import get_onchain_bias
 import derivatives
 import spread
+import shock_guard
 from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
 
 logger = logging.getLogger(__name__)
@@ -570,6 +571,87 @@ async def _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf)
     trade["intrabar_cursor_ms"] = candles[-1][0]
 
 
+# 🆕 System alerts (on-chain wallet anomaly, market shock). detected_ts values
+# of anomaly events that were already announced, so one incident is announced once.
+_alerted_anomaly_ts: set = set()
+
+
+async def _send_system_alert(channel, text: str, push_title: str, push_body: str, event: Dict) -> None:
+    """Fan a system alert out to Discord, the web dashboard (WebSocket) and
+    push. Every channel has its own try/except so one failing can't swallow
+    the others (same pattern as the TP1 notification)."""
+    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+        try:
+            await channel.send(text)
+        except Exception as discord_err:
+            logger.error(f"[DISCORD] Failed to send system alert: {discord_err}", exc_info=True)
+    try:
+        from web_api import broadcast_event
+        await broadcast_event(event)
+    except Exception as ws_err:
+        logger.warning(f"[WS] broadcast failed: {ws_err}")
+    try:
+        import push as _push
+        await asyncio.to_thread(
+            _push.send_push,
+            title=push_title,
+            body=push_body,
+            data={"type": str(event.get("type", "system_alert"))},
+        )
+    except Exception as push_err:
+        logger.warning(f"[PUSH] send failed: {push_err}")
+
+
+async def _alert_onchain_anomaly(channel, bias: Optional[Dict]) -> None:
+    """Announces a freshly detected exchange-wallet anomaly (see
+    onchain.get_eth_flow_delta). Only the cycle that detected it carries
+    anomaly["fresh"], and detected_ts dedupes on top of that."""
+    try:
+        anomaly = (bias or {}).get("anomaly")
+        if not anomaly or not anomaly.get("fresh"):
+            return
+        for ev in anomaly.get("events", []):
+            ts = ev.get("detected_ts")
+            if ts in _alerted_anomaly_ts:
+                continue
+            _alerted_anomaly_ts.add(ts)
+            text = (
+                f"🚨 **ON-CHAIN ANOMALY** | `{ev.get('exchange')}` wallet {ev.get('kind')}: "
+                f"`{ev.get('prev_eth', 0):,.0f} → {ev.get('curr_eth', 0):,.0f} ETH` "
+                f"({ev.get('change_pct', 0):+.1f}%)\n"
+                f"This is not read as market flow (no bullish/bearish bias from it) and leverage is "
+                f"reduced for the next {_cfg.ONCHAIN_ANOMALY_HOLD_SECONDS // 3600}h. "
+                f"Possible hack or emergency wallet move — **expect abnormal volatility**."
+            )
+            await _send_system_alert(
+                channel, text,
+                push_title=f"🚨 {ev.get('exchange')} wallet anomaly",
+                push_body=f"{ev.get('change_pct', 0):+.0f}% ETH balance change — possible incident",
+                event={"type": "onchain_anomaly", **ev},
+            )
+        # keep the set from growing forever
+        if len(_alerted_anomaly_ts) > 50:
+            for old in sorted(_alerted_anomaly_ts)[:-20]:
+                _alerted_anomaly_ts.discard(old)
+    except Exception as e:
+        logger.warning(f"[ONCHAIN] Anomaly alert failed: {e}")
+
+
+async def _alert_market_shocks(channel) -> None:
+    """Announces market shocks recorded by shock_guard during the last scan
+    cycle (rate-limited per ticker/timeframe inside shock_guard.pop_alerts)."""
+    try:
+        for info in shock_guard.pop_alerts():
+            await _send_system_alert(
+                channel, shock_guard.format_shock_alert(info),
+                push_title=f"{'🔻' if info['direction'] == 'down' else '🔺'} Market shock {info['ticker']} {info['timeframe']}",
+                push_body=f"{info['move_pct']:+.2f}% in {info['bars']} bars ({info['move_atr']}x ATR)",
+                event={"type": "market_shock", **{k: v for k, v in info.items() if k != "since_ts"}},
+            )
+    except Exception as e:
+        logger.warning(f"[SHOCK] Alert failed: {e}")
+
+
 @tasks.loop(seconds=_cfg.SCAN_INTERVAL_SECONDS)
 async def market_scanner():
     """Main scanning loop."""
@@ -585,6 +667,9 @@ async def market_scanner():
     exchange = _exchange_ref
     if exchange is None:
         return
+
+    # 🆕 Announce market shocks recorded during the previous scan cycle.
+    await _alert_market_shocks(channel)
 
     # 🆕 Refresh on-chain bias at an interval of _cfg.ONCHAIN_CACHE_TTL
     # (15m/30m/1h, configurable from the web UI — see set_onchain_interval())
@@ -608,6 +693,7 @@ async def market_scanner():
                 logger.info("[ONCHAIN] First run detected — bias cache cleared for next cycle")
             else:
                 logger.info(f"[ONCHAIN] Bias refreshed: long={_onchain_bias_cache.get('bias_long',0):+d} short={_onchain_bias_cache.get('bias_short',0):+d}")
+                await _alert_onchain_anomaly(channel, _onchain_bias_cache)
             _cfg.save_onchain_bias_cache(_onchain_bias_cache, _onchain_last_fetch)
         except Exception as e:
             logger.warning(f"[ONCHAIN] Refresh failed: {e}")

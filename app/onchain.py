@@ -60,6 +60,13 @@ _prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FI
 _ONCHAIN_BASELINE_TS_FILE = os.path.join(DATA_DIR, "onchain_baseline_ts.json")
 _prev_balances_ts: float = safe_json_load(_ONCHAIN_BASELINE_TS_FILE, {}).get("ts", 0.0)
 
+# Exchange-wallet anomaly state (see config.ONCHAIN_ANOMALY_*). Persisted so a
+# container restart in the middle of an incident doesn't silently re-enable the
+# "outflow = bullish" reading for a wallet that was just drained.
+#   {"until": <epoch seconds>, "events": [ {exchange, prev_eth, curr_eth, ...}, ... ]}
+_ONCHAIN_ANOMALY_FILE = os.path.join(DATA_DIR, "onchain_anomaly.json")
+_anomaly_state: Dict[str, Any] = safe_json_load(_ONCHAIN_ANOMALY_FILE, {})
+
 
 def _cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -83,9 +90,11 @@ def clear_onchain_cache_full():
     _cache.clear()
     _prev_balances.clear()
     _prev_balances_ts = 0.0
+    _anomaly_state.clear()
     # Otherwise the baseline would just get pulled back from the on-disk file on the next scan.
     safe_json_save(_ONCHAIN_BASELINE_FILE, {})
     safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": 0.0})
+    safe_json_save(_ONCHAIN_ANOMALY_FILE, {})
     logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
@@ -238,14 +247,31 @@ async def get_eth_flow_delta() -> Dict:
     # Compute the delta
     delta_total = 0.0
     per_exchange = {}
+    anomalies = []
 
     for name in EXCHANGE_ETH_ADDRESSES:
         curr = curr_balances.get(name)
         prev = _prev_balances.get(name)
         if curr is not None and prev is not None:
             delta = curr - prev    # + = inflow to the exchange, - = outflow from the exchange
-            delta_total += delta
             per_exchange[name] = round(delta, 2)
+            # 🆕 Anomaly guard: a change this large relative to the wallet's own
+            # size is a drain/surge of the wallet itself (hack, emergency
+            # cold-storage move, internal consolidation), not market flow.
+            # Exclude it from the flow total instead of reading it as
+            # accumulation/distribution.
+            if prev >= _cfg.ONCHAIN_ANOMALY_MIN_BALANCE_ETH and abs(delta) / prev >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION:
+                anomalies.append({
+                    "exchange": name,
+                    "kind": "drain" if delta < 0 else "surge",
+                    "prev_eth": round(prev, 2),
+                    "curr_eth": round(curr, 2),
+                    "change_eth": round(delta, 2),
+                    "change_pct": round(delta / prev * 100, 1),
+                    "detected_ts": now,
+                })
+                continue
+            delta_total += delta
 
     # How much time has actually elapsed since the last baseline — thresholds scale off this
     elapsed_seconds = (now - _prev_balances_ts) if _prev_balances_ts else 3600.0
@@ -294,6 +320,33 @@ async def get_eth_flow_delta() -> Dict:
 
     flow = "inflow" if delta_total > neutral_threshold else "outflow" if delta_total < -neutral_threshold else "neutral"
 
+    # 🆕 Anomaly handling. A fresh anomaly (re)starts a hold window: the balance
+    # baseline has already been moved to the post-event value above, so on the
+    # next cycles the wallet would look "quiet" (or show a small leftover
+    # outflow, as happened on 2026-10-30) even though the incident is ongoing.
+    # While the hold is active the flow reading is forced neutral.
+    for ev in anomalies:
+        logger.warning(
+            f"[ONCHAIN] ⚠️ ANOMALY: {ev['exchange']} wallet {ev['kind']} "
+            f"{ev['prev_eth']:.0f} -> {ev['curr_eth']:.0f} ETH ({ev['change_pct']:+.1f}%) — "
+            f"not read as market flow"
+        )
+    if anomalies:
+        _anomaly_state["until"] = now + _cfg.ONCHAIN_ANOMALY_HOLD_SECONDS
+        _anomaly_state["events"] = anomalies
+        safe_json_save(_ONCHAIN_ANOMALY_FILE, _anomaly_state)
+
+    anomaly = None
+    anomaly_until = float(_anomaly_state.get("until", 0.0) or 0.0)
+    if now < anomaly_until:
+        anomaly = {
+            "active": True,
+            "fresh": bool(anomalies),          # True only on the cycle that detected it (used to alert once)
+            "until": anomaly_until,
+            "events": _anomaly_state.get("events", []),
+        }
+        flow, strength = "neutral", "weak"
+
     logger.info(
         f"[ONCHAIN] ETH flow: {flow} | delta={delta_total:.0f} ETH | strength={strength} "
         f"| window={elapsed_seconds/60:.0f}m (scale={scale:.2f}, thresholds={threshold_normal:.0f}/{threshold_large:.0f})"
@@ -305,6 +358,7 @@ async def get_eth_flow_delta() -> Dict:
         "strength": strength,
         "per_exchange": per_exchange,
         "note": "ok",
+        "anomaly": anomaly,
     }
 
 # =====================================================================
@@ -653,6 +707,19 @@ async def _compute_onchain_bias() -> Dict:
     elif flow == "inflow" and strength == "normal":
         lev_delta = -1
 
+    # Exchange-wallet anomaly: flow was forced neutral in get_eth_flow_delta()
+    # (no directional bias, no TP/SL tilt). The cause of the anomaly is unknown
+    # (hack / emergency move), so the one thing we do apply is less leverage.
+    anomaly = flow_data.get("anomaly")
+    if anomaly and anomaly.get("active"):
+        lev_delta = min(lev_delta, _cfg.ONCHAIN_ANOMALY_LEV_DELTA)
+        for ev in anomaly.get("events", []):
+            reasons.append(
+                f"⚠️ {ev.get('exchange')} wallet {ev.get('kind')} "
+                f"{ev.get('prev_eth', 0):.0f} → {ev.get('curr_eth', 0):.0f} ETH "
+                f"({ev.get('change_pct', 0):+.0f}%) — flow ignored, leverage reduced"
+            )
+
     # ─────────────────────────────────────────────────────────────────
     # TEXT SUMMARY
     # ─────────────────────────────────────────────────────────────────
@@ -678,6 +745,7 @@ async def _compute_onchain_bias() -> Dict:
         "eth_delta_eth":  flow_data.get("delta_eth", 0.0),
         "flow":           flow,
         "flow_strength":  strength,
+        "anomaly":        anomaly if (anomaly and anomaly.get("active")) else None,
     }
 
     # a failed balance fetch is reported but not cached, so the next caller
@@ -727,6 +795,16 @@ def format_onchain_report(bias: Dict) -> str:
     elif note == "error":
         lines.append("  _(failed to fetch exchange balances — showing the last known result)_")
     else:
+        anomaly = bias.get("anomaly")
+        if anomaly and anomaly.get("active"):
+            for ev in anomaly.get("events", []):
+                lines.append(
+                    f"  ⚠️ **ANOMALY:** {ev.get('exchange')} wallet {ev.get('kind')} "
+                    f"`{ev.get('prev_eth', 0):.0f} → {ev.get('curr_eth', 0):.0f} ETH` "
+                    f"({ev.get('change_pct', 0):+.0f}%) — treated as a wallet event, not market flow"
+                )
+            hold_min = max(0, int((anomaly.get("until", 0) - time.time()) / 60))
+            lines.append(f"  _(on-chain flow is held neutral for another ~{hold_min} min)_")
         lines.append(f"  Total delta: `{delta:+.0f} ETH`")
         if per_ex:
             for exch, d in per_ex.items():

@@ -50,6 +50,32 @@ ONCHAIN_FLOW_THRESHOLD_ETH    = 5_000   # ETH — threshold for a "normal" signa
 ONCHAIN_FLOW_THRESHOLD_LARGE_ETH = 20_000  # ETH — threshold for a "large" signal
 ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
 
+# Exchange-wallet anomaly guard. The on-chain flow signal reads an ETH outflow
+# from a tracked exchange wallet as accumulation (bullish). That assumption
+# breaks when a hot wallet is drained (hack, emergency cold-storage move): the
+# 2026-10-30 Binance incident emptied the tracked wallet (160k -> 305 ETH) and
+# the bot read it as a "large outflow = bullish" signal while the market crashed.
+# A balance change this large *relative to the wallet's own size* is treated as
+# an anomaly, not as market flow: flow is forced neutral, leverage is reduced
+# and an alert is raised.
+ONCHAIN_ANOMALY_MIN_BALANCE_ETH = 5_000  # only judge wallets that held at least this much in the previous snapshot
+ONCHAIN_ANOMALY_CHANGE_FRACTION = 0.50   # |balance change| / previous balance at or above this = anomaly
+ONCHAIN_ANOMALY_HOLD_SECONDS    = 4 * 3600  # keep on-chain flow neutralized this long after an anomaly
+ONCHAIN_ANOMALY_LEV_DELTA       = -1     # leverage adjustment while an anomaly is active (unknown risk -> less leverage)
+
+# Market shock guard. Detects an abnormal price move (a multiple of the ATR
+# measured *before* the move) over the last few closed bars - news-driven
+# cascades (exchange hacks, flash crashes) that the trend/reversal tracks are
+# not built for. By default it only warns (Discord alert + dashboard status);
+# SHOCK_GUARD_BLOCK_ENTRIES = True also stops new entries while a shock is active.
+SHOCK_GUARD_ENABLED                = True
+SHOCK_GUARD_BARS                   = 4      # move is measured over this many closed bars
+SHOCK_GUARD_ATR_MULT               = 5.0    # |close move| >= this x ATR(14) at the start of the window
+# SHOCK_GUARD_BLOCK_ENTRIES (block new entries while a shock is active) is a
+# runtime toggle persisted to disk - defined further down, next to the other
+# web-editable toggles (it needs safe_json_load, which is defined later).
+SHOCK_GUARD_ALERT_COOLDOWN_SECONDS = 3600   # at most one alert per ticker/timeframe per this window
+
 # =====================================================================
 # 🔒  THREAD-SAFE FILE OPERATIONS
 # =====================================================================
@@ -913,6 +939,23 @@ def save_discord_notifications_enabled(enabled: bool):
     safe_json_save(DISCORD_NOTIFICATIONS_FILE, {"enabled": bool(enabled)})
 
 DISCORD_NOTIFICATIONS_ENABLED = load_discord_notifications_enabled()
+
+# =====================================================================
+# 🛑  SHOCK GUARD — BLOCK ENTRIES TOGGLE
+# =====================================================================
+# Off (default): a detected market shock only raises an alert / dashboard
+# banner. On: new entries are also blocked while a shock is active
+# (see shock_guard.py and check_signals()). Editable from the web Settings tab,
+# takes effect on the next scan without a restart.
+SHOCK_GUARD_BLOCK_ENTRIES_FILE = os.path.join(DATA_DIR, "shock_guard_block_entries.json")
+
+def load_shock_guard_block_entries() -> bool:
+    return _load_typed(SHOCK_GUARD_BLOCK_ENTRIES_FILE, {"enabled": False})["enabled"]
+
+def save_shock_guard_block_entries(enabled: bool):
+    safe_json_save(SHOCK_GUARD_BLOCK_ENTRIES_FILE, {"enabled": bool(enabled)})
+
+SHOCK_GUARD_BLOCK_ENTRIES = load_shock_guard_block_entries()
 
 # =====================================================================
 # ⏱️  SCAN INTERVAL

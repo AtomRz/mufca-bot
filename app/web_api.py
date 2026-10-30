@@ -58,13 +58,14 @@ app = FastAPI(
 # web_api at the very bottom, once bot/state/config are already set up.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_hurst_window, save_hurst_config
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_shock_guard_block_entries, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components
 import push as _push
 import derivatives
 import spread
+import shock_guard
 
 
 # =====================================================================
@@ -518,6 +519,11 @@ async def get_status():
         "scan_stats": core.scan_stats,
         "market_mode": _cfg.MARKET_MODE,
         "htf_bias": _cfg.HTF_BIAS,
+        # 🆕 Why the bot may be quiet: active market shocks (shock_guard) and an
+        # active exchange-wallet anomaly (onchain). Empty/None when all is normal.
+        "market_shocks": shock_guard.get_active_shocks(),
+        "onchain_anomaly": (core._onchain_bias_cache or {}).get("anomaly"),
+        "shock_blocks_entries": bool(_cfg.SHOCK_GUARD_BLOCK_ENTRIES),
         "pairs": {},
     }
     for ticker in _cfg.TICKERS:
@@ -884,6 +890,7 @@ async def get_config():
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
+        "shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
         "onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL,
@@ -1084,6 +1091,28 @@ async def set_discord_notifications(body: DiscordNotificationsIn):
         "value": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
     })
     return {"discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED, "changed": True}
+
+
+class ShockGuardBlockIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/shock-guard-block")
+async def set_shock_guard_block(body: ShockGuardBlockIn):
+    """Turns "block new entries during a market shock" on/off. Off = shocks
+    only raise an alert and a dashboard banner. Takes effect on the next scan;
+    already open positions are not touched."""
+    if body.enabled == _cfg.SHOCK_GUARD_BLOCK_ENTRIES:
+        return {"shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES, "changed": False}
+
+    _cfg.SHOCK_GUARD_BLOCK_ENTRIES = body.enabled
+    save_shock_guard_block_entries(_cfg.SHOCK_GUARD_BLOCK_ENTRIES)
+    await broadcast_event({
+        "type": "config_changed",
+        "key": "shock_guard_block_entries",
+        "value": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
+    })
+    return {"shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES, "changed": True}
 
 
 class ScanIntervalIn(BaseModel):

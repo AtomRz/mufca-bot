@@ -349,6 +349,24 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
+            <h3 className="panel-title">Market Shock Guard</h3>
+            <div className="toggle-row">
+              <span className="row-label" title="A market shock is a move of 5x ATR or more over the last 4 closed bars (news cascades, exchange hacks). Off = warn only (alert + dashboard banner). On = also stop opening new positions while the shock lasts.">
+                Block new entries during a shock
+              </span>
+              <Toggle
+                checked={config.shock_guard_block_entries ?? false}
+                disabled={busy === 'shock_guard_block'}
+                onChange={(v) => run('shock_guard_block', () => api.setShockGuardBlock(v))}
+              />
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Off (default) = a shock only raises an alert and a banner on the Status tab. On = the bot also
+              skips new entries while the move lasts. Open positions are never touched.
+            </p>
+          </div>
+
+          <div className="panel">
             <h3 className="panel-title">Signal Filters</h3>
             {FILTER_TOGGLES.map(({ key, label, hint }) => (
               <div className="toggle-row" key={key}>

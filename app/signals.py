@@ -66,6 +66,7 @@ from state import (
 from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, round_price, format_price
 from config import ONCHAIN_ENABLED
 import spread
+import shock_guard
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
 # separate modules that know nothing about confidence/TP themselves.
@@ -1139,6 +1140,14 @@ async def check_signals(
         atr_ok = ATR_MIN <= atr_pct_v <= ATR_MAX
         chop_ok = chop_v < CHOP_THRESHOLD.get(timeframe, 61.8)
 
+        # 🆕 Market shock guard: records an abnormal multi-bar move (news
+        # cascade) so the bot can say WHY it is silent instead of just
+        # showing FLAT. Warn-only unless SHOCK_GUARD_BLOCK_ENTRIES is on.
+        # update_shock() never raises.
+        market_shock = shock_guard.update_shock(
+            ticker, timeframe, bar_time, df["close"].values, atr14.values, idx
+        )
+
         frama_slope = float(fs.iloc[idx]) - float(fs.iloc[idx - 1])
         slope_long = frama_slope > 0
         slope_short = frama_slope < 0
@@ -1339,6 +1348,15 @@ async def check_signals(
         # Andean/MFI), so it's gated by is_new_bar the same way U-track is.
         sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and not b_in_pos and b_long_cd_ok  and is_new_bar and b_warmed_up
         sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and not b_in_pos and b_short_cd_ok and is_new_bar and b_warmed_up
+
+        # 🆕 Optional hard stop during a market shock (off by default).
+        if market_shock and _cfg.SHOCK_GUARD_BLOCK_ENTRIES:
+            if any((sig_a_long, sig_a_short, sig_u_long, sig_u_short, sig_b_long, sig_b_short)):
+                logger.info(
+                    f"[SHOCK] {ticker} {timeframe}: entries blocked during market shock "
+                    f"({market_shock['move_pct']:+.2f}% = {market_shock['move_atr']}x ATR)"
+                )
+            sig_a_long = sig_a_short = sig_u_long = sig_u_short = sig_b_long = sig_b_short = False
 
         # Track flags are only set on an actual open (not dry_run), and ALWAYS
         # together with active_trade, so they never get out of sync.

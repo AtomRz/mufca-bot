@@ -95,10 +95,39 @@ export default function StatusPanel({ lastEvent }) {
   if (!status) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">Loading…</div>
 
   const pairs = Object.entries(status.pairs || {})
+  const shocks = status.market_shocks || []
+  const anomaly = status.onchain_anomaly
 
   return (
     <div>
       {error && <div className="error-banner">{error}</div>}
+      {(shocks.length > 0 || (anomaly && anomaly.active)) && (
+        <div className="panel" style={{ borderColor: 'var(--short)' }}>
+          <h3 className="panel-title" style={{ color: 'var(--short)' }}>⚠️ Abnormal market conditions</h3>
+          {shocks.map((s) => (
+            <div className="row" key={`${s.ticker}-${s.timeframe}`}>
+              <span className="row-label">{s.ticker} · {s.timeframe} market shock</span>
+              <span className="row-value">
+                {s.move_pct > 0 ? '+' : ''}{s.move_pct}% in {s.bars} bars ({s.move_atr}× ATR)
+              </span>
+            </div>
+          ))}
+          {anomaly && anomaly.active && (anomaly.events || []).map((ev) => (
+            <div className="row" key={`${ev.exchange}-${ev.detected_ts}`}>
+              <span className="row-label">{ev.exchange} wallet {ev.kind}</span>
+              <span className="row-value">
+                {Math.round(ev.prev_eth).toLocaleString()} → {Math.round(ev.curr_eth).toLocaleString()} ETH ({ev.change_pct}%)
+              </span>
+            </div>
+          ))}
+          <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
+            {status.shock_blocks_entries && shocks.length > 0
+              ? 'New entries are blocked while the shock lasts. '
+              : 'The A/U/B tracks are not built for news-driven cascades, so FLAT here can simply mean "no valid trigger". '}
+            {anomaly && anomaly.active ? 'On-chain flow is held neutral and leverage is reduced.' : ''}
+          </p>
+        </div>
+      )}
       {tp1Banner && (
         <div className="panel" style={{ borderColor: 'var(--accent)' }}>
           <h3 className="panel-title" style={{ color: 'var(--accent)' }}>🎯 TP1 Hit</h3>
