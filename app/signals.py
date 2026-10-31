@@ -2,7 +2,7 @@ import asyncio
 import time
 import numpy as np
 import pandas as pd
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, Optional, Any, Callable
 from datetime import datetime, timezone
 import logging
 
@@ -67,6 +67,7 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, roun
 from config import ONCHAIN_ENABLED
 import spread
 import shock_guard
+from sim_pool import SimPool
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
 # separate modules that know nothing about confidence/TP themselves.
@@ -1577,7 +1578,12 @@ def _fetch_ohlcv_paginated(exchange: ccxt.Exchange, ticker: str, tf: str, num_ba
     """
     tf_ms = exchange.parse_timeframe(tf) * 1000
     now_ms = exchange.milliseconds()
-    since = now_ms - num_bars * tf_ms
+    # 🆕 FIX: `now - num_bars * tf` is not a bar boundary, so the first bar
+    # whose open is >= that moment is the NEXT one - every request came back
+    # exactly one bar short (5999 of 6000) and tripped the "got fewer bars than
+    # requested" warning in every run. Anchor on the open of the bar we want
+    # first: with the still-forming bar included, that is num_bars bars.
+    since = (now_ms // tf_ms - num_bars + 1) * tf_ms
 
     all_bars = []
     while len(all_bars) < num_bars:
@@ -1615,6 +1621,8 @@ def backtest_history(
     dry_run: bool = False,
     df: Optional[pd.DataFrame] = None,
     compute_confidence: bool = False,
+    benchmark_df: Optional[pd.DataFrame] = None,
+    htf_df: Optional[pd.DataFrame] = None,
 ):
     """Backtest for accumulating signal history.
 
@@ -1664,6 +1672,13 @@ def backtest_history(
     and is simply omitted from the dict rather than guessed at — a
     consumer checking `"onchain_bias" in components` can tell backtest-
     sourced records apart from live ones for that reason alone.
+
+    benchmark_df / htf_df — pre-fetched OHLCV for the relative-strength
+    benchmark (BTC, only used when compute_confidence=True) and for the
+    HTF-bias timeframe. When given, nothing is fetched for them. Together
+    with df this makes the whole call network-free, which is what lets
+    sim_pool.py run it in a separate worker process (exchange=None there).
+    None (the default) fetches through `exchange` exactly as before.
 
     Returns signals_found (int) when dry_run=False — unchanged from
     before this parameter existed, every existing caller keeps working
@@ -1725,12 +1740,15 @@ def backtest_history(
             benchmark_ticker = default_benchmark_for(ticker)
             if benchmark_ticker is not None:
                 try:
-                    benchmark_bars = _fetch_ohlcv_paginated(exchange, benchmark_ticker, tf, bars_fetched)
-                    if benchmark_bars and len(benchmark_bars) >= 30:
-                        benchmark_df = parse_ohlcv(benchmark_bars)
+                    _bench_df = benchmark_df
+                    if _bench_df is None:
+                        benchmark_bars = _fetch_ohlcv_paginated(exchange, benchmark_ticker, tf, bars_fetched)
+                        if benchmark_bars and len(benchmark_bars) >= 30:
+                            _bench_df = parse_ohlcv(benchmark_bars)
+                    if _bench_df is not None and len(_bench_df) >= 30:
                         rs_merged = pd.merge(
                             df[["timestamp", "close"]].rename(columns={"close": "asset_close"}),
-                            benchmark_df[["timestamp", "close"]].rename(columns={"close": "benchmark_close"}),
+                            _bench_df[["timestamp", "close"]].rename(columns={"close": "benchmark_close"}),
                             on="timestamp", how="inner",
                         ).sort_values("timestamp").reset_index(drop=True)
                         rs_ts_to_pos = {int(ts): i for i, ts in enumerate(rs_merged["timestamp"])}
@@ -1786,9 +1804,12 @@ def backtest_history(
         htf_bias_arr = np.zeros(len(df))
 
         try:
-            htf_bars = exchange.fetch_ohlcv(ticker, htf, limit=num_bars)
-            if htf_bars and len(htf_bars) >= 100:
-                df_htf = parse_ohlcv(htf_bars)
+            df_htf = htf_df
+            if df_htf is None and exchange is not None:
+                htf_bars = exchange.fetch_ohlcv(ticker, htf, limit=num_bars)
+                if htf_bars and len(htf_bars) >= 100:
+                    df_htf = parse_ohlcv(htf_bars)
+            if df_htf is not None and len(df_htf) >= 100:
                 if validate_dataframe(df_htf, 50):
                     fs_htf, fu_htf, fl_htf, fdir_htf = calculate_frama(df_htf, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
                     ltf_times = df["timestamp"].values
@@ -2305,7 +2326,63 @@ def backtest_history(
         return (0, {}, bars_fetched) if dry_run else 0
 
 
-async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000) -> Dict:
+def _prefetch_backtest_inputs(exchange: ccxt.Exchange, ticker: str, tf: str, num_bars: int,
+                              need_benchmark: bool) -> Dict:
+    """Blocking - run it in a thread. The network half of a dry-run backtest:
+    everything backtest_history() would fetch through `exchange` (main OHLCV,
+    the relative-strength benchmark, the HTF series), done once up front so
+    the CPU half can run in a worker process that has no exchange at all.
+
+    Mirrors the fetches inside backtest_history() exactly (same helpers, same
+    sizes), so a backtest fed these frames behaves like one that fetched
+    them itself. Returns {"bars_fetched", "df", "benchmark_df", "htf_df"};
+    df is None when there aren't enough bars to simulate on.
+    """
+    out: Dict = {"bars_fetched": 0, "df": None, "benchmark_df": None, "htf_df": None}
+    bars = _fetch_ohlcv_paginated(exchange, ticker, tf, num_bars)
+    out["bars_fetched"] = len(bars or [])
+    if not bars or len(bars) < 100:
+        logger.warning(f"[BACKTEST] Not enough bars for {ticker} {tf}")
+        return out
+    if len(bars) < num_bars:
+        logger.warning(
+            f"[BACKTEST] {ticker} {tf}: requested {num_bars} bars, got {len(bars)} "
+            f"(that may be all the history the exchange has for this pair/timeframe)"
+        )
+    out["df"] = parse_ohlcv(bars)
+
+    if need_benchmark:
+        benchmark_ticker = default_benchmark_for(ticker)
+        if benchmark_ticker is not None:
+            try:
+                benchmark_bars = _fetch_ohlcv_paginated(exchange, benchmark_ticker, tf, len(bars))
+                if benchmark_bars and len(benchmark_bars) >= 30:
+                    out["benchmark_df"] = parse_ohlcv(benchmark_bars)
+            except Exception as e:
+                logger.warning(f"[BACKTEST] {ticker} {tf}: relative-strength benchmark fetch failed: {e}")
+
+    try:
+        htf_bars = exchange.fetch_ohlcv(ticker, _cfg.HTF_BIAS, limit=num_bars)
+        if htf_bars and len(htf_bars) >= 100:
+            out["htf_df"] = parse_ohlcv(htf_bars)
+    except Exception as e:
+        logger.warning(f"[BACKTEST] HTF bias fetch failed for {ticker} {tf}: {e}")
+    return out
+
+
+def _report_progress(progress: Optional[Callable[[int, int, str], None]], done: int, total: int, message: str) -> None:
+    """Progress callbacks must never be able to break a simulation."""
+    if progress is None:
+        return
+    try:
+        progress(done, total, message)
+    except Exception as e:
+        logger.debug(f"progress callback failed: {e}")
+
+
+async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                                  progress: Optional[Callable[[int, int, str], None]] = None,
+                                  workers: Optional[int] = None) -> Dict:
     """Compares breakeven/quarter/half/three_quarter SL-after-TP1 modes on
     real historical OHLCV via dry-run backtest_history() calls — one per
     (ticker, tf, fraction) combo, sharing one fetched df across all 4
@@ -2334,46 +2411,62 @@ async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     outcome past that point is unknown. See tp1sim_cmd's docstring for the
     fuller reasoning (asymmetric dropout across fractions).
     """
+    # 🆕 CPU-bound work runs on a process pool (sim_pool.py: SIM_WORKERS, default
+    # = all usable cores, 1 = the old single-thread behaviour). The exchange
+    # is only used here, in the parent, to fetch each ticker/tf ONCE (plus the
+    # HTF series); every fraction then simulates on those shared frames.
+    # progress(done, total, message) is called as backtests finish.
     buckets: Dict[tuple, list] = {}
     bar_coverage: List[Dict] = []
+    fractions = list(_cfg.TP1_SL_MODE_FRACTIONS.items())
+    counters = {"done": 0, "total": len(tickers) * len(tfs) * len(fractions)}
+    submitted: List[tuple] = []  # (ticker, tf, mode_name, future)
 
-    for t in tickers:
-        for f in tfs:
-            # 🆕 FIX: fetch each ticker/tf ONCE and reuse the df across all
-            # fractions, as the docstring always claimed (it used to re-fetch,
-            # paginated, once per fraction).
-            try:
-                _bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
-            except Exception as e:
-                logger.error(f"run_tp1_mode_comparison: fetch error for {t} {f}: {e}")
-                continue
-            if not _bars or len(_bars) < 100:
-                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(_bars or [])})
-                continue
-            df_shared = parse_ohlcv(_bars)
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
 
-            for mode_name, fraction in _cfg.TP1_SL_MODE_FRACTIONS.items():
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
                 try:
-                    count, history, bars_fetched = await asyncio.to_thread(
-                        backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, fraction, True, df_shared
-                    )
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
                 except Exception as e:
-                    logger.error(f"run_tp1_mode_comparison: backtest error for {t} {f} {mode_name}: {e}")
+                    logger.error(f"run_tp1_mode_comparison: fetch error for {t} {f}: {e}")
+                    counters["total"] -= len(fractions)
                     continue
+                if inputs["df"] is None:
+                    bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                    counters["total"] -= len(fractions)
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(inputs["df"])})
 
-                existing = next((c for c in bar_coverage if c["ticker"] == t and c["tf"] == f), None)
-                if existing is None:
-                    bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": bars_fetched})
-                else:
-                    existing["got"] = min(existing["got"], bars_fetched)
+                for mode_name, fraction in fractions:
+                    fut = pool.submit({
+                        "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                        "tp1_sl_fraction": fraction, "dry_run": True, "df": inputs["df"],
+                        "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                    })
+                    fut.add_done_callback(_on_done(f"{t} {f} {mode_name}"))
+                    submitted.append((t, f, mode_name, fut))
 
-                for side in ("long", "short"):
-                    for rec in history.get(t, {}).get(f, {}).get(side, []):
-                        et = rec.get("exit_type")
-                        if et in ("tp", "sl_after_tp1") or (et == "cancelled" and rec.get("tp1_reached")):
-                            key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
-                            buckets.setdefault(key, []).append(rec)
-                await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+        outcomes = await asyncio.gather(*(item[3] for item in submitted), return_exceptions=True)
+
+    for (t, f, mode_name, _), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_tp1_mode_comparison: backtest error for {t} {f} {mode_name}: {outcome!r}")
+            continue
+        count, history, bars_fetched = outcome
+        for side in ("long", "short"):
+            for rec in history.get(t, {}).get(f, {}).get(side, []):
+                et = rec.get("exit_type")
+                if et in ("tp", "sl_after_tp1") or (et == "cancelled" and rec.get("tp1_reached")):
+                    key = (mode_name, rec.get("track", "?"), rec.get("regime", "?"))
+                    buckets.setdefault(key, []).append(rec)
 
     modes_out: Dict[str, List[Dict]] = {m: [] for m in _cfg.TP1_SL_MODE_FRACTIONS}
     for mode_name in _cfg.TP1_SL_MODE_FRACTIONS:
@@ -2395,7 +2488,9 @@ async def run_tp1_mode_comparison(exchange: ccxt.Exchange, tickers: List[str], t
     return {"bar_coverage": bar_coverage, "modes": modes_out}
 
 
-async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000, min_samples: int = 30, group_by: Optional[List[str]] = None) -> Dict:
+async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000, min_samples: int = 30, group_by: Optional[List[str]] = None,
+                                 progress: Optional[Callable[[int, int, str], None]] = None,
+                                 workers: Optional[int] = None) -> Dict:
     """Replays real historical OHLCV through dry-run backtest_history(...,
     compute_confidence=True) across the given tickers/tfs, merges the
     resulting records, and runs them through
@@ -2422,24 +2517,53 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     if group_by is None:
         group_by = ["track", "regime"]
 
+    # 🆕 Same split as run_tp1_mode_comparison(): fetch in the parent (incl.
+    # the BTC benchmark and HTF series), simulate on the process pool.
     combined_history: Dict = {}
     bar_coverage: List[Dict] = []
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    submitted: List[tuple] = []  # (ticker, tf, future)
 
-    for t in tickers:
-        for f in tfs:
-            try:
-                count, history, bars_fetched = await asyncio.to_thread(
-                    backtest_history, exchange, t, f, num_bars, _cfg.TRACKS, None, True, None, True
-                )
-            except Exception as e:
-                logger.error(f"run_component_backtest: backtest error for {t} {f}: {e}")
-                continue
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
 
-            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": bars_fetched})
-            for side in ("long", "short"):
-                combined_history.setdefault(t, {}).setdefault(f, {}).setdefault(side, [])
-                combined_history[t][f][side].extend(history.get(t, {}).get(f, {}).get(side, []))
-            await asyncio.sleep(0.2)  # yield to the event loop between heavy backtest calls
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f} (+ benchmark)")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, True)
+                except Exception as e:
+                    logger.error(f"run_component_backtest: fetch error for {t} {f}: {e}")
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    counters["total"] -= 1
+                    continue
+
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": True, "benchmark_df": inputs["benchmark_df"], "htf_df": inputs["htf_df"],
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, fut))
+
+        outcomes = await asyncio.gather(*(item[2] for item in submitted), return_exceptions=True)
+
+    for (t, f, _), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_component_backtest: backtest error for {t} {f}: {outcome!r}")
+            continue
+        count, history, bars_fetched = outcome
+        for side in ("long", "short"):
+            combined_history.setdefault(t, {}).setdefault(f, {}).setdefault(side, [])
+            combined_history[t][f][side].extend(history.get(t, {}).get(f, {}).get(side, []))
 
     report = analyze_confidence_components(history=combined_history, min_samples=min_samples, group_by=group_by)
     report["bar_coverage"] = bar_coverage

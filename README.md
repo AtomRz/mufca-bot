@@ -99,6 +99,9 @@ mufca-bot/
 │   ├── onchain.py            # Etherscan + CoinGecko on-chain bias
 │   ├── derivatives.py         # Gate.io funding rate + open interest bias (futures only)
 │   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
+│   ├── sim_jobs.py            # Background jobs for !tp1sim/!compsim and /api/tp1sim, /api/compsim (one at a time, progress, cancel)
+│   ├── sim_pool.py            # Process pool that runs those backtests on all CPU cores (SIM_WORKERS)
+│   ├── sim_worker.py          # Worker process entry point used by sim_pool.py
 │   ├── push.py               # Android push notifications (Firebase Cloud Messaging)
 │   ├── chart.py              # Candlestick chart (PNG) generation for Discord `!chart`
 │   ├── chart_data.py         # Same indicator data as chart.py, as JSON for the web dashboard
@@ -259,7 +262,6 @@ volumes:
 | `!add SOL/USDT` | Add pair to scanner (auto-runs backtest) |
 | `!remove SOL/USDT` | Remove pair from scanner (also clears its derivatives cache/OI baseline and spread history) |
 | `!delsignals SOL/USDT [TF] [yes]` | Delete accumulated signal history for a pair (optionally one timeframe only). Preview first, then confirm with `yes` |
-| `!cleanup_sim [yes]` | Remove all synthetic `!sim` records from signal history across every pair/timeframe/side. Preview first, then confirm with `yes` |
 
 ### ⚙️ Configuration
 
@@ -316,11 +318,12 @@ Dry-run — replay real historical OHLCV instead of waiting on live signals to a
 | `!compsim [pair] [tf] [bars] [min_n]` | `!components`, sourced from a backtest instead of live history — reconstructs `relative_strength`/`volume_profile` point-in-time at each simulated entry |
 | `!tp1sim [pair] [tf] [bars]` | Compares breakeven/quarter/half/three-quarter SL-after-TP1 on real historical data, split by track/regime, with timed-out (reached TP1, never resolved within `MAX_HOLD_BARS`) trades tracked separately so a looser SL isn't silently under-counted relative to a tighter one |
 
+Both run as a **background job on all CPU cores** (see `SIM_WORKERS` in `.env.example`) and only one simulation runs at a time — a second request is refused until the first finishes. The bot posts a progress line about every 90 s. Worker processes run at lower priority, so the live scanner is not starved.
+
 ### 🧪 Testing
 
 | Command | Description |
 |---|---|
-| `!sim long ETH/USDT 4h` | Simulate signal entry+exit (adds to TP training history) |
 | `!forcerun long ETH/USDT 4h` | Force-fire signal bypassing all filters (always opens on the A-track, by design — see `discord_commands.py`) |
 | `!reset yes` | Clear all signal history and re-run backtest |
 
@@ -338,7 +341,7 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
   - **Bias** — on-chain bias snapshot (ETH exchange flow, Fear & Greed, BTC dominance) and derivatives bias (funding rate, open interest), plus the resulting TP/SL/leverage multipliers
   - **Spread** — live order book spread + filter status/warm-up progress
   - **Components** — `!components`' report, in-browser
-  - **Simulate** — `!tp1sim`/`!compsim`, in-browser: pick a pair/timeframe/bar count, run, see the result as a table instead of Discord text
+  - **Simulate** — `!tp1sim`/`!compsim`, in-browser: pick a pair/timeframe/bar count, run, see the result as a table instead of Discord text. Runs as a background job with a progress bar and a Cancel button; the result is kept for a few hours, so it survives a reload or a tab switch (`POST /api/tp1sim` / `/api/compsim` return `202` + a job id, poll `GET /api/sim-jobs/{id}`; `DELETE` cancels)
 - **Settings** — everything below is editable at runtime, no redeploy or restart required:
   - Market mode (spot/futures), HTF bias, UT Bot Heikin Ashi toggle
   - SL-after-TP1 mode (breakeven / quarter / half / three-quarter of the way to TP1)
@@ -440,7 +443,7 @@ Fallback to fixed R:R 2.0 when fewer than 3 closed signals exist.
 
 **TP hit-rate auto-adjust:** once at least 15 recent signals are recorded and `TP_AUTO_ADJUST` is on, the active percentile is nudged up or down automatically to keep the real hit-rate close to the configured target.
 
-**Adaptive SL:** the stop is set from the 85th percentile of historical MAE on *winning* trades (synthetic `!sim` entries are excluded so they don't skew real market behavior), plus a small fixed buffer. If there isn't enough history yet, SL falls back to the opposite FRAMA line.
+**Adaptive SL:** the stop is set from the 85th percentile of historical MAE on *winning* trades, plus a small fixed buffer. If there isn't enough history yet, SL falls back to the opposite FRAMA line.
 
 **On-chain & derivatives adjustment:** when enabled, exchange-flow bias and market-wide sentiment from `onchain.py`, combined with funding rate + open interest bias from `derivatives.py` (futures only), can multiply TP/SL distances and shift leverage before the signal is finalized. The two sources' TP/SL multipliers are combined multiplicatively then hard-capped (`COMBINED_MULT_CAP = 1.20`) so they can't compound past what either alone was calibrated for; downstream safety caps also ensure the combined result can never push R:R below the configured minimum.
 

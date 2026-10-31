@@ -57,13 +57,12 @@ from signals import (
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full
 import derivatives
 import spread
+import sim_jobs
 from state import (
     load_signals_history,
     save_signals_history,
     calculate_combined_tp,
     add_signal_record,
-    update_signal_record,
-    update_signal_mae_mfe,
     clear_history_cache,
     get_signal_stats,
     analyze_confidence_components,
@@ -166,11 +165,9 @@ async def help_cmd(ctx):
         "`!add <pair>`   — add a pair (e.g. `!add SOL/USDT`)",
         "`!remove <pair>` — remove a pair",
         "`!delsignals <pair> [tf]` — delete a pair's signal history",
-        "`!cleanup_sim` — remove all synthetic `!sim` records from history",
         "",
 
         "**🛠️ Utilities**",
-        "`!sim <pair> <tf> <side>` — simulate a trade",
         "`!forcerun`     — force-run the scanner",
         "`!reset`        — reset all state and history",
         "`!reset_cache`  — reset HTF, on-chain, and derivatives cache",
@@ -490,67 +487,6 @@ async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = "")
 
     save_signals_history(history)
     await ctx.send(f"🗑️ Signal history for {scope} deleted.")
-
-@core.bot.command(name="cleanup_sim")
-async def cleanup_sim_cmd(ctx, confirm: str = ""):
-    """Removes synthetic (!sim) records from signals_history.json across
-    ALL pairs/timeframes/sides, leaving everything else untouched.
-
-    !cleanup_sim       — preview
-    !cleanup_sim yes   — delete
-
-    🆕 !sim records are already excluded from stats (get_signal_stats),
-    adaptive TP/SL calibration (calculate_adaptive_tp/calculate_adaptive_sl),
-    and the web dashboard's History tab (see synthetic in
-    web_api._aggregate_records) — they're harmless to leave in place. This
-    command exists purely for tidiness: !debug and !signals count them as
-    regular closed signals (they don't check the synthetic flag), so their
-    totals can look off by however many !sim runs happened, compared to the
-    web dashboard's History tab.
-    """
-    history = load_signals_history()
-
-    to_remove = []
-    for ticker, tfs in history.items():
-        for tf, sides in tfs.items():
-            for side in ("long", "short"):
-                for rec in sides.get(side, []):
-                    if rec.get("synthetic") or rec.get("track") == "sim":
-                        to_remove.append((ticker, tf, side, rec))
-
-    if not to_remove:
-        await ctx.send("✅ No synthetic (`!sim`) records found — nothing to clean up.")
-        return
-
-    if confirm.lower() != "yes":
-        lines = [f"⚠️ This will DELETE {len(to_remove)} synthetic (`!sim`) record(s):"]
-        for ticker, tf, side, rec in to_remove[:15]:
-            lines.append(f"• `{ticker}` `{tf}` {side.upper()} entry=${rec.get('entry')} exit_type={rec.get('exit_type')}")
-        if len(to_remove) > 15:
-            lines.append(f"… and {len(to_remove) - 15} more")
-        lines.append("\nTo confirm, type: `!cleanup_sim yes`")
-        msg = "\n".join(lines)
-        while msg:
-            chunk = msg[:1900]
-            if len(msg) > 1900:
-                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
-            await ctx.send(chunk)
-            msg = msg[len(chunk):].lstrip("\n")
-        return
-
-    removed = 0
-    for ticker, tfs in history.items():
-        for tf, sides in tfs.items():
-            for side in ("long", "short"):
-                before = len(sides.get(side, []))
-                sides[side] = [
-                    r for r in sides.get(side, [])
-                    if not (r.get("synthetic") or r.get("track") == "sim")
-                ]
-                removed += before - len(sides[side])
-
-    save_signals_history(history)
-    await ctx.send(f"🗑️ Removed {removed} synthetic (`!sim`) record(s). `!debug`/`!signals` totals will now match the web dashboard's History tab.")
 
 @core.bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
@@ -1036,6 +972,36 @@ async def components_cmd(ctx, min_samples: int = 30):
         logger.error(f"Components command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
+async def _run_sim_job(ctx, kind: str, params: dict, run, intro: str):
+    """Starts a background simulation job (sim_jobs.py - shared with the web
+    dashboard, one at a time) and waits for it, posting a short progress line
+    about every 90 s so a multi-minute run isn't silent. Returns the job's
+    result, or None when it could not start / failed (already reported)."""
+    try:
+        job = sim_jobs.jobs.start(kind, params, run)
+    except sim_jobs.SimBusy as busy:
+        await ctx.send(
+            f"⏳ A {busy.job.kind} simulation is already running "
+            f"({busy.job.done}/{busy.job.total} backtests done) — wait for it to finish."
+        )
+        return None
+
+    await ctx.send(intro)
+    while True:
+        finished, _ = await asyncio.wait({job.task}, timeout=90)
+        if finished:
+            break
+        try:
+            await ctx.send(f"⏳ …{job.done}/{job.total} backtests done ({job.message})")
+        except Exception as e:
+            logger.warning(f"[SIM] progress message failed: {e}")
+
+    if job.status == "done":
+        return job.result
+    await ctx.send(f"❌ Simulation {job.status}: {job.error}")
+    return None
+
+
 @core.bot.command(name="tp1sim", aliases=["tp1compare"])
 async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
     """
@@ -1096,13 +1062,17 @@ async def tp1sim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
             await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
             return
 
-    await ctx.send(
-        f"⏳ Running TP1-mode comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 4 modes, "
-        f"{num_bars} bars each. This is slow — sit tight."
-    )
-
     try:
-        result = await run_tp1_mode_comparison(exchange, scope_tickers, scope_tfs, num_bars)
+        result = await _run_sim_job(
+            ctx, "tp1sim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars},
+            lambda progress: run_tp1_mode_comparison(exchange, scope_tickers, scope_tfs, num_bars, progress=progress),
+            intro=(
+                f"⏳ Running TP1-mode comparison: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × 4 modes, "
+                f"{num_bars} bars each. This is slow — sit tight."
+            ),
+        )
+        if result is None:
+            return
 
         lines = [f"**🧪 TP1-mode comparison** (dry-run backtest, {num_bars} bars requested — nothing written to history)\n"]
 
@@ -1203,13 +1173,17 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
             return
 
     min_samples = max(1, min(10000, min_samples))
-    await ctx.send(
-        f"⏳ Running component backtest: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), "
-        f"{num_bars} bars each (+ BTC benchmark fetch per pair). This is slow — sit tight."
-    )
-
     try:
-        report = await run_component_backtest(exchange, scope_tickers, scope_tfs, num_bars, min_samples)
+        report = await _run_sim_job(
+            ctx, "compsim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "min_samples": min_samples},
+            lambda progress: run_component_backtest(exchange, scope_tickers, scope_tfs, num_bars, min_samples, progress=progress),
+            intro=(
+                f"⏳ Running component backtest: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), "
+                f"{num_bars} bars each (+ BTC benchmark fetch per pair). This is slow — sit tight."
+            ),
+        )
+        if report is None:
+            return
 
         lines = [f"**🧪 Component backtest** ({report['total_closed']} closed records simulated, {num_bars} bars requested per pair/tf)\n"]
 
@@ -1532,100 +1506,6 @@ async def reset_cmd(ctx, confirm: str = ""):
         core.market_scanner.start()
 
     await ctx.send(f"🎓 Fresh backtest complete! Total signals: **{total}**\nRun `!signals` to see statistics.")
-
-@core.bot.command(name="sim")
-async def sim_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):
-    side = side.lower()
-    if side not in ("long", "short"):
-        await ctx.send("Side must be `long` or `short`")
-        return
-
-    ticker = ticker.upper()
-    tf = tf.lower()
-
-    if tf not in TIMEFRAMES:
-        await ctx.send(f"❌ Unknown timeframe. Available: {', '.join(TIMEFRAMES)}")
-        return
-
-    await ctx.send(f"Simulating {side.upper()} signal for `{ticker}` `{tf}`…")
-
-    exchange = core._exchange_ref
-    if exchange is None:
-        await ctx.send("❌ Exchange not initialized")
-        return
-
-    # 🆕 FIX: Use lock during sim
-    async with _cmd_lock(ticker, tf):
-        try:
-            bars = await asyncio.to_thread(exchange.fetch_ohlcv, ticker, tf, limit=100)
-            df = parse_ohlcv(bars)
-
-            last_close = float(df["close"].iloc[-2])
-
-            atr14 = calculate_atr(df, ATR_PERIOD)
-
-            fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
-
-            idx = len(df) - 2
-
-            sl, sl_desc = calculate_adaptive_sl(last_close, side, ticker, tf, fs, fu, fl, atr14, idx)
-
-            tp1, tp2, tp_desc = calculate_combined_tp(ticker, tf, side, last_close, sl, df, idx, atr14)
-            tp = tp2
-
-
-            # 🆕 FIX BUG-HI005: compute a realistic MFE/MAE before closing the record.
-            # Before: update_signal_mae_mfe was NOT called, so max_favorable_pct and
-            # max_adverse_pct stayed at 0.0, skewing the TP percentile.
-            # Now: call update_signal_mae_mfe for both SL and TP, so realistic
-            # MAE/MFE values get written to history.
-            #
-            # 🆕 FIX: tag with track="sim" + synthetic=True — this record is
-            # idealized (the full move to TP AND to SL at once) and used to be
-            # written under the same track as real A/U trades, skewing
-            # calculate_adaptive_sl/tp (including inflating the adaptive SL,
-            # since max_adverse_pct here equals the full distance to SL).
-            # Such records are now excluded from stats/calibration (see state.py).
-            add_signal_record(
-                ticker, tf, side, last_close, datetime.now(timezone.utc).isoformat(),
-                track="sim", synthetic=True,
-            )
-
-            # Compute MFE (maximum favorable move = TP)
-            # and MAE (maximum adverse move = SL) for correct statistics
-            update_signal_mae_mfe(ticker, tf, side, tp, track="sim")   # MFE = (TP - entry)/entry
-            update_signal_mae_mfe(ticker, tf, side, sl, track="sim")   # MAE = (entry - SL)/entry
-
-            update_signal_record(ticker, tf, side, tp, "tp", 5, track="sim")
-
-            stats = get_signal_stats(ticker, tf, side)
-
-
-            lines = [f"✅ Simulated {side.upper()} signal recorded!"]
-
-            lines.append(f"• Entry: **${format_price(last_close)}**")
-
-            lines.append(f"• SL: **${format_price(sl)}**")
-
-            lines.append(f"• TP: **${format_price(tp)}**")
-
-            # 🆕 NOTE: stats['count'] now only counts real (non-sim) closed
-            # signals — the synthetic sim record isn't part of the calibration.
-            lines.append(f"• Real closed {side} signals in history: **{stats['count']}** (the sim record is tagged separately and doesn't affect adaptive TP/SL)")
-
-            msg = "\n".join(lines)
-            while msg:
-                chunk = msg[:1900]
-                if len(msg) > 1900:
-                    chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
-                await ctx.send(chunk)
-                msg = msg[len(chunk):].lstrip("\n")
-
-        except Exception as e:
-            logger.error(f"Sim command error: {e}", exc_info=True)
-
-            await ctx.send(f"❌ Simulation failed: {e}")
-
 
 @core.bot.command(name="forcerun")
 async def forcerun_cmd(ctx, side: str = "long", ticker: str = "BTC/USDT", tf: str = "1h"):

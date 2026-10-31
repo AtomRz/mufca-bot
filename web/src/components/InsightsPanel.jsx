@@ -560,29 +560,144 @@ function BarCoverageWarning({ coverage, requested }) {
   )
 }
 
+// 🆕 Simulations run as background jobs on the server (see sim_jobs.py): starting one
+// returns a job id immediately and this hook polls it every 2 s. A single long HTTP
+// request used to be dropped by the Cloudflare Tunnel (~100 s limit) once a run got
+// big (e.g. 6000 bars x several pairs), so the page just never showed a result.
+// The last job id per kind lives at module level so a finished result (or a running
+// job) is still there after switching sub-tabs, which unmounts this view.
+const simMemory = { tp1sim: null, compsim: null }
+
+function useSimJob(kind) {
+  const [job, setJob] = useState(null)
+  const [error, setError] = useState(null)
+  const [otherRunning, setOtherRunning] = useState(null)
+  const timer = useRef(null)
+  const alive = useRef(true)
+
+  const stopPolling = () => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null }
+  }
+
+  const poll = (id) => {
+    stopPolling()
+    timer.current = setTimeout(async () => {
+      if (!alive.current) return
+      if (document.hidden) { poll(id); return } // don't wake the radio for a hidden tab
+      try {
+        const j = await api.getSimJob(id)
+        if (!alive.current) return
+        setJob(j)
+        if (j.status === 'running') poll(id)
+      } catch (e) {
+        if (!alive.current) return
+        if (/unknown or expired/i.test(e.message)) {
+          simMemory[kind] = null
+          setError('The simulation result expired on the server — run it again.')
+        } else {
+          poll(id) // transient network error (e.g. phone switching networks): keep trying
+        }
+      }
+    }, 2000)
+  }
+
+  useEffect(() => {
+    alive.current = true
+    ;(async () => {
+      let adopted = false
+      try {
+        const { job: active } = await api.getActiveSim()
+        if (!alive.current) return
+        if (active && active.kind === kind) {
+          simMemory[kind] = active.id
+          setJob(active)
+          poll(active.id)
+          adopted = true
+        } else if (active) {
+          setOtherRunning(active)
+        }
+      } catch (_) { /* fall through to the remembered job */ }
+      if (adopted || !simMemory[kind]) return
+      try {
+        const j = await api.getSimJob(simMemory[kind])
+        if (!alive.current) return
+        setJob(j)
+        if (j.status === 'running') poll(j.id)
+      } catch (_) {
+        simMemory[kind] = null
+      }
+    })()
+    return () => { alive.current = false; stopPolling() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const start = async (startRequest) => {
+    setError(null)
+    setOtherRunning(null)
+    try {
+      const j = await startRequest()
+      simMemory[kind] = j.id
+      setJob(j)
+      poll(j.id)
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
+  const cancel = async () => {
+    if (!job) return
+    try { await api.cancelSimJob(job.id) } catch (e) { setError(e.message) }
+  }
+
+  return { job, error, setError, otherRunning, start, cancel, running: job?.status === 'running' }
+}
+
+function SimProgress({ job, onCancel }) {
+  const { done, total, message } = job.progress
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <p style={{ color: 'var(--text-faint)', fontSize: 13, marginBottom: 6 }}>
+        Running… {done}/{total || '?'} backtests · {message} · {Math.round(job.elapsed_seconds)}s
+        {' '}<button className="btn" onClick={onCancel} style={{ marginLeft: 8 }}>Cancel</button>
+      </p>
+      <progress value={done} max={Math.max(total, 1)} style={{ width: '100%' }} />
+    </div>
+  )
+}
+
+function SimStatus({ sim }) {
+  const { job, error, otherRunning } = sim
+  return (
+    <>
+      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
+      {job && (job.status === 'error' || job.status === 'cancelled') && (
+        <p style={{ color: 'var(--short)', fontSize: 13 }}>
+          {job.status === 'cancelled' ? 'Cancelled.' : `Failed: ${job.error}`}
+        </p>
+      )}
+      {otherRunning && !sim.running && (
+        <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>
+          Another simulation ({otherRunning.kind}) is running — {otherRunning.progress.done}/{otherRunning.progress.total} done.
+          Only one runs at a time.
+        </p>
+      )}
+      {sim.running && <SimProgress job={job} onCancel={sim.cancel} />}
+    </>
+  )
+}
+
 function Tp1SimSection({ pairs, timeframes }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
-  const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState(null)
-  const [ranBars, setRanBars] = useState(numBars) // bars of the run that produced `result`, not of the input now
-  const [error, setError] = useState(null)
+  const sim = useSimJob('tp1sim')
+  const result = sim.job?.status === 'done' ? sim.job.result : null
+  const ranBars = sim.job?.params?.num_bars ?? numBars // bars of the run that produced `result`, not of the input now
 
-  const run = async () => {
+  const run = () => {
     const bad = barsError(numBars)
-    if (bad) { setError(bad); return }
-    setLoading(true)
-    setError(null)
-    try {
-      const r = await api.runTp1Sim({ ticker, tf, numBars })
-      setResult(r)
-      setRanBars(numBars)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
+    if (bad) { sim.setError(bad); return }
+    sim.start(() => api.runTp1Sim({ ticker, tf, numBars }))
   }
 
   return (
@@ -595,11 +710,10 @@ function Tp1SimSection({ pairs, timeframes }) {
       <SimScopeFields
         pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
-        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+        extra={<button onClick={run} disabled={sim.running}>{sim.running ? 'Running…' : 'Run'}</button>}
       />
-      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
-      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests across pairs × timeframes × 4 modes — this is slow, sit tight…</p>}
-      {result && !loading && (
+      <SimStatus sim={sim} />
+      {result && !sim.running && (
         <>
           <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
           {Object.entries(result.modes).map(([modeName, rows]) => (
@@ -636,25 +750,15 @@ function CompSimSection({ pairs, timeframes }) {
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
   const [minSamples, setMinSamples] = useState(30)
-  const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState(null)
-  const [ranBars, setRanBars] = useState(numBars)
-  const [error, setError] = useState(null)
+  const sim = useSimJob('compsim')
+  const result = sim.job?.status === 'done' ? sim.job.result : null
+  const ranBars = sim.job?.params?.num_bars ?? numBars
+  const ranMinSamples = sim.job?.params?.min_samples ?? minSamples
 
-  const run = async () => {
+  const run = () => {
     const bad = barsError(numBars)
-    if (bad) { setError(bad); return }
-    setLoading(true)
-    setError(null)
-    try {
-      const r = await api.runCompSim({ ticker, tf, numBars, minSamples })
-      setResult(r)
-      setRanBars(numBars)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
+    if (bad) { sim.setError(bad); return }
+    sim.start(() => api.runCompSim({ ticker, tf, numBars, minSamples }))
   }
 
   return (
@@ -667,11 +771,10 @@ function CompSimSection({ pairs, timeframes }) {
       <SimScopeFields
         pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
-        extra={<button onClick={run} disabled={loading}>{loading ? 'Running…' : 'Run'}</button>}
+        extra={<button onClick={run} disabled={sim.running}>{sim.running ? 'Running…' : 'Run'}</button>}
       />
-      {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
-      {loading && <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>Running backtests (each also fetches BTC as the relative-strength benchmark) — this is slow, sit tight…</p>}
-      {result && !loading && (
+      <SimStatus sim={sim} />
+      {result && !sim.running && (
         <>
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>{result.total_closed} closed records simulated.</p>
           <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
@@ -684,7 +787,7 @@ function CompSimSection({ pairs, timeframes }) {
                   <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No records carry this component.</p>
                 ) : (
                   rows.map((row, i) => (
-                    <ComponentRow key={i} row={row} minSamples={minSamples} />
+                    <ComponentRow key={i} row={row} minSamples={ranMinSamples} />
                   ))
                 )}
               </div>
