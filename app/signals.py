@@ -1302,6 +1302,29 @@ async def check_signals(
                 )
             sig_a_long = sig_a_short = sig_u_long = sig_u_short = False
 
+        # 🆕 Per-track/side entry switches (Settings → "Entry switches", see
+        # ENTRY_BLOCK in config.py). Applied BEFORE the in_long/in_short flags
+        # are set below, so a blocked signal leaves no state behind.
+        # A-track confirmations stay True for the whole closed bar, so the
+        # attempt-bar mark (same one open_position's caller sets) keeps the
+        # skip to one log line per bar instead of one per scan cycle.
+        if sig_a_long and _cfg.is_entry_blocked("a", "long", regime):
+            logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-LONG skipped — switched off for regime={regime}")
+            sig_a_long = False
+            if not dry_run:
+                state["last_a_long_attempt_bar"] = bar_time
+        if sig_a_short and _cfg.is_entry_blocked("a", "short", regime):
+            logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-SHORT skipped — switched off for regime={regime}")
+            sig_a_short = False
+            if not dry_run:
+                state["last_a_short_attempt_bar"] = bar_time
+        if sig_u_long and _cfg.is_entry_blocked("u", "long", regime):
+            logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-LONG skipped — switched off for regime={regime}")
+            sig_u_long = False
+        if sig_u_short and _cfg.is_entry_blocked("u", "short", regime):
+            logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-SHORT skipped — switched off for regime={regime}")
+            sig_u_short = False
+
         # Track flags are only set on an actual open (not dry_run), and ALWAYS
         # together with active_trade, so they never get out of sync.
         # 🆕 FIX BUG-LO006: last_{track}_{side}_bar/_time (cooldown) are no
