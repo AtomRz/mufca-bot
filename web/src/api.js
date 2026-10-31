@@ -120,6 +120,7 @@ export const api = {
     request(`/api/derivatives${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   getSpread: (ticker) =>
     request(`/api/spread${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
+  getShadow: () => request('/api/shadow'),
   getComponents: (minSamples = 30, split = false, shadow = false) =>
     request(`/api/components?min_samples=${minSamples}&split=${split}&shadow=${shadow}`),
   // 🆕 Simulations are background jobs: run* returns {id, status, progress, ...}
