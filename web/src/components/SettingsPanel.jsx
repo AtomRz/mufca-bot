@@ -22,6 +22,13 @@ const FILTER_TOGGLES = [
   },
 ]
 
+const ENTRY_SWITCHES = [
+  { key: 'a_long', label: 'A-track long' },
+  { key: 'a_short', label: 'A-track short' },
+  { key: 'u_long', label: 'U-track long' },
+  { key: 'u_short', label: 'U-track short' },
+]
+
 function Toggle({ checked, onChange, disabled }) {
   return (
     <label className="switch">
@@ -259,6 +266,22 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => run('intrabar_check', () => api.setIntrabarCheck(v))}
               />
             </div>
+            {ENTRY_SWITCHES.map(({ key, label }) => (
+              <div className="field" key={key}>
+                <label title="Stops NEW entries for this track and side. Open trades are not affected. Off in TREND = still opens in NORMAL/CHAOS. Based on !compsim win-rates; the backtest itself ignores this switch.">
+                  Entry: {label}
+                </label>
+                <select
+                  value={config.entry_block?.[key] ?? 'allow'}
+                  disabled={busy === `entry_block_${key}`}
+                  onChange={(e) => run(`entry_block_${key}`, () => api.setEntryBlock(key, e.target.value))}
+                >
+                  <option value="allow">On</option>
+                  <option value="block_trend">Off in TREND</option>
+                  <option value="block_all">Off (all regimes)</option>
+                </select>
+              </div>
+            ))}
             <div className="field">
               <label title="How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard's live numbers are.">Scan interval</label>
               <select

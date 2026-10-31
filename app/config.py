@@ -816,6 +816,53 @@ def save_intrabar_check(enabled: bool):
 INTRABAR_CHECK_ENABLED = load_intrabar_check()
 
 # =====================================================================
+# 🚫  PER-TRACK / PER-SIDE ENTRY SWITCHES
+# =====================================================================
+# Component backtest (ETH+BTC, 8000 bars) showed some track/side/regime
+# combinations losing consistently (e.g. U-track long in TREND: win_rate
+# 9-19% on n=31-47). relative_strength / volume_profile are informational
+# confidence components and gate nothing, so there was no way to switch a
+# weak combination off — this is that switch.
+#
+# One mode per track+side:
+#   "allow"        — default, no change in behavior
+#   "block_trend"  — don't open this track+side while regime == "TREND"
+#   "block_all"    — don't open this track+side in any regime
+#
+# Applied in check_signals() right where the sig_{track}_{side} flags are
+# finalized, so a blocked signal opens nothing: no in_long/in_short flag and
+# no cooldown. (A-track only records the per-bar attempt mark, purely so the
+# skip is logged once per bar instead of on every scan cycle.)
+# Live scanning only: backtest_history() does NOT apply it, so !compsim /
+# !tp1sim still show the unfiltered picture of each combination.
+ENTRY_BLOCK_KEYS = ("a_long", "a_short", "u_long", "u_short")
+ENTRY_BLOCK_MODES = ("allow", "block_trend", "block_all")
+ENTRY_BLOCK_FILE = os.path.join(DATA_DIR, "entry_block.json")
+
+def load_entry_block() -> dict:
+    data = safe_json_load(ENTRY_BLOCK_FILE, {})
+    out = {k: "allow" for k in ENTRY_BLOCK_KEYS}
+    if isinstance(data, dict):
+        for k in ENTRY_BLOCK_KEYS:
+            if data.get(k) in ENTRY_BLOCK_MODES:
+                out[k] = data[k]
+    return out
+
+def save_entry_block(modes: dict):
+    safe_json_save(ENTRY_BLOCK_FILE, {k: modes.get(k, "allow") for k in ENTRY_BLOCK_KEYS})
+
+ENTRY_BLOCK = load_entry_block()
+
+def is_entry_blocked(track: str, side: str, regime: str) -> bool:
+    """True if opening `track`/`side` is switched off for the current regime.
+    Reads ENTRY_BLOCK at call time, so a Settings change applies on the next
+    scan without a restart."""
+    mode = ENTRY_BLOCK.get(f"{track}_{side}", "allow")
+    if mode == "block_all":
+        return True
+    return mode == "block_trend" and regime == "TREND"
+
+# =====================================================================
 # 📈  HURST ANIS-LLOYD BIAS CORRECTION
 # =====================================================================
 # ON  (default) — the R/S Hurst estimate is Anis-Lloyd bias-corrected, so pure

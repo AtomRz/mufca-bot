@@ -935,6 +935,7 @@ async def get_config():
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
+        "entry_block": dict(_cfg.ENTRY_BLOCK),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
@@ -1241,6 +1242,29 @@ async def set_intrabar_check(body: IntrabarCheckIn):
     _cfg.save_intrabar_check(_cfg.INTRABAR_CHECK_ENABLED)
     await broadcast_event({"type": "config_changed", "key": "intrabar_check_enabled", "value": _cfg.INTRABAR_CHECK_ENABLED})
     return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": True}
+
+
+class EntryBlockIn(BaseModel):
+    key: str   # one of config.ENTRY_BLOCK_KEYS: a_long / a_short / u_long / u_short
+    mode: str  # one of config.ENTRY_BLOCK_MODES: allow / block_trend / block_all
+
+
+@app.post("/api/config/entry-block")
+async def set_entry_block(body: EntryBlockIn):
+    """Switches one track+side off (in TREND only, or in every regime) or back
+    on, live (no restart). Open trades are NOT touched — this only stops new
+    entries from opening. See config.ENTRY_BLOCK."""
+    if body.key not in _cfg.ENTRY_BLOCK_KEYS:
+        raise HTTPException(400, f"key must be one of {list(_cfg.ENTRY_BLOCK_KEYS)}")
+    if body.mode not in _cfg.ENTRY_BLOCK_MODES:
+        raise HTTPException(400, f"mode must be one of {list(_cfg.ENTRY_BLOCK_MODES)}")
+    if body.mode == _cfg.ENTRY_BLOCK.get(body.key):
+        return {"entry_block": dict(_cfg.ENTRY_BLOCK), "changed": False}
+
+    _cfg.ENTRY_BLOCK[body.key] = body.mode  # in place: is_entry_blocked() reads the same dict
+    _cfg.save_entry_block(_cfg.ENTRY_BLOCK)
+    await broadcast_event({"type": "config_changed", "key": "entry_block", "value": dict(_cfg.ENTRY_BLOCK)})
+    return {"entry_block": dict(_cfg.ENTRY_BLOCK), "changed": True}
 
 
 class HurstBiasCorrectionIn(BaseModel):
