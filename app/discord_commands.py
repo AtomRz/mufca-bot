@@ -902,8 +902,14 @@ async def signals_cmd(ctx, ticker: str = "", tf: str = "", side: str = ""):
         await ctx.send(f"❌ Error: {e}")
 
 @core.bot.command(name="components", aliases=["confcomp"])
-async def components_cmd(ctx, min_samples: int = 30):
+async def components_cmd(ctx, *args):
     """
+    Usage: !components [min_samples] [split] [shadow]   (any order, all optional)
+      split  — also bucket by track and regime (like !compsim does).
+      shadow — add rows for entries an Entry switch (web Settings) blocked,
+               replayed on the bars that followed (shadow.py); marked
+               `shadow`, never pooled with real trades.
+
     🆕 (external review): reports whether the relative_strength /
     volume_profile confidence components (see calc_confidence() in
     signals.py) actually correlate with trade outcomes, bucketed by
@@ -925,9 +931,33 @@ async def components_cmd(ctx, min_samples: int = 30):
     are only a first look.
     """
     try:
-        report = analyze_confidence_components(min_samples=min_samples)
+        min_samples = 30
+        opts = set()
+        bad = []
+        for a in args:
+            a = str(a).lower()
+            if a.isdigit():
+                min_samples = int(a)
+            elif a in ("split", "shadow"):
+                opts.add(a)
+            else:
+                bad.append(a)
+        if bad:
+            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!components [min_samples] [split] [shadow]`")
+            return
+        want_split = "split" in opts
+        want_shadow = "shadow" in opts
 
-        lines = [f"**🧪 Confidence component analysis** ({report['total_closed']} closed records total)\n"]
+        report = analyze_confidence_components(
+            min_samples=min_samples,
+            group_by=["track", "regime"] if want_split else None,
+            include_shadow=want_shadow,
+        )
+
+        header = f"**🧪 Confidence component analysis** ({report['total_closed']} closed records total"
+        if want_shadow:
+            header += f", {report.get('shadow_closed', 0)} closed shadow"
+        lines = [header + ")\n"]
 
         for comp_name in ("relative_strength", "volume_profile"):
             rows = report["components"][comp_name]
@@ -939,8 +969,13 @@ async def components_cmd(ctx, min_samples: int = 30):
                 raw_str = f", raw_mfe={row['avg_raw_mfe']:.2f}% (n={row['raw_mfe_n']})" if row["avg_raw_mfe"] is not None else ", raw_mfe=n/a"
                 flag = "" if row["enough_samples"] else f" ⚠️ only {row['n']}/{min_samples}"
                 exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
+                slice_str = ""
+                if "track" in row or "regime" in row:
+                    slice_str += f" track={row.get('track', '?')} regime={row.get('regime', '?')}"
+                if row.get("src") == "shadow":
+                    slice_str += " 👻shadow"
                 lines.append(
-                    f"  `{row['side']}` value={row['value']:>3}: n={row['n']} win_rate={row['win_rate']:.0%} "
+                    f"  `{row['side']}` value={row['value']:>3}{slice_str}: n={row['n']} win_rate={row['win_rate']:.0%} "
                     f"avg_mfe={row['avg_mfe']:.2f}%{raw_str}  [{exit_str}]{flag}"
                 )
             lines.append("")

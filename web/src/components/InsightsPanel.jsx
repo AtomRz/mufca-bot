@@ -435,6 +435,14 @@ function ComponentRow({ row, minSamples }) {
             {row.track ? `track=${row.track}` : ''}{row.track && row.regime ? ' ' : ''}{row.regime ? `regime=${row.regime}` : ''}
           </span>
         )}
+        {row.src === 'shadow' && (
+          <span
+            style={{ color: 'var(--accent)', fontSize: 11 }}
+            title="Entry was switched off in Settings, so no trade was opened — this is the outcome it WOULD have had, replayed on the bars that followed (closed-bar model, not a real fill)."
+          >
+            shadow
+          </span>
+        )}
         {!row.enough_samples && (
           <span style={{ color: 'var(--accent)', fontSize: 11 }} title={`Only ${row.n}/${minSamples} — not enough yet to trust this row`}>
             ⚠ {row.n}/{minSamples}
@@ -457,8 +465,15 @@ function ComponentRow({ row, minSamples }) {
 
 function ComponentsView({ lastEvent }) {
   const minSamples = 30
+  const [split, setSplit] = useState(false)
+  const [shadow, setShadow] = useState(false)
   // This only changes when a trade closes, not every scan tick — a slow poll is enough.
-  const { data: report, error: loadError } = usePolled(() => api.getComponents(minSamples), 'components', 60000, lastEvent)
+  const { data: report, error: loadError } = usePolled(
+    () => api.getComponents(minSamples, split, shadow),
+    `components-${split}-${shadow}`,
+    60000,
+    lastEvent,
+  )
   const error = report ? null : loadError
 
   if (error) {
@@ -481,6 +496,16 @@ function ComponentsView({ lastEvent }) {
           it's not truncated by whatever TP/SL policy closed the trade, so it's the number worth
           trusting once it has enough samples of its own. win_rate/avg_mfe are only a first look.
         </p>
+        <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginTop: 10, fontSize: 13 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }} title="Bucket every row by track (A/U) and regime (TREND/NORMAL) as well — the same split !compsim uses. Live samples per bucket are small, so expect many ⚠ rows.">
+            <input type="checkbox" checked={split} onChange={(e) => setSplit(e.target.checked)} />
+            Split by track / regime
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }} title="Adds rows for signals an Entry switch (Settings) stopped from opening, replayed on the bars that followed. Shown separately, never pooled with real trades.">
+            <input type="checkbox" checked={shadow} onChange={(e) => setShadow(e.target.checked)} />
+            Include shadow (blocked entries){report.shadow_closed ? ` — ${report.shadow_closed} closed` : ''}
+          </label>
+        </div>
       </div>
 
       {['relative_strength', 'volume_profile'].map((compName) => {
@@ -491,7 +516,13 @@ function ComponentsView({ lastEvent }) {
             {rows.length === 0 ? (
               <p style={{ color: 'var(--text-faint)', fontSize: 13 }}>No closed records carry this component yet.</p>
             ) : (
-              rows.map((row) => <ComponentRow key={`${row.side}-${row.value}`} row={row} minSamples={minSamples} />)
+              rows.map((row) => (
+                <ComponentRow
+                  key={`${row.side}-${row.value}-${row.track ?? ''}-${row.regime ?? ''}-${row.src ?? ''}`}
+                  row={row}
+                  minSamples={minSamples}
+                />
+              ))
             )}
           </div>
         )
