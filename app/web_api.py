@@ -580,7 +580,6 @@ async def get_status():
             result["pairs"][ticker][tf] = {
                 "a_active_trade": st.get("a_active_trade"),
                 "u_active_trade": st.get("u_active_trade"),
-                "b_active_trade": st.get("b_active_trade"),
                 "last_bar_time": st.get("last_bar_time"),
             }
     return result
@@ -906,7 +905,7 @@ async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track
                                 timestamp: Optional[str] = None, entry: Optional[float] = None):
     """Deletes a single closed-trade record from signals_history.json —
     used by the History tab's per-row delete button to clean up duplicate or
-    junk entries (e.g. left behind by re-running `!backfill_breakout` after
+    junk entries (e.g. left behind by re-running a backfill after
     a parameter change)."""
     ticker = unquote(ticker).upper().strip()
     side = side.lower()
@@ -948,8 +947,6 @@ async def get_config():
         "chop_threshold": CHOP_THRESHOLD,
         "hurst_window": _cfg.HURST_WINDOW,
         "hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION,
-        "hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT,
-        "htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT,
         "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
         "hurst_mode": _cfg.HURST_MODE,
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
@@ -976,14 +973,6 @@ async def get_config():
             "bb_stddev": _cfg.BB_STDDEV,
             "sr_pivot_window": _cfg.SR_PIVOT_WINDOW,
             "sr_max_levels": _cfg.SR_MAX_LEVELS,
-        },
-        "breakout": {
-            "lookback": _cfg.BREAKOUT_LOOKBACK,
-            "squeeze_window": _cfg.BREAKOUT_SQUEEZE_WINDOW,
-            "squeeze_percentile": _cfg.BREAKOUT_SQUEEZE_PERCENTILE,
-            "vol_spike_mult": _cfg.BREAKOUT_VOL_SPIKE_MULT,
-            "range_atr_mult": _cfg.BREAKOUT_RANGE_ATR_MULT,
-            "close_loc_min": _cfg.BREAKOUT_CLOSE_LOC_MIN,
         },
         "volume_profile": {
             "enabled": _cfg.VP_ENABLED,
@@ -1272,42 +1261,6 @@ async def set_hurst_bias_correction(body: HurstBiasCorrectionIn):
     _cfg.save_hurst_bias_correction(_cfg.HURST_BIAS_CORRECTION)
     await broadcast_event({"type": "config_changed", "key": "hurst_bias_correction", "value": _cfg.HURST_BIAS_CORRECTION})
     return {"hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION, "changed": True}
-
-
-class HurstBreakoutIn(BaseModel):
-    enabled: bool
-
-
-@app.post("/api/config/hurst-breakout")
-async def set_hurst_breakout(body: HurstBreakoutIn):
-    """Whether the Hurst filter also gates the Breakout (B) track. Only has an
-    effect while the Hurst filter itself is enabled. See
-    config.HURST_APPLY_TO_BREAKOUT."""
-    if body.enabled == _cfg.HURST_APPLY_TO_BREAKOUT:
-        return {"hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT, "changed": False}
-
-    _cfg.HURST_APPLY_TO_BREAKOUT = body.enabled
-    _cfg.save_hurst_apply_to_breakout(_cfg.HURST_APPLY_TO_BREAKOUT)
-    await broadcast_event({"type": "config_changed", "key": "hurst_apply_to_breakout", "value": _cfg.HURST_APPLY_TO_BREAKOUT})
-    return {"hurst_apply_to_breakout": _cfg.HURST_APPLY_TO_BREAKOUT, "changed": True}
-
-
-class HtfBreakoutIn(BaseModel):
-    enabled: bool
-
-
-@app.post("/api/config/htf-breakout")
-async def set_htf_breakout(body: HtfBreakoutIn):
-    """Whether the HTF bias filter also gates the Breakout (B) track. Only has
-    an effect while the HTF bias filter itself is enabled. See
-    config.HTF_APPLY_TO_BREAKOUT."""
-    if body.enabled == _cfg.HTF_APPLY_TO_BREAKOUT:
-        return {"htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT, "changed": False}
-
-    _cfg.HTF_APPLY_TO_BREAKOUT = body.enabled
-    _cfg.save_htf_apply_to_breakout(_cfg.HTF_APPLY_TO_BREAKOUT)
-    await broadcast_event({"type": "config_changed", "key": "htf_apply_to_breakout", "value": _cfg.HTF_APPLY_TO_BREAKOUT})
-    return {"htf_apply_to_breakout": _cfg.HTF_APPLY_TO_BREAKOUT, "changed": True}
 
 
 class UthaIn(BaseModel):
@@ -1607,77 +1560,6 @@ async def set_indicators(body: IndicatorsIn):
         "bb_stddev": _cfg.BB_STDDEV,
         "sr_pivot_window": _cfg.SR_PIVOT_WINDOW,
         "sr_max_levels": _cfg.SR_MAX_LEVELS,
-    }
-
-
-_BREAKOUT_BOUNDS = {
-    # 🆕 Breakout track (B) — see config.py's BREAKOUT section for what each
-    # one does. Bounds are generous but not unlimited: e.g. squeeze_window
-    # must stay bigger than lookback (checked separately below, not per-field)
-    # or the squeeze percentile would be computed over a shorter span than
-    # the breakout level itself, which doesn't make sense.
-    "lookback": ("BREAKOUT_LOOKBACK", int, 5, 100),
-    "squeeze_window": ("BREAKOUT_SQUEEZE_WINDOW", int, 10, 300),
-    "squeeze_percentile": ("BREAKOUT_SQUEEZE_PERCENTILE", float, 0.05, 0.75),
-    "vol_spike_mult": ("BREAKOUT_VOL_SPIKE_MULT", float, 1.0, 10.0),
-    "range_atr_mult": ("BREAKOUT_RANGE_ATR_MULT", float, 0.5, 5.0),
-    "close_loc_min": ("BREAKOUT_CLOSE_LOC_MIN", float, 0.5, 0.99),
-}
-
-
-class BreakoutConfigIn(BaseModel):
-    # Any subset of fields — a partial PATCH, same pattern as IndicatorsIn.
-    lookback: Optional[int] = None
-    squeeze_window: Optional[int] = None
-    squeeze_percentile: Optional[float] = None
-    vol_spike_mult: Optional[float] = None
-    range_atr_mult: Optional[float] = None
-    close_loc_min: Optional[float] = None
-
-
-@app.post("/api/config/breakout")
-async def set_breakout_config(body: BreakoutConfigIn):
-    updates = body.model_dump(exclude_none=True)
-    if not updates:
-        raise HTTPException(400, "At least one field is required")
-
-    # Validate everything first (same reasoning as set_indicators — don't
-    # leave _cfg half-mutated if a later field in the same PATCH fails).
-    casted = {}
-    for key, value in updates.items():
-        attr, caster, lo, hi = _BREAKOUT_BOUNDS[key]
-        if not (lo <= value <= hi):
-            raise HTTPException(400, f"{key} must be between {lo} and {hi}")
-        casted[attr] = caster(value)
-
-    # squeeze_window must stay wider than lookback, or the squeeze
-    # percentile would be measured over a shorter span than the breakout
-    # range itself — check against whichever value (new or current) applies
-    # after this PATCH.
-    new_window = casted.get("BREAKOUT_SQUEEZE_WINDOW", _cfg.BREAKOUT_SQUEEZE_WINDOW)
-    new_lookback = casted.get("BREAKOUT_LOOKBACK", _cfg.BREAKOUT_LOOKBACK)
-    if new_window <= new_lookback:
-        raise HTTPException(400, "squeeze_window must be greater than lookback")
-
-    for attr, value in casted.items():
-        setattr(_cfg, attr, value)
-
-    _cfg.save_breakout_config({
-        "BREAKOUT_LOOKBACK": _cfg.BREAKOUT_LOOKBACK,
-        "BREAKOUT_SQUEEZE_WINDOW": _cfg.BREAKOUT_SQUEEZE_WINDOW,
-        "BREAKOUT_SQUEEZE_PERCENTILE": _cfg.BREAKOUT_SQUEEZE_PERCENTILE,
-        "BREAKOUT_VOL_SPIKE_MULT": _cfg.BREAKOUT_VOL_SPIKE_MULT,
-        "BREAKOUT_RANGE_ATR_MULT": _cfg.BREAKOUT_RANGE_ATR_MULT,
-        "BREAKOUT_CLOSE_LOC_MIN": _cfg.BREAKOUT_CLOSE_LOC_MIN,
-    })
-    await broadcast_event({"type": "config_changed", "key": "breakout"})
-    return {
-        "lookback": _cfg.BREAKOUT_LOOKBACK,
-        "squeeze_window": _cfg.BREAKOUT_SQUEEZE_WINDOW,
-        "squeeze_percentile": _cfg.BREAKOUT_SQUEEZE_PERCENTILE,
-        "vol_spike_mult": _cfg.BREAKOUT_VOL_SPIKE_MULT,
-        "range_atr_mult": _cfg.BREAKOUT_RANGE_ATR_MULT,
-        "close_loc_min": _cfg.BREAKOUT_CLOSE_LOC_MIN,
     }
 
 

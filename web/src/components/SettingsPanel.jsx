@@ -199,11 +199,9 @@ export default function SettingsPanel({ config, onChanged }) {
   const chopValue = (t) => chopDraft[t] ?? config.chop_threshold[t]
   const hurstWindowValue = (t) => hurstWindowDraft[t] ?? config.hurst_window[t]
   const ind = config.indicators
-  const brk = config.breakout
   const colors = config.colors
 
   const saveIndicator = (field, value) => run(`ind_${field}`, () => api.setIndicators({ [field]: value }))
-  const saveBreakout = (field, value) => run(`brk_${field}`, () => api.setBreakoutConfig({ [field]: value }))
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
   const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
   const saveZones = (field, value) => run(`zones_${field}`, () => api.setZones({ [field]: value }))
@@ -237,16 +235,6 @@ export default function SettingsPanel({ config, onChanged }) {
                   <option key={h} value={h}>{h}</option>
                 ))}
               </select>
-            </div>
-            <div className="toggle-row">
-              <span className="row-label" title="Also apply the HTF Bias filter to the Breakout (B) track. Off by default: a squeeze breakout is often the first move of a new trend, which the higher-timeframe bias only confirms later. A and U tracks are always gated when HTF Bias is on.">
-                HTF Bias applies to Breakout
-              </span>
-              <Toggle
-                checked={config.htf_apply_to_breakout ?? false}
-                disabled={busy === 'htf_breakout'}
-                onChange={(v) => run('htf_breakout', () => api.setHtfBreakout(v))}
-              />
             </div>
             <div className="field">
               <label title="Where to move SL after closing 50% at TP1">SL after TP1</label>
@@ -439,16 +427,6 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => run('hurst_bias_correction', () => api.setHurstBiasCorrection(v))}
               />
             </div>
-            <div className="toggle-row">
-              <span className="row-label" title="Also apply the Hurst filter to the Breakout (B) track. Off by default: on a breakout bar the Hurst window is still mostly the flat squeeze, so it lags and tends to block the very breakouts B exists to catch. A and U tracks are always gated when the Hurst filter is on.">
-                Apply to Breakout track
-              </span>
-              <Toggle
-                checked={config.hurst_apply_to_breakout ?? false}
-                disabled={busy === 'hurst_breakout'}
-                onChange={(v) => run('hurst_breakout', () => api.setHurstBreakout(v))}
-              />
-            </div>
             <NumberField
               label="Min Deviation from 0.5" hint="0–0.5 — higher = stricter, fewer but more selective signals"
               value={config.hurst_min_deviation} min={0} max={0.5} step={0.01}
@@ -637,28 +615,6 @@ export default function SettingsPanel({ config, onChanged }) {
               busyKey="ind_bb_stddev" busy={busy} onSave={(v) => saveIndicator('bb_stddev', v)} />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               Basis MA type and source are fixed (SMA of Close) — not configurable yet.
-            </p>
-          </div>
-
-          <div className="panel">
-            <h3 className="panel-title">Breakout Track (B)</h3>
-            <NumberField label="Squeeze Lookback" hint="5–100 bars — pre-breakout range (Darvas box)" value={brk.lookback} min={5} max={100}
-              busyKey="brk_lookback" busy={busy} onSave={(v) => saveBreakout('lookback', v)} />
-            <NumberField label="Squeeze Window" hint="10–300 bars — must stay > Squeeze Lookback" value={brk.squeeze_window} min={10} max={300}
-              busyKey="brk_squeeze_window" busy={busy} onSave={(v) => saveBreakout('squeeze_window', v)} />
-            <NumberField label="Squeeze Percentile" hint="0.05–0.75 — ATR% must sit below this percentile of its own window" value={brk.squeeze_percentile} min={0.05} max={0.75} step={0.01}
-              busyKey="brk_squeeze_percentile" busy={busy} onSave={(v) => saveBreakout('squeeze_percentile', v)} />
-            <NumberField label="Volume Spike Mult" hint="1.0–10.0 — breakout bar's volume vs its own 20-bar average" value={brk.vol_spike_mult} min={1} max={10} step={0.1}
-              busyKey="brk_vol_spike_mult" busy={busy} onSave={(v) => saveBreakout('vol_spike_mult', v)} />
-            <NumberField label="Range/ATR Mult" hint="0.5–5.0 — breakout bar's (high-low) vs ATR14" value={brk.range_atr_mult} min={0.5} max={5} step={0.1}
-              busyKey="brk_range_atr_mult" busy={busy} onSave={(v) => saveBreakout('range_atr_mult', v)} />
-            <NumberField label="Close Location Min" hint="0.5–0.99 — close must sit in top/bottom share of the bar's own range" value={brk.close_loc_min} min={0.5} max={0.99} step={0.01}
-              busyKey="brk_close_loc_min" busy={busy} onSave={(v) => saveBreakout('close_loc_min', v)} />
-            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Volatility-squeeze + volume/range breakout detector (Wyckoff SOS / VSA / NR7 methodology — see README).
-              Deliberately skips CHOP and FRAMA-direction filtering; ATR bounds, HTF bias, fake-break/liquidity-sweep,
-              Hurst, and spread filters still apply. Not backtestable retroactively past a config change — new values
-              only affect signals generated after saving.
             </p>
           </div>
 

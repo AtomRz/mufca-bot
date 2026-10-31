@@ -30,11 +30,9 @@ def calculate_relative_volume(df: pd.DataFrame, period: int = 20) -> pd.Series:
     reads as ~4.17x instead of the true ~5x vs. the *prior* baseline).
     Shifted by 1 so "how much bigger is this bar than the recent normal
     volume" doesn't have the bar answering that question baked into the
-    question itself. Matters most for the B-track breakout detector, which
-    thresholds directly on this value (BREAKOUT_VOL_SPIKE_MULT) — the old
-    self-inclusive version made genuine spikes read as systematically
-    smaller than they were, requiring an even bigger real spike to clear
-    the same nominal threshold."""
+    question itself. Matters most for anything that thresholds directly on
+    this value — the old self-inclusive version made genuine spikes read as
+    systematically smaller than they were."""
     vol_sma = df["volume"].shift(1).rolling(window=period).mean()
     return df["volume"] / (vol_sma + 1e-12)
 

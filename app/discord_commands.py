@@ -128,7 +128,7 @@ async def help_cmd(ctx):
         "**📖 MUFCA v4.0 — Commands**\n",
 
         "**📊 Monitoring**",
-        "`!status`       — scanner status: pairs, A/U/B tracks, volume",
+        "`!status`       — scanner status: pairs, A/U tracks, volume",
         "`!scan <pair> <tf>` — manual scan (e.g. `!scan BTC/USDT 1h`)",
         "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — signal statistics for a pair",
@@ -141,7 +141,6 @@ async def help_cmd(ctx):
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
-        "`!backfill_breakout [pair]` — backtest ONLY the B-track (Breakout) and add to history, without touching A/U",
         "",
 
         "**⚙️ Settings**",
@@ -212,13 +211,11 @@ async def status_cmd(ctx):
                     ts = str(last)
             a_trade = st.get("a_active_trade")
             u_trade = st.get("u_active_trade")
-            b_trade = st.get("b_active_trade")
 
             # Only show a position if both the flag AND active_trade are set.
             # If only the flag is set with no trade — that's a desync, show a warning.
             a_flag = "LONG" if st["a_in_long"] else "SHORT" if st["a_in_short"] else None
             u_flag = "LONG" if st["u_in_long"] else "SHORT" if st["u_in_short"] else None
-            b_flag = "LONG" if st["b_in_long"] else "SHORT" if st["b_in_short"] else None
 
             # 🆕 FIX BUG-HI001: removed a double assignment to a_pos.
             # Before: a_pos = f"⚠️{a_flag}" → then a_pos = "—" (overwriting it!)
@@ -240,22 +237,11 @@ async def status_cmd(ctx):
                     u_pos = f"⚠️{u_flag} (fixed)"  # ← same fix for the U-track
                 else:
                     u_pos = u_flag or "—"
-
-                # 🆕 Same fix for the B-track (Breakout)
-                if b_flag and not b_trade:
-                    logger.warning(f"[STATE] B-track desync fixed for {ticker} {tf}")
-                    core.state[ticker][tf]["b_in_long"] = False   # auto-heal
-                    core.state[ticker][tf]["b_in_short"] = False
-                    b_pos = f"⚠️{b_flag} (fixed)"
-                else:
-                    b_pos = b_flag or "—"
             trade_info = ""
             if a_trade:
                 trade_info += f" | 🎯[A] {a_trade['side'].upper()} @ ${format_price(a_trade['entry'])}"
             if u_trade:
                 trade_info += f" | 🎯[U] {u_trade['side'].upper()} @ ${format_price(u_trade['entry'])}"
-            if b_trade:
-                trade_info += f" | 🎯[B] {b_trade['side'].upper()} @ ${format_price(b_trade['entry'])}"
 
             # 🆕 Volume info
             vol_info = ""
@@ -271,7 +257,7 @@ async def status_cmd(ctx):
                 except Exception:
                     pass
 
-            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}** | B: **{b_pos}**{trade_info}{vol_info}")
+            lines.append(f"• `{ticker}` `{tf}` — bar: {ts} | A: **{a_pos}** | U: **{u_pos}**{trade_info}{vol_info}")
 
     # 🆕 FIX: used to cut the message at 1900 chars ("... (truncated)") — with a
     # few pairs × timeframes the tail pairs simply vanished from !status.
@@ -1206,7 +1192,7 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
                 exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
                 # 🆕 (external review, component-backtest follow-up): now
                 # broken down by track/regime (run_component_backtest()
-                # defaults to group_by=["track","regime"]) — pooling A/U/B
+                # defaults to group_by=["track","regime"]) — pooling A/U
                 # and TREND/NORMAL together risked hiding a real effect or
                 # manufacturing one that's really two cancelling out.
                 slice_str = f"track={row.get('track', '?')} regime={row.get('regime', '?')}"
@@ -1349,8 +1335,7 @@ async def chart_cmd(ctx, pair: str = "BTC", tf: str = "1h", limit: int = 50):
             if _tf_key == tf:
                 a_trade = st.get("a_active_trade")
                 u_trade = st.get("u_active_trade")
-                b_trade = st.get("b_active_trade")
-                active = a_trade or u_trade or b_trade or st.get("active_trade")
+                active = a_trade or u_trade or st.get("active_trade")
                 if active:
                     # 🆕 FIX: used to pass a positional "bar_opened" index computed
                     # on the signal's df — but !chart builds its own df with a
@@ -1405,9 +1390,9 @@ async def debug_cmd(ctx):
     lines.append(f"• History file: **{'Yes' if os.path.exists(SIGNALS_HISTORY_FILE) else 'No'}**")
 
     # 🆕 FIX: used to read the legacy "active_trade" key, which only !forcerun
-    # still sets — real A/U/B trades were never counted (always showed 0).
+    # still sets — real A/U trades were never counted (always showed 0).
     active_count = sum(
-        1 for t in list(TICKERS) for tf in TIMEFRAMES for tr in ("a", "u", "b")
+        1 for t in list(TICKERS) for tf in TIMEFRAMES for tr in _cfg.TRACKS
         if core.state.get(t, {}).get(tf, {}).get(f"{tr}_active_trade")
     )
     lines.append(f"• Active trades: **{active_count}**")
@@ -1651,46 +1636,6 @@ async def onchain_cmd(ctx):
         await msg.edit(content=report)
     except Exception as e:
         await msg.edit(content=f"❌ On-chain error: `{e}`")
-
-
-@core.bot.command(name="backfill_breakout")
-async def backfill_breakout_cmd(ctx, ticker: str = ""):
-    """Backtests ONLY the B-track (Breakout) and appends its signals to
-    history — safe to run on pairs that already have A/U history, unlike
-    !reset (which deletes and rebuilds everything, A/U included). Useful
-    right after adding a new track to a bot that's already been running for
-    a while: the normal startup backtest skips any ticker/tf whose history
-    is already non-empty (see startup_sequence in bot.py), so B never gets
-    its own backtest pass on existing pairs — only live signals from here
-    on, which can take a long time to accumulate given how selective the
-    squeeze+volume conditions are by design.
-
-    !backfill_breakout            — all tracked pairs
-    !backfill_breakout ETH/USDT   — one pair only
-    """
-    exchange = core._exchange_ref
-    if exchange is None:
-        await ctx.send("❌ Exchange not initialized")
-        return
-
-    targets = [ticker.upper()] if ticker else list(TICKERS)
-    for t in targets:
-        if t not in TICKERS:
-            await ctx.send(f"⚠️ `{t}` is not a tracked pair. See `!pairs`.")
-            return
-
-    await ctx.send(f"🔄 Backfilling B-track history for {', '.join(targets)}...")
-    total = 0
-    for t in targets:
-        for tf in TIMEFRAMES:
-            try:
-                count = await asyncio.to_thread(backtest_history, exchange, t, tf, 3000, ("b",))
-                total += count
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"B-track backfill error for {t} {tf}: {e}")
-
-    await ctx.send(f"✅ B-track backfill done: {total} signals added. A/U history untouched.")
 
 
 @core.bot.command(name="reset_cache")

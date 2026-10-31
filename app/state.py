@@ -415,7 +415,7 @@ def delete_signal_record(ticker: str, tf: str, side: str, index: int, track: Opt
     raw (unfiltered, chronological) list for ticker/tf/side.
 
     🆕 Added so duplicate/junk records — e.g. from re-running
-    `!backfill_breakout` after a parameter change, which can append
+    re-running a backfill after a parameter change, which can append
     overlapping records rather than replacing the old ones — can be removed
     individually from the web dashboard's History tab, instead of wiping the
     whole ticker/tf/side/track combination with `!delsignals`.
@@ -571,11 +571,11 @@ def update_raw_outcome(ticker: str, tf: str, side: str, current_price: float, tr
 def get_signal_stats(ticker: str, tf: str, side: str, regime: Optional[str] = None, as_of: Optional[str] = None, track: Optional[str] = None) -> Dict:
     """Returns statistics for the given signal.
 
-    track — "a" | "u" | "b" | None. 🆕 FIX: each track's adaptive TP/SL is
+    track — "a" | "u" | None. 🆕 FIX: each track's adaptive TP/SL is
     supposed to be calibrated off its OWN track's history (that's the
     entire point of tracking `track` on every record — see
     add_signal_record's docstring) but this function used to read
-    history[ticker][tf][side] unfiltered, silently pooling A+U+B together.
+    history[ticker][tf][side] unfiltered, silently pooling A+U together.
     Two tracks opening on the same ticker/tf/side at the same time ended
     up with byte-identical TP1/TP2/SL, regardless of how differently each
     track actually performs. None (the default) keeps the old pooled
@@ -1251,7 +1251,7 @@ def analyze_confidence_components(
     group_by=["track", "regime"]. None (the default) keeps the original,
     coarser (side, value) bucketing — every existing caller that doesn't
     pass this keeps getting exactly the same rows as before. Pooling
-    across track (A/U/B are different strategies entirely) and regime
+    across track (A/U are different strategies entirely) and regime
     (TREND/NORMAL) can hide a real effect that only shows up in one
     track/regime, or manufacture an apparent one that's really just a mix
     of two that cancel differently — run_component_backtest() defaults to

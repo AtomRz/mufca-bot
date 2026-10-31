@@ -190,7 +190,7 @@ export default function HistoryPanel({ lastEvent }) {
                   <td className={r.side === 'long' ? 'tag long' : 'tag short'} style={{ display: 'inline-block', margin: '2px 0' }}>
                     {r.side}
                   </td>
-                  <td>{r.track === 'a' ? 'Andean' : r.track === 'u' ? 'UT Bot' : r.track === 'b' ? 'Breakout' : r.track}</td>
+                  <td>{r.track === 'a' ? 'Andean' : r.track === 'u' ? 'UT Bot' : r.track}</td>
                   <td>{r.count}</td>
                   <td>
                     <span className="winrate-bar">
@@ -217,7 +217,7 @@ export default function HistoryPanel({ lastEvent }) {
       {selected && (
         <div className="panel">
           <h3 className="panel-title">
-            {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : selected.track === 'u' ? 'UT Bot' : selected.track === 'b' ? 'Breakout' : selected.track} — recent trades
+            {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : selected.track === 'u' ? 'UT Bot' : selected.track} — recent trades
           </h3>
           {recordsError && <div className="error-banner">{recordsError}</div>}
           {deleteError && <div className="error-banner">{deleteError}</div>}

@@ -102,10 +102,6 @@ export const api = {
     request('/api/config/intrabar-check', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setHurstBiasCorrection: (enabled) =>
     request('/api/config/hurst-bias-correction', { method: 'POST', body: JSON.stringify({ enabled }) }),
-  setHurstBreakout: (enabled) =>
-    request('/api/config/hurst-breakout', { method: 'POST', body: JSON.stringify({ enabled }) }),
-  setHtfBreakout: (enabled) =>
-    request('/api/config/htf-breakout', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setDiscordNotifications: (enabled) =>
     request('/api/config/discord-notifications', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setShockGuardBlock: (enabled) =>
@@ -151,8 +147,6 @@ export const api = {
     }),
   setIndicators: (patch) =>
     request('/api/config/indicators', { method: 'POST', body: JSON.stringify(patch) }),
-  setBreakoutConfig: (patch) =>
-    request('/api/config/breakout', { method: 'POST', body: JSON.stringify(patch) }),
   setColors: (patch) =>
     request('/api/config/colors', { method: 'POST', body: JSON.stringify(patch) }),
   setVolumeProfile: (patch) =>

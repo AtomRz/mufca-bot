@@ -123,7 +123,7 @@ export default function StatusPanel({ lastEvent }) {
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
             {status.shock_blocks_entries && shocks.length > 0
               ? 'New entries are blocked while the shock lasts. '
-              : 'The A/U/B tracks are not built for news-driven cascades, so FLAT here can simply mean "no valid trigger". '}
+              : 'The A/U tracks are not built for news-driven cascades, so FLAT here can simply mean "no valid trigger". '}
             {anomaly && anomaly.active ? 'On-chain flow is held neutral and leverage is reduced.' : ''}
           </p>
         </div>
@@ -133,7 +133,7 @@ export default function StatusPanel({ lastEvent }) {
           <h3 className="panel-title" style={{ color: 'var(--accent)' }}>🎯 TP1 Hit</h3>
           <div className="row">
             <span className="row-label">
-              {tp1Banner.ticker} · {tp1Banner.tf} · {tp1Banner.track === 'a' ? 'Andean' : tp1Banner.track === 'u' ? 'UT Bot' : 'Breakout'}
+              {tp1Banner.ticker} · {tp1Banner.tf} · {tp1Banner.track === 'a' ? 'Andean' : 'UT Bot'}
             </span>
             <span className={`tag ${tp1Banner.side}`}>{tp1Banner.side}</span>
           </div>
@@ -176,7 +176,6 @@ export default function StatusPanel({ lastEvent }) {
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>{tf}</div>
               <TradeCard trade={data.a_active_trade} label="Andean (A)" />
               <TradeCard trade={data.u_active_trade} label="UT Bot (U)" />
-              <TradeCard trade={data.b_active_trade} label="Breakout (B)" />
             </div>
           ))}
         </div>

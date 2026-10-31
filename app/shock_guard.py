@@ -3,8 +3,8 @@ Market shock guard.
 
 Detects an abnormal price move over the last few closed bars, measured as a
 multiple of the ATR taken *before* the move started. News-driven cascades
-(exchange hacks, flash crashes) look like this, and the A/U/B tracks are not
-built for them: they look for reversals, trend starts and squeeze breakouts,
+(exchange hacks, flash crashes) look like this, and the A/U tracks are not
+built for them: they look for reversals and trend starts,
 so during a cascade the bot usually stays silent without telling anyone why.
 
 This module only records and reports the condition. check_signals() calls
@@ -128,7 +128,7 @@ def format_shock_alert(info: Dict) -> str:
     action = (
         "New entries are **blocked** while the shock lasts."
         if getattr(_cfg, "SHOCK_GUARD_BLOCK_ENTRIES", False)
-        else "Signals are **not blocked**, but A/U/B tracks are not built for news cascades — "
+        else "Signals are **not blocked**, but A/U tracks are not built for news cascades — "
              "expect no (or late) signals and wide candles."
     )
     return (
