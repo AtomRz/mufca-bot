@@ -30,6 +30,7 @@ from urllib.parse import unquote
 
 import ccxt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from starlette.responses import Response
 from pydantic import BaseModel, Field
 
@@ -66,6 +67,7 @@ import push as _push
 import derivatives
 import spread
 import shock_guard
+import sim_jobs
 
 
 # =====================================================================
@@ -427,6 +429,43 @@ class Tp1SimIn(BaseModel):
     num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
 
 
+class CompSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
+    min_samples: int = Field(30, ge=1, le=10000)
+
+
+def _sim_scope(ticker: Optional[str], tf: Optional[str]):
+    """Validates the pair/timeframe scope of a simulation request.
+    ticker/tf default to every tracked pair/timeframe when omitted."""
+    ticker = ticker.upper().strip() if ticker else None
+    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
+    scope_tfs = [tf] if tf else list(_cfg.TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in _cfg.TICKERS:
+            raise HTTPException(404, f"{t} is not a tracked pair")
+    for f in scope_tfs:
+        if f not in _cfg.TIMEFRAMES:
+            raise HTTPException(404, f"{f} is not a tracked timeframe")
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+    return exchange, scope_tickers, scope_tfs
+
+
+def _start_sim_job(kind: str, params: dict, run):
+    try:
+        job = sim_jobs.jobs.start(kind, params, run)
+    except sim_jobs.SimBusy as busy:
+        raise HTTPException(
+            409,
+            f"A {busy.job.kind} simulation is already running ({busy.job.done}/{busy.job.total}) — "
+            f"wait for it to finish or cancel it first",
+        )
+    return JSONResponse(job.to_dict(include_result=False), status_code=202)
+
+
 @app.post("/api/tp1sim")
 async def run_tp1sim(body: Tp1SimIn):
     """🆕 (external review, TP1-mode comparison): compares breakeven/
@@ -435,35 +474,23 @@ async def run_tp1sim(body: Tp1SimIn):
     Discord !tp1sim command, both call signals.run_tp1_mode_comparison()
     so the two can never disagree. Never writes to signals_history.json or
     touches the live TP1_SL_MODE setting. See that function's docstring
-    (signals.py) for the exact response shape.
+    (signals.py) for the exact result shape.
 
-    ticker/tf default to every tracked pair/timeframe when omitted — this
-    is a slow, CPU-heavy call (pairs × timeframes × 4 modes, each a full
-    backtest); the frontend should show it as a long-running action, not
-    something polled quickly."""
-    ticker = body.ticker.upper().strip() if body.ticker else None
-    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
-    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
-    for t in scope_tickers:
-        if t not in _cfg.TICKERS:
-            raise HTTPException(404, f"{t} is not a tracked pair")
-    for f in scope_tfs:
-        if f not in _cfg.TIMEFRAMES:
-            raise HTTPException(404, f"{f} is not a tracked timeframe")
-
-    exchange = core._exchange_ref
-    if exchange is None:
-        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
-
+    🆕 Runs as a BACKGROUND JOB: pairs × timeframes × 4 modes at thousands
+    of bars takes minutes, longer than the ~100 s a Cloudflare Tunnel keeps an
+    HTTP request open — the old synchronous response was dropped on the way
+    back and the page showed nothing. This returns 202 + the job (id, status,
+    progress) immediately; poll GET /api/sim-jobs/{id} for progress and the
+    result (same shape the endpoint used to return directly). 409 if another
+    simulation is already running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
     from signals import run_tp1_mode_comparison
-    return await run_tp1_mode_comparison(exchange, scope_tickers, scope_tfs, body.num_bars)
-
-
-class CompSimIn(BaseModel):
-    ticker: Optional[str] = None
-    tf: Optional[str] = None
-    num_bars: int = Field(3000, ge=300, le=20000)  # 🆕 bounded: was unbounded (negative/huge values reached the OHLCV paging loop)
-    min_samples: int = Field(30, ge=1, le=10000)
+    return _start_sim_job(
+        "tp1sim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars},
+        lambda progress: run_tp1_mode_comparison(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress),
+    )
 
 
 @app.post("/api/compsim")
@@ -477,28 +504,48 @@ async def run_compsim(body: CompSimIn):
     accumulate it. Same computation as the Discord !compsim command, both
     call signals.run_component_backtest(). Never writes to
     signals_history.json. See that function's docstring (signals.py) for
-    the exact response shape (analyze_confidence_components()'s own
+    the exact result shape (analyze_confidence_components()'s own
     report shape, plus a bar_coverage list).
 
     Slower than /api/tp1sim per pair/tf — each also fetches BTC as the
     relative-strength benchmark and runs get_market_structure() at every
-    triggered signal, not just 4 backtests but 1 with extra per-bar work."""
-    ticker = body.ticker.upper().strip() if body.ticker else None
-    scope_tickers = [ticker] if ticker else list(_cfg.TICKERS)
-    scope_tfs = [body.tf] if body.tf else list(_cfg.TIMEFRAMES)
-    for t in scope_tickers:
-        if t not in _cfg.TICKERS:
-            raise HTTPException(404, f"{t} is not a tracked pair")
-    for f in scope_tfs:
-        if f not in _cfg.TIMEFRAMES:
-            raise HTTPException(404, f"{f} is not a tracked timeframe")
+    triggered signal.
 
-    exchange = core._exchange_ref
-    if exchange is None:
-        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
-
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
     from signals import run_component_backtest
-    return await run_component_backtest(exchange, scope_tickers, scope_tfs, body.num_bars, body.min_samples)
+    return _start_sim_job(
+        "compsim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "min_samples": body.min_samples},
+        lambda progress: run_component_backtest(
+            exchange, scope_tickers, scope_tfs, body.num_bars, body.min_samples, progress=progress),
+    )
+
+
+@app.get("/api/sim-jobs/active")
+async def get_active_sim_job():
+    """The simulation that is running right now (or null) — lets a page that was
+    reloaded or re-opened pick up the progress of a job it started earlier."""
+    job = sim_jobs.jobs.active()
+    return {"job": job.to_dict(include_result=False) if job else None}
+
+
+@app.get("/api/sim-jobs/{job_id}")
+async def get_sim_job(job_id: str):
+    """Status/progress of a simulation job; includes `result` once status is "done"."""
+    job = sim_jobs.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired simulation job")
+    return job.to_dict()
+
+
+@app.delete("/api/sim-jobs/{job_id}")
+async def cancel_sim_job(job_id: str):
+    """Cancels a running simulation (its worker processes are stopped)."""
+    if not sim_jobs.jobs.cancel(job_id):
+        raise HTTPException(404, "No running simulation with that id")
+    return {"cancelled": True}
 
 
 @app.get("/api/health")

@@ -124,6 +124,12 @@ export const api = {
     request(`/api/spread${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`),
   getComponents: (minSamples = 30) =>
     request(`/api/components?min_samples=${minSamples}`),
+  // 🆕 Simulations are background jobs: run* returns {id, status, progress, ...}
+  // at once (HTTP 202); getSimJob(id) is polled for progress and the final result.
+  // A single long request used to be cut off by the Cloudflare Tunnel (~100 s).
+  getActiveSim: () => request('/api/sim-jobs/active'),
+  getSimJob: (id) => request(`/api/sim-jobs/${encodeURIComponent(id)}`),
+  cancelSimJob: (id) => request(`/api/sim-jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   runTp1Sim: ({ ticker, tf, numBars = 3000 } = {}) =>
     request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runCompSim: ({ ticker, tf, numBars = 3000, minSamples = 30 } = {}) =>

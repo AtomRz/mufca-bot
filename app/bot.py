@@ -748,7 +748,7 @@ async def market_scanner():
                 # 🆕 FIX: the lock used to be held for the whole cycle —
                 # check_signals, fetching OHLCV for the chart, generating the
                 # chart (another fetch), and all Discord messages. Because of
-                # this, any command (!forcerun/!sim/!tp) on the SAME pair/TF
+                # this, any command (!forcerun/!tp) on the SAME pair/TF
                 # would block for several seconds until the scanner finished
                 # all of its network/Discord work. Now only check_signals
                 # stays under the lock (that's where positions actually open/
