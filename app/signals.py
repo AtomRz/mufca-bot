@@ -66,6 +66,7 @@ from utils import safe_fetch_ohlcv, parse_ohlcv, validate_dataframe, Timer, roun
 from config import ONCHAIN_ENABLED
 import spread
 import shock_guard
+import shadow
 from sim_pool import SimPool
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
@@ -1267,6 +1268,25 @@ async def check_signals(
         def cooldown_ok(last_time):
             return last_time is None or (bar_time - last_time) >= COOLDOWN_BARS * tf_ms
 
+        # 🆕 Shadow positions (entries an Entry switch blocked, tracked for
+        # outcome only — see shadow.py): replay any still-unfinished ones
+        # against the closed bars first, so the one-position-per-track and
+        # cooldown checks further down see exits that happened this bar.
+        # Never allowed to break the signal pipeline.
+        if not dry_run:
+            try:
+                _tail = df.iloc[:idx + 1].tail(200)
+                shadow.resolve_shadow_records(
+                    ticker, timeframe,
+                    list(zip(_tail["timestamp"].astype("int64").tolist(),
+                             _tail["high"].astype(float).tolist(),
+                             _tail["low"].astype(float).tolist(),
+                             _tail["close"].astype(float).tolist())),
+                    _tp1_moved_sl, tf_ms,
+                )
+            except Exception as e:
+                logger.warning(f"[SHADOW] resolve failed for {ticker} {timeframe}: {e}", exc_info=True)
+
         a_long_cd_ok = cooldown_ok(state.get("last_a_long_time"))
         a_short_cd_ok = cooldown_ok(state.get("last_a_short_time"))
         u_long_cd_ok = cooldown_ok(state.get("last_u_long_time"))
@@ -1308,22 +1328,32 @@ async def check_signals(
         # A-track confirmations stay True for the whole closed bar, so the
         # attempt-bar mark (same one open_position's caller sets) keeps the
         # skip to one log line per bar instead of one per scan cycle.
+        #
+        # A blocked signal is not forgotten: it is collected in
+        # _entry_blocked and, further down (once calc_confidence exists),
+        # run through open_position as a dry run and stored as a shadow
+        # record (shadow.py) so its outcome can still be measured.
+        _entry_blocked: List[Tuple[str, str]] = []
         if sig_a_long and _cfg.is_entry_blocked("a", "long", regime):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-LONG skipped — switched off for regime={regime}")
             sig_a_long = False
+            _entry_blocked.append(("a", "long"))
             if not dry_run:
                 state["last_a_long_attempt_bar"] = bar_time
         if sig_a_short and _cfg.is_entry_blocked("a", "short", regime):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-SHORT skipped — switched off for regime={regime}")
             sig_a_short = False
+            _entry_blocked.append(("a", "short"))
             if not dry_run:
                 state["last_a_short_attempt_bar"] = bar_time
         if sig_u_long and _cfg.is_entry_blocked("u", "long", regime):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-LONG skipped — switched off for regime={regime}")
             sig_u_long = False
+            _entry_blocked.append(("u", "long"))
         if sig_u_short and _cfg.is_entry_blocked("u", "short", regime):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-SHORT skipped — switched off for regime={regime}")
             sig_u_short = False
+            _entry_blocked.append(("u", "short"))
 
         # Track flags are only set on an actual open (not dry_run), and ALWAYS
         # together with active_trade, so they never get out of sync.
@@ -1477,6 +1507,50 @@ async def check_signals(
                 signals.append(sig)
             else:
                 sig_u_short = False
+
+        # 🆕 Shadow capture for entries an Entry switch blocked (see
+        # shadow.py). The signal flags were zeroed above so a blocked signal
+        # can't open a real trade or count toward a REAL trade's confluence;
+        # for the shadow run only, the flag is switched back on so its own
+        # confidence_components read exactly as a live signal's would.
+        # Live scan only, and wrapped: shadow tracking must never be able to
+        # break the real pipeline.
+        if _entry_blocked and not dry_run:
+            def _set_sig(trk: str, sd: str, val: bool):
+                nonlocal sig_a_long, sig_a_short, sig_u_long, sig_u_short
+                if (trk, sd) == ("a", "long"):
+                    sig_a_long = val
+                elif (trk, sd) == ("a", "short"):
+                    sig_a_short = val
+                elif (trk, sd) == ("u", "long"):
+                    sig_u_long = val
+                else:
+                    sig_u_short = val
+
+            for _trk, _sd in _entry_blocked:
+                try:
+                    if not shadow.shadow_gate_ok(ticker, timeframe, _trk, _sd, bar_time, tf_ms):
+                        continue
+                    _set_sig(_trk, _sd, True)
+                    try:
+                        _shadow_sig = await open_position(
+                            {}, _trk, _sd, close_v, fs, fu, fl, atr14, df, idx,
+                            ticker, timeframe, regime, vol_info, oc_lev_delta, onchain_bias, True,
+                            calc_confidence, MIN_RR, spread_info=spread_info,
+                            market_structure=market_structure,
+                        )
+                        if _shadow_sig:
+                            _, _shadow_comps = calc_confidence(_sd == "long")
+                            # tuple layout: see open_position's return — [6]=sl, [7]=tp2, [8]=tp1
+                            shadow.add_shadow_record(
+                                ticker, timeframe, _sd, _trk, regime, close_v,
+                                _shadow_sig[6], _shadow_sig[8], _shadow_sig[7],
+                                bar_time, _shadow_comps,
+                            )
+                    finally:
+                        _set_sig(_trk, _sd, False)
+                except Exception as e:
+                    logger.warning(f"[SHADOW] capture failed for {ticker} {timeframe} {_trk.upper()}-{_sd.upper()}: {e}", exc_info=True)
 
         # 🆕 FIX (external review): commit point for last_processed_bar_time
         # — see the comment where is_new_bar was computed above for why

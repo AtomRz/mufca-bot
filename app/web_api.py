@@ -412,15 +412,24 @@ async def get_spread(ticker: Optional[str] = None):
 
 
 @app.get("/api/components")
-async def get_components(min_samples: int = 30):
+async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False):
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
     with trade outcomes — same report as the Discord !components command,
     both call state.analyze_confidence_components() so the two can never
     drift out of sync. See that function's docstring for the exact shape
     of the response and why avg_raw_mfe is the metric worth trusting over
-    win_rate/avg_mfe once it has enough samples of its own."""
-    return analyze_confidence_components(min_samples=min_samples)
+    win_rate/avg_mfe once it has enough samples of its own.
+
+    split=true  — additionally bucket by track and regime (like !compsim).
+    shadow=true — add rows for entries an Entry switch blocked, replayed on
+                  later bars (shadow.py); reported separately as src=shadow,
+                  never pooled with real trades."""
+    return analyze_confidence_components(
+        min_samples=min_samples,
+        group_by=["track", "regime"] if split else None,
+        include_shadow=shadow,
+    )
 
 
 class Tp1SimIn(BaseModel):

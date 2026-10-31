@@ -1227,6 +1227,7 @@ def analyze_confidence_components(
     history: Optional[Dict] = None,
     min_samples: int = DEFAULT_COMPONENT_MIN_SAMPLES,
     group_by: Optional[List[str]] = None,
+    include_shadow: bool = False,
 ) -> Dict:
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
@@ -1260,6 +1261,13 @@ def analyze_confidence_components(
     coarser default since live samples are far scarcer per (track,
     regime) cell.
 
+    include_shadow — also read shadow.py's records: signals that an Entry
+    switch (config.ENTRY_BLOCK) stopped from opening, replayed on the bars
+    that followed. They are reported as SEPARATE rows (each row gets
+    "src": "live" | "shadow", and "src" is added to the grouping), never
+    pooled with real trades — a shadow outcome is a closed-bar replay, not
+    a fill. Default False: existing callers get exactly the same report.
+
     Returns a JSON-serializable dict:
         {
             "total_closed": int,
@@ -1275,24 +1283,37 @@ def analyze_confidence_components(
                 ],
                 "volume_profile": [...],
             },
+            "shadow_closed": int,   # closed shadow records seen (0 unless include_shadow)
         }
     """
     if history is None:
         history = load_signals_history()
-    group_by = group_by or []
+    group_by = list(group_by or [])
+
+    sources = [("live", history)]
+    if include_shadow:
+        from shadow import load_shadow_history  # lazy: keeps state.py importable without it
+        sources.append(("shadow", load_shadow_history()))
+        if "src" not in group_by:
+            group_by.append("src")  # never pool shadow with live rows
 
     buckets: Dict[Tuple, List[Dict]] = {}
     total_closed = 0
+    shadow_closed = 0
 
-    for ticker, tf, side, rec in _iter_closed_records(history):
-        total_closed += 1
-        comps = rec.get("confidence_components")
-        if not comps:
-            continue
-        extra_key = tuple(rec.get(g, "?") for g in group_by)
-        for comp_name in ("relative_strength", "volume_profile"):
-            if comp_name in comps:
-                buckets.setdefault((comp_name, side, comps[comp_name]) + extra_key, []).append(rec)
+    for src, src_history in sources:
+        for ticker, tf, side, rec in _iter_closed_records(src_history):
+            if src == "live":
+                total_closed += 1
+            else:
+                shadow_closed += 1
+            comps = rec.get("confidence_components")
+            if not comps:
+                continue
+            extra_key = tuple(src if g == "src" else rec.get(g, "?") for g in group_by)
+            for comp_name in ("relative_strength", "volume_profile"):
+                if comp_name in comps:
+                    buckets.setdefault((comp_name, side, comps[comp_name]) + extra_key, []).append(rec)
 
     components_out: Dict[str, List[Dict]] = {"relative_strength": [], "volume_profile": []}
     for key, records in buckets.items():
@@ -1328,6 +1349,7 @@ def analyze_confidence_components(
 
     return {
         "total_closed": total_closed,
+        "shadow_closed": shadow_closed,
         "min_samples": min_samples,
         "components": components_out,
     }
