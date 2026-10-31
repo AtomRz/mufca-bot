@@ -67,6 +67,7 @@ import push as _push
 import derivatives
 import spread
 import shock_guard
+import shadow as shadow_mod
 import sim_jobs
 
 
@@ -409,6 +410,17 @@ async def get_spread(ticker: Optional[str] = None):
         "warmed_up": snapshot["sample_count"] >= _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
         "min_samples_for_anomaly": _cfg.SPREAD_MIN_SAMPLES_FOR_ANOMALY,
     }
+
+
+@app.get("/api/shadow")
+async def get_shadow_status():
+    """Top-bar "SHDW" lamp: which Entry switches are active (anything other
+    than "allow"), plus how many shadow positions they have recorded so far
+    (open / closed, per track+side) and when the last one was recorded.
+    Light — reads two small JSON-backed dicts, no exchange calls."""
+    status = shadow_mod.summary()
+    status["blocks"] = {k: m for k, m in _cfg.ENTRY_BLOCK.items() if m != "allow"}
+    return status
 
 
 @app.get("/api/components")

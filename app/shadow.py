@@ -244,6 +244,35 @@ def add_shadow_record(
     )
 
 
+_WIN_EXIT_TYPES = ("tp", "sl_after_tp1")  # same definition as state.WIN_EXIT_TYPES
+
+
+def summary() -> Dict:
+    """Cheap overview for the web top-bar lamp (GET /api/shadow): how many
+    shadow positions are open / closed, per track+side, and when the last one
+    was recorded. Reads only shadow_signals.json."""
+    by_key: Dict[str, Dict[str, int]] = {}
+    open_n = closed_n = 0
+    last_recorded: Optional[str] = None
+    for _ticker, tfs in load_shadow_history().items():
+        for _tf, sides in tfs.items():
+            for side, recs in sides.items():
+                for rec in recs:
+                    b = by_key.setdefault(f"{rec.get('track', '?')}_{side}", {"open": 0, "closed": 0, "wins": 0})
+                    if rec.get("exit_type") == "open":
+                        b["open"] += 1
+                        open_n += 1
+                    else:
+                        b["closed"] += 1
+                        closed_n += 1
+                        if rec.get("exit_type") in _WIN_EXIT_TYPES:
+                            b["wins"] += 1
+                    ts = rec.get("timestamp")
+                    if ts and (last_recorded is None or ts > last_recorded):
+                        last_recorded = ts
+    return {"open": open_n, "closed": closed_n, "last_recorded": last_recorded, "by_key": by_key}
+
+
 _OUTCOME_KEYS = (
     "exit_type", "exit", "exit_bar_ts", "bars_held", "tp1_hit", "moved_pct",
     "max_favorable_pct", "max_adverse_pct", "raw_mfe_pct", "raw_mae_pct", "done",

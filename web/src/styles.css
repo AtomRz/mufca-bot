@@ -179,6 +179,22 @@ input {
   letter-spacing: 0.03em;
 }
 
+/* 🆕 SHDW lamp (shadow tracking of Entry-switched signals): wrapped in its own
+   bordered box like .signal-lamps, and flashes when a new shadow record appears. */
+.shadow-lamp {
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.lamp-flash .lamp-dot {
+  animation: shadow-flash 1s ease-in-out 6;
+}
+@keyframes shadow-flash {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.8); opacity: 0.4; }
+}
+
 .lamp-sep {
   width: 1px;
   height: 16px;

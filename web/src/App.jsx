@@ -7,6 +7,7 @@ import InsightsPanel from './components/InsightsPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
+import ShadowLamp from './components/ShadowLamp'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -26,6 +27,7 @@ export default function App() {
   const [lastEvent, setLastEvent] = useState(null)
   const [pulseKey, setPulseKey] = useState(0)
   const [pulse, setPulse] = useState(null)
+  const [shadow, setShadow] = useState(null)
   const [chartTicker, setChartTicker] = useState(null)
   const [chartTf, setChartTf] = useState('1h')
   const [chartLoading, setChartLoading] = useState(false)
@@ -33,6 +35,15 @@ export default function App() {
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
+  }, [])
+
+  // 🆕 SHDW lamp: global (not tied to the Chart-tab pair) and cheap on the
+  // server (/api/shadow reads two small JSON-backed dicts), so unlike pulse it
+  // can follow every scan_tick, throttled to once per 20 s.
+  const lastShadowAt = useRef(0)
+  const loadShadow = useCallback(() => {
+    lastShadowAt.current = Date.now()
+    api.getShadow().then(setShadow).catch(() => {})
   }, [])
 
   // 🆕 CHOP/Trend/Leverage in the top bar now follow the pair/tf selected on
@@ -67,7 +78,8 @@ export default function App() {
   useEffect(() => {
     if (!authenticated) return
     loadConfig()
-  }, [authenticated, loadConfig])
+    loadShadow()
+  }, [authenticated, loadConfig, loadShadow])
 
   useEffect(() => {
     if (!authenticated) return
@@ -79,8 +91,10 @@ export default function App() {
   // connection on every pair click in Chart, and only depends on authenticated
   const loadConfigRef = useRef(loadConfig)
   const loadPulseRef = useRef(loadPulse)
+  const loadShadowRef = useRef(loadShadow)
   loadConfigRef.current = loadConfig
   loadPulseRef.current = loadPulse
+  loadShadowRef.current = loadShadow
 
   useEffect(() => {
     if (!authenticated) return
@@ -89,7 +103,10 @@ export default function App() {
       (event) => {
         setLastEvent(event)
         setPulseKey((k) => k + 1)
-        if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current() }
+        if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current() }
+        if (event.type === 'scan_tick' && !document.hidden && Date.now() - lastShadowAt.current >= 20000) {
+          loadShadowRef.current()
+        }
         // 🆕 scan_tick arrives every scan (15-180 s) and /api/pulse is heavy
         // (900 bars + HTF + indicators server-side): don't refresh it from a
         // hidden tab, and at most every 30 s otherwise.
@@ -102,7 +119,7 @@ export default function App() {
         // 🆕 after a RE-connect, events were missed while offline: resync config
         // and pulse (an initial config load that failed also gets retried this way)
         if (status === 'connected') {
-          if (connectedOnce) { loadConfigRef.current(); loadPulseRef.current() }
+          if (connectedOnce) { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current() }
           connectedOnce = true
         }
       },
@@ -185,6 +202,7 @@ export default function App() {
           </span>
         )}
         {pulse && <SignalLamps lamps={pulse.lamps} />}
+        <ShadowLamp shadow={shadow} onClick={() => setTab('insights')} />
         <div className="spacer" />
         {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>loading…</span>}
         <span className="conn-label">
