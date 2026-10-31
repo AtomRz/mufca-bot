@@ -12,7 +12,7 @@ import aiohttp
 import logging
 import os
 import time
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple
 
 from config import (
     DATA_DIR,
@@ -30,12 +30,47 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # 🏦  EXCHANGE ETH ADDRESSES (publicly known hot wallets)
 # =====================================================================
-EXCHANGE_ETH_ADDRESSES: Dict[str, str] = {
-    "Binance":  "0x28C6c06298d514Db089934071355E5743bf21d60",
-    "Coinbase": "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3",
-    "Kraken":   "0xE853c56864A2ebe4576a807D26Fdc4A0adA51919",
-    "OKX":      "0x6cC5F688a315f3dC28A7781717a9A798a59fDA7b",
+# Several hot wallets per exchange. One address is a poor proxy for a whole
+# exchange: exchanges spread and rotate hot wallets, and a quiet address reads as
+# a permanent 0 delta (Coinbase/Kraken/OKX sat at 0 while only Binance moved).
+# Balances are tracked per wallet and summed per exchange, so transfers between an
+# exchange's own tracked wallets net out in that sum.
+# Format: {exchange: {wallet_label: address}}. To track another wallet, add a line.
+EXCHANGE_ETH_ADDRESSES: Dict[str, Dict[str, str]] = {
+    "Binance": {
+        "Binance":    "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE",
+        "Binance 14": "0x28C6c06298d514Db089934071355E5743bf21d60",
+        "Binance 15": "0x21a31Ee1afC51d94C2eFcCAa2092aD1028285549",
+    },
+    "Coinbase": {
+        # Only the old single address so far — add Coinbase's active hot wallets here.
+        "Coinbase": "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3",
+    },
+    "Kraken": {
+        "Hot Wallet 1": "0xe9f7eCAe3A53D2A67105292894676b00d1FaB785",
+        "Hot Wallet 2": "0xf30ba13e4b04Ce5dC4D254Ae5FA95477800F0EB0",
+        "Hot Wallet 3": "0xcC282E2004428939ee5149A9e7872F0B4d5d5ec7",
+        "Hot Wallet 4": "0x05ff6964D21e5dAE3b1010D5AE0465b3c450F381",
+    },
+    "OKX": {
+        "OKX":    "0x6cC5F688a315f3dC28A7781717a9A798a59fDA7b",
+        "OKX 4":  "0x2c8FBB630289363Ac80705A1a61273f76fD5a161",
+        "OKX 27": "0xD7efCbB86eFdD9E8dE014dafA5944AaE36E817e4",
+    },
 }
+
+# Flat view: (exchange, label, lowercase address). Balances/baseline are keyed by
+# the lowercase address — stable even if a label is renamed.
+_WALLETS: List[Tuple[str, str, str]] = [
+    (_ex, _label, _addr.lower())
+    for _ex, _wallets in EXCHANGE_ETH_ADDRESSES.items()
+    for _label, _addr in _wallets.items()
+]
+_WALLET_KEYS = {_addr for _, _, _addr in _WALLETS}
+
+# Free Etherscan keys allow 5 calls/s; ~10 wallets are fetched sequentially with
+# this pause between calls (parallel requests mostly came back as 429).
+_ETHERSCAN_CALL_SPACING = 0.25
 
 # =====================================================================
 # 💾  CACHE
@@ -48,7 +83,13 @@ _bias_lock = asyncio.Lock()
 # analysis by a full ONCHAIN_CACHE_TTL cycle (~1h) each time. Persisted to disk
 # so a restart doesn't reset the baseline.
 _ONCHAIN_BASELINE_FILE = os.path.join(DATA_DIR, "onchain_baseline.json")
-_prev_balances: Dict[str, Optional[float]] = safe_json_load(_ONCHAIN_BASELINE_FILE, {})
+# The baseline is keyed by lowercase wallet address. A baseline saved by the old
+# one-address-per-exchange version (keys like "Binance") has no matching keys and
+# is dropped here, so the first cycle after the upgrade is a clean "first_run"
+# and no manual !reset_cache is needed.
+_prev_balances: Dict[str, Optional[float]] = {
+    k: v for k, v in safe_json_load(_ONCHAIN_BASELINE_FILE, {}).items() if k in _WALLET_KEYS
+}
 
 # 🆕 Timestamp of the last baseline snapshot — needed to normalize the
 # ONCHAIN_FLOW_THRESHOLD_ETH/_LARGE_ETH thresholds against the actually
@@ -156,28 +197,36 @@ async def _fetch_eth_balance(session: aiohttp.ClientSession, address: str, retri
 
 async def get_exchange_balances() -> Dict[str, Optional[float]]:
     """
-    Fetches all exchange address balances in parallel.
-    Returns: {exchange_name: balance_eth}
+    Fetches the balance of every tracked wallet.
+    Returns: {wallet_address_lowercase: balance_eth}  (None = fetch failed)
+
+    Wallets are fetched one after another with a short pause — see
+    _ETHERSCAN_CALL_SPACING (free-key limit is 5 calls/s).
     """
     cached = _cache_get("eth_balances")
     if cached is not None:
         return cached
 
+    balances: Dict[str, Optional[float]] = {}
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[_fetch_eth_balance(session, addr) for addr in EXCHANGE_ETH_ADDRESSES.values()],
-            return_exceptions=True,
-        )
-
-    balances = {}
-    for name, result in zip(EXCHANGE_ETH_ADDRESSES.keys(), results):
-        balances[name] = result if not isinstance(result, Exception) else None
+        for i, (_ex, _label, addr) in enumerate(_WALLETS):
+            if i:
+                await asyncio.sleep(_ETHERSCAN_CALL_SPACING)
+            try:
+                balances[addr] = await _fetch_eth_balance(session, addr)
+            except Exception as e:
+                logger.warning(f"[ONCHAIN] Etherscan balance error {addr[:10]}…: {e}")
+                balances[addr] = None
 
     # 🆕 FIX: an all-None result (Etherscan down / rate-limited) was cached for the
     # whole TTL, so one bad moment froze "N/A" for up to an hour.
     if any(v is not None for v in balances.values()):
         _cache_set("eth_balances", balances)
-    logger.info(f"[ONCHAIN] ETH balances fetched: { {k: f'{v:.0f}' if v is not None else 'N/A' for k, v in balances.items()} }")
+    shown = {
+        f"{ex}/{label}": (f"{balances[addr]:.0f}" if balances.get(addr) is not None else "N/A")
+        for ex, label, addr in _WALLETS
+    }
+    logger.info(f"[ONCHAIN] ETH balances fetched: {shown}")
     return balances
 
 
@@ -188,7 +237,8 @@ async def get_eth_flow_delta() -> Dict:
       delta_eth:    total delta across all exchanges (+ = inflow to exchanges, - = outflow from exchanges)
       flow:         "inflow" | "outflow" | "neutral"
       strength:     "large" | "normal" | "weak"
-      per_exchange: per-exchange breakdown
+      per_exchange: per-exchange breakdown (sum over the exchange's tracked wallets)
+      per_wallet:   {exchange: {wallet_label: delta}} — shows which wallets actually move
 
     🆕 The strength/flow thresholds are normalized against the actually
     elapsed time since the last baseline snapshot (elapsed), instead of being
@@ -244,34 +294,64 @@ async def get_eth_flow_delta() -> Dict:
             "note": "first_run",
         }
 
-    # Compute the delta
+    # Compute the delta: per wallet first, then summed per exchange
     delta_total = 0.0
-    per_exchange = {}
+    per_exchange: Dict[str, float] = {}
+    per_wallet: Dict[str, Dict[str, float]] = {}
     anomalies = []
 
-    for name in EXCHANGE_ETH_ADDRESSES:
-        curr = curr_balances.get(name)
-        prev = _prev_balances.get(name)
-        if curr is not None and prev is not None:
-            delta = curr - prev    # + = inflow to the exchange, - = outflow from the exchange
-            per_exchange[name] = round(delta, 2)
-            # 🆕 Anomaly guard: a change this large relative to the wallet's own
-            # size is a drain/surge of the wallet itself (hack, emergency
-            # cold-storage move, internal consolidation), not market flow.
-            # Exclude it from the flow total instead of reading it as
-            # accumulation/distribution.
-            if prev >= _cfg.ONCHAIN_ANOMALY_MIN_BALANCE_ETH and abs(delta) / prev >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION:
-                anomalies.append({
-                    "exchange": name,
-                    "kind": "drain" if delta < 0 else "surge",
-                    "prev_eth": round(prev, 2),
-                    "curr_eth": round(curr, 2),
-                    "change_eth": round(delta, 2),
-                    "change_pct": round(delta / prev * 100, 1),
-                    "detected_ts": now,
-                })
+    for exchange, wallets in EXCHANGE_ETH_ADDRESSES.items():
+        # label -> (delta, prev, curr); only wallets with both a baseline and a fresh balance
+        wallet_deltas: Dict[str, Tuple[float, float, float]] = {}
+        for label, address in wallets.items():
+            addr = address.lower()
+            curr = curr_balances.get(addr)
+            prev = _prev_balances.get(addr)
+            if curr is not None and prev is not None:
+                # + = inflow to the exchange, - = outflow from the exchange
+                wallet_deltas[label] = (curr - prev, prev, curr)
+        if not wallet_deltas:
+            continue
+
+        net = sum(d for d, _p, _c in wallet_deltas.values())
+        per_exchange[exchange] = round(net, 2)
+        per_wallet[exchange] = {label: round(d, 2) for label, (d, _p, _c) in wallet_deltas.items()}
+
+        # 🆕 Anomaly guard: a change this large relative to the wallet's own
+        # size is a drain/surge of the wallet itself (hack, emergency
+        # cold-storage move, internal consolidation), not market flow.
+        # With several wallets per exchange a big move of one wallet is often just
+        # a transfer to another tracked wallet of the same exchange (hot-wallet
+        # rebalancing): it nets out in the exchange sum and is NOT an anomaly.
+        # It only counts if at least ANOMALY_CHANGE_FRACTION of the moved amount
+        # really left/entered the tracked set (|net| vs the candidates' moves).
+        # An anomalous exchange is excluded from the flow total as a whole, so a
+        # half-visible transfer can't leak into it as fake inflow/outflow.
+        candidates = {
+            label: v for label, v in wallet_deltas.items()
+            if v[1] >= _cfg.ONCHAIN_ANOMALY_MIN_BALANCE_ETH
+            and abs(v[0]) / v[1] >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION
+        }
+        if candidates:
+            moved = sum(abs(v[0]) for v in candidates.values())
+            if abs(net) >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION * moved:
+                for label, (delta, prev, curr) in candidates.items():
+                    anomalies.append({
+                        "exchange": exchange,
+                        "wallet": label,
+                        "kind": "drain" if delta < 0 else "surge",
+                        "prev_eth": round(prev, 2),
+                        "curr_eth": round(curr, 2),
+                        "change_eth": round(delta, 2),
+                        "change_pct": round(delta / prev * 100, 1),
+                        "detected_ts": now,
+                    })
                 continue
-            delta_total += delta
+            logger.info(
+                f"[ONCHAIN] {exchange}: large wallet move(s) {moved:.0f} ETH but net {net:+.0f} ETH "
+                f"— internal transfer between tracked wallets, not an anomaly"
+            )
+        delta_total += net
 
     # How much time has actually elapsed since the last baseline — thresholds scale off this
     elapsed_seconds = (now - _prev_balances_ts) if _prev_balances_ts else 3600.0
@@ -294,8 +374,8 @@ async def get_eth_flow_delta() -> Dict:
     # keeping the older timestamp makes the thresholds scale up (more
     # conservative) instead of treating a multi-cycle delta as a one-cycle one.
     fully_refreshed = all(
-        curr_balances.get(n) is not None
-        for n in EXCHANGE_ETH_ADDRESSES if _prev_balances.get(n) is not None
+        curr_balances.get(addr) is not None
+        for _ex, _label, addr in _WALLETS if _prev_balances.get(addr) is not None
     )
     for name, curr in curr_balances.items():
         if curr is not None:
@@ -327,7 +407,7 @@ async def get_eth_flow_delta() -> Dict:
     # While the hold is active the flow reading is forced neutral.
     for ev in anomalies:
         logger.warning(
-            f"[ONCHAIN] ⚠️ ANOMALY: {ev['exchange']} wallet {ev['kind']} "
+            f"[ONCHAIN] ⚠️ ANOMALY: {ev['exchange']} ({ev['wallet']}) wallet {ev['kind']} "
             f"{ev['prev_eth']:.0f} -> {ev['curr_eth']:.0f} ETH ({ev['change_pct']:+.1f}%) — "
             f"not read as market flow"
         )
@@ -357,6 +437,7 @@ async def get_eth_flow_delta() -> Dict:
         "flow": flow,
         "strength": strength,
         "per_exchange": per_exchange,
+        "per_wallet": per_wallet,
         "note": "ok",
         "anomaly": anomaly,
     }
