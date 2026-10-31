@@ -86,7 +86,7 @@ def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
     🆕 FIX (external review, P2): the above only ever checked "is there a
     NaN", not "does this data make structural sense". A duplicated or
     out-of-order timestamp doesn't produce a NaN anywhere, but every rolling
-    indicator (ATR, FRAMA, Andean, MFI, the B-track squeeze/breakout logic,
+    indicator (ATR, FRAMA, Andean, MFI,
     cooldown bar-counting, the whole backtest) implicitly assumes strictly
     increasing, one-row-per-bar timestamps — silently treating a duplicate
     as if it were four separate consecutive bars, or a resorted-in-place gap

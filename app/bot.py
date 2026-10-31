@@ -62,17 +62,21 @@ state = {
     ticker: {
         # 🆕 FIX: used to be `_saved_state.get(ticker, {}).get(tf) or
         # make_state()` — a saved dict from BEFORE a new field was added to
-        # make_state() (e.g. today's b_in_long/b_active_trade/etc. for the
-        # breakout track) got restored as-is, permanently missing that key —
-        # not just a KeyError waiting to happen (as seen with !status and
-        # b_in_long), but silently wrong for anything that used .get() too,
-        # since a missing b_active_trade is indistinguishable from "no
-        # position". Merge onto a fresh make_state() instead: new keys get
+        # make_state() got restored as-is, permanently missing that key —
+        # not just a KeyError waiting to happen (as seen with !status), but
+        # silently wrong for anything that used .get() too, since a missing
+        # active_trade is indistinguishable from "no position". Merge onto
+        # a fresh make_state() instead: new keys get
         # their default, every key that was actually saved still overrides
         # it — same restore behavior as before for everything that already
         # existed, plus forward-compatible with the next field this pattern
         # eventually needs too.
-        tf: {**make_state(), **(_saved_state.get(ticker, {}).get(tf) or {})}
+        # Keys of the removed B (Breakout) track in an old snapshot are
+        # dropped here so they don't linger in the state forever.
+        tf: {**make_state(), **{
+            k: v for k, v in (_saved_state.get(ticker, {}).get(tf) or {}).items()
+            if not (k.startswith("b_") or k.startswith("last_b_"))
+        }}
         for tf in TIMEFRAMES
     }
     for ticker in TICKERS
@@ -94,10 +98,6 @@ def _heal_state():
                 st["u_in_long"] = False
                 st["u_in_short"] = False
                 logger.warning(f"[HEAL] U-track desync fixed at startup: {ticker} {tf}")
-            if (st.get("b_in_long") or st.get("b_in_short")) and not st.get("b_active_trade"):
-                st["b_in_long"] = False
-                st["b_in_short"] = False
-                logger.warning(f"[HEAL] B-track desync fixed at startup: {ticker} {tf}")
 
 _heal_state()
 reconcile_orphaned_signals(state)
@@ -127,7 +127,7 @@ def any_active_trades() -> bool:
     for ticker in list(TICKERS):
         for tf in TIMEFRAMES:
             st = state.get(ticker, {}).get(tf, {})
-            for track in ("a", "u", "b"):
+            for track in _cfg.TRACKS:
                 if st.get(f"{track}_active_trade"):
                     return True
     return False

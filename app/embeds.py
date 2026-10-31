@@ -35,7 +35,7 @@ def build_embed(ticker, tf, signal_type, price, regime, leverage, confidence,
     # signal_type, which silently fell through to a generic "⚪" for any
     # track that isn't A or U (as B now is) rather than genuinely detecting it.
     track_letter = signal_type.strip()[:1]
-    _TRACK_EMOJI = {"A": "🔵", "U": "🟢", "B": "🟠"}
+    _TRACK_EMOJI = {"A": "🔵", "U": "🟢"}
     _COIN_EMOJI = {
         "BTC": "🟡", "ETH": "🔷", "SOL": "🟢", "XRP": "⚪",
         "DOGE": "🐕", "BNB": "🟨", "ADA": "🔵", "AVAX": "🔺",

@@ -43,7 +43,6 @@ from indicators import (
     run_kmeans_mfi_rolling,
     heikin_ashi,
     calculate_hurst,
-    calculate_breakout_signal,
 )
 from volume_indicators import (
     volume_flow_signal_v3,
@@ -316,7 +315,7 @@ def calculate_adaptive_sl(
     - Take the SL_MAE_PERCENTILE percentile of these MAE values + an SL_MAE_BUFFER buffer.
     - If there are fewer winning trades than SL_MIN_HISTORY — fall back to a fixed % or ATR-based SL.
 
-    track — "a" | "u" | "b" | None. 🆕 FIX: each track is supposed to be
+    track — "a" | "u" | None. 🆕 FIX: each track is supposed to be
     calibrated off its OWN MAE history — that's the whole reason records
     are tagged with `track` (see state.add_signal_record's docstring) —
     but this pulled history.get(ticker, {}).get(timeframe, {}).get(side, [])
@@ -710,7 +709,7 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
 
     # 🆕 REMOVED: the generic (non-tracked) state["trade_history"] used to
     # be appended here too, duplicating every closed trade into a 4th list
-    # on top of a_/u_/b_trade_history. Its only reader was the old
+    # on top of a_/u_trade_history. Its only reader was the old
     # !history Discord command (see discord_commands.py), which read
     # core.state directly and therefore got silently wiped on every
     # _reset_states_after_regime_change() (mode/htf/indicator changes,
@@ -732,15 +731,13 @@ def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: st
     state[notified_key] = False
 
     # 🆕 FIX: generalized from `if track == "a": ... else: (assumed "u")` —
-    # that else branch would have reset u_in_long/u_in_short for a closing
-    # B-track trade instead of b_in_long/b_in_short, permanently stranding
-    # b_in_long/b_in_short at True and blocking every future B-track signal
-    # for the life of the process.
+    # the per-track flags are reset by name so a closing trade can never
+    # reset another track's in_long/in_short flags.
     state[f"{track}_in_long"] = False
     state[f"{track}_in_short"] = False
 
-    state["active_trade"] = state.get("a_active_trade") or state.get("u_active_trade") or state.get("b_active_trade")
-    state["bars_in_trade"] = max(state.get("a_bars_in_trade", 0), state.get("u_bars_in_trade", 0), state.get("b_bars_in_trade", 0))
+    state["active_trade"] = state.get("a_active_trade") or state.get("u_active_trade")
+    state["bars_in_trade"] = max(state.get("a_bars_in_trade", 0), state.get("u_bars_in_trade", 0))
     state["last_closure_notified"] = state.get("a_last_closure_notified", False) and state.get("u_last_closure_notified", False)
 
     logger.info(f"[TRADE] Closed {track.upper()}-track {side.upper()} | PnL: {pnl_pct:.2f}% | Result: {result.upper()}")
@@ -1018,8 +1015,8 @@ async def check_signals(
         # catches any exception and returns [], None, "ERROR", 1 — but by
         # then last_processed_bar_time was already updated. On the retry,
         # is_new_bar would read False for a bar that was never actually
-        # processed, and since sig_u_long/short and sig_b_long/short are
-        # gated on `and is_new_bar`, that bar's U/B signal opportunity
+        # processed, and since sig_u_long/short is
+        # gated on `and is_new_bar`, that bar's U signal opportunity
         # would be silently lost forever (A-track has its own separate
         # last_a_*_attempt_bar guard and isn't affected the same way).
         # The commit now happens only at the bottom, right before the
@@ -1115,18 +1112,6 @@ async def check_signals(
         # the rolling R/S calculation is meaningfully more expensive than the
         # other indicators here, no point paying for it unused.
         hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(timeframe, 100)) if _cfg.ENABLE_HURST_FILTER else None
-        # 🆕 Track "b" (Breakout) — see config.py's BREAKOUT section for the
-        # methodology. Always computed (unlike Hurst, this isn't behind a
-        # toggle — it IS the B-track's entry logic, not an optional filter).
-        breakout_long_s, breakout_short_s = calculate_breakout_signal(
-            df, atr14, atr_pct,
-            lookback=_cfg.BREAKOUT_LOOKBACK,
-            squeeze_window=_cfg.BREAKOUT_SQUEEZE_WINDOW,
-            squeeze_percentile=_cfg.BREAKOUT_SQUEEZE_PERCENTILE,
-            vol_spike_mult=_cfg.BREAKOUT_VOL_SPIKE_MULT,
-            range_atr_mult=_cfg.BREAKOUT_RANGE_ATR_MULT,
-            close_loc_min=_cfg.BREAKOUT_CLOSE_LOC_MIN,
-        )
 
         idx = len(df) - 2
         bar_idx = idx
@@ -1224,14 +1209,6 @@ async def check_signals(
         # up" the same way instead of one being exact and the other an
         # approximation that happens to not matter yet.
         warmed_up = mfi.notna().sum() >= _cfg.MFI_TRAINING
-        # 🆕 FIX: B-track doesn't use MFI/Andean at all, so gating it on
-        # MFI_TRAINING (default 800 bars) was borrowed from A-track without
-        # actually applying to B — if MFI_TRAINING is ever raised above the
-        # fetched 900-bar window, B would silently stop firing for a reason
-        # that has nothing to do with what it actually needs. B's own
-        # requirement is just enough bars for its squeeze window + box
-        # lookback to have real (non-truncated) history.
-        b_warmed_up = len(df) >= (_cfg.BREAKOUT_SQUEEZE_WINDOW + _cfg.BREAKOUT_LOOKBACK)
 
         filter_long = (
             (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
@@ -1254,32 +1231,6 @@ async def check_signals(
             and hurst_ok
         )
 
-        # 🆕 Track "b" (Breakout) — deliberately does NOT gate on CHOP or
-        # FRAMA direction/slope (see config.py's BREAKOUT section): CHOP
-        # reads the tail of the just-ended squeeze as "still choppy" right
-        # as the breakout starts, and FRAMA's slope is exactly what lags in
-        # this pattern — gating on either would block the track from ever
-        # catching what it exists to catch. ATR bounds, HTF bias,
-        # fake-break/liquidity-sweep and spread filters still apply; those
-        # catch different failure modes (thin execution, manipulation wicks)
-        # a strong squeeze breakout is not automatically immune to. Hurst
-        # applies only if config.HURST_APPLY_TO_BREAKOUT is on (default off):
-        # its rolling window is still mostly the flat squeeze on the breakout
-        # bar, so it lags exactly like CHOP/FRAMA do.
-        filter_long_b = (
-            (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bull)
-            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
-            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-            and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
-        )
-        filter_short_b = (
-            (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bear)
-            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
-            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-            and (hurst_ok or not _cfg.HURST_APPLY_TO_BREAKOUT)
-        )
 
         mfi_bull_sig = crossover(mfi, level_os, idx)
         mfi_bear_sig = crossunder(mfi, level_ob, idx)
@@ -1320,12 +1271,9 @@ async def check_signals(
         a_short_cd_ok = cooldown_ok(state.get("last_a_short_time"))
         u_long_cd_ok = cooldown_ok(state.get("last_u_long_time"))
         u_short_cd_ok = cooldown_ok(state.get("last_u_short_time"))
-        b_long_cd_ok = cooldown_ok(state.get("last_b_long_time"))
-        b_short_cd_ok = cooldown_ok(state.get("last_b_short_time"))
 
         a_in_pos = state["a_in_long"] or state["a_in_short"]
         u_in_pos = state["u_in_long"] or state["u_in_short"]
-        b_in_pos = state["b_in_long"] or state["b_in_short"]
 
         # 🆕 FIX (Kimi review #1): U-track was already gated by is_new_bar
         # (the signal is checked once per new bar). A-track had no such
@@ -1344,20 +1292,15 @@ async def check_signals(
         sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok and warmed_up and a_short_not_attempted
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
         sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and not u_in_pos and u_short_cd_ok and is_new_bar
-        # 🆕 Track "b" — like UT Bot, this is a one-shot "this bar IS the
-        # breakout bar" condition (not a lingering confluence state like
-        # Andean/MFI), so it's gated by is_new_bar the same way U-track is.
-        sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and not b_in_pos and b_long_cd_ok  and is_new_bar and b_warmed_up
-        sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and not b_in_pos and b_short_cd_ok and is_new_bar and b_warmed_up
 
         # 🆕 Optional hard stop during a market shock (off by default).
         if market_shock and _cfg.SHOCK_GUARD_BLOCK_ENTRIES:
-            if any((sig_a_long, sig_a_short, sig_u_long, sig_u_short, sig_b_long, sig_b_short)):
+            if any((sig_a_long, sig_a_short, sig_u_long, sig_u_short)):
                 logger.info(
                     f"[SHOCK] {ticker} {timeframe}: entries blocked during market shock "
                     f"({market_shock['move_pct']:+.2f}% = {market_shock['move_atr']}x ATR)"
                 )
-            sig_a_long = sig_a_short = sig_u_long = sig_u_short = sig_b_long = sig_b_short = False
+            sig_a_long = sig_a_short = sig_u_long = sig_u_short = False
 
         # Track flags are only set on an actual open (not dry_run), and ALWAYS
         # together with active_trade, so they never get out of sync.
@@ -1380,12 +1323,6 @@ async def check_signals(
             if sig_u_short:
                 state["u_in_short"] = True
                 state["u_in_long"] = False
-            if sig_b_long:
-                state["b_in_long"] = True
-                state["b_in_short"] = False
-            if sig_b_short:
-                state["b_in_short"] = True
-                state["b_in_long"] = False
 
         # 🆕 NOTE: sugg_lev here is a rough informational estimate (from the
         # FRAMA channel width), used only as a fallback value when there's no
@@ -1395,7 +1332,7 @@ async def check_signals(
         # this estimate has no effect on it.
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
-        sugg_sl = frama_sl_long if (sig_a_long or sig_u_long or sig_b_long) else frama_sl_short
+        sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
         sugg_lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sugg_sl, 0.1))))
 
         if regime == "CHAOS":
@@ -1518,30 +1455,14 @@ async def check_signals(
             else:
                 sig_u_short = False
 
-        # --- B-track (Breakout) LONG ---
-        if sig_b_long:
-            sig = await _safe_open_position("b", "long")
-            if sig:
-                signals.append(sig)
-            else:
-                sig_b_long = False
-
-        # --- B-track (Breakout) SHORT ---
-        if sig_b_short:
-            sig = await _safe_open_position("b", "short")
-            if sig:
-                signals.append(sig)
-            else:
-                sig_b_short = False
-
         # 🆕 FIX (external review): commit point for last_processed_bar_time
         # — see the comment where is_new_bar was computed above for why
         # this moved from immediately-after-read to immediately-before the
         # only successful return in this function.
         # BUGFIX: this write was unconditional, so a dry_run call (e.g.
         # !scan) permanently advanced the real live last_processed_bar_time
-        # — silently consuming that bar's live U/B-track opportunity
-        # (both gated on is_new_bar) without ever opening a position for it.
+        # — silently consuming that bar's live U-track opportunity
+        # (gated on is_new_bar) without ever opening a position for it.
         if not dry_run:
             state["last_processed_bar_time"] = current_bar_time
         return signals, bar_time, regime, sugg_lev
@@ -1627,12 +1548,11 @@ def backtest_history(
     """Backtest for accumulating signal history.
 
     tracks — restrict which track(s) get simulated (default: all of them).
-    Use this to backfill just one track (e.g. tracks=("b",)) on a
+    Use this to backfill just one track (e.g. tracks=("u",)) on a
     ticker/tf that already has history for the others — running the full,
     unrestricted backtest again on an already-populated ticker/tf would
     duplicate every existing A/U record (see startup_sequence's comment on
-    this in bot.py), so this is the safe way to add coverage for a track
-    added after the others already had months of accumulated history.
+    this in bot.py).
 
     tp1_sl_fraction — 🆕 (external review, TP1-mode comparison): overrides
     config.TP1_SL_FRACTION for this one backtest run only (see
@@ -1787,18 +1707,6 @@ def backtest_history(
         # concern, and needs to match live's filter logic for calibration
         # consistency regardless of whether the toggle happens to be on right now.
         hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(tf, 100))
-        # 🆕 Track "b" (Breakout) — same detector as the live path, computed
-        # once as a full series here too (see calculate_breakout_signal's
-        # docstring / config.py's BREAKOUT section for the methodology).
-        breakout_long_s, breakout_short_s = calculate_breakout_signal(
-            df, atr14, atr_pct,
-            lookback=_cfg.BREAKOUT_LOOKBACK,
-            squeeze_window=_cfg.BREAKOUT_SQUEEZE_WINDOW,
-            squeeze_percentile=_cfg.BREAKOUT_SQUEEZE_PERCENTILE,
-            vol_spike_mult=_cfg.BREAKOUT_VOL_SPIKE_MULT,
-            range_atr_mult=_cfg.BREAKOUT_RANGE_ATR_MULT,
-            close_loc_min=_cfg.BREAKOUT_CLOSE_LOC_MIN,
-        )
 
         htf = _cfg.HTF_BIAS
         htf_bias_arr = np.zeros(len(df))
@@ -1933,12 +1841,6 @@ def backtest_history(
 
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = mfi_valid_cumcount.iloc[idx] >= _cfg.MFI_TRAINING
-            # 🆕 FIX: same reasoning as live's b_warmed_up — B doesn't use
-            # MFI, so it shouldn't be gated on MFI_TRAINING (previously it
-            # had NO warmup gate at all in the backtest, the opposite
-            # problem: too permissive, could fire on bars where the squeeze
-            # window's rolling percentile is only partially populated).
-            b_warmed_up_bt = idx >= (_cfg.BREAKOUT_SQUEEZE_WINDOW + _cfg.BREAKOUT_LOOKBACK)
 
             filter_long = (
                 (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
@@ -1959,21 +1861,6 @@ def backtest_history(
                 and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
             )
 
-            # 🆕 Track "b" filters — mirrors filter_long_b/filter_short_b in
-            # check_signals() exactly (no CHOP/FRAMA gating, see that
-            # function's comment for why).
-            filter_long_b = (
-                (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
-                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-                and (not _cfg.ENABLE_HURST_FILTER or not _cfg.HURST_APPLY_TO_BREAKOUT or hurst_ok)
-            )
-            filter_short_b = (
-                (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
-                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-                and (not _cfg.ENABLE_HURST_FILTER or not _cfg.HURST_APPLY_TO_BREAKOUT or hurst_ok)
-            )
 
             mfi_bull_sig = crossover(mfi, level_os, idx)
             mfi_bear_sig = crossunder(mfi, level_ob, idx)
@@ -1999,11 +1886,6 @@ def backtest_history(
             # signals live would have blocked.
             sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
             sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
-            # 🆕 Track "b" — HTF applied here (not inside filter_long_b/short_b,
-            # which are defined before htf_bull_bt/htf_bear_bt exist), same
-            # place A-track's HTF check happens.
-            sig_b_long  = bool(breakout_long_s.iloc[idx])  and filter_long_b  and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bull_bt) and b_warmed_up_bt
-            sig_b_short = bool(breakout_short_s.iloc[idx]) and filter_short_b and (not _cfg.ENABLE_MTF_BIAS or not _cfg.HTF_APPLY_TO_BREAKOUT or htf_bear_bt) and b_warmed_up_bt
 
             # 🆕 (external review, component-backtest): market_structure/
             # relative_strength for THIS bar, computed at most once (lazily,
@@ -2018,7 +1900,7 @@ def backtest_history(
             # works, just replayed at a historical idx instead of "now".
             ms_this_bar = None
             rs_this_bar = None
-            if compute_confidence and (sig_a_long or sig_a_short or sig_u_long or sig_u_short or sig_b_long or sig_b_short):
+            if compute_confidence and (sig_a_long or sig_a_short or sig_u_long or sig_u_short):
                 try:
                     ms_slice = df.iloc[:min(idx + 2, len(df))]
                     if len(ms_slice) >= 10:
@@ -2040,7 +1922,6 @@ def backtest_history(
             for track, side, sig_ok in [
                 ("a", "long", sig_a_long), ("a", "short", sig_a_short),
                 ("u", "long", sig_u_long), ("u", "short", sig_u_short),
-                ("b", "long", sig_b_long), ("b", "short", sig_b_short),
             ]:
                 if track not in tracks:
                     continue
@@ -2505,7 +2386,7 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     forwarded to analyze_confidence_components() (see its docstring for
     the exact effect). Defaults to ["track", "regime"] here — unlike live
     !components, a backtest run easily produces enough samples per cell
-    for the finer breakdown to be worth it, and pooling across A/U/B
+    for the finer breakdown to be worth it, and pooling across A/U
     tracks (different strategies entirely) or TREND/NORMAL regimes risks
     hiding a real effect or manufacturing an apparent one that's really
     just two that cancel differently when pooled.
@@ -2574,7 +2455,7 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
 # =====================================================================
 
 def make_state() -> Dict:
-    """Creates the initial state with independent A, U, and B tracks."""
+    """Creates the initial state with independent A and U tracks."""
     return {
         "a_in_long": False,
         "a_in_short": False,
@@ -2610,19 +2491,6 @@ def make_state() -> Dict:
         "u_bars_in_trade": 0,
         "a_last_closure_notified": False,
         "u_last_closure_notified": False,
-        # 🆕 Track "b" (Breakout) — same shape as a_*/u_* above.
-        "b_in_long": False,
-        "b_in_short": False,
-        "b_long_bar": None,
-        "b_short_bar": None,
-        "last_b_long_bar": None,
-        "last_b_short_bar": None,
-        "last_b_long_time": None,
-        "last_b_short_time": None,
-        "b_active_trade": None,
-        "b_trade_history": [],
-        "b_bars_in_trade": 0,
-        "b_last_closure_notified": False,
         "active_trade": None,
         "bars_in_trade": 0,
         "last_closure_notified": False,
