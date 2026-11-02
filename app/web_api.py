@@ -981,6 +981,13 @@ async def get_config():
             "max_tp_pct": _cfg.MAX_TP_PCT,
             "max_hold_bars": _cfg.MAX_HOLD_BARS,
         },
+        "trade_params": {
+            "target_risk_dep": _cfg.TARGET_RISK_DEP,
+            "max_hold_bars": _cfg.MAX_HOLD_BARS,
+            "max_allowed_lev": _cfg.MAX_ALLOWED_LEV,
+            "target_risk_dep_bounds": list(_cfg.TARGET_RISK_DEP_BOUNDS),
+            "max_hold_bars_bounds": list(_cfg.MAX_HOLD_BARS_BOUNDS),
+        },
         "indicators": {
             "frama_len": _cfg.FRAMA_LEN,
             "frama_mult": _cfg.FRAMA_MULT,
@@ -1450,6 +1457,49 @@ async def set_hurst_config(body: HurstConfigIn):
     })
     await broadcast_event({"type": "config_changed", "key": "hurst_config"})
     return {"hurst_min_deviation": _cfg.HURST_MIN_DEVIATION, "hurst_mode": _cfg.HURST_MODE}
+
+
+class TradeParamsIn(BaseModel):
+    target_risk_dep: Optional[float] = None  # risk per trade, % of deposit (drives leverage)
+    max_hold_bars: Optional[int] = None      # time stop: force-close a trade after this many bars
+
+
+@app.post("/api/config/trade-params")
+async def set_trade_params(body: TradeParamsIn):
+    """Risk per trade and max bars to hold a trade, live (no restart).
+    Applies to NEW positions (leverage is fixed at entry); max_hold_bars also
+    applies to trades that are already open — the next bar-count check uses
+    the new limit. See config.TARGET_RISK_DEP / config.MAX_HOLD_BARS."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+
+    if "target_risk_dep" in updates:
+        lo, hi = _cfg.TARGET_RISK_DEP_BOUNDS
+        v = updates["target_risk_dep"]
+        if not (v == v and lo <= v <= hi):  # v == v rejects NaN
+            raise HTTPException(400, f"target_risk_dep must be between {lo} and {hi}")
+    if "max_hold_bars" in updates:
+        lo, hi = _cfg.MAX_HOLD_BARS_BOUNDS
+        if not (lo <= updates["max_hold_bars"] <= hi):
+            raise HTTPException(400, f"max_hold_bars must be between {lo} and {hi}")
+
+    changed = False
+    if "target_risk_dep" in updates and updates["target_risk_dep"] != _cfg.TARGET_RISK_DEP:
+        _cfg.TARGET_RISK_DEP = updates["target_risk_dep"]
+        changed = True
+    if "max_hold_bars" in updates and updates["max_hold_bars"] != _cfg.MAX_HOLD_BARS:
+        _cfg.MAX_HOLD_BARS = updates["max_hold_bars"]
+        changed = True
+
+    if changed:
+        _cfg.save_trade_params()
+        await broadcast_event({"type": "config_changed", "key": "trade_params"})
+    return {
+        "target_risk_dep": _cfg.TARGET_RISK_DEP,
+        "max_hold_bars": _cfg.MAX_HOLD_BARS,
+        "changed": changed,
+    }
 
 
 class TpConfigIn(BaseModel):

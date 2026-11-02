@@ -19,11 +19,12 @@ from config import (
     CHOP_THRESHOLD,
     COOLDOWN_BARS,
     MAX_ALLOWED_LEV,
-    TARGET_RISK_DEP,
-    MAX_HOLD_BARS,
     HTF_CACHE_TTL_SECONDS,
     MARKET_MODE,
 )
+# TARGET_RISK_DEP and MAX_HOLD_BARS are likewise NOT bare-imported: they are
+# editable live from the web Settings tab (_cfg.X = ... in web_api.py), so they
+# are always read as _cfg.TARGET_RISK_DEP / _cfg.MAX_HOLD_BARS.
 # SIGNAL_HISTORY_LIMIT deliberately NOT bare-imported: it's runtime-mutable via
 # !tpconfig limit / web_api.py (_cfg.SIGNAL_HISTORY_LIMIT = ...). A bare import
 # would bind a stale int copy here that never sees those updates. Same reasoning
@@ -789,7 +790,7 @@ async def open_position(
     # computed from the actual sl.
     atr_v = max(float(atr14.iloc[idx]), 1e-8)
     sl_atr_mult = max(1.0, min(3.5, abs(close_v - sl) / atr_v))
-    lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sl_atr_mult, 0.1))))
+    lev = max(1, min(MAX_ALLOWED_LEV, int(_cfg.TARGET_RISK_DEP / max(sl_atr_mult, 0.1))))
     if regime == "CHAOS":
         lev = max(1, int(lev * 0.5))
     if regime == "TREND":
@@ -1088,9 +1089,9 @@ async def check_signals(
                     trade["last_counted_bar"] = current_bar_time
                     bars_key = f"{track}_bars_in_trade"
                     state[bars_key] = state.get(bars_key, 0) + 1
-                    if state[bars_key] >= MAX_HOLD_BARS:
+                    if state[bars_key] >= _cfg.MAX_HOLD_BARS:
                         close_trade(state, last_close, "cancelled", ticker, timeframe, track, close_time_ms=current_bar_time)
-                        logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {MAX_HOLD_BARS} bars")
+                        logger.info(f"[TRADE] Force-closed {track.upper()}-track {trade['side'].upper()} after {_cfg.MAX_HOLD_BARS} bars")
 
         atr14 = calculate_atr(df, ATR_PERIOD)
         atr_pct = (atr14 / df["close"]) * 100
@@ -1386,7 +1387,7 @@ async def check_signals(
         frama_sl_long = max(1.0, min(3.5, abs(close_v - float(fl.iloc[idx])) / atr_v))
         frama_sl_short = max(1.0, min(3.5, abs(float(fu.iloc[idx]) - close_v) / atr_v))
         sugg_sl = frama_sl_long if (sig_a_long or sig_u_long) else frama_sl_short
-        sugg_lev = max(1, min(MAX_ALLOWED_LEV, int(TARGET_RISK_DEP / max(sugg_sl, 0.1))))
+        sugg_lev = max(1, min(MAX_ALLOWED_LEV, int(_cfg.TARGET_RISK_DEP / max(sugg_sl, 0.1))))
 
         if regime == "CHAOS":
             sugg_lev = max(1, int(sugg_lev * 0.5))
