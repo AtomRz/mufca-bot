@@ -37,10 +37,40 @@ logger = logging.getLogger(__name__)
 # exchange's own tracked wallets net out in that sum.
 # Format: {exchange: {wallet_label: address}}. To track another wallet, add a line.
 EXCHANGE_ETH_ADDRESSES: Dict[str, Dict[str, str]] = {
+    # Binance: the FULL ETH-mainnet wallet list from Binance's Proof of Reserves
+    # (snapshot at block 26,309,019, taken right after the 2026-10-29 hot-wallet
+    # drain). Binance 14 / 15 / 16 were emptied in that incident and Binance
+    # announced that all further withdrawals go out of newly generated wallets,
+    # so the old 3-address set (Binance, Binance 14, Binance 15) went flat. The
+    # old "Binance" 0x3f5CE5... is not in the PoR list and was dropped.
+    # Tracking the whole set (cold + hot + Ceffu custody) lets hot<->cold
+    # rebalancing net out in the per-exchange sum; only real in/outflow of the
+    # set shows up as flow (see get_eth_flow_delta). When Binance publishes a new
+    # PoR list, re-sync this block with the "ETH,ETH" rows.
     "Binance": {
-        "Binance":    "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE",
-        "Binance 14": "0x28C6c06298d514Db089934071355E5743bf21d60",
-        "Binance 15": "0x21a31Ee1afC51d94C2eFcCAa2092aD1028285549",
+        "Binance 14 (drained)": "0x28c6c06298d514db089934071355e5743bf21d60",
+        "Binance 15 (drained)": "0x21a31ee1afc51d94c2efccaa2092ad1028285549",
+        "Binance 16 (drained)": "0xdfd5293d8e347dfe59e90efd55b2956a1343963d",
+        "0xbe0e…33e8": "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8",
+        "0xf977…acec": "0xf977814e90da44bfa03b6295a0616a897441acec",
+        "0x98ad…ba9d": "0x98adef6f2ac8572ec48965509d69a8dd5e8bba9d",
+        "0x32e1…1149": "0x32e11a20337ebc79abd0eeab2d91bafbd9591149",
+        "0x8356…0007": "0x835678a611b28684005a5e2233695fb6cbbb0007",
+        "0x5a1e…6694": "0x5a1e5b56aa33c056ed7bb93b88b1774a456f6694",
+        "0x4368…f042": "0x43684d03d81d3a4c70da68febdd61029d426f042",
+        "0x8652…8d96": "0x86523c87c8ec98c7539e2c58cd813ee9d1a08d96",
+        "0x18e2…e4d1": "0x18e226459ccf0eec276514a4fd3b226d8961e4d1",
+        "0x4fdf…271e": "0x4fdfe365436b5273a42f135c6a6244a20404271e",
+        "0xa7c0…592d": "0xa7c0d36c4698981fab42a7d8c783674c6fe2592d",
+        "0x4ed6…17f1": "0x4ed6cf63bd9c009d247ee51224fc1c7041f517f1",
+        "0x5a52…efcb": "0x5a52e96bacdabb82fd05763e25335261b270efcb",
+        "0x4aec…4b96": "0x4aec0e98fc1fb55b9cc2faaa7a81acca42cb4e96",
+        "0x9696…6976": "0x9696f59e4d72e237be84ffd425dcad154bf96976",
+        "0x56ed…b17f": "0x56eddb7aa87536c09ccc2793473599fd21a8b17f",
+        "0x4976…2327":"0x4976a4a02f38326660d17bf34b431dc6e2eb2327",
+        "Ceffu 0xd3a2…c4a1": "0xd3a22590f8243f8e83ac230d1842c9af0404c4a1",
+        "Ceffu 0x3a3c…1dc8": "0x3a3c006053a9b40286b9951a11be4c5808c11dc8",
+        "Ceffu 0x4a9e…261f": "0x4a9e49a45a4b2545cb177f79c7381a30e1dc261f",
     },
     "Coinbase": {
         # Only the old single address so far — add Coinbase's active hot wallets here.
