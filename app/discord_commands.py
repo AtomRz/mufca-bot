@@ -38,7 +38,6 @@ from config import (
     TIMEFRAMES,
     MIN_TP_PCT,
     MAX_TP_PCT,
-    MAX_HOLD_BARS,
     CHOP_THRESHOLD,
     SIGNALS_HISTORY_FILE,
     ATR_PERIOD,
@@ -591,7 +590,7 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
                 f"• Safe percentile: **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th**\n"
                 f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals\n"
                 f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
-                f"• Max hold: **{MAX_HOLD_BARS}** bars\n"
+                f"• Max hold: **{_cfg.MAX_HOLD_BARS}** bars\n"
                 "\nTo change: `!tpconfig mode safe` | `!tpconfig mode aggressive` | "
                 "`!tpconfig limit 30` | `!tpconfig percentile 70` | `!tpconfig safe 50`"
             )

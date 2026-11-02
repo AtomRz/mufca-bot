@@ -143,6 +143,8 @@ export const api = {
     request('/api/config/hurst_window', { method: 'POST', body: JSON.stringify({ tf, value }) }),
   setHurstConfig: (patch) =>
     request('/api/config/hurst_config', { method: 'POST', body: JSON.stringify(patch) }),
+  setTradeParams: (patch) =>
+    request('/api/config/trade-params', { method: 'POST', body: JSON.stringify(patch) }),
   setTpConfig: (param, value) =>
     request('/api/config/tpconfig', {
       method: 'POST',

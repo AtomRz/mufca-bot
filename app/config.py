@@ -1104,6 +1104,48 @@ def save_tp_config():
 load_tp_config()
 
 # =====================================================================
+# 🎛️  TRADE PARAMETERS — risk per trade + time stop (editable in web Settings)
+# =====================================================================
+# TARGET_RISK_DEP (default 5.0, "risk % of deposit") and MAX_HOLD_BARS
+# (default 20) used to be plain hardcoded constants. They are now persisted in
+# trade_params.json and changed live from the web Settings tab. Every reader
+# must access them as _cfg.TARGET_RISK_DEP / _cfg.MAX_HOLD_BARS at the call
+# site — a bare `from config import TARGET_RISK_DEP` would keep a stale copy.
+#
+# TARGET_RISK_DEP drives leverage for NEW positions:
+#     lev = int(TARGET_RISK_DEP / SL distance in ATR (1..3.5)), capped by MAX_ALLOWED_LEV
+# MAX_HOLD_BARS is the time stop: a trade still open after this many bars is
+# force-closed as "cancelled" (also the horizon for shadow/backtest tracking).
+TRADE_PARAMS_FILE = os.path.join(DATA_DIR, "trade_params.json")
+TARGET_RISK_DEP_BOUNDS = (1.0, 20.0)
+MAX_HOLD_BARS_BOUNDS = (2, 100)
+
+def load_trade_params():
+    global TARGET_RISK_DEP, MAX_HOLD_BARS
+    d = _load_typed(TRADE_PARAMS_FILE, {
+        "target_risk_dep": float(TARGET_RISK_DEP),
+        "max_hold_bars": int(MAX_HOLD_BARS),
+    })
+    lo, hi = TARGET_RISK_DEP_BOUNDS
+    if lo <= d["target_risk_dep"] <= hi:
+        TARGET_RISK_DEP = d["target_risk_dep"]
+    else:
+        logger.error(f"[CONFIG] trade_params.json target_risk_dep={d['target_risk_dep']!r} outside {lo}..{hi} — using default {TARGET_RISK_DEP}")
+    lo, hi = MAX_HOLD_BARS_BOUNDS
+    if lo <= d["max_hold_bars"] <= hi:
+        MAX_HOLD_BARS = d["max_hold_bars"]
+    else:
+        logger.error(f"[CONFIG] trade_params.json max_hold_bars={d['max_hold_bars']!r} outside {lo}..{hi} — using default {MAX_HOLD_BARS}")
+
+def save_trade_params():
+    safe_json_save(TRADE_PARAMS_FILE, {
+        "target_risk_dep": TARGET_RISK_DEP,
+        "max_hold_bars": MAX_HOLD_BARS,
+    })
+
+load_trade_params()
+
+# =====================================================================
 # 🕯️  HEIKIN ASHI FOR UT BOT
 # =====================================================================
 UT_HA_FILE = os.path.join(DATA_DIR, "ut_ha.json")

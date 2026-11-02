@@ -207,6 +207,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const hurstWindowValue = (t) => hurstWindowDraft[t] ?? config.hurst_window[t]
   const ind = config.indicators
   const colors = config.colors
+  const tp = config.trade_params
 
   const saveIndicator = (field, value) => run(`ind_${field}`, () => api.setIndicators({ [field]: value }))
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
@@ -524,10 +525,32 @@ export default function SettingsPanel({ config, onChanged }) {
               <span className="row-label">Min / Max TP</span>
               <span className="row-value">{config.tp_config.min_tp_pct}% / {config.tp_config.max_tp_pct}%</span>
             </div>
-            <div className="row">
-              <span className="row-label">Max hold bars</span>
-              <span className="row-value">{config.tp_config.max_hold_bars}</span>
-            </div>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Risk &amp; Hold Time</h3>
+            <NumberField
+              label="Risk per trade, % of deposit"
+              hint={`${tp.target_risk_dep_bounds[0]}–${tp.target_risk_dep_bounds[1]}`}
+              value={tp.target_risk_dep}
+              min={tp.target_risk_dep_bounds[0]} max={tp.target_risk_dep_bounds[1]} step={0.5}
+              busyKey="trade_risk" busy={busy}
+              onSave={(v) => run('trade_risk', () => api.setTradeParams({ target_risk_dep: v }))}
+            />
+            <NumberField
+              label="Max bars to hold a trade"
+              hint={`${tp.max_hold_bars_bounds[0]}–${tp.max_hold_bars_bounds[1]}`}
+              value={tp.max_hold_bars}
+              min={tp.max_hold_bars_bounds[0]} max={tp.max_hold_bars_bounds[1]}
+              busyKey="trade_hold" busy={busy}
+              onSave={(v) => run('trade_hold', () => api.setTradeParams({ max_hold_bars: v }))}
+            />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Risk sets the leverage of NEW positions: leverage = risk % ÷ stop-loss distance in ATR (1–3.5),
+              capped at {tp.max_allowed_lev}x, then adjusted for regime and volume. Open positions keep their
+              leverage. Max bars is a time stop: a trade still unresolved after that many bars is closed as
+              cancelled — it also applies to trades that are already open.
+            </p>
           </div>
 
           <div className="panel">
