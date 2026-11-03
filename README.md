@@ -286,6 +286,7 @@ volumes:
 |---|---|
 | `!chart [PAIR] [TF] [LIMIT]` | Candlestick PNG with FRAMA, BB, S/R, volume & MFI panels. Example: `!chart ETH 4h 100` |
 | `!onchain` | Show current on-chain bias (exchange flows, Fear & Greed, BTC dominance) |
+| `!ethtrace [EXCHANGE] [MIN_ETH]` | Find an exchange's new wallets after a rotation: lists big counterparties (≥ MIN_ETH, default 1000) of its tracked wallets that the bot doesn't track yet. Read-only. Example: `!ethtrace Binance 500` |
 | `!derivatives [PAIR]` | Show current derivatives bias — funding rate + open interest (futures mode only). Example: `!derivatives ETH/USDT` |
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
 | `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`) |
