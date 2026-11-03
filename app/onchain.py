@@ -473,6 +473,129 @@ async def get_eth_flow_delta() -> Dict:
     }
 
 # =====================================================================
+# 🔎  WALLET TRACE — find an exchange's NEW wallets (used by !ethtrace)
+# =====================================================================
+# Exchanges rotate hot wallets (Binance did after the 2026-10-29 incident). When
+# the tracked set goes quiet, the funds went to addresses we don't track. This
+# looks at the latest normal transactions of every tracked wallet of an exchange
+# and lists the big counterparties that are NOT in the tracked set — those are
+# the candidates to add to EXCHANGE_ETH_ADDRESSES. Read-only: changes nothing.
+_TRACE_TX_PER_WALLET = 100   # latest N normal txs per wallet (Etherscan page size)
+
+
+async def _fetch_txlist(session: aiohttp.ClientSession, address: str, retries: int = 3) -> Optional[List[dict]]:
+    """Latest normal transactions of an address, newest first.
+    [] = the address has none; None = the fetch failed."""
+    url = (
+        f"https://api.etherscan.io/v2/api"
+        f"?chainid=1&module=account&action=txlist"
+        f"&address={address}&startblock=0&endblock=99999999"
+        f"&page=1&offset={_TRACE_TX_PER_WALLET}&sort=desc"
+        f"&apikey={ETHERSCAN_API_KEY}"
+    )
+    for attempt in range(retries):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 429:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                data = await resp.json()
+                result = data.get("result")
+                if str(data.get("status")) == "1" and isinstance(result, list):
+                    return result
+                if "no transactions found" in str(data.get("message", "")).lower():
+                    return []
+                if "rate limit" in str(result).lower():
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.warning(f"[ONCHAIN] txlist error for {address[:10]}…: {data.get('message')} — {str(result)[:120]}")
+                return None
+        except Exception as e:
+            logger.warning(f"[ONCHAIN] txlist error {address[:10]}… (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+    return None
+
+
+def _aggregate_counterparties(wallet: str, label: str, txs: List[dict], tracked: set,
+                              agg: Dict[str, Dict[str, Any]]) -> None:
+    """Adds one wallet's transactions to `agg` ({counterparty: totals}).
+    Only successful transfers with value > 0 whose other side is not tracked.
+    out_eth = sent BY the tracked wallet TO the counterparty; in_eth = the reverse."""
+    for tx in txs:
+        if str(tx.get("isError", "0")) == "1":
+            continue
+        try:
+            value = int(tx.get("value", "0")) / 1e18
+            ts = int(tx.get("timeStamp", 0))
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        frm = str(tx.get("from") or "").lower()
+        to = str(tx.get("to") or "").lower()
+        if frm == wallet:
+            other, key = to, "out_eth"
+        elif to == wallet:
+            other, key = frm, "in_eth"
+        else:
+            continue
+        if not other or other in tracked:
+            continue
+        rec = agg.setdefault(other, {"in_eth": 0.0, "out_eth": 0.0, "txs": 0, "last_ts": 0, "via": set()})
+        rec[key] += value
+        rec["txs"] += 1
+        rec["last_ts"] = max(rec["last_ts"], ts)
+        rec["via"].add(label)
+
+
+async def trace_exchange_wallets(exchange: str = "Binance", min_eth: float = 1000.0, top_n: int = 15) -> Dict:
+    """Big counterparties (>= min_eth in total) of an exchange's tracked wallets
+    that are not tracked themselves, ranked by volume. Returns
+    {exchange, wallets_checked, failed: [labels], min_eth, counterparties: [...]}
+    or {"error": "..."} for an unknown exchange."""
+    wanted = next((ex for ex in EXCHANGE_ETH_ADDRESSES if ex.lower() == exchange.strip().lower()), None)
+    if wanted is None:
+        return {"error": f"unknown exchange {exchange!r}, choose from: {', '.join(EXCHANGE_ETH_ADDRESSES)}"}
+
+    agg: Dict[str, Dict[str, Any]] = {}
+    failed: List[str] = []
+    wallets = list(EXCHANGE_ETH_ADDRESSES[wanted].items())
+    async with aiohttp.ClientSession() as session:
+        for i, (label, address) in enumerate(wallets):
+            if i:
+                await asyncio.sleep(_ETHERSCAN_CALL_SPACING)
+            addr = address.lower()
+            txs = await _fetch_txlist(session, addr)
+            if txs is None:
+                failed.append(label)
+                continue
+            _aggregate_counterparties(addr, label, txs, _WALLET_KEYS, agg)
+
+    rows = []
+    for other, r in agg.items():
+        total = r["in_eth"] + r["out_eth"]
+        if total >= min_eth:
+            rows.append({
+                "address": other,
+                "in_eth": round(r["in_eth"], 2),
+                "out_eth": round(r["out_eth"], 2),
+                "txs": r["txs"],
+                "last_ts": r["last_ts"],
+                "via": sorted(r["via"]),
+            })
+    rows.sort(key=lambda x: x["in_eth"] + x["out_eth"], reverse=True)
+    return {
+        "exchange": wanted,
+        "wallets_checked": len(wallets) - len(failed),
+        "failed": failed,
+        "min_eth": min_eth,
+        "counterparties": rows[:top_n],
+        "total_matches": len(rows),
+    }
+
+
+# =====================================================================
 # 📊  COINGECKO — Fear & Greed, dominance, volume
 # =====================================================================
 

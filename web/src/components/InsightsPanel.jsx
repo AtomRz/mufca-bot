@@ -231,6 +231,8 @@ function BiasView({ lastEvent, pairs }) {
         )}
       </div>
 
+      <WalletTracePanel />
+
       <div className="panel">
         <h3 className="panel-title">Market sentiment</h3>
         <div className="row">
@@ -852,6 +854,103 @@ const VIEWS = [
   { id: 'components', label: 'Components' },
   { id: 'simulate', label: 'Simulate' },
 ]
+
+// =====================================================================
+// 🔎  FIND NEW EXCHANGE WALLETS — web twin of Discord's !ethtrace.
+// On demand only (≈23 Etherscan calls, 15–30 s), never polled.
+// =====================================================================
+const TRACE_EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'OKX']
+
+function WalletTracePanel() {
+  const [exchange, setExchange] = useState('Binance')
+  const [minEth, setMinEth] = useState('1000')
+  const [busy, setBusy] = useState(false)
+  const [res, setRes] = useState(null)
+  const [err, setErr] = useState(null)
+  const [copied, setCopied] = useState(null)
+
+  const run = async () => {
+    const v = parseFloat(minEth)
+    if (!Number.isFinite(v) || v < 0) { setErr('Min ETH must be a non-negative number'); return }
+    setBusy(true)
+    setErr(null)
+    try {
+      setRes(await api.traceOnchain(exchange, v))
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copy = (addr) => {
+    // clipboard can be missing/blocked in an Android WebView — the address is
+    // also selectable text and has an Etherscan link, so a failure is harmless
+    try {
+      navigator.clipboard.writeText(addr).then(() => {
+        setCopied(addr)
+        setTimeout(() => setCopied(null), 1500)
+      }).catch(() => {})
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Find new exchange wallets</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 10px' }}>
+        If an exchange's flow sits at 0, its active wallets may have rotated. This reads the latest 100
+        transactions of every tracked wallet and lists big counterparties the bot doesn't track yet
+        (takes 15–30 s, uses Etherscan). Add promising addresses to <code>EXCHANGE_ETH_ADDRESSES</code> in <code>onchain.py</code>.
+      </p>
+      <div className="field">
+        <label>Exchange</label>
+        <select value={exchange} disabled={busy} onChange={(e) => setExchange(e.target.value)}>
+          {TRACE_EXCHANGES.map((x) => <option key={x} value={x}>{x}</option>)}
+        </select>
+      </div>
+      <div className="field">
+        <label>Min ETH (total per address)</label>
+        <input type="number" min={0} step={100} value={minEth} disabled={busy}
+          onChange={(e) => setMinEth(e.target.value)} />
+      </div>
+      <button className="btn primary" disabled={busy} onClick={run}>
+        {busy ? 'Tracing… (up to 30 s)' : 'Trace'}
+      </button>
+      {err && <p style={{ fontSize: 12, color: 'var(--short)', marginTop: 10 }}>{err}</p>}
+      {res && (
+        <div style={{ marginTop: 12 }}>
+          <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 6px' }}>
+            {res.exchange}: checked {res.wallets_checked} wallets
+            {res.failed?.length > 0 && ` (${res.failed.length} failed: ${res.failed.join(', ')})`}
+            {' · '}≥ {Number(res.min_eth).toLocaleString()} ETH · <code>out</code> = sent by a tracked wallet to it,
+            {' '}<code>in</code> = sent by it to a tracked wallet
+          </p>
+          {res.counterparties.length === 0 && (
+            <p style={{ fontSize: 13 }}>Nothing found — try a lower threshold (e.g. 200).</p>
+          )}
+          {res.counterparties.map((r) => (
+            <div key={r.address} style={{ padding: '8px 0', borderTop: '1px solid var(--border-soft)', fontSize: 12 }}>
+              <div className="mono" style={{ wordBreak: 'break-all' }}>{r.address}</div>
+              <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>
+                out <b>{Math.round(r.out_eth).toLocaleString()}</b> / in <b>{Math.round(r.in_eth).toLocaleString()}</b> ETH
+                {' · '}{r.txs} tx · last {fmtAge(r.last_ts)} · via {r.via.join(', ')}
+              </div>
+              <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
+                <a href={`https://etherscan.io/address/${r.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
+                <button className="btn" onClick={() => copy(r.address)}>{copied === r.address ? 'Copied' : 'Copy'}</button>
+              </div>
+            </div>
+          ))}
+          {res.total_matches > res.counterparties.length && (
+            <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>
+              Showing top {res.counterparties.length} of {res.total_matches}.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function InsightsPanel({ lastEvent, pairs, timeframes }) {
   const [view, setView] = useState('bias')

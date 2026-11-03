@@ -53,7 +53,7 @@ from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest,
 )
-from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full
+from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full, trace_exchange_wallets
 import derivatives
 import spread
 import sim_jobs
@@ -138,6 +138,7 @@ async def help_cmd(ctx):
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
+        "`!ethtrace [exchange] [min_eth]` — find an exchange's new wallets: big untracked counterparties of its tracked wallets (default Binance, 1000 ETH)",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
         "",
@@ -1670,6 +1671,76 @@ async def onchain_cmd(ctx):
         await msg.edit(content=report)
     except Exception as e:
         await msg.edit(content=f"❌ On-chain error: `{e}`")
+
+
+def _age_label(ts: int) -> str:
+    """'5m ago' / '3h ago' / '2d ago' for a unix timestamp."""
+    s = max(0, int(time.time()) - int(ts))
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+@core.bot.command(name="ethtrace")
+async def ethtrace_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0):
+    """Finds an exchange's NEW wallets: big counterparties of its tracked wallets
+    that the bot doesn't track yet (read-only, uses the Etherscan key)."""
+    if not _cfg.ETHERSCAN_API_KEY:
+        await ctx.send("⚠️ `ETHERSCAN_API_KEY` is not set — `!ethtrace` needs it.")
+        return
+    if not (min_eth == min_eth and min_eth >= 0):
+        await ctx.send("⚠️ `min_eth` must be a non-negative number.")
+        return
+
+    msg = await ctx.send(f"⏳ Tracing {exchange} wallets via Etherscan (≈15–30 s)...")
+    try:
+        res = await trace_exchange_wallets(exchange, min_eth)
+    except Exception as e:
+        await msg.edit(content=f"❌ Trace error: `{e}`")
+        return
+    if res.get("error"):
+        await msg.edit(content=f"⚠️ {res['error']}")
+        return
+
+    head = (
+        f"**🔎 {res['exchange']} — untracked counterparties ≥ {res['min_eth']:,.0f} ETH**\n"
+        f"Last 100 txs of {res['wallets_checked']} tracked wallets"
+        + (f" ({len(res['failed'])} failed: {', '.join(res['failed'])})" if res["failed"] else "")
+        + ".\n`out` = sent by the tracked wallet to it, `in` = sent by it to the tracked wallet."
+    )
+    rows = res["counterparties"]
+    if not rows:
+        await msg.edit(content=head + "\n\nNothing found. Try a lower threshold, e.g. `!ethtrace "
+                       f"{res['exchange']} 200`.")
+        return
+
+    blocks = []
+    for r in rows:
+        blocks.append(
+            f"`{r['address']}`\n"
+            f"  out **{r['out_eth']:,.0f}** / in **{r['in_eth']:,.0f}** ETH · {r['txs']} tx · "
+            f"last {_age_label(r['last_ts'])} · via {', '.join(r['via'])}"
+        )
+    foot = "\n_Add promising addresses to `EXCHANGE_ETH_ADDRESSES` in `onchain.py`._"
+    if res["total_matches"] > len(rows):
+        foot = f"\n_Showing top {len(rows)} of {res['total_matches']}._" + foot
+
+    # Discord's limit is 2000 chars per message — split, keeping each block whole
+    chunks, cur = [], head
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 1900:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n\n" if cur else "") + b
+    chunks.append(cur + foot if len(cur) + len(foot) <= 1900 else cur)
+    if len(cur) + len(foot) > 1900:
+        chunks.append(foot)
+
+    await msg.edit(content=chunks[0])
+    for c in chunks[1:]:
+        await ctx.send(c)
 
 
 @core.bot.command(name="reset_cache")
