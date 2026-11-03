@@ -65,6 +65,7 @@ from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components
 import push as _push
 import derivatives
+import onchain as _onchain
 import spread
 import shock_guard
 import shadow as shadow_mod
@@ -352,6 +353,37 @@ async def get_onchain():
         "bias": core._onchain_bias_cache,
         "last_fetch": core._onchain_last_fetch or None,
     }
+
+
+_trace_lock = asyncio.Lock()
+_trace_cache: dict = {}          # (exchange lower, min_eth) -> (timestamp, result)
+_TRACE_CACHE_SECONDS = 60
+
+
+@app.get("/api/onchain/trace")
+async def trace_onchain(exchange: str = "Binance", min_eth: float = 1000.0):
+    """Finds an exchange's NEW wallets (same as Discord !ethtrace): big
+    counterparties of its tracked wallets that the bot doesn't track yet.
+    Read-only, ~23 Etherscan calls (15-30 s), so it is on demand only: calls are
+    serialised and a result is reused for 60 s — repeated clicks can't hammer
+    the Etherscan quota."""
+    if not _cfg.ETHERSCAN_API_KEY:
+        raise HTTPException(400, "ETHERSCAN_API_KEY is not set")
+    if not (min_eth == min_eth and 0 <= min_eth <= 10_000_000):  # min_eth == min_eth rejects NaN
+        raise HTTPException(400, "min_eth must be between 0 and 10,000,000")
+
+    key = (exchange.strip().lower(), float(min_eth))
+    async with _trace_lock:
+        hit = _trace_cache.get(key)
+        if hit and time.time() - hit[0] < _TRACE_CACHE_SECONDS:
+            return hit[1]
+        res = await _onchain.trace_exchange_wallets(exchange, min_eth)
+        if res.get("error"):
+            raise HTTPException(400, res["error"])
+        res = {**res, "generated_at": time.time()}
+        if res["wallets_checked"] > 0:  # don't cache a run where every fetch failed
+            _trace_cache[key] = (time.time(), res)
+        return res
 
 
 @app.get("/api/derivatives")
