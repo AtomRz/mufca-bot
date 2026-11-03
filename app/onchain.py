@@ -51,6 +51,10 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, Dict[str, str]] = {
         "Binance 14 (drained)": "0x28c6c06298d514db089934071355e5743bf21d60",
         "Binance 15 (drained)": "0x21a31ee1afc51d94c2efccaa2092ad1028285549",
         "Binance 16 (drained)": "0xdfd5293d8e347dfe59e90efd55b2956a1343963d",
+        # Found with !ethtrace on 2026-11-03: received ~285.8k ETH from tracked
+        # wallets 0xf977/0x4ed6/0x5a52 and sent ~37.4k back, 18 txs, active
+        # minutes before the check. No public label found — verify on Etherscan.
+        "0x690c…91cc (hub)": "0x690c3eebf6ee237f00fc96f9766282f096c191cc",
         "0xbe0e…33e8": "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8",
         "0xf977…acec": "0xf977814e90da44bfa03b6295a0616a897441acec",
         "0x98ad…ba9d": "0x98adef6f2ac8572ec48965509d69a8dd5e8bba9d",
