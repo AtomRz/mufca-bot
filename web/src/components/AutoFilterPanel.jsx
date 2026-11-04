@@ -70,6 +70,54 @@ function PinnedSets({ overrides, busy, onRevert, onClear }) {
   )
 }
 
+const FILTER_LABELS = {
+  frama: 'FRAMA trend', slope: 'FRAMA slope', chop: 'CHOP', atr: 'ATR', htf: 'HTF bias',
+  fake_break: 'Fake breakout', liq_sweep: 'Liquidity sweep', hurst: 'Hurst',
+}
+
+// Hand-edit the filters of ONE pair/timeframe. Shows what is in force right now
+// (the pinned set, else the global toggles); flipping a switch pins the pair.
+function ManualPin({ config, busy, act }) {
+  const pairs = config.pairs || []
+  const tfs = config.timeframes || []
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const t = ticker || pairs[0] || ''
+  const f = tf || tfs[0] || ''
+  const pinned = config.filter_overrides?.active?.[t]?.[f]
+  const flags = pinned || config.filter_toggles || {}
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Set filters by hand</div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 8 }}>
+        <select value={t} onChange={(e) => setTicker(e.target.value)}>
+          {pairs.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+        <select value={f} onChange={(e) => setTf(e.target.value)}>
+          {tfs.map((x) => <option key={x} value={x}>{x}</option>)}
+        </select>
+      </div>
+      <p style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
+        {pinned ? 'Pinned for this pair/timeframe.' : 'Following the global toggles — flipping a switch pins this pair/timeframe.'}
+      </p>
+      {FILTER_ORDER.map((key) => (
+        <div className="toggle-row" key={key}>
+          <span className="row-label">{FILTER_LABELS[key]}</span>
+          <label className="switch">
+            <input type="checkbox" checked={!!flags[key]} disabled={busy || !t || !f}
+                   onChange={(e) => act(() => api.pinFilters(t, f, { [key]: e.target.checked }))} />
+            <span className="switch-track" />
+          </label>
+        </div>
+      ))}
+      <button className="btn" style={{ marginTop: 8 }} disabled={busy || !pinned}
+              onClick={() => act(() => api.pinFilters(t, f, null))}>
+        Remove pin (use global toggles)
+      </button>
+    </div>
+  )
+}
+
 export default function AutoFilterPanel({ config, onChanged }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
@@ -142,6 +190,7 @@ export default function AutoFilterPanel({ config, onChanged }) {
         onRevert={() => act(() => api.revertFilterOverrides())}
         onClear={() => act(() => api.clearFilterOverrides())}
       />
+      <ManualPin config={config} busy={busy || sim.running} act={act} />
       <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
         Pinned sets win over the global toggles for that pair/timeframe. Also available in Discord: !autofilter.
       </p>

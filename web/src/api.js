@@ -137,6 +137,8 @@ export const api = {
     request('/api/compsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, min_samples: minSamples }) }),
   runAutoFilter: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
     request('/api/autofilter', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
+  pinFilters: (ticker, tf, filters) =>
+    request('/api/filter-overrides', { method: 'POST', body: JSON.stringify({ ticker, tf, filters }) }),
   revertFilterOverrides: () =>
     request('/api/filter-overrides/revert', { method: 'POST' }),
   clearFilterOverrides: () =>
