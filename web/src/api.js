@@ -135,6 +135,12 @@ export const api = {
     request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runCompSim: ({ ticker, tf, numBars = 3000, minSamples = 30 } = {}) =>
     request('/api/compsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, min_samples: minSamples }) }),
+  runAutoFilter: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
+    request('/api/autofilter', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
+  revertFilterOverrides: () =>
+    request('/api/filter-overrides/revert', { method: 'POST' }),
+  clearFilterOverrides: () =>
+    request('/api/filter-overrides', { method: 'DELETE' }),
   setUtha: (enabled) =>
     request('/api/config/utha', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setFilterToggle: (filter, enabled) =>

@@ -2,6 +2,7 @@ import os
 import json
 import copy
 import math
+import time
 import threading
 import logging
 from typing import List, Optional
@@ -290,6 +291,7 @@ FILTERS_FILE = os.path.join(DATA_DIR, "filter_toggles.json")
 
 DEFAULT_FILTER_TOGGLES = {
     "frama": True,       # use_frama_filter
+    "slope": True,       # 🆕 FRAMA slope confirmation (used to be always on, no switch)
     "chop": True,        # use_chop
     "atr": True,         # use_atr_f
     "htf": True,         # enable_mtf_bias
@@ -309,6 +311,7 @@ def save_filter_toggles(toggles: dict):
 
 _filter_toggles = load_filter_toggles()
 ENABLE_FRAMA_FILTER      = _filter_toggles["frama"]       # use_frama_filter
+ENABLE_SLOPE_FILTER      = _filter_toggles["slope"]
 ENABLE_CHOP_FILTER       = _filter_toggles["chop"]        # use_chop
 ENABLE_ATR_FILTER        = _filter_toggles["atr"]         # use_atr_f
 ENABLE_MTF_BIAS          = _filter_toggles["htf"]         # enable_mtf_bias
@@ -316,6 +319,125 @@ ENABLE_FAKE_BREAK_FILTER = _filter_toggles["fake_break"]
 ENABLE_LIQ_SWEEP_FILTER  = _filter_toggles["liq_sweep"]
 ENABLE_HURST_FILTER      = _filter_toggles["hurst"]
 ENABLE_SPREAD_FILTER     = _filter_toggles["spread"]
+
+# =====================================================================
+# 🎛️  PER-PAIR / PER-TIMEFRAME FILTER OVERRIDES (auto-tuning)
+# =====================================================================
+# The global toggles above are the default. The auto-tuner (!autofilter /
+# POST /api/autofilter) can pin a different set of backtestable filters for a
+# single (ticker, timeframe); those live here and win over the global toggles.
+# Layout: {"active": {"BTC/USDT": {"4h": {"frama": True, ...}}},
+#          "previous": <the active map before the last apply, for revert>,
+#          "applied_at": <unix ts>, "meta": {"BTC/USDT": {"4h": {...}}}}
+# Only the 8 backtestable keys are stored (spread is live-only, always global).
+FILTER_OVERRIDES_FILE = os.path.join(DATA_DIR, "filter_overrides.json")
+BACKTEST_FILTER_KEYS = ("frama", "slope", "chop", "atr", "htf", "fake_break", "liq_sweep", "hurst")
+
+_filter_overrides_lock = threading.RLock()
+
+def _empty_overrides() -> dict:
+    return {"active": {}, "previous": {}, "applied_at": 0, "meta": {}}
+
+def _clean_override_map(raw) -> dict:
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for tk, tfs in raw.items():
+        if not isinstance(tfs, dict):
+            continue
+        for tf, flags in tfs.items():
+            if not isinstance(flags, dict):
+                continue
+            clean = {k: flags[k] for k in BACKTEST_FILTER_KEYS if isinstance(flags.get(k), bool)}
+            if len(clean) == len(BACKTEST_FILTER_KEYS):
+                out.setdefault(str(tk), {})[str(tf)] = clean
+    return out
+
+def load_filter_overrides() -> dict:
+    data = safe_json_load(FILTER_OVERRIDES_FILE, _empty_overrides())
+    if not isinstance(data, dict):
+        data = {}
+    meta = data.get("meta")
+    applied = data.get("applied_at")
+    return {
+        "active": _clean_override_map(data.get("active")),
+        "previous": _clean_override_map(data.get("previous")),
+        "applied_at": applied if isinstance(applied, (int, float)) else 0,
+        "meta": meta if isinstance(meta, dict) else {},
+    }
+
+_filter_overrides = load_filter_overrides()
+
+def _save_filter_overrides():
+    safe_json_save(FILTER_OVERRIDES_FILE, _filter_overrides)
+
+def global_filter_flags() -> dict:
+    """Backtestable filter flags from the global toggles (read at call time)."""
+    g = globals()
+    return {
+        "frama": bool(g["ENABLE_FRAMA_FILTER"]),
+        "slope": bool(g["ENABLE_SLOPE_FILTER"]),
+        "chop": bool(g["ENABLE_CHOP_FILTER"]),
+        "atr": bool(g["ENABLE_ATR_FILTER"]),
+        "htf": bool(g["ENABLE_MTF_BIAS"]),
+        "fake_break": bool(g["ENABLE_FAKE_BREAK_FILTER"]),
+        "liq_sweep": bool(g["ENABLE_LIQ_SWEEP_FILTER"]),
+        "hurst": bool(g["ENABLE_HURST_FILTER"]),
+    }
+
+def filter_flags_for(ticker: Optional[str], timeframe: Optional[str]) -> dict:
+    """Effective flags for one (ticker, tf): the pinned override if any, else global."""
+    if ticker is not None and timeframe is not None:
+        with _filter_overrides_lock:
+            ov = _filter_overrides["active"].get(ticker, {}).get(timeframe)
+            if ov is not None:
+                return dict(ov)
+    return global_filter_flags()
+
+def get_filter_overrides() -> dict:
+    with _filter_overrides_lock:
+        return copy.deepcopy(_filter_overrides)
+
+def apply_filter_overrides(new_map: dict, meta: Optional[dict] = None):
+    """Merges `new_map` into the active overrides (keeping the prior state for
+    revert). Entries for other pairs/tfs are left untouched."""
+    clean = _clean_override_map(new_map)
+    with _filter_overrides_lock:
+        _filter_overrides["previous"] = copy.deepcopy(_filter_overrides["active"])
+        for tk, tfs in clean.items():
+            for tf, flags in tfs.items():
+                _filter_overrides["active"].setdefault(tk, {})[tf] = flags
+                if meta and tk in meta and tf in meta[tk]:
+                    _filter_overrides["meta"].setdefault(tk, {})[tf] = meta[tk][tf]
+        _filter_overrides["applied_at"] = int(time.time())
+        _save_filter_overrides()
+
+def revert_filter_overrides() -> bool:
+    with _filter_overrides_lock:
+        if not _filter_overrides["previous"] and not _filter_overrides["active"]:
+            return False
+        _filter_overrides["active"], _filter_overrides["previous"] = (
+            _filter_overrides["previous"], _filter_overrides["active"])
+        _filter_overrides["applied_at"] = int(time.time())
+        _save_filter_overrides()
+        return True
+
+def clear_filter_overrides():
+    """Drops every pinned set — all pairs/tfs fall back to the global toggles."""
+    with _filter_overrides_lock:
+        _filter_overrides["previous"] = copy.deepcopy(_filter_overrides["active"])
+        _filter_overrides["active"] = {}
+        _filter_overrides["meta"] = {}
+        _filter_overrides["applied_at"] = int(time.time())
+        _save_filter_overrides()
+
+# Auto-tuner knobs (see signals.run_filter_autotune)
+AUTOTUNE_FEE_PCT = 0.10           # assumed round-trip cost per trade, in % of price, deducted from every trade
+AUTOTUNE_TRAIN_FRACTION = 0.6     # earliest share of trades used to pick the set; the rest validates it
+AUTOTUNE_MIN_TRAIN_TRADES = 15    # a candidate set needs at least this many trades in the train window
+AUTOTUNE_MIN_TEST_TRADES = 8      # ...and in the test window
+AUTOTUNE_MIN_GAIN_SE = 1.0        # train total-PnL gain over the current set must exceed this many standard errors
+AUTOTUNE_MIN_TEST_GAIN_SE = 0.5   # the test window must confirm the gain by at least this many standard errors
 
 # =====================================================================
 # 📈  HURST EXPONENT (regime-clarity filter)

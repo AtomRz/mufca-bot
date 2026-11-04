@@ -129,19 +129,11 @@ def _hurst_passes(hurst_v: float, mode: str, min_deviation: float) -> bool:
 FILTER_KEYS = ("frama", "slope", "chop", "atr", "htf", "fake_break", "liq_sweep", "hurst")
 
 
-def current_filter_flags() -> Dict[str, bool]:
-    """On/off state of every entry filter right now. "slope" (FRAMA slope sign)
-    has no toggle - it is always applied - so it is always True here."""
-    return {
-        "frama": bool(_cfg.ENABLE_FRAMA_FILTER),
-        "slope": True,
-        "chop": bool(_cfg.ENABLE_CHOP_FILTER),
-        "atr": bool(_cfg.ENABLE_ATR_FILTER),
-        "htf": bool(_cfg.ENABLE_MTF_BIAS),
-        "fake_break": bool(_cfg.ENABLE_FAKE_BREAK_FILTER),
-        "liq_sweep": bool(_cfg.ENABLE_LIQ_SWEEP_FILTER),
-        "hurst": bool(_cfg.ENABLE_HURST_FILTER),
-    }
+def current_filter_flags(ticker: Optional[str] = None, timeframe: Optional[str] = None) -> Dict[str, bool]:
+    """On/off state of every backtestable entry filter. With a (ticker, tf) it is
+    the set pinned for that pair/timeframe by the auto-tuner (config.filter_flags_for),
+    falling back to the global toggles; without, the global toggles."""
+    return _cfg.filter_flags_for(ticker, timeframe)
 
 
 def filter_checks(is_long: bool, frama_dir: int, frama_slope: float, chop_ok: bool, atr_ok: bool,
@@ -1165,7 +1157,9 @@ async def check_signals(
         # 🆕 Only computed when the filter is actually on (off by default) —
         # the rolling R/S calculation is meaningfully more expensive than the
         # other indicators here, no point paying for it unused.
-        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(timeframe, 100)) if _cfg.ENABLE_HURST_FILTER else None
+        # Effective per-(ticker, tf) filter flags (auto-tuner pins, else global toggles).
+        _flt_eff = current_filter_flags(ticker, timeframe)
+        hurst = calculate_hurst(df, window=_cfg.HURST_WINDOW.get(timeframe, 100)) if _flt_eff["hurst"] else None
 
         idx = len(df) - 2
         bar_idx = idx
@@ -1217,7 +1211,7 @@ async def check_signals(
         # split between the A/U tracks (that's a possible future refinement,
         # not what this first version does).
         hurst_ok = True
-        if _cfg.ENABLE_HURST_FILTER and hurst is not None:
+        if _flt_eff["hurst"] and hurst is not None:
             hurst_ok = _hurst_passes(float(hurst.iloc[idx]), _cfg.HURST_MODE, _cfg.HURST_MIN_DEVIATION)
 
         regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
@@ -1264,26 +1258,14 @@ async def check_signals(
         # approximation that happens to not matter yet.
         warmed_up = mfi.notna().sum() >= _cfg.MFI_TRAINING
 
-        filter_long = (
-            (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
-            and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
-            and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and slope_long
-            and (not _cfg.ENABLE_MTF_BIAS     or htf_bull)
-            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
-            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-            and hurst_ok
-        )
-        filter_short = (
-            (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
-            and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
-            and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-            and slope_short
-            and (not _cfg.ENABLE_MTF_BIAS     or htf_bear)
-            and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
-            and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-            and hurst_ok
-        )
+        _checks_long = filter_checks(True, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
+                                     fake_break_long, liq_sweep_short, hurst_ok)
+        _checks_short = filter_checks(False, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
+                                      fake_break_short, liq_sweep_long, hurst_ok)
+        _fails_l = failing_filters(_checks_long, _flt_eff)
+        _fails_s = failing_filters(_checks_short, _flt_eff)
+        filter_long = not _fails_l
+        filter_short = not _fails_s
 
 
         mfi_bull_sig = crossover(mfi, level_os, idx)
@@ -1369,13 +1351,6 @@ async def check_signals(
         # wrapped: it must never be able to break the pipeline.
         if not dry_run:
             try:
-                _flt_now = current_filter_flags()
-                _fails_l = failing_filters(
-                    filter_checks(True, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
-                                  fake_break_long, liq_sweep_short, hurst_ok), _flt_now)
-                _fails_s = failing_filters(
-                    filter_checks(False, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
-                                  fake_break_short, liq_sweep_long, hurst_ok), _flt_now)
                 for _trk, _sd, _raw, _free in (
                     ("a", "long", confirm_long_a and warmed_up, not a_in_pos and a_long_cd_ok and a_long_not_attempted),
                     ("a", "short", confirm_short_a and warmed_up, not a_in_pos and a_short_cd_ok and a_short_not_attempted),
@@ -1723,8 +1698,16 @@ def backtest_history(
     htf_df: Optional[pd.DataFrame] = None,
     filter_overrides: Optional[Dict[str, bool]] = None,
     collect_stats: bool = False,
+    trigger_table: bool = False,
 ):
     """Backtest for accumulating signal history.
+
+    trigger_table - dry_run + collect_stats only: evaluates EVERY raw trigger
+    (ignoring filters and the one-position-per-track rule) and records, per
+    trigger, its bar index, exit bar and the full list of filters that would
+    reject it. replay_filter_set() then reproduces the exact result of any
+    filter set from that table without re-running the backtest (trade outcomes
+    don't depend on the filter set - only which triggers get taken does).
 
     filter_overrides — {filter_key: enabled} for any of FILTER_KEYS; applied to
     THIS run only (a local copy of the flags - config is never touched, which
@@ -1954,11 +1937,13 @@ def backtest_history(
 
         # Effective filter flags for this run: the live toggles, then any
         # per-run overrides (local dict - _cfg is never mutated).
-        _flt = current_filter_flags()
+        _flt = current_filter_flags(ticker, tf)
         for _k, _v in (filter_overrides or {}).items():
             if _k in _flt:
                 _flt[_k] = bool(_v)
         _stats = {"funnel": {}, "trades": []} if (collect_stats and dry_run) else None
+        _trig_tbl = bool(trigger_table and _stats is not None)
+        _all_on = {k: True for k in FILTER_KEYS}
 
         # Hurst is always computed above (unlike check_signals, not gated
         # behind ENABLE_HURST_FILTER) and is NaN for its first HURST_WINDOW
@@ -2125,10 +2110,21 @@ def backtest_history(
             ]:
                 if track not in tracks:
                     continue
-                if idx < next_available_idx[track]:
+                if idx < next_available_idx[track] and not _trig_tbl:
                     continue
 
-                if _stats is not None and _raw_trig[(track, side)]:
+                if _trig_tbl:
+                    # every raw trigger gets simulated; filters are applied later
+                    # by replay_filter_set()
+                    if not _raw_trig[(track, side)]:
+                        continue
+                    sig_ok = True
+                    _tbl_checks = filter_checks(
+                        side == "long", frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias_v,
+                        fake_break_long if side == "long" else fake_break_short,
+                        liq_sweep_short if side == "long" else liq_sweep_long, hurst_ok)
+                    _tbl_fails = failing_filters(_tbl_checks, _all_on)
+                elif _stats is not None and _raw_trig[(track, side)]:
                     _fl = _stats["funnel"].setdefault(f"{track}_{side}", {
                         "triggers": 0, "passed": 0,
                         "blocked_by": {k: 0 for k in FILTER_KEYS}, "sole": {k: 0 for k in FILTER_KEYS},
@@ -2330,7 +2326,8 @@ def backtest_history(
                 # closes in the simulation; block re-entry for this track
                 # until COOLDOWN_BARS past that point, same as live.
                 exit_idx = base_idx + bars_held
-                next_available_idx[track] = exit_idx + _cfg.COOLDOWN_BARS
+                if not _trig_tbl:
+                    next_available_idx[track] = exit_idx + _cfg.COOLDOWN_BARS
 
                 _ensure_history_slot(history, ticker, tf)
                 # 🆕 FIX BUG-LO008 (backtest side of it): a trade where TP1
@@ -2412,6 +2409,7 @@ def backtest_history(
                         "track": track, "side": side, "exit_type": exit_type,
                         "moved_pct": round(moved_pct, 4), "regime": bt_regime,
                         "tp1_reached": bool(tp1_reached), "bars_held": bars_held,
+                        **({"idx": idx, "exit_idx": exit_idx, "fails": _tbl_fails} if _trig_tbl else {}),
                     })
                 signals_found += 1
 
@@ -2840,6 +2838,238 @@ async def run_filter_ablation(exchange: ccxt.Exchange, tickers: List[str], tfs: 
         out_variants.append(entry)
 
     return {"bar_coverage": bar_coverage, "base_flags": base, "variants": out_variants, "funnel": funnel}
+
+# ---------------------------------------------------------------------
+# Auto-tuner: best filter set per (ticker, timeframe)
+# ---------------------------------------------------------------------
+def replay_filter_set(triggers: List[Dict], flags: Dict[str, bool], tf: str,
+                      cooldown: Optional[int] = None) -> List[Dict]:
+    """The trades a backtest with `flags` would have taken, rebuilt from a
+    trigger table (backtest_history(trigger_table=True) -> stats["trades"]).
+    A trigger is taken when it is past the loop's start bar, its track is free
+    (one position per track + cooldown, exactly like the backtest) and none of
+    the ENABLED filters rejected it. `triggers` must be in backtest loop order
+    (by bar, then A-long, A-short, U-long, U-short), which is how they are recorded."""
+    cd = _cfg.COOLDOWN_BARS if cooldown is None else cooldown
+    start = max(50, _cfg.HURST_WINDOW.get(tf, 100) + 10) if flags.get("hurst") else 50
+    enabled = [k for k in FILTER_KEYS if flags.get(k)]
+    next_free: Dict[str, int] = {}
+    taken: List[Dict] = []
+    for t in triggers:
+        if t["idx"] < start or t["idx"] < next_free.get(t["track"], -1):
+            continue
+        fails = t["fails"]
+        if any(k in fails for k in enabled):
+            continue
+        taken.append(t)
+        next_free[t["track"]] = t["exit_idx"] + cd
+    return taken
+
+
+def _net_pnls(trades: List[Dict], fee_pct: float) -> List[float]:
+    return [float(t["moved_pct"]) - fee_pct for t in trades]
+
+
+def _window_stats(trades: List[Dict], fee_pct: float) -> Dict:
+    pn = _net_pnls(trades, fee_pct)
+    n = len(pn)
+    return {"n": n, "total": round(sum(pn), 4), "avg": round(sum(pn) / n, 4) if n else 0.0}
+
+
+def choose_filter_set(triggers: List[Dict], tf: str, current: Dict[str, bool], cutoff_idx: Optional[int],
+                      fee_pct: float, min_train: int, min_test: int, min_gain_se: float,
+                      validate: bool = True) -> Dict:
+    """Exhaustive search over all 2^len(FILTER_KEYS) filter sets for one pair/tf.
+
+    Picks the set with the highest net total PnL (moved_pct minus fee_pct per
+    trade) on the training window (trades entered before cutoff_idx; the whole
+    history when validate=False). The pick replaces `current` only if
+      - it has at least min_train trades in the training window,
+      - its training gain over `current` exceeds min_gain_se standard errors
+        (noise of the trades the two sets don't share), and
+      - (validate=True) it has at least min_test trades in the test window and
+        does not do worse there than `current`.
+    Ties go to the set with more filters on (a filter that costs nothing stays on).
+    """
+    import itertools
+    if not validate:
+        cutoff_idx = None
+
+    def split(trades):
+        if cutoff_idx is None:
+            return trades, []
+        return ([t for t in trades if t["idx"] < cutoff_idx], [t for t in trades if t["idx"] >= cutoff_idx])
+
+    def evaluate(flags):
+        trades = replay_filter_set(triggers, flags, tf)
+        tr, te = split(trades)
+        return trades, tr, te
+
+    cur_trades, cur_tr, cur_te = evaluate(current)
+    cur_train_total = sum(_net_pnls(cur_tr, fee_pct))
+
+    best = None  # (train_total, n_on, flags, trades, tr, te)
+    for combo in itertools.product((False, True), repeat=len(FILTER_KEYS)):
+        flags = dict(zip(FILTER_KEYS, combo))
+        trades, tr, te = evaluate(flags)
+        if len(tr) < min_train:
+            continue
+        total = sum(_net_pnls(tr, fee_pct))
+        key = (round(total, 9), sum(combo))
+        if best is None or key > (round(best[0], 9), best[1]):
+            best = (total, sum(combo), flags, trades, tr, te)
+
+    result: Dict = {
+        "current": dict(current),
+        "current_stats": {"train": _window_stats(cur_tr, fee_pct), "test": _window_stats(cur_te, fee_pct),
+                          "all": _window_stats(cur_trades, fee_pct)},
+        "n_triggers": len(triggers),
+        "validated": validate,
+        "best": None, "best_stats": None,
+        "chosen": dict(current), "changed": False, "reason": "",
+    }
+    if best is None:
+        result["reason"] = f"no filter set reaches {min_train} trades in the training window"
+        return result
+
+    b_total, _n_on, b_flags, b_trades, b_tr, b_te = best
+    result["best"] = b_flags
+    result["best_stats"] = {"train": _window_stats(b_tr, fee_pct), "test": _window_stats(b_te, fee_pct),
+                            "all": _window_stats(b_trades, fee_pct)}
+    if b_flags == current:
+        result["reason"] = "current set is already the best"
+        return result
+
+    # Is the improvement bigger than noise? Compare the trades only one of the two sets takes.
+    key = lambda t: (t["idx"], t["track"], t["side"])
+    cur_keys = {key(t) for t in cur_tr}
+    best_keys = {key(t) for t in b_tr}
+    diff = [t for t in cur_tr if key(t) not in best_keys] + [t for t in b_tr if key(t) not in cur_keys]
+    gain = b_total - cur_train_total
+    if diff:
+        pn = _net_pnls(diff, fee_pct)
+        mean = sum(pn) / len(pn)
+        sd = (sum((x - mean) ** 2 for x in pn) / max(len(pn) - 1, 1)) ** 0.5
+        noise = sd * (len(pn) ** 0.5)
+    else:
+        noise = 0.0
+    if gain <= min_gain_se * noise or gain <= 0:
+        result["reason"] = (f"gain {gain:+.2f}% on the training window is within noise "
+                            f"(needs > {min_gain_se * noise:.2f}%)")
+        return result
+    if validate:
+        if len(b_te) < min_test:
+            result["reason"] = f"only {len(b_te)} trades in the test window (needs {min_test})"
+            return result
+        b_test_total = sum(_net_pnls(b_te, fee_pct))
+        cur_test_total = sum(_net_pnls(cur_te, fee_pct))
+        # The test window must confirm the gain, not merely avoid a loss: the
+        # winner of 256 candidates is biased upward on the training data, so
+        # a result that is only "not worse" out-of-sample is mostly luck.
+        test_gain = b_test_total - cur_test_total
+        te_diff = [t for t in cur_te if key(t) not in {key(x) for x in b_te}] + \
+                  [t for t in b_te if key(t) not in {key(x) for x in cur_te}]
+        if te_diff:
+            tpn = _net_pnls(te_diff, fee_pct)
+            tmean = sum(tpn) / len(tpn)
+            tsd = (sum((x - tmean) ** 2 for x in tpn) / max(len(tpn) - 1, 1)) ** 0.5
+            test_noise = tsd * (len(tpn) ** 0.5)
+        else:
+            test_noise = 0.0
+        if test_gain <= _cfg.AUTOTUNE_MIN_TEST_GAIN_SE * test_noise or test_gain <= 0:
+            result["reason"] = (f"did not hold up on the test window ({b_test_total:+.2f}% vs "
+                                f"{cur_test_total:+.2f}% for the current set)")
+            return result
+    result["chosen"] = dict(b_flags)
+    result["changed"] = True
+    result["reason"] = "better on the training window" + (" and held up on the test window" if validate else "")
+    return result
+
+
+async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                              progress: Optional[Callable[[int, int, str], None]] = None,
+                              workers: Optional[int] = None, validate: bool = True,
+                              fee_pct: Optional[float] = None, apply: bool = False) -> Dict:
+    """Finds the best filter set for every (ticker, tf): one trigger-table backtest
+    each (shared fetched data), then choose_filter_set() over all 256 sets.
+    With apply=False nothing is written (preview); with apply=True the changed
+    sets are pinned via config.apply_filter_overrides (the previous state is kept
+    for config.revert_filter_overrides).
+
+    Returns {"fee_pct", "validate", "bar_coverage", "results": {ticker: {tf: choose_filter_set(...)}},
+             "assignments": {ticker: {tf: flags}}  # only the pairs/tfs whose set changed
+             "meta": {ticker: {tf: {...}}}, "applied": bool}
+    """
+    fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    bar_coverage: List[Dict] = []
+    submitted: List[tuple] = []  # (ticker, tf, bars, future)
+    off = {k: False for k in FILTER_KEYS}  # start at bar 50: hurst's longer warm-up is handled in the replay
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+                except Exception as e:
+                    logger.error(f"run_filter_autotune: fetch error for {t} {f}: {e}")
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    counters["total"] -= 1
+                    continue
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                    "filter_overrides": off, "collect_stats": True, "trigger_table": True,
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, len(inputs["df"]), fut))
+
+        outcomes = await asyncio.gather(*(item[3] for item in submitted), return_exceptions=True)
+
+    results: Dict[str, Dict] = {}
+    assignments: Dict[str, Dict] = {}
+    meta: Dict[str, Dict] = {}
+    now = int(time.time())
+    for (t, f, n_bars, _fut), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_filter_autotune: backtest error for {t} {f}: {outcome!r}")
+            continue
+        _count, history, _bars = outcome
+        stats = history.pop("__stats__", None) or {}
+        triggers = stats.get("trades", [])
+        first_idx = 50
+        last_idx = n_bars - _cfg.MAX_HOLD_BARS
+        cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
+        res = choose_filter_set(
+            triggers, f, current_filter_flags(t, f), cutoff, fee,
+            _cfg.AUTOTUNE_MIN_TRAIN_TRADES, _cfg.AUTOTUNE_MIN_TEST_TRADES, _cfg.AUTOTUNE_MIN_GAIN_SE,
+            validate=validate)
+        results.setdefault(t, {})[f] = res
+        if res["changed"]:
+            assignments.setdefault(t, {})[f] = res["chosen"]
+            meta.setdefault(t, {})[f] = {
+                "at": now, "bars": n_bars, "fee_pct": fee, "validated": validate,
+                "train": res["best_stats"]["train"], "test": res["best_stats"]["test"],
+                "previous_all": res["current_stats"]["all"], "new_all": res["best_stats"]["all"],
+            }
+    applied = False
+    if apply and assignments:
+        _cfg.apply_filter_overrides(assignments, meta)
+        applied = True
+    return {"fee_pct": fee, "validate": validate, "bar_coverage": bar_coverage,
+            "results": results, "assignments": assignments, "meta": meta, "applied": applied}
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

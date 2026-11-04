@@ -417,6 +417,8 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
     # formulas from signals.py — including the fact that liq_sweep_short
     # blocks LONG there, and liq_sweep_long blocks SHORT (that's how the
     # real trading logic works, not a QA typo — the lamp has to show it as-is).
+    # Effective flags for this ticker/tf (auto-tuner pins, else global toggles)
+    _flt = config.filter_flags_for(ticker, tf)
     lamps = {
         "mfi":    {"kind": "signal", "state": mfi_lamp},
         "andean": {"kind": "signal", "state": and_lamp},
@@ -424,51 +426,51 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
         "filters": {
             # 🆕 The FRAMA lamp used to fold the slope check into itself
             # (direction AND slope). In check_signals() only the direction is
-            # toggleable (ENABLE_FRAMA_FILTER) — the slope condition applies
+            # toggleable (ENABLE_FRAMA_FILTER) — the slope condition applied
             # ALWAYS — so with the toggle off the lamp read "disabled" while
             # the slope was still silently blocking signals. Split in two, each
             # mirroring its real rule.
             "frama": {
-                "enabled": config.ENABLE_FRAMA_FILTER,
+                "enabled": _flt["frama"],
                 "pass_long": frama_bull,
                 "pass_short": frama_bear,
             },
             "slope": {
-                "enabled": True,  # a hard condition in filter_long/filter_short, not toggleable
+                "enabled": _flt["slope"],
                 "pass_long": slope_long,
                 "pass_short": slope_short,
                 "value": round(frama_slope, 8),
             },
             "chop": {
-                "enabled": config.ENABLE_CHOP_FILTER,
+                "enabled": _flt["chop"],
                 "pass_long": chop_ok,
                 "pass_short": chop_ok,
                 "value": round(chop_v, 1),
                 "threshold": chop_threshold,
             },
             "atr": {
-                "enabled": config.ENABLE_ATR_FILTER,
+                "enabled": _flt["atr"],
                 "pass_long": atr_ok,
                 "pass_short": atr_ok,
                 "value": round(atr_pct_v, 2),
             },
             "htf": {
-                "enabled": config.ENABLE_MTF_BIAS,
+                "enabled": _flt["htf"],
                 "pass_long": htf_bull,
                 "pass_short": htf_bear,
             },
             "fake_break": {
-                "enabled": config.ENABLE_FAKE_BREAK_FILTER,
+                "enabled": _flt["fake_break"],
                 "pass_long": not fake_break_long,
                 "pass_short": not fake_break_short,
             },
             "liq_sweep": {
-                "enabled": config.ENABLE_LIQ_SWEEP_FILTER,
+                "enabled": _flt["liq_sweep"],
                 "pass_long": not liq_sweep_short,
                 "pass_short": not liq_sweep_long,
             },
             "hurst": {
-                "enabled": config.ENABLE_HURST_FILTER,
+                "enabled": _flt["hurst"],
                 "pass_long": hurst_ok,   # direction-agnostic — same reading for both sides
                 "pass_short": hurst_ok,
                 "value": round(hurst_v, 3) if hurst_valid else None,

@@ -51,7 +51,7 @@ from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
-    run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, FILTER_KEYS,
+    run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune, FILTER_KEYS,
 )
 import filter_stats
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full, trace_exchange_wallets
@@ -136,6 +136,7 @@ async def help_cmd(ctx):
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
+        "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
@@ -1370,6 +1371,130 @@ async def filtersim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 300
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"filtersim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _fmt_filter_set(flags: dict) -> str:
+    """`all on` / `off: chop, slope` - compact view of one filter set."""
+    off = [k for k in FILTER_KEYS if not flags.get(k)]
+    return "all on" if not off else "off: " + ", ".join(off)
+
+
+def _fmt_autotune_stats(label: str, st: dict) -> str:
+    return f"{label} n={st['n']} avg={st['avg']:+.2f}% total={st['total']:+.1f}%"
+
+
+def _autotune_lines(result: dict, applied: bool) -> list:
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            if r["changed"]:
+                head = "✅ " + ("pinned" if applied else "would pin")
+                bs, cs = r["best_stats"], r["current_stats"]
+                lines.append(f"**{ticker} {tf}** {head}: {_fmt_filter_set(r['chosen'])}  (was {_fmt_filter_set(r['current'])})")
+                lines.append(f"   {_fmt_autotune_stats('now ', bs['all'])} | {_fmt_autotune_stats('was ', cs['all'])}")
+                if r["validated"]:
+                    lines.append(f"   out-of-sample: {_fmt_autotune_stats('now ', bs['test'])} | {_fmt_autotune_stats('was ', cs['test'])}")
+            else:
+                lines.append(f"**{ticker} {tf}** unchanged ({_fmt_filter_set(r['current'])}) — {r['reason']}")
+    return lines
+
+
+@core.bot.command(name="autofilter", aliases=["autotune"])
+async def autofilter_cmd(ctx, *args):
+    """
+    Auto-tunes the entry filters per pair AND per timeframe. For every tracked
+    pair x timeframe it runs one dry-run backtest that records every raw trigger
+    with the filters that would reject it, tries all 256 on/off combinations of
+    the 8 backtestable filters and pins the set with the highest NET PnL
+    (fee deducted per trade, AUTOTUNE_FEE_PCT) for that pair/timeframe. Live
+    entries and chart lamps then use the pinned set instead of the global toggles.
+
+    Overfitting guard: the set is chosen on the oldest 60% of the history and
+    only replaces the current one if it is better beyond noise AND not worse on
+    the newest 40%. Otherwise the pair/timeframe keeps its current filters.
+
+    Usage:
+      !autofilter [pair] [tf] [bars]          - run + apply (default 3000 bars)
+      !autofilter preview [pair] [tf] [bars]  - same report, nothing applied
+      !autofilter full [pair] [tf] [bars]     - apply WITHOUT the out-of-sample check (max in-sample PnL, overfits)
+      !autofilter show                        - sets currently pinned per pair/timeframe
+      !autofilter revert                      - go back to the state before the last apply
+      !autofilter clear                       - drop every pinned set (global toggles again)
+    The spread filter is live-only and is never touched.
+    """
+    args = list(args)
+    action = "run"
+    if args and args[0].lower() in ("run", "preview", "full", "show", "revert", "clear"):
+        action = args.pop(0).lower()
+
+    if action == "show":
+        ov = _cfg.get_filter_overrides()
+        if not ov["active"]:
+            await ctx.send("No pinned filter sets — every pair/timeframe uses the global toggles.")
+            return
+        lines = ["**🎛️ Pinned filter sets**"]
+        for ticker, per_tf in sorted(ov["active"].items()):
+            for tf, flags in sorted(per_tf.items()):
+                lines.append(f"`{ticker} {tf}`: {_fmt_filter_set(flags)}")
+        await _send_chunked(ctx, "\n".join(lines))
+        return
+    if action in ("revert", "clear"):
+        if action == "revert":
+            ok = _cfg.revert_filter_overrides()
+            await ctx.send("↩️ Reverted to the previous filter sets." if ok else "Nothing to revert.")
+        else:
+            _cfg.clear_filter_overrides()
+            await ctx.send("🧹 Cleared all pinned sets — the global toggles apply everywhere (`!autofilter revert` undoes this).")
+        return
+
+    ticker = tf = ""
+    num_bars = 3000
+    for a in args:
+        if a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe or bar count.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    apply = action in ("run", "full")
+    validate = action != "full"
+
+    try:
+        result = await _run_sim_job(
+            ctx, "autofilter", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars,
+                                "apply": apply, "validate": validate},
+            lambda progress: run_filter_autotune(exchange, scope_tickers, scope_tfs, num_bars, progress=progress,
+                                                 validate=validate, apply=apply),
+            intro=(f"⏳ Auto-tuning filters: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each"
+                   f" ({'applying' if apply else 'preview only'}). This takes a while."),
+        )
+        if result is None:
+            return
+        applied = result["applied"]
+        n_changed = sum(len(v) for v in result["assignments"].values())
+        head = [f"**🎛️ Auto filter tuning** — net of {result['fee_pct']}% fee per trade, "
+                f"{'validated on the newest 40%' if result['validate'] else 'NO out-of-sample check'}; "
+                f"{n_changed} set(s) {'pinned' if applied else 'would change'}\n"]
+        short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
+        for c in short_pairs:
+            head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        lines = head + _autotune_lines(result, applied)
+        lines.append("\nPnL = unlevered % moves of simulated trades. Small samples can still overfit — "
+                     "`!autofilter revert` undoes the last apply; re-run with more `bars` to check stability.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"autofilter command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 
