@@ -82,6 +82,7 @@ def _flush_state_to_disk():
     from state import load_signals_history, save_signals_history, save_bot_state
     import derivatives
     import spread
+    import filter_stats
 
     # position snapshot first: it's the most valuable and the cheapest
     _step("bot_state_snapshot.json", lambda: save_bot_state(_bot_module.state))
@@ -89,6 +90,7 @@ def _flush_state_to_disk():
     _step("signals_history.json", lambda: save_signals_history(load_signals_history()))
     _step("derivatives OI baseline", derivatives.flush_oi_baseline)
     _step("spread history", spread.flush_spread_history)
+    _step("filter stats", filter_stats.flush)
 
 
 async def _stop_scanner(timeout: float = 5.0):

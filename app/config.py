@@ -470,6 +470,15 @@ SPREAD_SL_EAT_MAX_PCT = 0.15              # condition 1): spread_pct > this x sl
 SPREAD_HISTORY_SAVE_INTERVAL = 300        # seconds — throttled disk write, same pattern as OI baseline
 
 # =====================================================================
+# 🧮  ENTRY-FILTER FUNNEL COUNTERS (live)
+# =====================================================================
+# Per ticker/tf/track/side: how often a raw A/U trigger fired while the track was
+# free, how many passed every enabled filter, and which filter rejected the rest
+# (see filter_stats.py, shown by !filterstats). Counting only — never affects entries.
+FILTER_STATS_FILE = os.path.join(DATA_DIR, "filter_stats.json")
+FILTER_STATS_SAVE_INTERVAL = 300          # seconds — throttled disk write
+
+# =====================================================================
 # 🎯  SIGNAL TRACKS
 # =====================================================================
 # Single source of truth for the set of signal tracks. New code should

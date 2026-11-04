@@ -68,6 +68,7 @@ from config import ONCHAIN_ENABLED
 import spread
 import shock_guard
 import shadow
+import filter_stats
 from sim_pool import SimPool
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
@@ -119,6 +120,57 @@ def _hurst_passes(hurst_v: float, mode: str, min_deviation: float) -> bool:
     if mode == "trending_only":
         return (hurst_v - 0.5) >= min_deviation
     return abs(hurst_v - 0.5) >= min_deviation
+
+# ---------------------------------------------------------------------
+# Entry-filter bookkeeping shared by the live scanner (counters), the
+# backtest (decision + ablation) and the funnel report. One definition of
+# "which filter failed" so the three can't drift apart.
+# ---------------------------------------------------------------------
+FILTER_KEYS = ("frama", "slope", "chop", "atr", "htf", "fake_break", "liq_sweep", "hurst")
+
+
+def current_filter_flags() -> Dict[str, bool]:
+    """On/off state of every entry filter right now. "slope" (FRAMA slope sign)
+    has no toggle - it is always applied - so it is always True here."""
+    return {
+        "frama": bool(_cfg.ENABLE_FRAMA_FILTER),
+        "slope": True,
+        "chop": bool(_cfg.ENABLE_CHOP_FILTER),
+        "atr": bool(_cfg.ENABLE_ATR_FILTER),
+        "htf": bool(_cfg.ENABLE_MTF_BIAS),
+        "fake_break": bool(_cfg.ENABLE_FAKE_BREAK_FILTER),
+        "liq_sweep": bool(_cfg.ENABLE_LIQ_SWEEP_FILTER),
+        "hurst": bool(_cfg.ENABLE_HURST_FILTER),
+    }
+
+
+def filter_checks(is_long: bool, frama_dir: int, frama_slope: float, chop_ok: bool, atr_ok: bool,
+                  htf_bias: float, fake_break: bool, opposite_liq_sweep: bool, hurst_ok: bool) -> Dict[str, bool]:
+    """Pass/fail of every entry filter for one side, ignoring which ones are
+    enabled (see failing_filters). `fake_break` is the same-side fake-break flag,
+    `opposite_liq_sweep` the opposite-side liquidity-sweep flag (a long is
+    rejected by a bearish sweep candle, a short by a bullish one). NaN slope
+    fails both sides, same as the original `frama_slope > 0` / `< 0`."""
+    if is_long:
+        dir_ok, slope_ok, htf_ok = frama_dir == 1, frama_slope > 0, htf_bias == 1
+    else:
+        dir_ok, slope_ok, htf_ok = frama_dir == -1, frama_slope < 0, htf_bias == -1
+    return {
+        "frama": bool(dir_ok),
+        "slope": bool(slope_ok),
+        "chop": bool(chop_ok),
+        "atr": bool(atr_ok),
+        "htf": bool(htf_ok),
+        "fake_break": not fake_break,
+        "liq_sweep": not opposite_liq_sweep,
+        "hurst": bool(hurst_ok),
+    }
+
+
+def failing_filters(checks: Dict[str, bool], enabled: Dict[str, bool]) -> List[str]:
+    """Names of the ENABLED filters that reject this side (empty = passes)."""
+    return [k for k in FILTER_KEYS if enabled.get(k, False) and not checks[k]]
+
 
 def _rs_vp_components(is_long: bool, rel_strength: Optional[Dict], market_structure: Optional[Any]) -> Dict[str, float]:
     """The relative_strength/volume_profile confidence-score components —
@@ -1309,6 +1361,33 @@ async def check_signals(
         a_long_not_attempted  = state.get("last_a_long_attempt_bar")  != bar_time
         a_short_not_attempted = state.get("last_a_short_attempt_bar") != bar_time
 
+        # 🆕 Filter funnel counters (filter_stats.py, shown by !filterstats):
+        # for every raw trigger that fires while its track is actually free,
+        # record which ENABLED filters rejected it. Counting only - the
+        # decision below is made by the unchanged filter_long/filter_short.
+        # Live scan only (dry_run = !scan must not skew the counters), and
+        # wrapped: it must never be able to break the pipeline.
+        if not dry_run:
+            try:
+                _flt_now = current_filter_flags()
+                _fails_l = failing_filters(
+                    filter_checks(True, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
+                                  fake_break_long, liq_sweep_short, hurst_ok), _flt_now)
+                _fails_s = failing_filters(
+                    filter_checks(False, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias,
+                                  fake_break_short, liq_sweep_long, hurst_ok), _flt_now)
+                for _trk, _sd, _raw, _free in (
+                    ("a", "long", confirm_long_a and warmed_up, not a_in_pos and a_long_cd_ok and a_long_not_attempted),
+                    ("a", "short", confirm_short_a and warmed_up, not a_in_pos and a_short_cd_ok and a_short_not_attempted),
+                    ("u", "long", bool(ut_buy.iloc[idx]), not u_in_pos and u_long_cd_ok and is_new_bar),
+                    ("u", "short", bool(ut_sell.iloc[idx]), not u_in_pos and u_short_cd_ok and is_new_bar),
+                ):
+                    if _raw and _free:
+                        filter_stats.record(ticker, timeframe, _trk, _sd, bar_time,
+                                            _fails_l if _sd == "long" else _fails_s)
+            except Exception as e:
+                logger.warning(f"[FILTER_STATS] {ticker} {timeframe}: {e}")
+
         sig_a_long  = confirm_long_a  and filter_long  and not a_in_pos and a_long_cd_ok  and warmed_up and a_long_not_attempted
         sig_a_short = confirm_short_a and filter_short and not a_in_pos and a_short_cd_ok and warmed_up and a_short_not_attempted
         sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and not u_in_pos and u_long_cd_ok  and is_new_bar
@@ -1642,8 +1721,22 @@ def backtest_history(
     compute_confidence: bool = False,
     benchmark_df: Optional[pd.DataFrame] = None,
     htf_df: Optional[pd.DataFrame] = None,
+    filter_overrides: Optional[Dict[str, bool]] = None,
+    collect_stats: bool = False,
 ):
     """Backtest for accumulating signal history.
+
+    filter_overrides — {filter_key: enabled} for any of FILTER_KEYS; applied to
+    THIS run only (a local copy of the flags - config is never touched, which
+    matters when SIM_WORKERS=1 runs the backtest inside the live process).
+    Used by run_filter_ablation() (!filtersim). None = the live toggles.
+
+    collect_stats — dry_run only: adds history["__stats__"] =
+    {"funnel": {...}, "trades": [...]} to the returned history. "funnel" counts,
+    per track/side, how often the raw trigger fired while the track was free and
+    which enabled filters rejected it; "trades" lists EVERY simulated trade
+    (history itself keeps only the last SIGNAL_HISTORY_LIMIT*3 per side).
+    Remove the "__stats__" key before treating the dict as ticker history.
 
     tracks — restrict which track(s) get simulated (default: all of them).
     Use this to backfill just one track (e.g. tracks=("u",)) on a
@@ -1859,6 +1952,14 @@ def backtest_history(
         signals_found = 0
         history = {} if dry_run else load_signals_history()
 
+        # Effective filter flags for this run: the live toggles, then any
+        # per-run overrides (local dict - _cfg is never mutated).
+        _flt = current_filter_flags()
+        for _k, _v in (filter_overrides or {}).items():
+            if _k in _flt:
+                _flt[_k] = bool(_v)
+        _stats = {"funnel": {}, "trades": []} if (collect_stats and dry_run) else None
+
         # Hurst is always computed above (unlike check_signals, not gated
         # behind ENABLE_HURST_FILTER) and is NaN for its first HURST_WINDOW
         # bars while warming up. Starting the loop at a flat idx=50 used to
@@ -1874,7 +1975,7 @@ def backtest_history(
         # ENABLE_HURST_FILTER off (the default), that discarded ~110 bars
         # of otherwise-usable training data for a filter that isn't even
         # active, shrinking the calibration sample for no reason.
-        start_idx = max(50, _cfg.HURST_WINDOW.get(tf, 100) + 10) if _cfg.ENABLE_HURST_FILTER else 50
+        start_idx = max(50, _cfg.HURST_WINDOW.get(tf, 100) + 10) if _flt["hurst"] else 50
 
         # 🆕 FIX (external review, P0): the loop below used to have no
         # concept of a track already being "in a position" — every idx
@@ -1940,24 +2041,19 @@ def backtest_history(
             bt_regime = "CHAOS" if atr_pct_v > ATR_MAX else "TREND" if atr_pct_v > ATR_MIN * 1.5 else "NORMAL"
             warmed_up_bt = mfi_valid_cumcount.iloc[idx] >= _cfg.MFI_TRAINING
 
-            filter_long = (
-                (not _cfg.ENABLE_FRAMA_FILTER or frama_bull)
-                and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
-                and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-                and slope_long
-                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_long)
-                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_short)
-                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
-            )
-            filter_short = (
-                (not _cfg.ENABLE_FRAMA_FILTER or frama_bear)
-                and (not _cfg.ENABLE_CHOP_FILTER  or chop_ok)
-                and (not _cfg.ENABLE_ATR_FILTER   or atr_ok)
-                and slope_short
-                and (not _cfg.ENABLE_FAKE_BREAK_FILTER or not fake_break_short)
-                and (not _cfg.ENABLE_LIQ_SWEEP_FILTER  or not liq_sweep_long)
-                and (not _cfg.ENABLE_HURST_FILTER or hurst_ok)
-            )
+            # One shared pass/fail definition (filter_checks) for the decision
+            # AND the funnel stats, so they can't disagree. HTF used to be
+            # applied separately on the sig_* lines below; it is simply one
+            # more AND here (same result: HTF bias 0 fails both sides).
+            htf_bias_v = htf_bias_arr[idx]
+            _fails_long = failing_filters(
+                filter_checks(True, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias_v,
+                              fake_break_long, liq_sweep_short, hurst_ok), _flt)
+            _fails_short = failing_filters(
+                filter_checks(False, frama_dir_v, frama_slope, chop_ok, atr_ok, htf_bias_v,
+                              fake_break_short, liq_sweep_long, hurst_ok), _flt)
+            filter_long = not _fails_long
+            filter_short = not _fails_short
 
 
             mfi_bull_sig = crossover(mfi, level_os, idx)
@@ -1976,14 +2072,20 @@ def backtest_history(
             htf_bull_bt = htf_bias_arr[idx] == 1
             htf_bear_bt = htf_bias_arr[idx] == -1
 
-            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
-            sig_a_short = confirm_short_a and filter_short and warmed_up_bt and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
-            # 🆕 FIX: live applies the MTF-bias gate to U-track too (it sits
-            # inside filter_long/filter_short in check_signals); the backtest
-            # only applied it to A and B, so U's calibration history contained
-            # signals live would have blocked.
-            sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long  and (not _cfg.ENABLE_MTF_BIAS or htf_bull_bt)
-            sig_u_short = bool(ut_sell.iloc[idx]) and filter_short and (not _cfg.ENABLE_MTF_BIAS or htf_bear_bt)
+            # (the MTF-bias gate now lives inside filter_long/filter_short, for
+            # BOTH tracks - same as live, where it sits in filter_long/short)
+            sig_a_long  = confirm_long_a  and filter_long  and warmed_up_bt
+            sig_a_short = confirm_short_a and filter_short and warmed_up_bt
+            sig_u_long  = bool(ut_buy.iloc[idx])  and filter_long
+            sig_u_short = bool(ut_sell.iloc[idx]) and filter_short
+
+            # Raw triggers (before any filter) - only used for the funnel stats.
+            _raw_trig = {
+                ("a", "long"): bool(confirm_long_a and warmed_up_bt),
+                ("a", "short"): bool(confirm_short_a and warmed_up_bt),
+                ("u", "long"): bool(ut_buy.iloc[idx]),
+                ("u", "short"): bool(ut_sell.iloc[idx]),
+            }
 
             # 🆕 (external review, component-backtest): market_structure/
             # relative_strength for THIS bar, computed at most once (lazily,
@@ -2025,6 +2127,21 @@ def backtest_history(
                     continue
                 if idx < next_available_idx[track]:
                     continue
+
+                if _stats is not None and _raw_trig[(track, side)]:
+                    _fl = _stats["funnel"].setdefault(f"{track}_{side}", {
+                        "triggers": 0, "passed": 0,
+                        "blocked_by": {k: 0 for k in FILTER_KEYS}, "sole": {k: 0 for k in FILTER_KEYS},
+                    })
+                    _fl["triggers"] += 1
+                    _f = _fails_long if side == "long" else _fails_short
+                    if not _f:
+                        _fl["passed"] += 1
+                    for _name in _f:
+                        _fl["blocked_by"][_name] += 1
+                    if len(_f) == 1:
+                        _fl["sole"][_f[0]] += 1
+
                 if not sig_ok:
                     continue
 
@@ -2290,10 +2407,18 @@ def backtest_history(
                     "tp1_reached": bool(tp1_reached),
                 })
                 history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
+                if _stats is not None:
+                    _stats["trades"].append({
+                        "track": track, "side": side, "exit_type": exit_type,
+                        "moved_pct": round(moved_pct, 4), "regime": bt_regime,
+                        "tp1_reached": bool(tp1_reached), "bars_held": bars_held,
+                    })
                 signals_found += 1
 
         if dry_run:
             logger.info(f"[BACKTEST] {ticker} {tf}: (dry run, tp1_sl_fraction={tp1_sl_fraction}) found {signals_found} historical signals")
+            if _stats is not None:
+                history["__stats__"] = _stats
             return signals_found, history, bars_fetched
 
         save_signals_history(history)
@@ -2547,6 +2672,174 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     report = analyze_confidence_components(history=combined_history, min_samples=min_samples, group_by=group_by)
     report["bar_coverage"] = bar_coverage
     return report
+
+
+_ABLATION_WIN_TYPES = ("tp", "sl_after_tp1")  # same convention as state.WIN_EXIT_TYPES (sl_after_tp1 = partial win)
+
+
+def _summarize_trades(trades: List[Dict]) -> Dict:
+    """n / win rate / avg + total PnL (+ standard error of the average) for a
+    list of simulated trades. pnl = moved_pct (unlevered % move, two-leg
+    economics once TP1 was crossed)."""
+    n = len(trades)
+    if n == 0:
+        return {"n": 0, "win_rate": 0.0, "avg_pnl": 0.0, "se": None, "total_pnl": 0.0,
+                "exits": {"tp": 0, "sl_after_tp1": 0, "sl": 0, "cancelled": 0}}
+    pnls = [float(t.get("moved_pct", 0.0)) for t in trades]
+    avg = sum(pnls) / n
+    se = None
+    if n >= 2:
+        var = sum((p - avg) ** 2 for p in pnls) / (n - 1)
+        se = (var / n) ** 0.5
+    exits = {"tp": 0, "sl_after_tp1": 0, "sl": 0, "cancelled": 0}
+    for t in trades:
+        exits[t.get("exit_type", "cancelled")] = exits.get(t.get("exit_type", "cancelled"), 0) + 1
+    wins = sum(1 for t in trades if t.get("exit_type") in _ABLATION_WIN_TYPES)
+    return {
+        "n": n,
+        "win_rate": round(wins / n, 4),
+        "avg_pnl": round(avg, 4),
+        "se": round(se, 4) if se is not None else None,
+        "total_pnl": round(sum(pnls), 4),
+        "exits": exits,
+    }
+
+
+def _ablation_variants(base: Dict[str, bool]) -> List[tuple]:
+    """(name, full flag dict) for every variant run by !filtersim: the live
+    baseline, each filter flipped one at a time (-x = switched off, +x = switched
+    on when it is currently off), the "trend cluster" (frama+slope+chop+htf: four
+    answers to the same "is there a trend?" question) off together, and
+    everything off (raw A/U triggers only)."""
+    variants: List[tuple] = [("baseline", dict(base))]
+    for k in FILTER_KEYS:
+        flags = dict(base)
+        flags[k] = not base[k]
+        variants.append((("-" if base[k] else "+") + k, flags))
+    cluster = [k for k in ("frama", "slope", "chop", "htf") if base[k]]
+    if len(cluster) >= 2:
+        flags = dict(base)
+        for k in cluster:
+            flags[k] = False
+        variants.append(("-trend_cluster(" + "+".join(cluster) + ")", flags))
+    variants.append(("no_filters", {k: False for k in FILTER_KEYS}))
+    return variants
+
+
+async def run_filter_ablation(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                              progress: Optional[Callable[[int, int, str], None]] = None,
+                              workers: Optional[int] = None) -> Dict:
+    """Filter ablation on real historical OHLCV: the same dry-run
+    backtest_history() once per variant (see _ablation_variants) per
+    ticker/tf, sharing one fetched df per ticker/tf. Answers "is this filter
+    earning its keep?" - if switching a filter off leaves avg_pnl about the same
+    (or better) and adds trades, it is only costing opportunities.
+
+    Same plumbing as run_tp1_mode_comparison()/run_component_backtest() (process
+    pool, no network in workers, never writes signals_history.json). Live
+    ENTRY_BLOCK switches are not applied (same as the other backtests).
+
+    Caveats worth keeping in mind when reading the numbers:
+      - TP/SL calibration in dry runs reads the on-disk live history (as_of
+        filtered), so it is identical for every variant - the comparison is
+        apples-to-apples - but bars older than the live history use fallback TP/SL.
+      - Spread (live order-book only) cannot be backtested and is not a variant.
+      - avg_pnl carries a standard error (se); differences within ~2 se are noise.
+
+    Returns:
+        {
+          "bar_coverage": [...],
+          "base_flags": {filter: enabled},
+          "variants": [{"name", "flags", "total": summary, "by_track": {"a": summary, "u": summary},
+                        "delta": {"n", "avg_pnl", "total_pnl"}  # vs baseline (absent on baseline)
+                       }, ...],
+          "funnel": {"a_long": {"triggers", "passed", "blocked_by": {...}, "sole": {...}}, ...},
+        }
+    funnel is measured on the baseline variant, summed over the scope.
+    """
+    base = current_filter_flags()
+    variants = _ablation_variants(base)
+    counters = {"done": 0, "total": len(tickers) * len(tfs) * len(variants)}
+    bar_coverage: List[Dict] = []
+    submitted: List[tuple] = []  # (variant_name, future)
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+                except Exception as e:
+                    logger.error(f"run_filter_ablation: fetch error for {t} {f}: {e}")
+                    counters["total"] -= len(variants)
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    counters["total"] -= len(variants)
+                    continue
+
+                for name, flags in variants:
+                    fut = pool.submit({
+                        "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                        "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                        "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                        "filter_overrides": flags, "collect_stats": True,
+                    })
+                    fut.add_done_callback(_on_done(f"{t} {f} {name}"))
+                    submitted.append((name, fut))
+
+        outcomes = await asyncio.gather(*(item[1] for item in submitted), return_exceptions=True)
+
+    trades_by_variant: Dict[str, List[Dict]] = {name: [] for name, _ in variants}
+    funnel: Dict[str, Dict] = {}
+    for (name, _), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_filter_ablation: backtest error for variant {name}: {outcome!r}")
+            continue
+        _count, history, _bars = outcome
+        stats = history.pop("__stats__", None) or {}
+        trades_by_variant[name].extend(stats.get("trades", []))
+        if name == "baseline":
+            for key, fl in (stats.get("funnel") or {}).items():
+                agg = funnel.setdefault(key, {
+                    "triggers": 0, "passed": 0,
+                    "blocked_by": {k: 0 for k in FILTER_KEYS}, "sole": {k: 0 for k in FILTER_KEYS},
+                })
+                agg["triggers"] += fl["triggers"]
+                agg["passed"] += fl["passed"]
+                for k in FILTER_KEYS:
+                    agg["blocked_by"][k] += fl["blocked_by"].get(k, 0)
+                    agg["sole"][k] += fl["sole"].get(k, 0)
+
+    out_variants: List[Dict] = []
+    base_total: Optional[Dict] = None
+    for name, flags in variants:
+        trades = trades_by_variant[name]
+        total = _summarize_trades(trades)
+        entry = {
+            "name": name,
+            "flags": flags,
+            "total": total,
+            "by_track": {trk: _summarize_trades([t for t in trades if t.get("track") == trk]) for trk in _cfg.TRACKS},
+        }
+        if name == "baseline":
+            base_total = total
+        elif base_total is not None:
+            entry["delta"] = {
+                "n": total["n"] - base_total["n"],
+                "avg_pnl": round(total["avg_pnl"] - base_total["avg_pnl"], 4),
+                "total_pnl": round(total["total_pnl"] - base_total["total_pnl"], 4),
+            }
+        out_variants.append(entry)
+
+    return {"bar_coverage": bar_coverage, "base_flags": base, "variants": out_variants, "funnel": funnel}
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

@@ -51,8 +51,9 @@ from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
-    run_tp1_mode_comparison, run_component_backtest,
+    run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, FILTER_KEYS,
 )
+import filter_stats
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full, trace_exchange_wallets
 import derivatives
 import spread
@@ -134,6 +135,8 @@ async def help_cmd(ctx):
         "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
+        "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
+        "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
         "`!debug`        — extended debug information",
@@ -1253,6 +1256,173 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
             msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"compsim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _fmt_funnel_cell(key: str, cell: dict) -> list:
+    """Two report lines for one track/side funnel cell (shared by !filtersim
+    and !filterstats). Only filters that rejected something are listed."""
+    trig, passed = cell["triggers"], cell["passed"]
+    if not trig:
+        return [f"`{key}`: no triggers"]
+    blocked = sorted(((n, k) for k, n in cell["blocked_by"].items() if n), reverse=True)
+    sole = sorted(((n, k) for k, n in cell["sole"].items() if n), reverse=True)
+    out = [f"`{key}`: {trig} triggers → {passed} passed ({passed / trig:.0%})"]
+    if blocked:
+        out.append("   rejected by: " + ", ".join(f"{k} {n}" for n, k in blocked))
+    if sole:
+        out.append("   ONLY this filter: " + ", ".join(f"{k} {n}" for n, k in sole))
+    return out
+
+
+async def _send_chunked(ctx, lines: list):
+    msg = "\n".join(lines)
+    while msg:
+        chunk = msg[:1900]
+        if len(msg) > 1900:
+            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+        await ctx.send(chunk)
+        msg = msg[len(chunk):].lstrip("\n")
+
+
+@core.bot.command(name="filtersim", aliases=["filterablation"])
+async def filtersim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
+    """
+    Filter ablation: dry-run backtest_history() once per variant on real
+    historical OHLCV - the live filter setup (baseline), each filter flipped one
+    at a time (-x = off, +x = on if it is currently off), the "trend cluster"
+    (frama+slope+chop+htf) off together, and everything off. Reports trades,
+    win rate and PnL per variant plus a funnel for the baseline (how many raw
+    A/U triggers each filter rejected, and how many ONLY that filter rejected).
+    Nothing is written to signals_history.json and no setting is touched.
+
+    Usage: !filtersim [ticker] [tf] [num_bars]
+      no args                    - every tracked pair x timeframe, 3000 bars
+      !filtersim ETH/USDT 4h 6000 - just that pair/timeframe, more history
+
+    Slow and CPU-heavy (pairs x timeframes x ~11 variants backtests). Spread is
+    live order-book only and cannot be backtested. Live entry switches are not applied.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+
+    num_bars = _clamp_bars(num_bars)
+    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in TICKERS:
+            await ctx.send(f"❌ `{t}` is not a tracked pair.")
+            return
+    for f in scope_tfs:
+        if f not in TIMEFRAMES:
+            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
+            return
+
+    try:
+        result = await _run_sim_job(
+            ctx, "filtersim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars},
+            lambda progress: run_filter_ablation(exchange, scope_tickers, scope_tfs, num_bars, progress=progress),
+            intro=(
+                f"⏳ Running filter ablation: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s) × "
+                f"~11 variants, {num_bars} bars each. This is slow — sit tight."
+            ),
+        )
+        if result is None:
+            return
+
+        on = [k for k in FILTER_KEYS if result["base_flags"][k]]
+        off = [k for k in FILTER_KEYS if not result["base_flags"][k]]
+        lines = [f"**🧪 Filter ablation** (dry-run, {num_bars} bars requested per pair/tf — nothing written)\n",
+                 f"Live filters ON: {', '.join(on) or 'none'} | OFF: {', '.join(off) or 'none'}\n"]
+
+        short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
+        if short_pairs:
+            lines.append("⚠️ Bars requested vs. actually received (may reflect real available history):")
+            for c in short_pairs:
+                lines.append(f"  {c['ticker']} {c['tf']}: requested {c['requested']}, got {c['got']}")
+            lines.append("")
+
+        lines.append("**Funnel (baseline) — raw trigger → passed all filters**")
+        for key in ("a_long", "a_short", "u_long", "u_short"):
+            cell = result["funnel"].get(key)
+            lines.extend(_fmt_funnel_cell(key, cell) if cell else [f"`{key}`: no triggers"])
+        lines.append("")
+
+        base_total = next((v["total"] for v in result["variants"] if v["name"] == "baseline"), None)
+        lines.append("**Variants** (n trades, win rate incl. partial wins, avg PnL ± se, total PnL; Δ vs baseline)")
+        for v in result["variants"]:
+            tot = v["total"]
+            if not tot["n"]:
+                lines.append(f"`{v['name']}`: no trades")
+                continue
+            se_str = f"±{tot['se']:.2f}" if tot["se"] is not None else ""
+            flag = " ⚠️ tiny sample" if tot["n"] < 30 else ""
+            delta_str = ""
+            hint = ""
+            d = v.get("delta")
+            if d:
+                delta_str = f" | Δn {d['n']:+d}, Δavg {d['avg_pnl']:+.2f}%, Δtotal {d['total_pnl']:+.1f}%"
+                if (base_total and base_total["se"] is not None and d["n"] >= 5
+                        and d["avg_pnl"] >= -base_total["se"] and not v["name"].startswith("+")):
+                    hint = " 💡 no clear cost to dropping it"
+            lines.append(
+                f"`{v['name']}`: n={tot['n']} win={tot['win_rate']:.0%} avg={tot['avg_pnl']:+.2f}%{se_str} "
+                f"total={tot['total_pnl']:+.1f}%{delta_str}{flag}{hint}"
+            )
+
+        lines.append(
+            "\nNumbers are unlevered % moves of the simulated trades. A Δavg inside ~2×se is noise — "
+            "compare Δn and Δtotal together, and prefer a bigger `bars`/scope before acting on small samples. "
+            "TP/SL calibration is identical for every variant (live history), so the comparison is like-for-like."
+        )
+        await _send_chunked(ctx, lines)
+    except Exception as e:
+        logger.error(f"filtersim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="filterstats", aliases=["fstats"])
+async def filterstats_cmd(ctx, arg1: str = "", arg2: str = ""):
+    """
+    Live entry-filter funnel (filter_stats.py): for every raw A/U trigger that
+    fired while its track was free, which enabled filters rejected it. Counting
+    only - nothing here changes entries.
+
+    Usage: !filterstats                 - all tracked pairs and timeframes
+           !filterstats ETH/USDT [tf]   - one pair (and optionally one timeframe)
+           !filterstats reset           - start the counters over (do this after
+                                          changing filters/thresholds)
+    """
+    try:
+        if arg1.lower() == "reset":
+            filter_stats.reset()
+            await ctx.send("🧮 Filter counters reset.")
+            return
+
+        ticker = arg1.upper() if arg1 else None
+        tf = arg2.lower() if arg2 else None
+        if ticker and ticker not in TICKERS:
+            await ctx.send(f"❌ `{ticker}` is not a tracked pair.")
+            return
+        if tf and tf not in TIMEFRAMES:
+            await ctx.send(f"❌ `{tf}` is not a tracked timeframe.")
+            return
+
+        agg = filter_stats.aggregate(ticker, tf)
+        scope = (ticker or "all pairs") + (f" {tf}" if tf else "")
+        lines = [f"**🧮 Filter funnel (live)** — {scope}, since {str(agg['since'])[:16].replace('T', ' ')} UTC\n"]
+        for key in filter_stats.TRACK_SIDES:
+            lines.extend(_fmt_funnel_cell(key, agg["cells"][key]))
+        lines.append(
+            "\n`passed` is counted before entry switches / shock guard / R:R and SL checks, so it is not the number "
+            "of trades opened. `ONLY this filter` = signals that would come back if just that filter were off. "
+            "Backtest the same question with `!filtersim`."
+        )
+        await _send_chunked(ctx, lines)
+    except Exception as e:
+        logger.error(f"filterstats command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 @core.bot.command(name="tp")
