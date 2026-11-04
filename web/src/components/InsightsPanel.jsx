@@ -550,12 +550,12 @@ const SIM_TIMEFRAMES = ['1h', '4h'] // matches config.py's TIMEFRAMES — small,
 
 const SIM_MIN_BARS = 300 // matches the server's bound (num_bars: 300..20000)
 const SIM_MAX_BARS = 20000
-const barsError = (n) =>
+export const barsError = (n) =>
   Number.isFinite(n) && n >= SIM_MIN_BARS && n <= SIM_MAX_BARS && Number.isInteger(n)
     ? null
     : `Bars must be a whole number between ${SIM_MIN_BARS} and ${SIM_MAX_BARS}`
 
-function SimScopeFields({ pairs, timeframes, ticker, setTicker, tf, setTf, numBars, setNumBars, extra }) {
+export function SimScopeFields({ pairs, timeframes, ticker, setTicker, tf, setTf, numBars, setNumBars, extra }) {
   return (
     <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
       <div>
@@ -582,7 +582,7 @@ function SimScopeFields({ pairs, timeframes, ticker, setTicker, tf, setTf, numBa
   )
 }
 
-function BarCoverageWarning({ coverage, requested }) {
+export function BarCoverageWarning({ coverage, requested }) {
   const short = (coverage || []).filter((c) => c.got < requested)
   if (short.length === 0) return null
   return (
@@ -599,9 +599,9 @@ function BarCoverageWarning({ coverage, requested }) {
 // big (e.g. 6000 bars x several pairs), so the page just never showed a result.
 // The last job id per kind lives at module level so a finished result (or a running
 // job) is still there after switching sub-tabs, which unmounts this view.
-const simMemory = { tp1sim: null, compsim: null }
+const simMemory = { tp1sim: null, compsim: null, autofilter: null }
 
-function useSimJob(kind) {
+export function useSimJob(kind) {
   const [job, setJob] = useState(null)
   const [error, setError] = useState(null)
   const [otherRunning, setOtherRunning] = useState(null)
@@ -698,7 +698,7 @@ function SimProgress({ job, onCancel }) {
   )
 }
 
-function SimStatus({ sim }) {
+export function SimStatus({ sim }) {
   const { job, error, otherRunning } = sim
   return (
     <>

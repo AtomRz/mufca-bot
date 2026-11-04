@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
+import AutoFilterPanel from './AutoFilterPanel'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
 const FILTER_TOGGLES = [
-  { key: 'frama', label: 'FRAMA trend', hint: 'Direction of the FRAMA channel only. The FRAMA slope check (SLOPE lamp) is always applied and cannot be switched off.' },
+  { key: 'frama', label: 'FRAMA trend', hint: 'Direction of the FRAMA channel only. The FRAMA slope check is a separate switch below.' },
+  { key: 'slope', label: 'FRAMA slope', hint: 'Requires the FRAMA line itself to be rising (long) or falling (short) on the signal bar (SLOPE lamp).' },
   { key: 'chop', label: 'CHOP' },
   { key: 'atr', label: 'ATR' },
   { key: 'htf', label: 'HTF bias' },
@@ -394,6 +396,8 @@ export default function SettingsPanel({ config, onChanged }) {
               Off = filter is skipped entirely (always passes) when deciding whether a signal fires. Matches the lamp row in the topbar.
             </p>
           </div>
+
+          <AutoFilterPanel config={config} onChanged={onChanged} />
 
           <div className="panel">
             <h3 className="panel-title">CHOP Threshold</h3>

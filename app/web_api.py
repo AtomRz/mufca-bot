@@ -604,6 +604,70 @@ async def run_filtersim(body: FilterSimIn):
     )
 
 
+class AutoFilterIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)
+    apply: bool = True        # False = preview: report only, nothing pinned
+    validate_oos: bool = True  # False = skip the out-of-sample check (max in-sample PnL, overfits)
+
+
+@app.post("/api/autofilter")
+async def run_autofilter(body: AutoFilterIn):
+    """Auto-tunes the entry filters per pair and timeframe (same computation as
+    the Discord !autofilter, both call signals.run_filter_autotune()): one
+    dry-run backtest per pair/timeframe recording every raw trigger, then an
+    exhaustive search of the 8 backtestable filters' on/off sets for the best
+    net PnL, guarded by a train/test split. With apply=true the sets that
+    changed are pinned (GET /api/filter-overrides shows them, POST
+    /api/filter-overrides/revert undoes the last apply); apply=false is a preview.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_filter_autotune
+
+    async def _run(progress):
+        result = await run_filter_autotune(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress,
+            validate=body.validate_oos, apply=body.apply)
+        if result["applied"]:
+            await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
+        return result
+
+    return _start_sim_job(
+        "autofilter",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars,
+         "apply": body.apply, "validate": body.validate_oos},
+        _run,
+    )
+
+
+@app.get("/api/filter-overrides")
+async def get_filter_overrides():
+    """Filter sets pinned per ticker/timeframe by the auto-tuner (they win over
+    the global toggles), plus when they were applied and the stats that justified each."""
+    return _cfg.get_filter_overrides()
+
+
+@app.post("/api/filter-overrides/revert")
+async def revert_filter_overrides():
+    """Swaps back to the pinned sets from before the last apply/clear (calling it
+    again re-applies them)."""
+    if not _cfg.revert_filter_overrides():
+        raise HTTPException(409, "Nothing to revert")
+    await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
+    return _cfg.get_filter_overrides()
+
+
+@app.delete("/api/filter-overrides")
+async def clear_filter_overrides():
+    """Drops every pinned set - all pairs/timeframes fall back to the global toggles."""
+    _cfg.clear_filter_overrides()
+    await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
+    return _cfg.get_filter_overrides()
+
+
 @app.get("/api/filter-stats")
 async def get_filter_stats(ticker: Optional[str] = None, tf: Optional[str] = None):
     """Live entry-filter funnel counters (filter_stats.py): per track/side, raw
@@ -1052,6 +1116,7 @@ async def get_config():
         "hurst_bias_correction": _cfg.HURST_BIAS_CORRECTION,
         "hurst_min_deviation": _cfg.HURST_MIN_DEVIATION,
         "hurst_mode": _cfg.HURST_MODE,
+        "filter_overrides": _cfg.get_filter_overrides(),
         "filter_toggles": _current_filter_toggles(),  # single source of truth — was a separately hand-maintained dict here, which is exactly how "spread" got left out
         "tp_config": {
             "use_safe_tp": _cfg.USE_SAFE_TP,
@@ -1416,6 +1481,7 @@ async def set_utha(body: UthaIn):
 # would keep running on the old value.
 _FILTER_ATTR = {
     "frama": "ENABLE_FRAMA_FILTER",
+    "slope": "ENABLE_SLOPE_FILTER",
     "chop": "ENABLE_CHOP_FILTER",
     "atr": "ENABLE_ATR_FILTER",
     "htf": "ENABLE_MTF_BIAS",
@@ -1427,7 +1493,7 @@ _FILTER_ATTR = {
 
 
 class FilterToggleIn(BaseModel):
-    filter: str  # frama | chop | atr | htf | fake_break | liq_sweep | hurst | spread
+    filter: str  # frama | slope | chop | atr | htf | fake_break | liq_sweep | hurst | spread
     enabled: bool
 
 
@@ -1450,6 +1516,7 @@ async def set_filter_toggle(body: FilterToggleIn):
 def _current_filter_toggles() -> dict:
     return {
         "frama": _cfg.ENABLE_FRAMA_FILTER,
+        "slope": _cfg.ENABLE_SLOPE_FILTER,
         "chop": _cfg.ENABLE_CHOP_FILTER,
         "atr": _cfg.ENABLE_ATR_FILTER,
         "htf": _cfg.ENABLE_MTF_BIAS,
