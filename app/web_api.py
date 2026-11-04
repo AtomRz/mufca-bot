@@ -69,6 +69,7 @@ import onchain as _onchain
 import spread
 import shock_guard
 import shadow as shadow_mod
+import filter_stats as filter_stats_mod
 import sim_jobs
 
 
@@ -574,6 +575,54 @@ async def run_compsim(body: CompSimIn):
         lambda progress: run_component_backtest(
             exchange, scope_tickers, scope_tfs, body.num_bars, body.min_samples, progress=progress),
     )
+
+
+class FilterSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)
+
+
+@app.post("/api/filtersim")
+async def run_filtersim(body: FilterSimIn):
+    """Filter ablation (same computation as the Discord !filtersim, both call
+    signals.run_filter_ablation()): the live filter setup vs each filter switched
+    off/on one at a time, the trend cluster off together, and everything off, on
+    real historical OHLCV via dry-run backtests, plus a funnel of how many raw
+    triggers each filter rejected. Never writes to signals_history.json and
+    touches no setting. See run_filter_ablation()'s docstring for the result shape.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_filter_ablation
+    return _start_sim_job(
+        "filtersim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars},
+        lambda progress: run_filter_ablation(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress),
+    )
+
+
+@app.get("/api/filter-stats")
+async def get_filter_stats(ticker: Optional[str] = None, tf: Optional[str] = None):
+    """Live entry-filter funnel counters (filter_stats.py): per track/side, raw
+    triggers seen, how many passed every enabled filter, which filters rejected
+    the rest and which ones were the ONLY rejecter. Light - in-memory counters,
+    no exchange calls. Counting only; nothing here affects entries."""
+    ticker = ticker.upper().strip() if ticker else None
+    if ticker and ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not a tracked pair")
+    if tf and tf not in _cfg.TIMEFRAMES:
+        raise HTTPException(404, f"{tf} is not a tracked timeframe")
+    return filter_stats_mod.aggregate(ticker, tf)
+
+
+@app.post("/api/filter-stats/reset")
+async def reset_filter_stats():
+    """Starts the funnel counters over (use after changing filters/thresholds)."""
+    filter_stats_mod.reset()
+    return {"reset": True}
 
 
 @app.get("/api/sim-jobs/active")
