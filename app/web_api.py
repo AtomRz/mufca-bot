@@ -643,6 +643,34 @@ async def run_autofilter(body: AutoFilterIn):
     )
 
 
+class IndOptIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)
+    trials: int = Field(60, ge=8, le=400)  # parameter sets tried per pair/timeframe
+
+
+@app.post("/api/indoptim")
+async def run_indoptim(body: IndOptIn):
+    """Indicator optimizer (same computation as the Discord !indoptim, both call
+    signals.run_indicator_optimize()): for every pair/timeframe, backtests `trials`
+    parameter sets of the entry indicators (FRAMA, MFI, Andean, UT Bot) with the pair's
+    current filter set and reports which settings would have done better, guarded by a
+    train/test split, a noise gate and a plateau check. PREVIEW ONLY - nothing is applied
+    and no setting changes (the indicator settings are global in the live bot).
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_indicator_optimize
+    return _start_sim_job(
+        "indoptim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "trials": body.trials},
+        lambda progress: run_indicator_optimize(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress, trials=body.trials),
+    )
+
+
 @app.get("/api/filter-overrides")
 async def get_filter_overrides():
     """Filter sets pinned per ticker/timeframe by the auto-tuner (they win over

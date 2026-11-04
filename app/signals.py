@@ -1684,6 +1684,34 @@ def _fetch_ohlcv_paginated(exchange: ccxt.Exchange, ticker: str, tf: str, num_ba
     return deduped[-num_bars:] if len(deduped) > num_bars else deduped
 
 
+# Indicator parameters the optimizer may vary: key -> (cast, low, high, step).
+# Ranges are the practical neighbourhood of the defaults and stay inside the hard
+# bounds web_api.py enforces for the Settings page (FRAMA_LEN must be even there).
+# CHOP_LENGTH / ATR_PERIOD are plain constants in config (no Settings entry), so they
+# are accepted as overrides but not searched.
+INDICATOR_SPACE: Dict[str, tuple] = {
+    "FRAMA_LEN": (int, 10, 40, 2),
+    "FRAMA_MULT": (float, 1.0, 3.5, 0.1),
+    "MFI_LEN": (int, 4, 20, 1),
+    "AND_LEN": (int, 10, 40, 1),
+    "AND_SIG_LEN": (int, 3, 12, 1),
+    "UT_SENSITIVITY": (float, 0.5, 3.0, 0.25),
+    "UT_PERIOD": (int, 5, 20, 1),
+}
+
+
+def indicator_params(overrides: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """The live indicator parameters (read at call time), with `overrides` on top.
+    Unknown keys and non-numbers are ignored; the result is a fresh dict, config is untouched."""
+    out: Dict[str, float] = {k: getattr(_cfg, k) for k in INDICATOR_SPACE}
+    out["CHOP_LENGTH"] = CHOP_LENGTH
+    out["ATR_PERIOD"] = ATR_PERIOD
+    for k, v in (overrides or {}).items():
+        if k in out and isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = INDICATOR_SPACE[k][0](v) if k in INDICATOR_SPACE else int(v)
+    return out
+
+
 def backtest_history(
     exchange: ccxt.Exchange,
     ticker: str,
@@ -1699,8 +1727,18 @@ def backtest_history(
     filter_overrides: Optional[Dict[str, bool]] = None,
     collect_stats: bool = False,
     trigger_table: bool = False,
+    indicator_overrides: Optional[Dict[str, float]] = None,
 ):
     """Backtest for accumulating signal history.
+
+    indicator_overrides - {INDICATOR_KEY: value} for any key of INDICATOR_SPACE
+    (FRAMA_LEN, FRAMA_MULT, MFI_LEN, AND_LEN, AND_SIG_LEN, UT_SENSITIVITY,
+    UT_PERIOD, CHOP_LENGTH, ATR_PERIOD); applied to THIS run only, through local
+    variables - config is never touched (same contract as filter_overrides, and
+    for the same reason: SIM_WORKERS=1 runs the backtest inside the live
+    process). The HTF-bias FRAMA deliberately keeps the GLOBAL FRAMA_LEN/MULT,
+    exactly like live get_htf_bias(), so a candidate only changes the entry
+    timeframe's own indicators. None = the live values.
 
     trigger_table - dry_run + collect_stats only: evaluates EVERY raw trigger
     (ignoring filters and the one-position-per-track rule) and records, per
@@ -1849,11 +1887,12 @@ def backtest_history(
                 except Exception as e:
                     logger.warning(f"[BACKTEST] {ticker} {tf}: relative-strength benchmark fetch failed: {e}")
 
-        atr14 = calculate_atr(df, ATR_PERIOD)
+        _ind = indicator_params(indicator_overrides)
+        atr14 = calculate_atr(df, _ind["ATR_PERIOD"])
         atr_pct = (atr14 / df["close"]) * 100
-        chop = calculate_chop(df, CHOP_LENGTH)
-        fs, fu, fl, fdir = calculate_frama(df, _cfg.FRAMA_LEN, _cfg.FRAMA_MULT)
-        mfi = calculate_mfi(df, _cfg.MFI_LEN)
+        chop = calculate_chop(df, _ind["CHOP_LENGTH"])
+        fs, fu, fl, fdir = calculate_frama(df, _ind["FRAMA_LEN"], _ind["FRAMA_MULT"])
+        mfi = calculate_mfi(df, _ind["MFI_LEN"])
         # 🆕 FIX (external review, P1): warmed_up_bt below used to compare
         # `idx` directly against MFI_TRAINING, but calculate_mfi() itself
         # has its own NaN warm-up (MFI_LEN bars, ~7-8 by default) before its
@@ -1874,8 +1913,8 @@ def backtest_history(
         # are now per-bar Series instead of fixed scalars; crossover() and
         # friends already handle either.
         level_os, level_ob = run_kmeans_mfi_rolling(mfi, _cfg.MFI_TRAINING)
-        and_osc, and_sig = calculate_andean(df, _cfg.AND_LEN, _cfg.AND_SIG_LEN)
-        ut_buy, ut_sell = calculate_ut_bot(df, _cfg.UT_SENSITIVITY, _cfg.UT_PERIOD, use_ha=_cfg.UT_HEIKIN_ASHI)
+        and_osc, and_sig = calculate_andean(df, _ind["AND_LEN"], _ind["AND_SIG_LEN"])
+        ut_buy, ut_sell = calculate_ut_bot(df, _ind["UT_SENSITIVITY"], _ind["UT_PERIOD"], use_ha=_cfg.UT_HEIKIN_ASHI)
         # 🆕 Always computed here (unlike check_signals, not gated behind the
         # toggle) — backtest_history is a one-off run, not a per-scan cost
         # concern, and needs to match live's filter logic for calibration
@@ -3075,6 +3114,304 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
         applied = True
     return {"fee_pct": fee, "validate": validate, "bar_coverage": bar_coverage, "skipped": skipped,
             "results": results, "assignments": assignments, "meta": meta, "applied": applied}
+
+
+# ---------------------------------------------------------------------
+# Indicator optimizer: best indicator parameters per (ticker, timeframe)
+# ---------------------------------------------------------------------
+def _grid_values(spec: tuple) -> List:
+    cast, lo, hi, step = spec
+    n = int(round((hi - lo) / step))
+    return [cast(round(lo + i * step, 6)) for i in range(n + 1)]
+
+
+def sample_indicator_candidates(n: int, seed: int, include: Optional[Dict] = None) -> List[Dict]:
+    """Up to `n` distinct parameter sets from INDICATOR_SPACE, Latin-hypercube style:
+    every parameter's range is covered evenly, so a few dozen points still span the
+    whole space (plain random sampling clumps). `include` (the live set) comes first.
+    Deterministic for a given seed."""
+    rng = np.random.default_rng(seed)
+    grids = {k: _grid_values(spec) for k, spec in INDICATOR_SPACE.items()}
+    out: List[Dict] = []
+    seen = set()
+
+    def add(c: Dict) -> None:
+        key = tuple(c[k] for k in INDICATOR_SPACE)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+
+    if include:
+        add({k: include[k] for k in INDICATOR_SPACE})
+    for _ in range(6):  # oversample + dedupe: collisions on the coarse grids must not leave us short
+        if len(out) >= n:
+            break
+        m = max(2, (n - len(out)) * 2)
+        cols = {}
+        for k, g in grids.items():
+            u = (rng.permutation(m) + rng.random(m)) / m
+            cols[k] = [g[min(int(x * len(g)), len(g) - 1)] for x in u]
+        for i in range(m):
+            if len(out) >= n:
+                break
+            add({k: cols[k][i] for k in grids})
+    return out[:n]
+
+
+def indicator_neighbours(params: Dict) -> List[Dict]:
+    """One step up and one step down in each searched parameter (the 'plateau'
+    around a candidate); steps that leave the search range are dropped."""
+    out: List[Dict] = []
+    for k, (cast, lo, hi, step) in INDICATOR_SPACE.items():
+        for d in (-step, step):
+            v = cast(round(params[k] + d, 6))
+            if lo <= v <= hi:
+                out.append({**{kk: params[kk] for kk in INDICATOR_SPACE}, k: v})
+    return out
+
+
+def _trade_key(t: Dict) -> tuple:
+    # moved_pct is part of the key: with different indicators the SAME bar can produce a
+    # different trade, and that is not a "shared" trade that cancels out of the comparison.
+    return (t["idx"], t["track"], t["side"], t["moved_pct"])
+
+
+def _diff_gain_noise(base: List[Dict], other: List[Dict], fee_pct: float) -> Tuple[float, float]:
+    """(total net PnL of `other` minus `base`, noise). Noise = sd of the trades only one of
+    the two takes x sqrt(their count) - the same yardstick choose_filter_set() uses."""
+    kb = {_trade_key(t) for t in base}
+    ko = {_trade_key(t) for t in other}
+    diff = [t for t in base if _trade_key(t) not in ko] + [t for t in other if _trade_key(t) not in kb]
+    gain = sum(_net_pnls(other, fee_pct)) - sum(_net_pnls(base, fee_pct))
+    if len(diff) < 2:
+        return gain, 0.0
+    pn = _net_pnls(diff, fee_pct)
+    mean = sum(pn) / len(pn)
+    sd = (sum((x - mean) ** 2 for x in pn) / (len(pn) - 1)) ** 0.5
+    return gain, sd * (len(pn) ** 0.5)
+
+
+def score_indicator_candidate(params: Dict, triggers: List[Dict], flags: Dict[str, bool], tf: str,
+                              cutoff: int, burn_in: int, fee_pct: float) -> Dict:
+    """Trades the live filter set `flags` would have taken on this candidate's trigger
+    table, split into the train (before `cutoff`) and test window, with their stats."""
+    usable = [t for t in triggers if t["idx"] >= burn_in]
+    trades = replay_filter_set(usable, flags, tf)
+    tr = [t for t in trades if t["idx"] < cutoff]
+    te = [t for t in trades if t["idx"] >= cutoff]
+    return {"params": dict(params), "trades": trades, "tr": tr, "te": te,
+            "train": _window_stats(tr, fee_pct), "test": _window_stats(te, fee_pct),
+            "all": _window_stats(trades, fee_pct)}
+
+
+def _public_score(s: Dict) -> Dict:
+    return {"params": s["params"], "train": s["train"], "test": s["test"], "all": s["all"]}
+
+
+def judge_indicator_winner(cur: Dict, win: Dict, fee_pct: float, min_test: int,
+                           min_gain_se: float, min_test_gain_se: float) -> Optional[str]:
+    """None when the train-window winner `win` clears the first three gates against the
+    live set `cur` (see choose_indicator_params); otherwise the reason it does not."""
+    gain, noise = _diff_gain_noise(cur["tr"], win["tr"], fee_pct)
+    if gain <= 0 or gain <= min_gain_se * noise:
+        return (f"best candidate's gain {gain:+.2f}% on the training window is within noise "
+                f"(needs > {min_gain_se * noise:.2f}%)")
+    if len(win["te"]) < min_test:
+        return f"only {len(win['te'])} trades in the test window (needs {min_test})"
+    tgain, tnoise = _diff_gain_noise(cur["te"], win["te"], fee_pct)
+    if tgain <= 0 or tgain <= min_test_gain_se * tnoise:
+        return (f"did not hold up on the test window ({win['test']['total']:+.2f}% vs "
+                f"{cur['test']['total']:+.2f}% for the live settings)")
+    return None
+
+
+def judge_plateau(cur: Dict, neighbours: List[Dict], min_train: int, min_share: float) -> Tuple[Optional[str], Dict]:
+    """Gate 4: a real optimum has decent neighbours; a lucky spike does not. Needs enough
+    neighbours with enough trades, `min_share` of them beating the live set on the train
+    window, and their median test result not worse than the live set's."""
+    valid = [n for n in neighbours if n["train"]["n"] >= min_train]
+    info: Dict = {"n": len(valid), "of": len(neighbours), "share_better": None, "median_test": None}
+    if len(valid) < 4:
+        return (f"unstable: only {len(valid)} of {len(neighbours)} neighbouring settings produce "
+                f"enough trades to compare"), info
+    better = sum(1 for n in valid if n["train"]["total"] > cur["train"]["total"])
+    info["share_better"] = round(better / len(valid), 2)
+    tests = sorted(n["test"]["total"] for n in valid)
+    mid = len(tests) // 2
+    info["median_test"] = round(tests[mid] if len(tests) % 2 else (tests[mid - 1] + tests[mid]) / 2, 4)
+    if info["share_better"] < min_share:
+        return (f"a sharp peak, not a plateau: only {better} of {len(valid)} neighbouring settings "
+                f"beat the live ones on the training window"), info
+    if info["median_test"] < cur["test"]["total"]:
+        return (f"neighbouring settings do worse than the live ones on the test window "
+                f"(median {info['median_test']:+.2f}% vs {cur['test']['total']:+.2f}%)"), info
+    return None, info
+
+
+def pick_indicator_winner(scored: List[Dict], min_train: int) -> Optional[Dict]:
+    """Highest net train-window PnL among candidates with at least min_train trades.
+    Test-window numbers never enter the choice - that is what keeps it an honest check."""
+    best = None
+    for s in scored:
+        if s["train"]["n"] < min_train:
+            continue
+        if best is None or round(s["train"]["total"], 9) > round(best["train"]["total"], 9):
+            best = s
+    return best
+
+
+async def run_indicator_optimize(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                                 progress: Optional[Callable[[int, int, str], None]] = None,
+                                 workers: Optional[int] = None, trials: Optional[int] = None,
+                                 fee_pct: Optional[float] = None) -> Dict:
+    """Searches INDICATOR_SPACE for better indicator parameters, per (ticker, tf). PREVIEW ONLY:
+    nothing is written, no setting changes - the result says what would be worth trying.
+
+    For each pair/tf: `trials` parameter sets (the live one always among them) are backtested
+    on the same fetched data, each as a trigger-table dry run; the pair's CURRENT filter set is
+    replayed on every table (so a candidate is judged the way it would actually trade). The
+    winner is picked on the older AUTOTUNE_TRAIN_FRACTION of the bars only, then must
+      1. beat the live settings on the train window by more than the noise,
+      2. confirm that on the newest bars (>= AUTOTUNE_MIN_TEST_TRADES trades, gain > noise),
+      3. sit on a plateau: its one-step neighbours (also backtested) mostly beat the live set too.
+    Otherwise `chosen` stays the live set and `reason` says which gate failed. With dozens of
+    candidates the best train score is biased upward - gates 2 and 3 exist for that, and an
+    accepted result is still a candidate to forward-test, not a guarantee.
+
+    Returns {"fee_pct","trials","space","bar_coverage","skipped","results": {ticker: {tf: {
+        "current","current_stats","best","best_stats","chosen","changed","reason",
+        "plateau","n_trials","n_failed","top"}}}, "applied": False}"""
+    import zlib
+    fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
+    n_trials = max(8, min(400, int(trials if trials else _cfg.INDOPT_TRIALS)))
+    burn_in = _cfg.INDOPT_BURN_IN_BARS
+    counters = {"done": 0, "total": 0}
+    bar_coverage: List[Dict] = []
+    skipped: List[Dict] = []
+    off = {k: False for k in FILTER_KEYS}
+
+    def _tick(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], label)
+        return cb
+
+    def _triggers(outcome) -> List[Dict]:
+        _count, history, _bars = outcome
+        return (history.pop("__stats__", None) or {}).get("trades", [])
+
+    async def optimize_one(pool: SimPool, t: str, f: str, inputs: Dict) -> Dict:
+        df = inputs["df"]
+        n_bars = len(df)
+        flags = current_filter_flags(t, f)
+        live = indicator_params(None)
+        live = {k: live[k] for k in INDICATOR_SPACE}
+        first_idx, last_idx = burn_in, n_bars - _cfg.MAX_HOLD_BARS
+        cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
+
+        def submit(params: Dict, label: str):
+            fut = pool.submit({
+                "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                "tp1_sl_fraction": None, "dry_run": True, "df": df,
+                "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                "filter_overrides": off, "collect_stats": True, "trigger_table": True,
+                "indicator_overrides": params,
+            })
+            fut.add_done_callback(_tick(label))
+            return fut
+
+        cands = sample_indicator_candidates(n_trials, zlib.crc32(f"{t}|{f}".encode()), include=live)
+        counters["total"] += len(cands)
+        outs = await asyncio.gather(*(submit(c, f"{t} {f}") for c in cands), return_exceptions=True)
+
+        scored: List[Dict] = []
+        failed = 0
+        for params, out in zip(cands, outs):
+            if isinstance(out, BaseException):
+                failed += 1
+                logger.error(f"run_indicator_optimize: {t} {f} {params}: {out!r}")
+                continue
+            scored.append(score_indicator_candidate(params, _triggers(out), flags, f, cutoff, burn_in, fee))
+        cur = next((s for s in scored if s["params"] == live), None)
+        if cur is None:
+            raise RuntimeError("the live-settings backtest itself failed, nothing to compare against")
+
+        res: Dict = {
+            "current": live, "current_stats": {k: cur[k] for k in ("train", "test", "all")},
+            "best": None, "best_stats": None, "chosen": dict(live), "changed": False, "reason": "",
+            "plateau": None, "n_trials": len(scored), "n_failed": failed,
+            "top": [_public_score(s) for s in sorted(
+                (s for s in scored if s["train"]["n"] >= _cfg.AUTOTUNE_MIN_TRAIN_TRADES),
+                key=lambda s: -s["train"]["total"])[:5]],
+        }
+        win = pick_indicator_winner(scored, _cfg.AUTOTUNE_MIN_TRAIN_TRADES)
+        if win is None:
+            res["reason"] = f"no candidate reaches {_cfg.AUTOTUNE_MIN_TRAIN_TRADES} trades in the training window"
+            return res
+        res["best"] = win["params"]
+        res["best_stats"] = {k: win[k] for k in ("train", "test", "all")}
+        if win is cur:
+            res["reason"] = f"the live settings are already the best of the {len(scored)} tried"
+            return res
+        why = judge_indicator_winner(cur, win, fee, _cfg.AUTOTUNE_MIN_TEST_TRADES,
+                                     _cfg.AUTOTUNE_MIN_GAIN_SE, _cfg.AUTOTUNE_MIN_TEST_GAIN_SE)
+        if why is not None:
+            res["reason"] = why
+            return res
+
+        # plateau check - only now, so a rejected pair costs no extra backtests
+        known = {tuple(s["params"][k] for k in INDICATOR_SPACE) for s in scored}
+        neigh = [p for p in indicator_neighbours(win["params"])]
+        fresh = [p for p in neigh if tuple(p[k] for k in INDICATOR_SPACE) not in known]
+        counters["total"] += len(fresh)
+        nouts = await asyncio.gather(*(submit(p, f"{t} {f} (stability)") for p in fresh), return_exceptions=True)
+        neigh_scored = [s for s in scored if s["params"] in neigh]
+        for params, out in zip(fresh, nouts):
+            if isinstance(out, BaseException):
+                logger.error(f"run_indicator_optimize: {t} {f} neighbour {params}: {out!r}")
+                continue
+            neigh_scored.append(score_indicator_candidate(params, _triggers(out), flags, f, cutoff, burn_in, fee))
+        why, info = judge_plateau(cur, neigh_scored, _cfg.AUTOTUNE_MIN_TRAIN_TRADES, _cfg.INDOPT_PLATEAU_SHARE)
+        res["plateau"] = info
+        if why is not None:
+            res["reason"] = why
+            return res
+        res["chosen"] = dict(win["params"])
+        res["changed"] = True
+        res["reason"] = "better on the training window, confirmed on the test window, and stable around the optimum"
+        return res
+
+    prepared: List[tuple] = []
+    _report_progress(progress, 0, 0, "starting")
+    for t in tickers:
+        for f in tfs:
+            _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+            try:
+                inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+            except Exception as e:
+                logger.error(f"run_indicator_optimize: fetch error for {t} {f}: {e}")
+                skipped.append({"ticker": t, "tf": f, "reason": f"data fetch failed: {e}"})
+                continue
+            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+            if inputs["df"] is None or len(inputs["df"]) < burn_in + _cfg.MAX_HOLD_BARS + 100:
+                skipped.append({"ticker": t, "tf": f,
+                                "reason": f"not enough history (got {inputs['bars_fetched']} bars)"})
+                continue
+            prepared.append((t, f, inputs))
+
+    results: Dict[str, Dict] = {}
+    async with SimPool(workers) as pool:
+        outcomes = await asyncio.gather(*(optimize_one(pool, t, f, inp) for t, f, inp in prepared),
+                                        return_exceptions=True)
+    for (t, f, _inp), outcome in zip(prepared, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_indicator_optimize: {t} {f} failed: {outcome!r}")
+            skipped.append({"ticker": t, "tf": f, "reason": f"optimization failed: {outcome}"})
+            continue
+        results.setdefault(t, {})[f] = outcome
+    return {"fee_pct": fee, "trials": n_trials,
+            "space": {k: {"low": lo, "high": hi, "step": st} for k, (_c, lo, hi, st) in INDICATOR_SPACE.items()},
+            "bar_coverage": bar_coverage, "skipped": skipped, "results": results, "applied": False}
 
 # =====================================================================
 # 🔄  HELPER FUNCTIONS

@@ -51,7 +51,8 @@ from indicators import calculate_atr, calculate_frama
 from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
-    run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune, FILTER_KEYS,
+    run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
+    run_indicator_optimize, FILTER_KEYS,
 )
 import filter_stats
 from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full, trace_exchange_wallets
@@ -137,6 +138,7 @@ async def help_cmd(ctx):
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
+        "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
         "`!tp <pair> <tf>` — current adaptive TP",
@@ -1535,6 +1537,110 @@ async def autofilter_cmd(ctx, *args):
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"autofilter command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+_IND_SHORT = {"FRAMA_LEN": "FRAMA len", "FRAMA_MULT": "FRAMA mult", "MFI_LEN": "MFI len", "AND_LEN": "Andean len",
+              "AND_SIG_LEN": "Andean sig", "UT_SENSITIVITY": "UT sens", "UT_PERIOD": "UT period"}
+
+
+def _fmt_ind_params(p: dict, ref: dict = None) -> str:
+    """`FRAMA len 34, MFI len 6 ...`; with `ref`, only the values that differ from it."""
+    keys = [k for k in _IND_SHORT if k in p and (ref is None or p[k] != ref.get(k))]
+    return ", ".join(f"{_IND_SHORT[k]} {p[k]:g}" for k in keys) or "same as live"
+
+
+def _indoptim_lines(result: dict) -> list:
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            cs = r["current_stats"]
+            if r["changed"]:
+                bs = r["best_stats"]
+                lines.append(f"**{ticker} {tf}** ✅ worth a forward test: {_fmt_ind_params(r['chosen'], r['current'])}")
+                lines.append(f"   {_fmt_autotune_stats('now ', bs['all'])} | {_fmt_autotune_stats('was ', cs['all'])}")
+                lines.append(f"   out-of-sample: {_fmt_autotune_stats('now ', bs['test'])} | {_fmt_autotune_stats('was ', cs['test'])}")
+                pl = r.get("plateau") or {}
+                if pl.get("share_better") is not None:
+                    lines.append(f"   stability: {pl['share_better']:.0%} of {pl['n']} neighbouring settings also beat the live ones")
+            else:
+                lines.append(f"**{ticker} {tf}** unchanged — {r['reason']}")
+                if r.get("best") and r["best"] != r["current"]:
+                    lines.append(f"   (best raw candidate: {_fmt_ind_params(r['best'], r['current'])} — rejected)")
+    return lines
+
+
+@core.bot.command(name="indoptim", aliases=["optind", "indopt"])
+async def indoptim_cmd(ctx, *args):
+    """
+    Indicator optimizer, PER PAIR AND TIMEFRAME - PREVIEW ONLY, nothing is changed.
+    Backtests a spread of FRAMA / MFI / Andean / UT Bot settings (the live ones are
+    always one of them) on real history, with each pair's current filter set and fee
+    deducted, and reports whether other settings would have traded better.
+
+    Overfitting guards: the winner is picked on the oldest 60% of the bars only, must
+    beat the live settings by more than the noise, must confirm that on the newest 40%,
+    and must sit on a plateau (its neighbouring settings must also do well). Most pairs
+    will honestly report "unchanged" - that is the guards working.
+
+    Usage: !indoptim [pair] [tf] [bars] [trials=N]
+      !indoptim BTC/USDT 4h 6000       - one pair/timeframe, more history
+      !indoptim BTC/USDT 4h trials=120 - wider search (default 60 sets per pair/tf)
+    Shares the one-at-a-time simulation slot with !tp1sim / !compsim / !filtersim / !autofilter.
+    """
+    ticker = tf = ""
+    num_bars = 3000
+    trials = _cfg.INDOPT_TRIALS
+    for a in args:
+        if a.lower().startswith("trials="):
+            try:
+                trials = max(8, min(400, int(a.split("=", 1)[1])))
+            except ValueError:
+                await ctx.send(f"❌ `{a}` — use `trials=<number>`.")
+                return
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe, bar count or `trials=N`.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        result = await _run_sim_job(
+            ctx, "indoptim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "trials": trials},
+            lambda progress: run_indicator_optimize(exchange, scope_tickers, scope_tfs, num_bars,
+                                                    progress=progress, trials=trials),
+            intro=(f"⏳ Optimizing indicators: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars, "
+                   f"~{trials} settings each (preview only, nothing is changed). This takes a while."),
+        )
+        if result is None:
+            return
+        n_ok = sum(1 for per_tf in result["results"].values() for r in per_tf.values() if r["changed"])
+        head = [f"**🧪 Indicator optimizer** — net of {result['fee_pct']}% fee per trade, validated on the newest 40%; "
+                f"{n_ok} pair/timeframe(s) with a candidate worth testing\n"]
+        for c in result["bar_coverage"]:
+            if c["got"] < c["requested"]:
+                head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
+        lines = head + _indoptim_lines(result)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above (the exchange may not serve that many bars; try fewer).")
+        lines.append("\nNothing was applied: indicator settings are global in the live bot. Treat a ✅ as a candidate to "
+                     "forward-test (e.g. on the TradingView indicator), not a guarantee — the best of dozens of tries is optimistic by construction.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"indoptim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 

@@ -461,6 +461,12 @@ AUTOTUNE_MIN_TEST_TRADES = 8      # ...and in the test window
 AUTOTUNE_MIN_GAIN_SE = 1.0        # train total-PnL gain over the current set must exceed this many standard errors
 AUTOTUNE_MIN_TEST_GAIN_SE = 0.5   # the test window must confirm the gain by at least this many standard errors
 
+# Indicator optimizer (!indoptim / POST /api/indoptim) - reuses the AUTOTUNE_* fee,
+# split and trade-count limits above; these three are its own.
+INDOPT_TRIALS = 60                # parameter sets tried per pair/timeframe (the live set is always one of them)
+INDOPT_BURN_IN_BARS = 100         # triggers before this bar are ignored for EVERY candidate (long-warm-up settings must not look worse)
+INDOPT_PLATEAU_SHARE = 0.6        # share of the winner's one-step neighbours that must also beat the live set on the train window
+
 # =====================================================================
 # 📈  HURST EXPONENT (regime-clarity filter)
 # =====================================================================
