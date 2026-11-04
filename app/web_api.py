@@ -650,6 +650,30 @@ async def get_filter_overrides():
     return _cfg.get_filter_overrides()
 
 
+class FilterPinIn(BaseModel):
+    ticker: str
+    tf: str
+    filters: Optional[dict] = None  # {filter: bool}; null = drop the pin
+
+
+@app.post("/api/filter-overrides")
+async def pin_filter_override(body: FilterPinIn):
+    """Manually pins filters for one ticker/timeframe on top of its current effective
+    flags (filters=null drops the pin)."""
+    ticker = body.ticker.upper().strip()
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not a tracked pair")
+    if body.tf not in _cfg.TIMEFRAMES:
+        raise HTTPException(404, f"{body.tf} is not a tracked timeframe")
+    if body.filters is not None:
+        bad = [k for k, v in body.filters.items() if k not in _cfg.BACKTEST_FILTER_KEYS or not isinstance(v, bool)]
+        if bad:
+            raise HTTPException(400, f"invalid filters {bad}; allowed: {list(_cfg.BACKTEST_FILTER_KEYS)} with boolean values")
+    _cfg.set_filter_override(ticker, body.tf, body.filters)
+    await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
+    return _cfg.get_filter_overrides()
+
+
 @app.post("/api/filter-overrides/revert")
 async def revert_filter_overrides():
     """Swaps back to the pinned sets from before the last apply/clear (calling it
