@@ -128,6 +128,11 @@ export default function AutoFilterPanel({ config, onChanged }) {
           <p style={{ fontSize: 12, marginBottom: 8 }}>
             Net of {result.fee_pct}% fee per trade · {result.applied ? 'applied' : 'nothing applied'}
           </p>
+          {(result.skipped || []).map((sk) => (
+            <p key={`${sk.ticker}-${sk.tf}`} style={{ fontSize: 12, color: 'var(--short)', marginBottom: 6 }}>
+              ❌ {sk.ticker} {sk.tf}: skipped — {sk.reason}
+            </p>
+          ))}
           <ResultRows result={result} />
         </>
       )}

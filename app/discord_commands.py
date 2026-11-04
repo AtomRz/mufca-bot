@@ -1489,7 +1489,11 @@ async def autofilter_cmd(ctx, *args):
         short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
         for c in short_pairs:
             head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
         lines = head + _autotune_lines(result, applied)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above (the exchange may not serve that many bars; try fewer).")
         lines.append("\nPnL = unlevered % moves of simulated trades. Small samples can still overfit — "
                      "`!autofilter revert` undoes the last apply; re-run with more `bars` to check stability.")
         await _send_chunked(ctx, "\n".join(lines))

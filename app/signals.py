@@ -3003,6 +3003,7 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
     counters = {"done": 0, "total": len(tickers) * len(tfs)}
     bar_coverage: List[Dict] = []
+    skipped: List[Dict] = []  # pairs/tfs that produced no result, with the reason
     submitted: List[tuple] = []  # (ticker, tf, bars, future)
     off = {k: False for k in FILTER_KEYS}  # start at bar 50: hurst's longer warm-up is handled in the replay
 
@@ -3021,10 +3022,13 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
                     inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
                 except Exception as e:
                     logger.error(f"run_filter_autotune: fetch error for {t} {f}: {e}")
+                    skipped.append({"ticker": t, "tf": f, "reason": f"data fetch failed: {e}"})
                     counters["total"] -= 1
                     continue
                 bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
                 if inputs["df"] is None:
+                    skipped.append({"ticker": t, "tf": f,
+                                    "reason": f"not enough history (got {inputs['bars_fetched']} bars)"})
                     counters["total"] -= 1
                     continue
                 fut = pool.submit({
@@ -3045,6 +3049,7 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     for (t, f, n_bars, _fut), outcome in zip(submitted, outcomes):
         if isinstance(outcome, BaseException):
             logger.error(f"run_filter_autotune: backtest error for {t} {f}: {outcome!r}")
+            skipped.append({"ticker": t, "tf": f, "reason": f"backtest failed: {outcome!r}"})
             continue
         _count, history, _bars = outcome
         stats = history.pop("__stats__", None) or {}
@@ -3068,7 +3073,7 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     if apply and assignments:
         _cfg.apply_filter_overrides(assignments, meta)
         applied = True
-    return {"fee_pct": fee, "validate": validate, "bar_coverage": bar_coverage,
+    return {"fee_pct": fee, "validate": validate, "bar_coverage": bar_coverage, "skipped": skipped,
             "results": results, "assignments": assignments, "meta": meta, "applied": applied}
 
 # =====================================================================
