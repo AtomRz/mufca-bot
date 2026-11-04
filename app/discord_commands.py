@@ -137,6 +137,7 @@ async def help_cmd(ctx):
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
+        "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
         "`!tp <pair> <tf>` — current adaptive TP",
         "`!chart <pair> <tf>` — candlestick chart with indicators (e.g. `!chart BTC 1h`)",
@@ -1400,6 +1401,41 @@ def _autotune_lines(result: dict, applied: bool) -> list:
     return lines
 
 
+@core.bot.command(name="pinfilter", aliases=["setfilters"])
+async def pinfilter_cmd(ctx, ticker: str = "", tf: str = "", *changes):
+    """
+    Manually sets the entry filters for ONE pair + timeframe (wins over the global
+    toggles and over auto-tuned sets).
+
+    Usage:
+      !pinfilter ETH/USDT 1h chop=off slope=off   - switch those filters off, keep the rest as they are now
+      !pinfilter ETH/USDT 1h chop=on              - switch one on
+      !pinfilter ETH/USDT 1h default              - drop the pin (global toggles again)
+    Filters: frama slope chop atr htf fake_break liq_sweep hurst. `!autofilter revert` undoes it.
+    """
+    ticker = ticker.upper()
+    tf = tf.lower()
+    if ticker not in TICKERS or tf not in TIMEFRAMES:
+        await ctx.send("❌ Usage: `!pinfilter <pair> <tf> <filter>=on|off ...` or `... default`")
+        return
+    if [c.lower() for c in changes] == ["default"]:
+        _cfg.set_filter_override(ticker, tf, None)
+        await ctx.send(f"🧹 {ticker} {tf}: pin removed — {_fmt_filter_set(_cfg.filter_flags_for(ticker, tf))} (global toggles).")
+        return
+    parsed = {}
+    for c in changes:
+        key, _, val = c.lower().partition("=")
+        if key not in FILTER_KEYS or val not in ("on", "off"):
+            await ctx.send(f"❌ `{c}` — use `<filter>=on|off`, filters: {', '.join(FILTER_KEYS)}")
+            return
+        parsed[key] = val == "on"
+    if not parsed:
+        await ctx.send(f"{ticker} {tf} now: {_fmt_filter_set(_cfg.filter_flags_for(ticker, tf))}")
+        return
+    flags = _cfg.set_filter_override(ticker, tf, parsed)
+    await ctx.send(f"📌 {ticker} {tf} pinned: {_fmt_filter_set(flags)} (`!autofilter revert` undoes)")
+
+
 @core.bot.command(name="autofilter", aliases=["autotune"])
 async def autofilter_cmd(ctx, *args):
     """
@@ -1489,7 +1525,11 @@ async def autofilter_cmd(ctx, *args):
         short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
         for c in short_pairs:
             head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
         lines = head + _autotune_lines(result, applied)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above (the exchange may not serve that many bars; try fewer).")
         lines.append("\nPnL = unlevered % moves of simulated trades. Small samples can still overfit — "
                      "`!autofilter revert` undoes the last apply; re-run with more `bars` to check stability.")
         await _send_chunked(ctx, "\n".join(lines))

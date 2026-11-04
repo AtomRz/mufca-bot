@@ -422,6 +422,28 @@ def revert_filter_overrides() -> bool:
         _save_filter_overrides()
         return True
 
+def set_filter_override(ticker: str, timeframe: str, changes: Optional[dict]) -> dict:
+    """Manually pins one (ticker, tf): `changes` ({filter: bool}) is applied on top of
+    the flags in force right now. None drops the pin (back to the global toggles).
+    Returns the effective flags afterwards. Keeps the prior state for revert."""
+    with _filter_overrides_lock:
+        _filter_overrides["previous"] = copy.deepcopy(_filter_overrides["active"])
+        if changes is None:
+            _filter_overrides["active"].get(ticker, {}).pop(timeframe, None)
+            if not _filter_overrides["active"].get(ticker, True):
+                _filter_overrides["active"].pop(ticker, None)
+            _filter_overrides["meta"].get(ticker, {}).pop(timeframe, None)
+        else:
+            flags = filter_flags_for(ticker, timeframe)
+            for k, v in changes.items():
+                if k in BACKTEST_FILTER_KEYS:
+                    flags[k] = bool(v)
+            _filter_overrides["active"].setdefault(ticker, {})[timeframe] = flags
+            _filter_overrides["meta"].setdefault(ticker, {})[timeframe] = {"manual": True}
+        _filter_overrides["applied_at"] = int(time.time())
+        _save_filter_overrides()
+        return filter_flags_for(ticker, timeframe)
+
 def clear_filter_overrides():
     """Drops every pinned set — all pairs/tfs fall back to the global toggles."""
     with _filter_overrides_lock:
