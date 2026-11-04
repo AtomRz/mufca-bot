@@ -1275,16 +1275,6 @@ def _fmt_funnel_cell(key: str, cell: dict) -> list:
     return out
 
 
-async def _send_chunked(ctx, lines: list):
-    msg = "\n".join(lines)
-    while msg:
-        chunk = msg[:1900]
-        if len(msg) > 1900:
-            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
-        await ctx.send(chunk)
-        msg = msg[len(chunk):].lstrip("\n")
-
-
 @core.bot.command(name="filtersim", aliases=["filterablation"])
 async def filtersim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000):
     """
@@ -1377,7 +1367,7 @@ async def filtersim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 300
             "compare Δn and Δtotal together, and prefer a bigger `bars`/scope before acting on small samples. "
             "TP/SL calibration is identical for every variant (live history), so the comparison is like-for-like."
         )
-        await _send_chunked(ctx, lines)
+        await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"filtersim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -1420,7 +1410,7 @@ async def filterstats_cmd(ctx, arg1: str = "", arg2: str = ""):
             "of trades opened. `ONLY this filter` = signals that would come back if just that filter were off. "
             "Backtest the same question with `!filtersim`."
         )
-        await _send_chunked(ctx, lines)
+        await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"filterstats command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
