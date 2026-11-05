@@ -81,6 +81,11 @@ export const api = {
     request(`/api/onchain/trace?exchange=${encodeURIComponent(exchange)}&min_eth=${encodeURIComponent(minEth)}`),
   verifyOnchain: (exchange, minEth) =>
     request(`/api/onchain/verify?exchange=${encodeURIComponent(exchange)}&min_eth=${encodeURIComponent(minEth)}`),
+  addOnchainWallet: (exchange, address, label) =>
+    request('/api/onchain/wallets', { method: 'POST', body: JSON.stringify({ exchange, address, label }) }),
+  removeOnchainWallet: (exchange, address) =>
+    request(`/api/onchain/wallets?exchange=${encodeURIComponent(exchange)}&address=${encodeURIComponent(address)}`,
+      { method: 'DELETE' }),
   // 🆕 REMOVED (dead code cleanup): getPairs() -> GET /api/pairs used to
   // sit here, called by nothing — the pairs list comes from getConfig()
   // (config.pairs) instead. The backend endpoint was removed too.

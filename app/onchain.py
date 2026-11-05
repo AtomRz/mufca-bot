@@ -9,8 +9,10 @@ Refresh: configurable interval (15m/30m/1h, default 1h) — see config.ONCHAIN_C
 
 import asyncio
 import aiohttp
+import copy
 import logging
 import os
+import re
 import time
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -35,7 +37,9 @@ logger = logging.getLogger(__name__)
 # a permanent 0 delta (Coinbase/Kraken/OKX sat at 0 while only Binance moved).
 # Balances are tracked per wallet and summed per exchange, so transfers between an
 # exchange's own tracked wallets net out in that sum.
-# Format: {exchange: {wallet_label: address}}. To track another wallet, add a line.
+# Format: {exchange: {wallet_label: address}}. These are the DEFAULTS: wallets can
+# also be added/removed at runtime from the web UI (see "RUNTIME WALLET EDITS"
+# below), and that is stored outside the code in DATA_DIR/onchain_wallets.json.
 EXCHANGE_ETH_ADDRESSES: Dict[str, Dict[str, str]] = {
     # Binance: the FULL ETH-mainnet wallet list from Binance's Proof of Reserves
     # (snapshot at block 26,309,019, taken right after the 2026-10-29 hot-wallet
@@ -93,14 +97,92 @@ EXCHANGE_ETH_ADDRESSES: Dict[str, Dict[str, str]] = {
     },
 }
 
+# =====================================================================
+# 🧩  RUNTIME WALLET EDITS (web "Add" / "Remove" buttons)
+# =====================================================================
+# EXCHANGE_ETH_ADDRESSES above is the DEFAULT list that ships with the code.
+# Edits made from the web UI live in DATA_DIR/onchain_wallets.json and are merged
+# on top of it at startup and after every edit, so the list can change without
+# touching the code, and a code update neither loses nor resurrects UI edits:
+#   {"added": {exchange: {label: address}}, "removed": [address, ...]}
+# "removed" only hides a default wallet; removing a wallet that was added from the
+# UI just deletes it from "added". EXCHANGE_ETH_ADDRESSES, _WALLETS and
+# _WALLET_KEYS are rebuilt IN PLACE, so every reference to them sees the new set.
+_DEFAULT_ETH_ADDRESSES: Dict[str, Dict[str, str]] = copy.deepcopy(EXCHANGE_ETH_ADDRESSES)
+_WALLET_OVERRIDES_FILE = os.path.join(DATA_DIR, "onchain_wallets.json")
+_MAX_CUSTOM_WALLETS = 50      # every tracked wallet costs one Etherscan call per refresh
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_ZERO_ADDRESS = "0x" + "0" * 40
+
+
+class WalletEditError(Exception):
+    """A wallet add/remove that was refused. .status is the matching HTTP code."""
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def _load_wallet_overrides() -> Dict[str, Any]:
+    """Overrides from disk, sanitised: a hand-edited or corrupt file must never
+    put a malformed address into the tracked set."""
+    raw = safe_json_load(_WALLET_OVERRIDES_FILE, {})
+    added: Dict[str, Dict[str, str]] = {}
+    removed: List[str] = []
+    if isinstance(raw, dict):
+        if isinstance(raw.get("added"), dict):
+            for ex, wallets in raw["added"].items():
+                if ex not in _DEFAULT_ETH_ADDRESSES or not isinstance(wallets, dict):
+                    continue
+                for label, addr in wallets.items():
+                    if isinstance(label, str) and isinstance(addr, str) and _ADDRESS_RE.match(addr):
+                        added.setdefault(ex, {})[label] = addr.lower()
+        if isinstance(raw.get("removed"), list):
+            removed = list(dict.fromkeys(
+                a.lower() for a in raw["removed"] if isinstance(a, str) and _ADDRESS_RE.match(a)
+            ))
+    return {"added": added, "removed": removed}
+
+
+_wallet_overrides: Dict[str, Any] = _load_wallet_overrides()
+
 # Flat view: (exchange, label, lowercase address). Balances/baseline are keyed by
 # the lowercase address — stable even if a label is renamed.
-_WALLETS: List[Tuple[str, str, str]] = [
-    (_ex, _label, _addr.lower())
-    for _ex, _wallets in EXCHANGE_ETH_ADDRESSES.items()
-    for _label, _addr in _wallets.items()
-]
-_WALLET_KEYS = {_addr for _, _, _addr in _WALLETS}
+_WALLETS: List[Tuple[str, str, str]] = []
+_WALLET_KEYS: set = set()
+
+
+def _rebuild_wallet_tables() -> None:
+    """EXCHANGE_ETH_ADDRESSES = defaults - removed + added, rebuilt in place."""
+    removed = set(_wallet_overrides["removed"])
+    effective: Dict[str, Dict[str, str]] = {}
+    seen: set = set()
+    for ex, wallets in _DEFAULT_ETH_ADDRESSES.items():
+        effective[ex] = {label: addr for label, addr in wallets.items() if addr.lower() not in removed}
+        if not effective[ex]:
+            # an exchange with no wallet would silently drop out of the flow: ignore the removals
+            logger.warning(f"[ONCHAIN] every default {ex} wallet is marked removed — ignoring the removals")
+            effective[ex] = dict(wallets)
+        seen.update(a.lower() for a in effective[ex].values())
+    for ex, wallets in _wallet_overrides["added"].items():
+        for label, addr in wallets.items():
+            if addr in seen:
+                continue   # a hand-edited file must not track one address twice
+            while label in effective[ex]:
+                label += " +"
+            effective[ex][label] = addr
+            seen.add(addr)
+    EXCHANGE_ETH_ADDRESSES.clear()
+    EXCHANGE_ETH_ADDRESSES.update(effective)
+    _WALLETS[:] = [
+        (ex, label, addr.lower())
+        for ex, wallets in EXCHANGE_ETH_ADDRESSES.items()
+        for label, addr in wallets.items()
+    ]
+    _WALLET_KEYS.clear()
+    _WALLET_KEYS.update(addr for _ex, _label, addr in _WALLETS)
+
+
+_rebuild_wallet_tables()
 
 # Free Etherscan keys allow 5 calls/s; ~10 wallets are fetched sequentially with
 # this pause between calls (parallel requests mostly came back as 429).
@@ -243,7 +325,9 @@ async def get_exchange_balances() -> Dict[str, Optional[float]]:
 
     balances: Dict[str, Optional[float]] = {}
     async with aiohttp.ClientSession() as session:
-        for i, (_ex, _label, addr) in enumerate(_WALLETS):
+        # a snapshot: a wallet added/removed from the web UI during these awaits
+        # must not shift the list under the loop
+        for i, (_ex, _label, addr) in enumerate(list(_WALLETS)):
             if i:
                 await asyncio.sleep(_ETHERSCAN_CALL_SPACING)
             try:
@@ -690,6 +774,7 @@ async def verify_exchange_wallets(exchange: str = "Binance", min_eth: float = 10
 
     wallets = list(EXCHANGE_ETH_ADDRESSES[wanted].items())
     now = time.time()
+    custom_addrs = {a for w in _wallet_overrides["added"].values() for a in w.values()}
     agg: Dict[str, Dict[str, Any]] = {}
     rows: List[Dict[str, Any]] = []
     failed: List[str] = []
@@ -714,6 +799,7 @@ async def verify_exchange_wallets(exchange: str = "Binance", min_eth: float = 10
                 "last_ts": last_ts,
                 "status": status,
                 "reason": reason,
+                "custom": addr in custom_addrs,   # added from the web UI, not from the code defaults
             })
     rows.sort(key=lambda r: (_WALLET_STATUS_ORDER[r["status"]], -(r["balance_eth"] or 0.0)))
 
@@ -753,6 +839,103 @@ async def verify_exchange_wallets(exchange: str = "Binance", min_eth: float = 10
         "total_candidates": len(cands),
         "snippet": snippet,
     }
+
+
+# =====================================================================
+# ✏️  ADD / REMOVE TRACKED WALLETS (web buttons, see "RUNTIME WALLET EDITS")
+# =====================================================================
+# Why this is safe for the flow signal: get_eth_flow_delta() only computes a delta
+# for a wallet that has BOTH a baseline and a fresh balance. A newly added wallet
+# has no baseline, so its first refresh just records one (no fake inflow); a removed
+# wallet simply stops being read, and its baseline is dropped here so a later
+# re-add starts clean instead of diffing against a stale balance.
+
+def _clean_label(label: Optional[str], addr: str) -> str:
+    """User label -> short safe text. Labels are printed in Discord messages, so
+    markdown/mention characters (@ ` * _ ~ | < >) are dropped; max 40 chars;
+    falls back to the short address."""
+    text = re.sub(r"[^\w .\-()#/…+]|_", "", label or "")
+    text = re.sub(r"\s+", " ", text).strip()[:40].strip()
+    return text or f"{addr[:6]}…{addr[-4:]}"
+
+
+def _canonical_exchange(exchange: str) -> str:
+    ex = next((e for e in _DEFAULT_ETH_ADDRESSES if e.lower() == (exchange or "").strip().lower()), None)
+    if ex is None:
+        raise WalletEditError(f"unknown exchange {exchange!r}, choose from: {', '.join(_DEFAULT_ETH_ADDRESSES)}", 400)
+    return ex
+
+
+def _clean_address(address: str) -> str:
+    addr = (address or "").strip()
+    if not _ADDRESS_RE.match(addr):
+        raise WalletEditError("address must be 0x followed by 40 hex characters", 400)
+    return addr.lower()
+
+
+def _commit_wallet_edit() -> None:
+    safe_json_save(_WALLET_OVERRIDES_FILE, _wallet_overrides)
+    _rebuild_wallet_tables()
+    # cached balances belong to the old set: the next refresh fetches the new one
+    _cache.pop("eth_balances", None)
+
+
+def add_tracked_wallet(exchange: str, address: str, label: Optional[str] = None) -> Dict[str, Any]:
+    """Starts tracking `address` for `exchange`. Re-adding a removed default wallet
+    of that exchange simply undoes the removal. Raises WalletEditError."""
+    ex = _canonical_exchange(exchange)
+    addr = _clean_address(address)
+    if addr == _ZERO_ADDRESS:
+        raise WalletEditError("the zero address cannot be tracked", 400)
+    if addr in _KNOWN_NON_EXCHANGE:
+        raise WalletEditError(f"not an exchange wallet: {_KNOWN_NON_EXCHANGE[addr]}", 400)
+    for t_ex, t_label, t_addr in _WALLETS:
+        if t_addr == addr:
+            raise WalletEditError(f"already tracked under {t_ex} as {t_label!r}", 409)
+
+    removed = _wallet_overrides["removed"]
+    default_label = next((l for l, a in _DEFAULT_ETH_ADDRESSES[ex].items() if a.lower() == addr), None)
+    if addr in removed and default_label is not None:
+        removed.remove(addr)                       # undo of a "Remove" on a default wallet
+        final_label = default_label
+    else:
+        if sum(len(w) for w in _wallet_overrides["added"].values()) >= _MAX_CUSTOM_WALLETS:
+            raise WalletEditError(f"at most {_MAX_CUSTOM_WALLETS} wallets can be added from the UI", 409)
+        base = _clean_label(label, addr)
+        final_label, n = base, 2
+        while final_label in EXCHANGE_ETH_ADDRESSES[ex]:
+            final_label, n = f"{base} ({n})", n + 1
+        _wallet_overrides["added"].setdefault(ex, {})[final_label] = addr
+    _commit_wallet_edit()
+    logger.info(f"[ONCHAIN] Wallet added from the UI: {ex} / {final_label} / {addr}")
+    return {"exchange": ex, "address": addr, "label": final_label, "tracked": len(EXCHANGE_ETH_ADDRESSES[ex])}
+
+
+def remove_tracked_wallet(exchange: str, address: str) -> Dict[str, Any]:
+    """Stops tracking `address` for `exchange` (a default wallet is hidden, a UI-added
+    one is deleted). The last wallet of an exchange cannot be removed.
+    Raises WalletEditError."""
+    ex = _canonical_exchange(exchange)
+    addr = _clean_address(address)
+    label = next((l for l, a in EXCHANGE_ETH_ADDRESSES[ex].items() if a.lower() == addr), None)
+    if label is None:
+        raise WalletEditError(f"{addr} is not tracked under {ex}", 404)
+    if len(EXCHANGE_ETH_ADDRESSES[ex]) <= 1:
+        raise WalletEditError(f"cannot remove the last tracked wallet of {ex}", 409)
+
+    added = _wallet_overrides["added"].get(ex, {})
+    custom_label = next((l for l, a in added.items() if a == addr), None)
+    if custom_label is not None:
+        del added[custom_label]
+        if not added:
+            _wallet_overrides["added"].pop(ex, None)
+    elif addr not in _wallet_overrides["removed"]:
+        _wallet_overrides["removed"].append(addr)
+    _commit_wallet_edit()
+    _prev_balances.pop(addr, None)
+    safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
+    logger.info(f"[ONCHAIN] Wallet removed from the UI: {ex} / {label} / {addr}")
+    return {"exchange": ex, "address": addr, "label": label, "tracked": len(EXCHANGE_ETH_ADDRESSES[ex])}
 
 
 # =====================================================================

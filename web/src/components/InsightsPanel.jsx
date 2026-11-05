@@ -877,23 +877,74 @@ const CANDIDATE_TAG = { add: 'long', review: 'flat', skip: 'flat' }
 // new candidates. Verdicts are heuristics — hence the Etherscan link on every row.
 function WalletVerifyResult({ res, copy, copied }) {
   const s = res.summary || {}
+  const [acts, setActs] = useState({})     // address -> { state: 'busy' | 'done' | 'error', kind: 'add' | 'remove', msg? }
+  const [armed, setArmed] = useState(null) // address waiting for its confirming second click
+
+  const act = async (kind, address, label) => {
+    setArmed(null)
+    setActs((a) => ({ ...a, [address]: { state: 'busy', kind } }))
+    try {
+      if (kind === 'add') await api.addOnchainWallet(res.exchange, address, label)
+      else await api.removeOnchainWallet(res.exchange, address)
+      setActs((a) => ({ ...a, [address]: { state: 'done', kind } }))
+    } catch (e) {
+      setActs((a) => ({ ...a, [address]: { state: 'error', kind, msg: e.message } }))
+    }
+  }
+
+  // Add / Remove / Undo of one row. Two clicks on purpose: this changes the inputs of the
+  // flow signal, and window.confirm is unreliable inside an Android WebView.
+  const rowActions = (address, label, kind, note) => {
+    const a = acts[address]
+    if (a?.state === 'busy') return <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>working…</span>
+    if (a?.state === 'done') {
+      return (
+        <>
+          <span style={{ fontSize: 12, color: 'var(--long)' }}>
+            {a.kind === 'remove' ? 'removed' : 'added'} ✓ (applies on the next on-chain refresh)
+          </span>
+          <button className="btn" onClick={() => act(a.kind === 'remove' ? 'add' : 'remove', address, label)}>Undo</button>
+        </>
+      )
+    }
+    return (
+      <>
+        {armed === address ? (
+          <>
+            <button className="btn" onClick={() => act(kind, address, label)}
+              style={kind === 'remove' ? { borderColor: 'var(--short)', color: 'var(--short)' } : undefined}>
+              Confirm {kind}{note ? ` (${note})` : ''}
+            </button>
+            <button className="btn" onClick={() => setArmed(null)}>Cancel</button>
+          </>
+        ) : (
+          <button className="btn" onClick={() => setArmed(address)}>{kind === 'remove' ? 'Remove' : 'Add'}</button>
+        )}
+        {a?.state === 'error' && <span style={{ fontSize: 12, color: 'var(--short)' }}>{a.msg}</span>}
+      </>
+    )
+  }
+  const removedDone = (addr) => acts[addr]?.state === 'done' && acts[addr]?.kind === 'remove'
   const attention = res.wallets.filter((w) => w.status === 'stale' || w.status === 'unknown')
   const healthy = res.wallets.filter((w) => w.status !== 'stale' && w.status !== 'unknown')
   const rowStyle = { padding: '8px 0', borderTop: '1px solid var(--border-soft)', fontSize: 12 }
   const walletRow = (w) => (
-    <div key={w.address} style={rowStyle}>
+    <div key={w.address} style={{ ...rowStyle, opacity: removedDone(w.address) ? 0.55 : 1 }}>
       <div>
         <span className={`tag ${WALLET_TAG[w.status] || 'flat'}`}>{w.status}</span>{' '}
         <b>{w.label}</b>
+        {w.custom && <span className="tag flat" style={{ marginLeft: 6 }} title="added from this page, not from the defaults in onchain.py">custom</span>}
       </div>
       <div className="mono" style={{ wordBreak: 'break-all', marginTop: 2 }}>{w.address}</div>
       <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>
         {w.balance_eth == null ? 'balance n/a' : `${Number(w.balance_eth).toLocaleString()} ETH`}
         {' · '}last tx {fmtAgeLong(w.last_ts)}{w.reason ? ` · ${w.reason}` : ''}
       </div>
-      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
+      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
         <a href={`https://etherscan.io/address/${w.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
         <button className="btn" onClick={() => copy(w.address)}>{copied === w.address ? 'Copied' : 'Copy'}</button>
+        {rowActions(w.address, w.label, 'remove',
+          w.balance_eth == null ? null : `${Number(w.balance_eth).toLocaleString()} ETH`)}
       </div>
     </div>
   )
@@ -909,9 +960,10 @@ function WalletVerifyResult({ res, copy, copied }) {
         {' · '}{c.txs} tx · last {fmtAgeLong(c.last_ts)} · via {c.via.join(', ')}
       </div>
       <div style={{ marginTop: 2 }}>{c.reason}</div>
-      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
+      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
         <a href={`https://etherscan.io/address/${c.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
         <button className="btn" onClick={() => copy(c.address)}>{copied === c.address ? 'Copied' : 'Copy'}</button>
+        {c.verdict !== 'skip' && rowActions(c.address, undefined, 'add', null)}
       </div>
     </div>
   )
@@ -923,7 +975,8 @@ function WalletVerifyResult({ res, copy, copied }) {
         {res.exchange}: {res.wallets.length} tracked wallets
         {['active', 'conduit', 'holding', 'quiet', 'stale', 'unknown'].filter((k) => s[k]).map((k) => ` · ${s[k]} ${k}`)}
         {res.failed?.length > 0 && ` · ${res.failed.length} fetch failed: ${res.failed.join(', ')}`}
-        {'. '}Verdicts are heuristics from on-chain activity, confirm on Etherscan before editing the list.
+        {'. '}Verdicts are heuristics from on-chain activity, confirm on Etherscan before changing the list.
+        {' '}Add / Remove are saved on the server and apply from the next on-chain refresh (Undo reverts them).
       </p>
 
       <div style={subTitle}>Remove? / re-run ({attention.length})</div>
@@ -942,7 +995,7 @@ function WalletVerifyResult({ res, copy, copied }) {
       )}
       {res.snippet && (
         <div style={{ marginTop: 8 }}>
-          <div style={subTitle}>Paste into EXCHANGE_ETH_ADDRESSES["{res.exchange}"]</div>
+          <div style={subTitle}>Or make the "add" ones permanent defaults: paste into EXCHANGE_ETH_ADDRESSES["{res.exchange}"]</div>
           <pre className="mono" style={{ fontSize: 11, overflowX: 'auto', margin: '4px 0' }}>{res.snippet}</pre>
           <button className="btn" onClick={() => copy(res.snippet)}>{copied === res.snippet ? 'Copied' : 'Copy snippet'}</button>
         </div>
@@ -999,9 +1052,10 @@ function WalletTracePanel() {
       <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 10px' }}>
         If an exchange's flow sits at 0, its active wallets may have rotated. This reads the latest 100
         transactions of every tracked wallet and lists big counterparties the bot doesn't track yet
-        (takes 15–30 s, uses Etherscan). Add promising addresses to <code>EXCHANGE_ETH_ADDRESSES</code> in <code>onchain.py</code>.
+        (takes 15–30 s, uses Etherscan).
         {' '}<b>Verify wallets</b> goes further: it checks balance and last activity of every tracked wallet
-        (keep / remove?) and sorts the new addresses into add / review / skip (25–45 s).
+        (keep / remove?) and sorts the new addresses into add / review / skip (25–45 s), with
+        Add / Remove buttons so the list can be changed without editing <code>onchain.py</code>.
       </p>
       <div className="field">
         <label>Exchange</label>
