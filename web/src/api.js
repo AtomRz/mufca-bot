@@ -79,6 +79,8 @@ export const api = {
   getOnchain: () => request('/api/onchain'),
   traceOnchain: (exchange, minEth) =>
     request(`/api/onchain/trace?exchange=${encodeURIComponent(exchange)}&min_eth=${encodeURIComponent(minEth)}`),
+  verifyOnchain: (exchange, minEth) =>
+    request(`/api/onchain/verify?exchange=${encodeURIComponent(exchange)}&min_eth=${encodeURIComponent(minEth)}`),
   // 🆕 REMOVED (dead code cleanup): getPairs() -> GET /api/pairs used to
   // sit here, called by nothing — the pairs list comes from getConfig()
   // (config.pairs) instead. The backend endpoint was removed too.

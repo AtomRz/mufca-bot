@@ -859,23 +859,122 @@ const VIEWS = [
 // 🔎  FIND NEW EXCHANGE WALLETS — web twin of Discord's !ethtrace.
 // On demand only (≈23 Etherscan calls, 15–30 s), never polled.
 // =====================================================================
-const TRACE_EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'OKX']
+const TRACE_EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'OKX']  // keep in sync with EXCHANGE_ETH_ADDRESSES (onchain.py)
+
+function fmtAgeLong(ts) {
+  if (!ts) return 'never'
+  const s = Math.max(0, Date.now() / 1000 - ts)
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+// status / verdict → tag look (stale = remove candidate, add = worth tracking)
+const WALLET_TAG = { active: 'long', holding: 'flat', quiet: 'flat', stale: 'short', unknown: 'flat' }
+const CANDIDATE_TAG = { add: 'long', review: 'flat', skip: 'flat' }
+
+// Result of the "Verify wallets" button: health of the tracked set + classified
+// new candidates. Verdicts are heuristics — hence the Etherscan link on every row.
+function WalletVerifyResult({ res, copy, copied }) {
+  const s = res.summary || {}
+  const attention = res.wallets.filter((w) => w.status === 'stale' || w.status === 'unknown')
+  const healthy = res.wallets.filter((w) => w.status !== 'stale' && w.status !== 'unknown')
+  const rowStyle = { padding: '8px 0', borderTop: '1px solid var(--border-soft)', fontSize: 12 }
+  const walletRow = (w) => (
+    <div key={w.address} style={rowStyle}>
+      <div>
+        <span className={`tag ${WALLET_TAG[w.status] || 'flat'}`}>{w.status}</span>{' '}
+        <b>{w.label}</b>
+      </div>
+      <div className="mono" style={{ wordBreak: 'break-all', marginTop: 2 }}>{w.address}</div>
+      <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>
+        {w.balance_eth == null ? 'balance n/a' : `${Number(w.balance_eth).toLocaleString()} ETH`}
+        {' · '}last tx {fmtAgeLong(w.last_ts)} · {w.reason}
+      </div>
+      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
+        <a href={`https://etherscan.io/address/${w.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
+        <button className="btn" onClick={() => copy(w.address)}>{copied === w.address ? 'Copied' : 'Copy'}</button>
+      </div>
+    </div>
+  )
+  const candRow = (c) => (
+    <div key={c.address} style={rowStyle}>
+      <div>
+        <span className={`tag ${CANDIDATE_TAG[c.verdict] || 'flat'}`}
+          style={c.verdict === 'review' ? { color: 'var(--accent)' } : undefined}>{c.verdict}</span>
+      </div>
+      <div className="mono" style={{ wordBreak: 'break-all', marginTop: 2 }}>{c.address}</div>
+      <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>
+        out <b>{Math.round(c.out_eth).toLocaleString()}</b> / in <b>{Math.round(c.in_eth).toLocaleString()}</b> ETH
+        {' · '}{c.txs} tx · last {fmtAgeLong(c.last_ts)} · via {c.via.join(', ')}
+      </div>
+      <div style={{ marginTop: 2 }}>{c.reason}</div>
+      <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
+        <a href={`https://etherscan.io/address/${c.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
+        <button className="btn" onClick={() => copy(c.address)}>{copied === c.address ? 'Copied' : 'Copy'}</button>
+      </div>
+    </div>
+  )
+  const subTitle = { fontSize: 12, fontWeight: 600, margin: '12px 0 2px' }
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 6px' }}>
+        {res.exchange}: {res.wallets.length} tracked wallets
+        {['active', 'holding', 'quiet', 'stale', 'unknown'].filter((k) => s[k]).map((k) => ` · ${s[k]} ${k}`)}
+        {res.failed?.length > 0 && ` · ${res.failed.length} fetch failed: ${res.failed.join(', ')}`}
+        {'. '}Verdicts are heuristics from on-chain activity, confirm on Etherscan before editing the list.
+      </p>
+
+      <div style={subTitle}>Remove? / re-run ({attention.length})</div>
+      {attention.length === 0 && <p style={{ fontSize: 13, margin: '4px 0' }}>Every tracked wallet looks alive.</p>}
+      {attention.map(walletRow)}
+
+      <div style={subTitle}>New candidates ≥ {Number(res.min_eth).toLocaleString()} ETH ({res.total_candidates})</div>
+      {res.candidates.length === 0 && (
+        <p style={{ fontSize: 13, margin: '4px 0' }}>Nothing found, try a lower threshold (e.g. 200).</p>
+      )}
+      {res.candidates.map(candRow)}
+      {res.total_candidates > res.candidates.length && (
+        <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>
+          Showing top {res.candidates.length} of {res.total_candidates}.
+        </p>
+      )}
+      {res.snippet && (
+        <div style={{ marginTop: 8 }}>
+          <div style={subTitle}>Paste into EXCHANGE_ETH_ADDRESSES["{res.exchange}"]</div>
+          <pre className="mono" style={{ fontSize: 11, overflowX: 'auto', margin: '4px 0' }}>{res.snippet}</pre>
+          <button className="btn" onClick={() => copy(res.snippet)}>{copied === res.snippet ? 'Copied' : 'Copy snippet'}</button>
+        </div>
+      )}
+
+      <details style={{ marginTop: 12 }}>
+        <summary style={{ fontSize: 12, cursor: 'pointer' }}>Healthy wallets ({healthy.length})</summary>
+        {healthy.map(walletRow)}
+      </details>
+    </div>
+  )
+}
 
 function WalletTracePanel() {
   const [exchange, setExchange] = useState('Binance')
   const [minEth, setMinEth] = useState('1000')
-  const [busy, setBusy] = useState(false)
+  const [busy, setBusy] = useState(false)   // false | 'trace' | 'verify'
+  const [kind, setKind] = useState('trace') // which result is shown
   const [res, setRes] = useState(null)
+  const [vres, setVres] = useState(null)
   const [err, setErr] = useState(null)
   const [copied, setCopied] = useState(null)
 
-  const run = async () => {
+  const run = async (mode) => {
     const v = parseFloat(minEth)
     if (!Number.isFinite(v) || v < 0) { setErr('Min ETH must be a non-negative number'); return }
-    setBusy(true)
+    setBusy(mode)
     setErr(null)
     try {
-      setRes(await api.traceOnchain(exchange, v))
+      if (mode === 'verify') setVres(await api.verifyOnchain(exchange, v))
+      else setRes(await api.traceOnchain(exchange, v))
+      setKind(mode)
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -901,6 +1000,8 @@ function WalletTracePanel() {
         If an exchange's flow sits at 0, its active wallets may have rotated. This reads the latest 100
         transactions of every tracked wallet and lists big counterparties the bot doesn't track yet
         (takes 15–30 s, uses Etherscan). Add promising addresses to <code>EXCHANGE_ETH_ADDRESSES</code> in <code>onchain.py</code>.
+        {' '}<b>Verify wallets</b> goes further: it checks balance and last activity of every tracked wallet
+        (keep / remove?) and sorts the new addresses into add / review / skip (25–45 s).
       </p>
       <div className="field">
         <label>Exchange</label>
@@ -913,11 +1014,17 @@ function WalletTracePanel() {
         <input type="number" min={0} step={100} value={minEth} disabled={busy}
           onChange={(e) => setMinEth(e.target.value)} />
       </div>
-      <button className="btn primary" disabled={busy} onClick={run}>
-        {busy ? 'Tracing… (up to 30 s)' : 'Trace'}
-      </button>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn primary" disabled={!!busy} onClick={() => run('trace')}>
+          {busy === 'trace' ? 'Tracing… (up to 30 s)' : 'Trace'}
+        </button>
+        <button className="btn" disabled={!!busy} onClick={() => run('verify')}>
+          {busy === 'verify' ? 'Verifying… (up to 45 s)' : 'Verify wallets'}
+        </button>
+      </div>
       {err && <p style={{ fontSize: 12, color: 'var(--short)', marginTop: 10 }}>{err}</p>}
-      {res && (
+      {kind === 'verify' && vres && <WalletVerifyResult res={vres} copy={copy} copied={copied} />}
+      {kind === 'trace' && res && (
         <div style={{ marginTop: 12 }}>
           <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 6px' }}>
             {res.exchange}: checked {res.wallets_checked} wallets

@@ -55,7 +55,10 @@ from signals import (
     run_indicator_optimize, FILTER_KEYS,
 )
 import filter_stats
-from onchain import get_onchain_bias, format_onchain_report, clear_onchain_cache_full, trace_exchange_wallets
+from onchain import (
+    get_onchain_bias, format_onchain_report, clear_onchain_cache_full,
+    trace_exchange_wallets, verify_exchange_wallets,
+)
 import derivatives
 import spread
 import sim_jobs
@@ -146,6 +149,7 @@ async def help_cmd(ctx):
         "`!debug`        — extended debug information",
         "`!onchain`      — on-chain analysis (F&G, ETH flows)",
         "`!ethtrace [exchange] [min_eth]` — find an exchange's new wallets: big untracked counterparties of its tracked wallets (default Binance, 1000 ETH)",
+        "`!ethverify [exchange] [min_eth]` — health check of an exchange's tracked wallets (active / stale) + add/review/skip verdicts for new candidates",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
         "",
@@ -2167,6 +2171,78 @@ async def ethtrace_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0):
         cur += ("\n\n" if cur else "") + b
     chunks.append(cur + foot if len(cur) + len(foot) <= 1900 else cur)
     if len(cur) + len(foot) > 1900:
+        chunks.append(foot)
+
+    await msg.edit(content=chunks[0])
+    for c in chunks[1:]:
+        await ctx.send(c)
+
+
+@core.bot.command(name="ethverify")
+async def ethverify_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0):
+    """Health check of an exchange's tracked wallets: balance + last activity
+    per wallet (keep / remove?) and the untracked big counterparties classified
+    add / review / skip. Read-only, ~2 Etherscan calls per wallet."""
+    if not _cfg.ETHERSCAN_API_KEY:
+        await ctx.send("⚠️ `ETHERSCAN_API_KEY` is not set — `!ethverify` needs it.")
+        return
+    if not (min_eth == min_eth and min_eth >= 0):
+        await ctx.send("⚠️ `min_eth` must be a non-negative number.")
+        return
+
+    msg = await ctx.send(f"⏳ Verifying {exchange} wallets via Etherscan (≈25–45 s)...")
+    try:
+        res = await verify_exchange_wallets(exchange, min_eth)
+    except Exception as e:
+        await msg.edit(content=f"❌ Verify error: `{e}`")
+        return
+    if res.get("error"):
+        await msg.edit(content=f"⚠️ {res['error']}")
+        return
+
+    s = res["summary"]
+    head = (
+        f"**✅ {res['exchange']} — wallet check** ({len(res['wallets'])} tracked)\n"
+        + " · ".join(f"{k} {s[k]}" for k in ("active", "holding", "quiet", "stale", "unknown") if s.get(k))
+        + (f"\n⚠️ failed: {', '.join(res['failed'])}" if res["failed"] else "")
+        + "\n_Heuristics from on-chain activity — confirm on Etherscan before editing the list._"
+    )
+    blocks = []
+    attention = [w for w in res["wallets"] if w["status"] in ("stale", "unknown")]
+    if attention:
+        blocks.append("**Remove? / re-run**")
+        for w in attention:
+            blocks.append(f"`{w['address']}` ({w['label']})\n  {w['status']}: {w['reason']}")
+    for verdict, title in (("add", "**Add**"), ("review", "**Review** (not added automatically)")):
+        group = [c for c in res["candidates"] if c["verdict"] == verdict]
+        if not group:
+            continue
+        blocks.append(title)
+        for c in group:
+            blocks.append(
+                f"`{c['address']}`\n"
+                f"  out **{c['out_eth']:,.0f}** / in **{c['in_eth']:,.0f}** ETH · {c['txs']} tx · "
+                f"last {_age_label(c['last_ts'])} · via {', '.join(c['via'])}\n  {c['reason']}"
+            )
+    skipped = sum(1 for c in res["candidates"] if c["verdict"] == "skip")
+    foot = f"\n_Skipped {skipped} (stale or not an exchange wallet)._" if skipped else ""
+    if res["snippet"]:
+        foot += "\n```python\n" + res["snippet"] + "\n```"
+    if not blocks:
+        await msg.edit(content=head + "\n\nNothing to change." + foot)
+        return
+
+    # Discord's limit is 2000 chars per message — split, keeping each block whole
+    chunks, cur = [], head
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 1900:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n\n" if cur else "") + b
+    chunks.append(cur)
+    if len(chunks[-1]) + len(foot) <= 1900:
+        chunks[-1] += foot
+    else:
         chunks.append(foot)
 
     await msg.edit(content=chunks[0])

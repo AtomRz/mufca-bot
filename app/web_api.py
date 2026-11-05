@@ -387,6 +387,37 @@ async def trace_onchain(exchange: str = "Binance", min_eth: float = 1000.0):
         return res
 
 
+_verify_cache: dict = {}         # (exchange lower, min_eth) -> (timestamp, result)
+_VERIFY_CACHE_SECONDS = 60
+
+
+@app.get("/api/onchain/verify")
+async def verify_onchain(exchange: str = "Binance", min_eth: float = 1000.0):
+    """Health check of an exchange's tracked wallets (same as Discord
+    !ethverify): balance + last activity per wallet with a keep/remove verdict,
+    and the untracked big counterparties classified add/review/skip.
+    Read-only, ~2 Etherscan calls per wallet (25-45 s for Binance), so it is on
+    demand only: it shares the trace lock (one Etherscan-heavy run at a time)
+    and a result is reused for 60 s."""
+    if not _cfg.ETHERSCAN_API_KEY:
+        raise HTTPException(400, "ETHERSCAN_API_KEY is not set")
+    if not (min_eth == min_eth and 0 <= min_eth <= 10_000_000):  # min_eth == min_eth rejects NaN
+        raise HTTPException(400, "min_eth must be between 0 and 10,000,000")
+
+    key = (exchange.strip().lower(), float(min_eth))
+    async with _trace_lock:
+        hit = _verify_cache.get(key)
+        if hit and time.time() - hit[0] < _VERIFY_CACHE_SECONDS:
+            return hit[1]
+        res = await _onchain.verify_exchange_wallets(exchange, min_eth)
+        if res.get("error"):
+            raise HTTPException(400, res["error"])
+        res = {**res, "generated_at": time.time()}
+        if res["wallets_checked"] > 0:  # don't cache a run where every fetch failed
+            _verify_cache[key] = (time.time(), res)
+        return res
+
+
 @app.get("/api/derivatives")
 async def get_derivatives(ticker: Optional[str] = None):
     """Funding rate / open interest bias for one pair — unlike /api/onchain
