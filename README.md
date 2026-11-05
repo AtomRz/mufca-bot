@@ -226,6 +226,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
 | `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
 | `onchain_baseline.json` / `onchain_baseline_ts.json` | Previous-cycle exchange ETH balances + timestamp, used to compute inflow/outflow delta — survives restarts so a restart doesn't delay flow analysis by a full cycle |
+| `onchain_wallets.json` | Exchange wallets added/removed from the web UI (Insights → Verify wallets), merged on top of the defaults in `onchain.py` — survives restarts and code updates |
 | `closure_notified.json` | Trade-closure notification dedup set, capped at the last 2000 entries |
 | `devices.json` | Registered Android devices (FCM tokens) for push notifications |
 
@@ -292,6 +293,7 @@ volumes:
 | `!chart [PAIR] [TF] [LIMIT]` | Candlestick PNG with FRAMA, BB, S/R, volume & MFI panels. Example: `!chart ETH 4h 100` |
 | `!onchain` | Show current on-chain bias (exchange flows, Fear & Greed, BTC dominance) |
 | `!ethtrace [EXCHANGE] [MIN_ETH]` | Find an exchange's new wallets after a rotation: lists big counterparties (≥ MIN_ETH, default 1000) of its tracked wallets that the bot doesn't track yet. Read-only. Example: `!ethtrace Binance 500` |
+| `!ethverify [EXCHANGE] [MIN_ETH]` | Health check of an exchange's tracked wallets (active / conduit / holding / stale) plus add / review / skip verdicts for new counterparties. Read-only; wallets are added/removed with the buttons in the web UI (Insights → Verify wallets). Example: `!ethverify Binance` |
 | `!derivatives [PAIR]` | Show current derivatives bias — funding rate + open interest (futures mode only). Example: `!derivatives ETH/USDT` |
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
 | `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`) |

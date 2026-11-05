@@ -2158,7 +2158,7 @@ async def ethtrace_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0):
             f"  out **{r['out_eth']:,.0f}** / in **{r['in_eth']:,.0f}** ETH · {r['txs']} tx · "
             f"last {_age_label(r['last_ts'])} · via {', '.join(r['via'])}"
         )
-    foot = "\n_Add promising addresses to `EXCHANGE_ETH_ADDRESSES` in `onchain.py`._"
+    foot = "\n_Add promising addresses with the web UI (Insights → Verify wallets → Add) or in `EXCHANGE_ETH_ADDRESSES` in `onchain.py`._"
     if res["total_matches"] > len(rows):
         foot = f"\n_Showing top {len(rows)} of {res['total_matches']}._" + foot
 

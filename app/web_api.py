@@ -418,6 +418,39 @@ async def verify_onchain(exchange: str = "Binance", min_eth: float = 1000.0):
         return res
 
 
+class WalletEditIn(BaseModel):
+    exchange: str
+    address: str
+    label: Optional[str] = Field(default=None, max_length=60)
+
+
+@app.post("/api/onchain/wallets")
+async def add_onchain_wallet(body: WalletEditIn):
+    """Starts tracking a wallet (the web "Add" button). Persisted in
+    onchain_wallets.json on top of the defaults in onchain.py; takes effect on the
+    next on-chain refresh. Adding a removed default wallet again undoes the removal."""
+    try:
+        res = _onchain.add_tracked_wallet(body.exchange, body.address, body.label)
+    except _onchain.WalletEditError as e:
+        raise HTTPException(e.status, str(e))
+    _trace_cache.clear()    # both caches describe the old wallet set
+    _verify_cache.clear()
+    return res
+
+
+@app.delete("/api/onchain/wallets")
+async def remove_onchain_wallet(exchange: str, address: str):
+    """Stops tracking a wallet (the web "Remove" button). The last wallet of an
+    exchange cannot be removed."""
+    try:
+        res = _onchain.remove_tracked_wallet(exchange, address)
+    except _onchain.WalletEditError as e:
+        raise HTTPException(e.status, str(e))
+    _trace_cache.clear()
+    _verify_cache.clear()
+    return res
+
+
 @app.get("/api/derivatives")
 async def get_derivatives(ticker: Optional[str] = None):
     """Funding rate / open interest bias for one pair — unlike /api/onchain
