@@ -296,7 +296,7 @@ volumes:
 | `!ethverify [EXCHANGE] [MIN_ETH]` | Health check of an exchange's tracked wallets (active / conduit / holding / stale) plus add / review / skip verdicts for new counterparties. Read-only; wallets are added/removed with the buttons in the web UI (Insights → Verify wallets). Example: `!ethverify Binance` |
 | `!derivatives [PAIR]` | Show current derivatives bias — funding rate + open interest (futures mode only). Example: `!derivatives ETH/USDT` |
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
-| `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`) |
+| `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`); the web UI has the same "Reset history" button (Insights → Spread) |
 | `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch (deliberately does not touch spread history — see `!spread reset`) |
 
 ### 📚 History & Stats

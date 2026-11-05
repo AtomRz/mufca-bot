@@ -70,7 +70,7 @@ function usePolled(fetcher, key, intervalMs, lastEvent, { enabled = true, minGap
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent])
 
-  return { data, error }
+  return { data, error, reload: load }
 }
 
 // 🆕 null-safe number formatting: one missing field used to throw
@@ -332,13 +332,36 @@ function SpreadView({ lastEvent, pairs }) {
   const [ticker, setTicker] = useSelectedPair(pairs)
   // Spread moves faster than funding/OI/on-chain data, so it's polled on a
   // shorter interval than the rest of this tab.
-  const { data, error: loadError } = usePolled(
+  const { data, error: loadError, reload } = usePolled(
     () => api.getSpread(ticker), ticker, 20000, lastEvent, { enabled: !!ticker, minGapMs: 15000 },
   )
   const error = data ? null : loadError
 
   const filterOn = data?.filter_enabled
   const snap = data?.snapshot
+
+  // Reset of this pair's warm-up history, same as Discord `!spread <pair> reset yes`.
+  // Two clicks on purpose (window.confirm is unreliable inside an Android WebView).
+  const [armed, setArmed] = useState(false)
+  const [resetBusy, setResetBusy] = useState(false)
+  const [resetMsg, setResetMsg] = useState(null)   // { ok: boolean, text: string }
+  useEffect(() => { setArmed(false); setResetMsg(null) }, [ticker])   // never carry a half-done reset to another pair
+
+  const doReset = async () => {
+    const pair = ticker
+    setArmed(false)
+    setResetBusy(true)
+    setResetMsg(null)
+    try {
+      const r = await api.resetSpread(pair)
+      setResetMsg({ ok: true, text: `Cleared ${r.cleared_samples} sample(s) for ${pair} — warm-up starts over.` })
+      reload()
+    } catch (e) {
+      setResetMsg({ ok: false, text: e.message })
+    } finally {
+      setResetBusy(false)
+    }
+  }
 
   return (
     <div>
@@ -391,6 +414,32 @@ function SpreadView({ lastEvent, pairs }) {
                   </span>
                 </div>
               </>
+            )}
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              {armed ? (
+                <>
+                  <button className="btn" disabled={resetBusy} onClick={doReset}
+                    style={{ borderColor: 'var(--short)', color: 'var(--short)' }}>
+                    Confirm: clear {snap ? snap.sample_count : ''} sample(s) of {ticker}
+                  </button>
+                  <button className="btn" onClick={() => setArmed(false)}>Cancel</button>
+                </>
+              ) : (
+                <button className="btn" disabled={resetBusy || !ticker} onClick={() => { setResetMsg(null); setArmed(true) }}>
+                  {resetBusy ? 'Resetting…' : 'Reset history'}
+                </button>
+              )}
+            </div>
+            {armed && (
+              <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '8px 0 0' }}>
+                Warm-up starts over for {ticker}: the "3x the rolling median" condition is skipped until
+                {' '}{data.min_samples_for_anomaly} new samples are collected. The "15% of SL distance" condition keeps working.
+              </p>
+            )}
+            {resetMsg && (
+              <p style={{ fontSize: 12, margin: '8px 0 0', color: resetMsg.ok ? 'var(--long)' : 'var(--short)' }}>
+                {resetMsg.text}
+              </p>
             )}
           </>
         )}
