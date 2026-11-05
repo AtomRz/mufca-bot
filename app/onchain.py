@@ -600,6 +600,157 @@ async def trace_exchange_wallets(exchange: str = "Binance", min_eth: float = 100
 
 
 # =====================================================================
+# ✅  WALLET VERIFY — health check of the tracked set + new candidates
+# =====================================================================
+# Web "Verify wallets" button and Discord !ethverify. Read-only: one txlist and
+# one balance call per tracked wallet (~2 x N Etherscan calls, 25-45 s for
+# Binance). It never edits EXCHANGE_ETH_ADDRESSES, it only recommends. Every
+# verdict is a heuristic from on-chain activity (Etherscan name tags are not in
+# the free API), so confirm on Etherscan before changing the list.
+# Limits: only normal txs (no internal transfers) and only the latest
+# _TRACE_TX_PER_WALLET txs per wallet are looked at.
+_VERIFY_ACTIVE_DAYS = 7        # a tx within this many days = "active"
+_VERIFY_STALE_DAYS = 30        # no tx for this long AND a dust balance = "stale"
+_VERIFY_DUST_ETH = 100.0       # below this a quiet wallet carries no flow signal
+_CANDIDATE_STALE_DAYS = 90     # candidate untouched this long = "skip"
+# Big counterparties that are not exchange wallets at all.
+_KNOWN_NON_EXCHANGE: Dict[str, str] = {
+    "0x00000000219ab540356cbb839cbe05303d7705fa": "Beacon Deposit Contract (ETH staking)",
+}
+_WALLET_STATUS_ORDER = {"stale": 0, "unknown": 1, "quiet": 2, "holding": 3, "active": 4}
+_CANDIDATE_VERDICT_ORDER = {"add": 0, "review": 1, "skip": 2}
+
+
+def _newest_ts(txs: Optional[List[dict]]) -> Optional[int]:
+    """Timestamp of the newest tx in a txlist, None if there are none."""
+    best = 0
+    for tx in txs or []:
+        try:
+            best = max(best, int(tx.get("timeStamp", 0)))
+        except (TypeError, ValueError):
+            continue
+    return best or None
+
+
+def _wallet_status(balance: Optional[float], last_ts: Optional[int], txs_ok: bool, now: float) -> Tuple[str, str]:
+    """(status, reason) for one tracked wallet.
+    active  = tx in the last _VERIFY_ACTIVE_DAYS days
+    holding = quiet but still holds >= _VERIFY_DUST_ETH (cold storage: keep)
+    stale   = no tx for _VERIFY_STALE_DAYS days and a dust balance (remove?)
+    quiet   = in between, nothing to act on
+    unknown = a fetch failed and the wallet is not visibly active"""
+    age_days = (now - last_ts) / 86400 if last_ts else None
+    if age_days is not None and age_days <= _VERIFY_ACTIVE_DAYS:
+        return "active", f"last tx {age_days:.1f}d ago"
+    if balance is None or not txs_ok:
+        return "unknown", "an Etherscan fetch failed, re-run"
+    if balance >= _VERIFY_DUST_ETH:
+        return "holding", f"quiet but holds {balance:,.0f} ETH (cold storage?), keep"
+    if age_days is None or age_days > _VERIFY_STALE_DAYS:
+        seen = "no txs at all" if age_days is None else f"no tx for {age_days:.0f}d"
+        return "stale", f"{seen}, balance {balance:,.1f} ETH: candidate to remove"
+    return "quiet", f"last tx {age_days:.0f}d ago, balance {balance:,.1f} ETH"
+
+
+def _classify_candidate(addr: str, rec: Dict[str, Any], now: float) -> Tuple[str, str]:
+    """(verdict, reason) for an untracked counterparty of the tracked set.
+    add    = ETH moves both to AND from tracked wallets: behaves like an
+             internal wallet of the exchange.
+    review = one-way only. A sender that only ever feeds a hub is usually a
+             deposit address being swept (millions exist, never worth tracking);
+             a receiver that only gets funds may be a client or a staking
+             address, and tracking it would net real withdrawals out of the flow.
+    skip   = known non-wallet or inactive."""
+    known = _KNOWN_NON_EXCHANGE.get(addr)
+    if known:
+        return "skip", f"not an exchange wallet: {known}"
+    age_days = (now - rec["last_ts"]) / 86400 if rec["last_ts"] else None
+    if age_days is None or age_days > _CANDIDATE_STALE_DAYS:
+        return "skip", "inactive for " + ("a long time" if age_days is None else f"{age_days:.0f}d")
+    if rec["in_eth"] > 0 and rec["out_eth"] > 0:
+        return "add", "moves ETH both to and from tracked wallets"
+    if rec["in_eth"] > 0:
+        return "review", "only sends to tracked wallets: likely a deposit/sweep address, add only if Etherscan labels it as the exchange"
+    return "review", "only receives from tracked wallets: may be a client or staking address, add only if Etherscan labels it as the exchange"
+
+
+async def verify_exchange_wallets(exchange: str = "Binance", min_eth: float = 1000.0, top_n: int = 20) -> Dict:
+    """Health check of an exchange's tracked wallets plus classified new candidates.
+    Returns {exchange, wallets_checked, failed: [labels], min_eth, summary,
+    wallets: [...], candidates: [...], total_candidates, snippet}
+    or {"error": "..."} for an unknown exchange."""
+    wanted = next((ex for ex in EXCHANGE_ETH_ADDRESSES if ex.lower() == exchange.strip().lower()), None)
+    if wanted is None:
+        return {"error": f"unknown exchange {exchange!r}, choose from: {', '.join(EXCHANGE_ETH_ADDRESSES)}"}
+
+    wallets = list(EXCHANGE_ETH_ADDRESSES[wanted].items())
+    now = time.time()
+    agg: Dict[str, Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+    failed: List[str] = []
+    async with aiohttp.ClientSession() as session:
+        for i, (label, address) in enumerate(wallets):
+            if i:
+                await asyncio.sleep(_ETHERSCAN_CALL_SPACING)
+            addr = address.lower()
+            txs = await _fetch_txlist(session, addr)
+            await asyncio.sleep(_ETHERSCAN_CALL_SPACING)
+            balance = await _fetch_eth_balance(session, addr)
+            if txs is None or balance is None:
+                failed.append(label)
+            if txs:
+                _aggregate_counterparties(addr, label, txs, _WALLET_KEYS, agg)
+            last_ts = _newest_ts(txs)
+            status, reason = _wallet_status(balance, last_ts, txs is not None, now)
+            rows.append({
+                "label": label,
+                "address": addr,
+                "balance_eth": None if balance is None else round(balance, 2),
+                "last_ts": last_ts,
+                "status": status,
+                "reason": reason,
+            })
+    rows.sort(key=lambda r: (_WALLET_STATUS_ORDER[r["status"]], -(r["balance_eth"] or 0.0)))
+
+    cands: List[Dict[str, Any]] = []
+    for other, r in agg.items():
+        if r["in_eth"] + r["out_eth"] < min_eth:
+            continue
+        verdict, reason = _classify_candidate(other, r, now)
+        cands.append({
+            "address": other,
+            "verdict": verdict,
+            "reason": reason,
+            "in_eth": round(r["in_eth"], 2),
+            "out_eth": round(r["out_eth"], 2),
+            "txs": r["txs"],
+            "last_ts": r["last_ts"],
+            "via": sorted(r["via"]),
+        })
+    cands.sort(key=lambda c: (_CANDIDATE_VERDICT_ORDER[c["verdict"]], -(c["in_eth"] + c["out_eth"])))
+
+    summary: Dict[str, int] = {}
+    for r in rows:
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+    # ready-to-paste lines for EXCHANGE_ETH_ADDRESSES, only for "add" verdicts
+    snippet = "\n".join(
+        f'        "{c["address"][:6]}…{c["address"][-4:]}": "{c["address"]}",'
+        for c in cands if c["verdict"] == "add"
+    )
+    return {
+        "exchange": wanted,
+        "wallets_checked": len(wallets) - len(failed),
+        "failed": failed,
+        "min_eth": min_eth,
+        "summary": summary,
+        "wallets": rows,
+        "candidates": cands[:top_n],
+        "total_candidates": len(cands),
+        "snippet": snippet,
+    }
+
+
+# =====================================================================
 # 📊  COINGECKO — Fear & Greed, dominance, volume
 # =====================================================================
 
