@@ -870,7 +870,7 @@ function fmtAgeLong(ts) {
 }
 
 // status / verdict → tag look (stale = remove candidate, add = worth tracking)
-const WALLET_TAG = { active: 'long', holding: 'flat', quiet: 'flat', stale: 'short', unknown: 'flat' }
+const WALLET_TAG = { active: 'long', conduit: 'flat', holding: 'flat', quiet: 'flat', stale: 'short', unknown: 'flat' }
 const CANDIDATE_TAG = { add: 'long', review: 'flat', skip: 'flat' }
 
 // Result of the "Verify wallets" button: health of the tracked set + classified
@@ -889,7 +889,7 @@ function WalletVerifyResult({ res, copy, copied }) {
       <div className="mono" style={{ wordBreak: 'break-all', marginTop: 2 }}>{w.address}</div>
       <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>
         {w.balance_eth == null ? 'balance n/a' : `${Number(w.balance_eth).toLocaleString()} ETH`}
-        {' · '}last tx {fmtAgeLong(w.last_ts)} · {w.reason}
+        {' · '}last tx {fmtAgeLong(w.last_ts)}{w.reason ? ` · ${w.reason}` : ''}
       </div>
       <div style={{ marginTop: 4, display: 'flex', gap: 10, alignItems: 'center' }}>
         <a href={`https://etherscan.io/address/${w.address}`} target="_blank" rel="noreferrer">Etherscan ↗</a>
@@ -921,7 +921,7 @@ function WalletVerifyResult({ res, copy, copied }) {
     <div style={{ marginTop: 12 }}>
       <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 6px' }}>
         {res.exchange}: {res.wallets.length} tracked wallets
-        {['active', 'holding', 'quiet', 'stale', 'unknown'].filter((k) => s[k]).map((k) => ` · ${s[k]} ${k}`)}
+        {['active', 'conduit', 'holding', 'quiet', 'stale', 'unknown'].filter((k) => s[k]).map((k) => ` · ${s[k]} ${k}`)}
         {res.failed?.length > 0 && ` · ${res.failed.length} fetch failed: ${res.failed.join(', ')}`}
         {'. '}Verdicts are heuristics from on-chain activity, confirm on Etherscan before editing the list.
       </p>

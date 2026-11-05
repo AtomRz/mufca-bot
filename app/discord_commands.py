@@ -2203,7 +2203,7 @@ async def ethverify_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0)
     s = res["summary"]
     head = (
         f"**✅ {res['exchange']} — wallet check** ({len(res['wallets'])} tracked)\n"
-        + " · ".join(f"{k} {s[k]}" for k in ("active", "holding", "quiet", "stale", "unknown") if s.get(k))
+        + " · ".join(f"{k} {s[k]}" for k in ("active", "conduit", "holding", "quiet", "stale", "unknown") if s.get(k))
         + (f"\n⚠️ failed: {', '.join(res['failed'])}" if res["failed"] else "")
         + "\n_Heuristics from on-chain activity — confirm on Etherscan before editing the list._"
     )
@@ -2212,7 +2212,11 @@ async def ethverify_cmd(ctx, exchange: str = "Binance", min_eth: float = 1000.0)
     if attention:
         blocks.append("**Remove? / re-run**")
         for w in attention:
-            blocks.append(f"`{w['address']}` ({w['label']})\n  {w['status']}: {w['reason']}")
+            bal = "balance n/a" if w["balance_eth"] is None else f"{w['balance_eth']:,.1f} ETH"
+            seen = _age_label(w["last_ts"]) if w["last_ts"] else "never"
+            blocks.append(
+                f"`{w['address']}` ({w['label']})\n  {w['status']}: {w['reason']} · {bal} · last tx {seen}"
+            )
     for verdict, title in (("add", "**Add**"), ("review", "**Review** (not added automatically)")):
         group = [c for c in res["candidates"] if c["verdict"] == verdict]
         if not group:

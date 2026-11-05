@@ -612,12 +612,13 @@ async def trace_exchange_wallets(exchange: str = "Binance", min_eth: float = 100
 _VERIFY_ACTIVE_DAYS = 7        # a tx within this many days = "active"
 _VERIFY_STALE_DAYS = 30        # no tx for this long AND a dust balance = "stale"
 _VERIFY_DUST_ETH = 100.0       # below this a quiet wallet carries no flow signal
+_VERIFY_CONDUIT_ETH = 10.0     # a recently active wallet holding less than this is a pass-through
 _CANDIDATE_STALE_DAYS = 90     # candidate untouched this long = "skip"
 # Big counterparties that are not exchange wallets at all.
 _KNOWN_NON_EXCHANGE: Dict[str, str] = {
     "0x00000000219ab540356cbb839cbe05303d7705fa": "Beacon Deposit Contract (ETH staking)",
 }
-_WALLET_STATUS_ORDER = {"stale": 0, "unknown": 1, "quiet": 2, "holding": 3, "active": 4}
+_WALLET_STATUS_ORDER = {"stale": 0, "unknown": 1, "quiet": 2, "holding": 3, "conduit": 4, "active": 5}
 _CANDIDATE_VERDICT_ORDER = {"add": 0, "review": 1, "skip": 2}
 
 
@@ -633,23 +634,27 @@ def _newest_ts(txs: Optional[List[dict]]) -> Optional[int]:
 
 
 def _wallet_status(balance: Optional[float], last_ts: Optional[int], txs_ok: bool, now: float) -> Tuple[str, str]:
-    """(status, reason) for one tracked wallet.
+    """(status, reason) for one tracked wallet. The reason never repeats the
+    balance or the last-tx age: the web row and the Discord line show those next to it.
     active  = tx in the last _VERIFY_ACTIVE_DAYS days
+    conduit = recent txs but holds < _VERIFY_CONDUIT_ETH: a pass-through that no
+              longer carries the exchange's balance (harmless to keep)
     holding = quiet but still holds >= _VERIFY_DUST_ETH (cold storage: keep)
     stale   = no tx for _VERIFY_STALE_DAYS days and a dust balance (remove?)
     quiet   = in between, nothing to act on
     unknown = a fetch failed and the wallet is not visibly active"""
     age_days = (now - last_ts) / 86400 if last_ts else None
     if age_days is not None and age_days <= _VERIFY_ACTIVE_DAYS:
-        return "active", f"last tx {age_days:.1f}d ago"
+        if balance is not None and balance < _VERIFY_CONDUIT_ETH:
+            return "conduit", "pass-through: moves ETH but holds almost none, harmless to keep"
+        return "active", ""
     if balance is None or not txs_ok:
         return "unknown", "an Etherscan fetch failed, re-run"
     if balance >= _VERIFY_DUST_ETH:
-        return "holding", f"quiet but holds {balance:,.0f} ETH (cold storage?), keep"
+        return "holding", "quiet but holds funds (cold storage?), keep"
     if age_days is None or age_days > _VERIFY_STALE_DAYS:
-        seen = "no txs at all" if age_days is None else f"no tx for {age_days:.0f}d"
-        return "stale", f"{seen}, balance {balance:,.1f} ETH: candidate to remove"
-    return "quiet", f"last tx {age_days:.0f}d ago, balance {balance:,.1f} ETH"
+        return "stale", "no recent activity and almost no balance: candidate to remove"
+    return "quiet", "no recent activity, nothing to act on"
 
 
 def _classify_candidate(addr: str, rec: Dict[str, Any], now: float) -> Tuple[str, str]:
