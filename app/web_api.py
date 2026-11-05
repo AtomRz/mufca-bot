@@ -768,12 +768,16 @@ class FilterPinIn(BaseModel):
 @app.post("/api/filter-overrides")
 async def pin_filter_override(body: FilterPinIn):
     """Manually pins filters for one ticker/timeframe on top of its current effective
-    flags (filters=null drops the pin)."""
+    flags (filters=null drops the pin - allowed even for a pair/timeframe that is no
+    longer tracked, so a leftover pin can always be removed)."""
     ticker = body.ticker.upper().strip()
-    if ticker not in _cfg.TICKERS:
-        raise HTTPException(404, f"{ticker} is not a tracked pair")
-    if body.tf not in _cfg.TIMEFRAMES:
-        raise HTTPException(404, f"{body.tf} is not a tracked timeframe")
+    if body.filters is not None:
+        if ticker not in _cfg.TICKERS:
+            raise HTTPException(404, f"{ticker} is not a tracked pair")
+        if body.tf not in _cfg.TIMEFRAMES:
+            raise HTTPException(404, f"{body.tf} is not a tracked timeframe")
+    elif body.tf not in _cfg.get_filter_overrides()["active"].get(ticker, {}):
+        raise HTTPException(404, f"No pinned filter set for {ticker} {body.tf}")
     if body.filters is not None:
         bad = [k for k, v in body.filters.items() if k not in _cfg.BACKTEST_FILTER_KEYS or not isinstance(v, bool)]
         if bad:
@@ -1021,6 +1025,10 @@ async def remove_pair(ticker: str, purge_history: bool = False):
     # bug in both places.
     derivatives.clear_ticker_cache(ticker)
     spread.clear_ticker_cache(ticker)
+    # Filter pins of a pair that is no longer scanned would otherwise stay in
+    # filter_overrides.json forever (and a re-add would inherit them).
+    if _cfg.drop_ticker_filter_overrides(ticker):
+        await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
 
     purged = 0
     if purge_history:

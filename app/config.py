@@ -444,6 +444,23 @@ def set_filter_override(ticker: str, timeframe: str, changes: Optional[dict]) ->
         _save_filter_overrides()
         return filter_flags_for(ticker, timeframe)
 
+def drop_ticker_filter_overrides(ticker: str) -> bool:
+    """Housekeeping when a pair is removed from scanning: forgets every pin of that pair
+    (active, the revert copy and the stats), so a later re-add starts from the global
+    toggles instead of silently inheriting an old tuning, and no orphaned pin is left
+    behind. Unlike set_filter_override() this does NOT make the change revertable -
+    reverting must not bring pins back for a pair that is no longer tracked.
+    Returns True when anything was removed."""
+    with _filter_overrides_lock:
+        found = False
+        for key in ("active", "previous", "meta"):
+            if _filter_overrides[key].pop(ticker, None) is not None:
+                found = True
+        if found:
+            _filter_overrides["applied_at"] = int(time.time())
+            _save_filter_overrides()
+        return found
+
 def clear_filter_overrides():
     """Drops every pinned set — all pairs/tfs fall back to the global toggles."""
     with _filter_overrides_lock:
