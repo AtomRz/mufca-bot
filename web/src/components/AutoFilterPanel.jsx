@@ -42,7 +42,7 @@ function ResultRows({ result }) {
   )
 }
 
-function PinnedSets({ overrides, busy, onRevert, onClear }) {
+function PinnedSets({ overrides, tracked, busy, onRevert, onClear, onRemove }) {
   const active = overrides?.active || {}
   const rows = []
   Object.keys(active).sort().forEach((ticker) => {
@@ -57,8 +57,15 @@ function PinnedSets({ overrides, busy, onRevert, onClear }) {
       ) : (
         rows.map(({ ticker, tf, flags }) => (
           <div className="row" key={`${ticker}-${tf}`} style={{ fontSize: 12 }}>
-            <span className="row-label">{ticker} {tf}</span>
-            <span className="row-value">{describeSet(flags)}</span>
+            <span className="row-label">
+              {ticker} {tf}
+              {tracked && !tracked.includes(ticker) && <span style={{ color: 'var(--accent)' }}> · pair no longer tracked</span>}
+            </span>
+            <span className="row-value">
+              {describeSet(flags)}{' '}
+              <button className="btn" disabled={busy} title="Remove this pin (the pair/timeframe goes back to the global toggles)"
+                      onClick={() => onRemove(ticker, tf)} style={{ marginLeft: 6, padding: '0 8px' }}>✕</button>
+            </span>
           </div>
         ))
       )}
@@ -186,7 +193,9 @@ export default function AutoFilterPanel({ config, onChanged }) {
       )}
       <PinnedSets
         overrides={config.filter_overrides}
+        tracked={config.pairs}
         busy={busy || sim.running}
+        onRemove={(t, f) => act(() => api.pinFilters(t, f, null))}
         onRevert={() => act(() => api.revertFilterOverrides())}
         onClear={() => act(() => api.clearFilterOverrides())}
       />

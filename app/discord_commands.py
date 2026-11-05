@@ -424,8 +424,10 @@ async def remove_cmd(ctx, ticker: str = ""):
     # in time.
     derivatives.clear_ticker_cache(ticker)
     spread.clear_ticker_cache(ticker)
+    dropped_pins = _cfg.drop_ticker_filter_overrides(ticker)
 
-    await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}")
+    await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}"
+                   + (" Its pinned filter sets were dropped too." if dropped_pins else ""))
 
 @core.bot.command(name="delsignals")
 async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = ""):
@@ -1421,12 +1423,16 @@ async def pinfilter_cmd(ctx, ticker: str = "", tf: str = "", *changes):
     """
     ticker = ticker.upper()
     tf = tf.lower()
-    if ticker not in TICKERS or tf not in TIMEFRAMES:
-        await ctx.send("❌ Usage: `!pinfilter <pair> <tf> <filter>=on|off ...` or `... default`")
-        return
     if [c.lower() for c in changes] == ["default"]:
+        # allowed for a pair/timeframe that is no longer tracked, so a leftover pin can always be removed
+        if tf not in _cfg.get_filter_overrides()["active"].get(ticker, {}):
+            await ctx.send(f"❌ No pinned filter set for {ticker} {tf} (`!autofilter show` lists them).")
+            return
         _cfg.set_filter_override(ticker, tf, None)
         await ctx.send(f"🧹 {ticker} {tf}: pin removed — {_fmt_filter_set(_cfg.filter_flags_for(ticker, tf))} (global toggles).")
+        return
+    if ticker not in TICKERS or tf not in TIMEFRAMES:
+        await ctx.send("❌ Usage: `!pinfilter <pair> <tf> <filter>=on|off ...` or `... default`")
         return
     parsed = {}
     for c in changes:
