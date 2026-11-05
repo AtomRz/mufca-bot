@@ -509,6 +509,23 @@ async def get_spread(ticker: Optional[str] = None):
     }
 
 
+class SpreadResetIn(BaseModel):
+    ticker: str
+
+
+@app.post("/api/spread/reset")
+async def reset_spread(body: SpreadResetIn):
+    """Clears one pair's accumulated spread history, so its warm-up starts over.
+    Same effect as Discord `!spread {ticker} reset yes`; the confirmation step
+    lives in the web UI (two clicks), like the other destructive buttons."""
+    ticker = unquote(body.ticker).upper().strip()
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not tracked")
+    cleared = spread.get_sample_count(ticker)
+    spread.clear_ticker_cache(ticker)
+    return {"ticker": ticker, "cleared_samples": cleared}
+
+
 @app.get("/api/shadow")
 async def get_shadow_status():
     """Top-bar "SHDW" lamp: which Entry switches are active (anything other
