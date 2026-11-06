@@ -134,6 +134,7 @@ export const api = {
   resetSpread: (ticker) =>
     request('/api/spread/reset', { method: 'POST', body: JSON.stringify({ ticker }) }),
   getShadow: () => request('/api/shadow'),
+  getShock: () => request('/api/shock'),
   getComponents: (minSamples = 30, split = false, shadow = false) =>
     request(`/api/components?min_samples=${minSamples}&split=${split}&shadow=${shadow}`),
   // 🆕 Simulations are background jobs: run* returns {id, status, progress, ...}
