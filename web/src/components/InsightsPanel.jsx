@@ -1067,6 +1067,26 @@ function WalletTracePanel() {
   const [vres, setVres] = useState(null)
   const [err, setErr] = useState(null)
   const [copied, setCopied] = useState(null)
+  // Manual add by address: Trace/Verify only surface counterparties of wallets that are
+  // already tracked, so an exchange whose tracked wallets all went dead (Coinbase) never
+  // yields a candidate to press "Add" on. Seed it by hand from an Etherscan label page.
+  const [manAddr, setManAddr] = useState('')
+  const [manLabel, setManLabel] = useState('')
+  const [manState, setManState] = useState(null)   // null | 'busy' | { ok, msg }
+
+  const addManual = async () => {
+    const address = manAddr.trim()
+    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) { setManState({ ok: false, msg: 'Address must be 0x followed by 40 hex characters' }); return }
+    setManState('busy')
+    try {
+      await api.addOnchainWallet(exchange, address, manLabel.trim() || undefined)
+      setManState({ ok: true, msg: `added to ${exchange} ✓ — press Verify wallets to check it is active (applies on the next on-chain refresh)` })
+      setManAddr('')
+      setManLabel('')
+    } catch (e) {
+      setManState({ ok: false, msg: e.message })
+    }
+  }
 
   const run = async (mode) => {
     const v = parseFloat(minEth)
@@ -1124,6 +1144,28 @@ function WalletTracePanel() {
         <button className="btn" disabled={!!busy} onClick={() => run('verify')}>
           {busy === 'verify' ? 'Verifying… (up to 45 s)' : 'Verify wallets'}
         </button>
+      </div>
+      <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--border-soft)' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-faint)', margin: '0 0 8px' }}>
+          <b>Add a wallet by address</b> to <b>{exchange}</b> (e.g. from the exchange's Etherscan label page,
+          sorted by recent activity). Use this when Trace finds nothing because every tracked wallet is dead.
+        </p>
+        <div className="field">
+          <label>Address</label>
+          <input type="text" placeholder="0x…" value={manAddr} spellCheck={false} autoCapitalize="off"
+            disabled={manState === 'busy'} onChange={(e) => setManAddr(e.target.value)} />
+        </div>
+        <div className="field">
+          <label>Label (optional)</label>
+          <input type="text" placeholder={`${exchange} hot wallet`} value={manLabel} maxLength={40}
+            disabled={manState === 'busy'} onChange={(e) => setManLabel(e.target.value)} />
+        </div>
+        <button className="btn" disabled={manState === 'busy' || !manAddr.trim()} onClick={addManual}>
+          {manState === 'busy' ? 'Adding…' : 'Add wallet'}
+        </button>
+        {manState && manState !== 'busy' && (
+          <p style={{ fontSize: 12, marginTop: 8, color: manState.ok ? 'var(--long)' : 'var(--short)' }}>{manState.msg}</p>
+        )}
       </div>
       {err && <p style={{ fontSize: 12, color: 'var(--short)', marginTop: 10 }}>{err}</p>}
       {kind === 'verify' && vres && <WalletVerifyResult res={vres} copy={copy} copied={copied} />}
