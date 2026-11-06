@@ -537,6 +537,21 @@ async def get_shadow_status():
     return status
 
 
+@app.get("/api/shock")
+async def get_shock_status():
+    """Top-bar "SHOCK" lamp: active market shocks (shock_guard) and an active
+    exchange-wallet on-chain anomaly. Light — reads in-memory state only, no
+    exchange calls. `alerts_muted` mirrors the Settings toggle that silences
+    Discord/push for these alerts, so the lamp can say so in its tooltip."""
+    anomaly = (core._onchain_bias_cache or {}).get("anomaly")
+    return {
+        "market_shocks": shock_guard.get_active_shocks(),
+        "onchain_anomaly": anomaly if anomaly and anomaly.get("active") else None,
+        "blocks_entries": bool(_cfg.SHOCK_GUARD_BLOCK_ENTRIES),
+        "alerts_muted": not _cfg.SYSTEM_ALERTS_ENABLED,
+    }
+
+
 @app.get("/api/components")
 async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False):
     """Reports whether the relative_strength / volume_profile confidence

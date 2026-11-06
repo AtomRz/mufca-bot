@@ -8,6 +8,7 @@ import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
 import ShadowLamp from './components/ShadowLamp'
+import ShockLamp from './components/ShockLamp'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -28,6 +29,7 @@ export default function App() {
   const [pulseKey, setPulseKey] = useState(0)
   const [pulse, setPulse] = useState(null)
   const [shadow, setShadow] = useState(null)
+  const [shock, setShock] = useState(null)
   const [chartTicker, setChartTicker] = useState(null)
   const [chartTf, setChartTf] = useState('1h')
   const [chartLoading, setChartLoading] = useState(false)
@@ -44,6 +46,16 @@ export default function App() {
   const loadShadow = useCallback(() => {
     lastShadowAt.current = Date.now()
     api.getShadow().then(setShadow).catch(() => {})
+  }, [])
+
+  // 🆕 SHOCK lamp: global like SHDW, in-memory on the server (/api/shock), so it
+  // follows scan_tick (throttled to 20 s) and refreshes immediately when a
+  // market_shock / onchain_anomaly event arrives over the WebSocket — those
+  // events are sent even when Discord/push alerts are muted in Settings.
+  const lastShockAt = useRef(0)
+  const loadShock = useCallback(() => {
+    lastShockAt.current = Date.now()
+    api.getShock().then(setShock).catch(() => {})
   }, [])
 
   // 🆕 CHOP/Trend/Leverage in the top bar now follow the pair/tf selected on
@@ -79,7 +91,8 @@ export default function App() {
     if (!authenticated) return
     loadConfig()
     loadShadow()
-  }, [authenticated, loadConfig, loadShadow])
+    loadShock()
+  }, [authenticated, loadConfig, loadShadow, loadShock])
 
   useEffect(() => {
     if (!authenticated) return
@@ -92,9 +105,11 @@ export default function App() {
   const loadConfigRef = useRef(loadConfig)
   const loadPulseRef = useRef(loadPulse)
   const loadShadowRef = useRef(loadShadow)
+  const loadShockRef = useRef(loadShock)
   loadConfigRef.current = loadConfig
   loadPulseRef.current = loadPulse
   loadShadowRef.current = loadShadow
+  loadShockRef.current = loadShock
 
   useEffect(() => {
     if (!authenticated) return
@@ -103,9 +118,13 @@ export default function App() {
       (event) => {
         setLastEvent(event)
         setPulseKey((k) => k + 1)
-        if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current() }
+        if (event.type === 'config_changed') { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current(); loadShockRef.current() }
+        if (event.type === 'market_shock' || event.type === 'onchain_anomaly') loadShockRef.current()
         if (event.type === 'scan_tick' && !document.hidden && Date.now() - lastShadowAt.current >= 20000) {
           loadShadowRef.current()
+        }
+        if (event.type === 'scan_tick' && !document.hidden && Date.now() - lastShockAt.current >= 20000) {
+          loadShockRef.current()
         }
         // 🆕 scan_tick arrives every scan (15-180 s) and /api/pulse is heavy
         // (900 bars + HTF + indicators server-side): don't refresh it from a
@@ -119,7 +138,7 @@ export default function App() {
         // 🆕 after a RE-connect, events were missed while offline: resync config
         // and pulse (an initial config load that failed also gets retried this way)
         if (status === 'connected') {
-          if (connectedOnce) { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current() }
+          if (connectedOnce) { loadConfigRef.current(); loadPulseRef.current(); loadShadowRef.current(); loadShockRef.current() }
           connectedOnce = true
         }
       },
@@ -183,15 +202,6 @@ export default function App() {
         {config && <span className="mode-badge">{config.mode}</span>}
         {config && <span className="mode-badge">HTF {config.htf_bias}</span>}
         {pulse && (
-          <span
-            className="mode-badge"
-            title={`${pulse.ticker} ${pulse.tf} — CHOP ${pulse.chop} (threshold ${pulse.chop_threshold})`}
-            style={{ color: pulse.chop_trending ? 'var(--long)' : 'var(--text-dim)' }}
-          >
-            {pulse.ticker} CHOP {pulse.chop}
-          </span>
-        )}
-        {pulse && (
           <span className="mode-badge" style={{ color: TREND_COLOR[pulse.trend] }} title={`${pulse.ticker} ${pulse.tf} trend`}>
             {TREND_LABEL[pulse.trend]}
           </span>
@@ -202,6 +212,7 @@ export default function App() {
           </span>
         )}
         {pulse && <SignalLamps lamps={pulse.lamps} />}
+        <ShockLamp shock={shock} onClick={() => setTab('status')} />
         <ShadowLamp shadow={shadow} onClick={() => setTab('insights')} />
         <div className="spacer" />
         {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>loading…</span>}
