@@ -213,6 +213,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `tp_config.json` | TP mode, percentiles, history limit, auto-adjust state |
 | `tp1_sl_mode.json` | SL-after-TP1 mode: breakeven / quarter / half (default) / three-quarter of the way to TP1 (editable from the web dashboard) |
 | `discord_notifications.json` | Discord channel notifications on/off (editable from the web dashboard; independent of `DISCORD_ENABLED` — see "Running without Discord" above) |
+| `system_alerts.json` | Market shock / abnormal on-chain alerts to Discord + push on/off (editable from the web Settings tab; off = web Status banner only) |
 | `shock_guard_block_entries.json` | Market Shock Guard: block new entries during a shock on/off (editable from the web Settings tab; off = warn only) |
 | `scan_interval.json` | Scanner poll interval — 15/30/60/180s (editable from the web dashboard) |
 | `onchain_interval.json` | On-chain data refresh interval — 15m/30m/1h (editable from the web dashboard) |

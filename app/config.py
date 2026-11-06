@@ -1094,6 +1094,25 @@ def save_shock_guard_block_entries(enabled: bool):
 SHOCK_GUARD_BLOCK_ENTRIES = load_shock_guard_block_entries()
 
 # =====================================================================
+# 🔔  SYSTEM ALERTS TOGGLE (market shock + abnormal on-chain)
+# =====================================================================
+# On (default): market-shock and on-chain-anomaly alerts go to Discord and
+# Android push (plus the web dashboard). Off: Discord and push are skipped for
+# these two alert types only - the web Status tab banner ("Abnormal market
+# conditions") is built from /api/status and keeps showing them either way.
+# Signal / TP1 notifications are not affected. Editable from the web Settings
+# tab, takes effect immediately.
+SYSTEM_ALERTS_FILE = os.path.join(DATA_DIR, "system_alerts.json")
+
+def load_system_alerts_enabled() -> bool:
+    return _load_typed(SYSTEM_ALERTS_FILE, {"enabled": True})["enabled"]
+
+def save_system_alerts_enabled(enabled: bool):
+    safe_json_save(SYSTEM_ALERTS_FILE, {"enabled": bool(enabled)})
+
+SYSTEM_ALERTS_ENABLED = load_system_alerts_enabled()
+
+# =====================================================================
 # ⏱️  SCAN INTERVAL
 # =====================================================================
 # Signals only ever form on a closed bar (anti-repainting, idx=-2), so on a 1h

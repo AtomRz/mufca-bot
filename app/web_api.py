@@ -59,7 +59,7 @@ app = FastAPI(
 # web_api at the very bottom, once bot/state/config are already set up.
 import bot as core
 import config as _cfg
-from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_shock_guard_block_entries, save_hurst_window, save_hurst_config
+from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_shock_guard_block_entries, save_system_alerts_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components
@@ -1245,6 +1245,7 @@ async def get_config():
         "entry_block": dict(_cfg.ENTRY_BLOCK),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
+        "system_alerts_enabled": _cfg.SYSTEM_ALERTS_ENABLED,
         "scan_interval_seconds": _cfg.SCAN_INTERVAL_SECONDS,
         "scan_interval_options": list(_cfg.SCAN_INTERVAL_OPTIONS),
         "onchain_interval_seconds": _cfg.ONCHAIN_CACHE_TTL,
@@ -1465,6 +1466,29 @@ async def set_shock_guard_block(body: ShockGuardBlockIn):
         "value": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
     })
     return {"shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES, "changed": True}
+
+
+class SystemAlertsIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/system-alerts")
+async def set_system_alerts(body: SystemAlertsIn):
+    """Turns Discord + push delivery of market-shock / abnormal on-chain alerts
+    on/off. Off = the condition is still shown in the web Status tab banner,
+    just no Discord message and no push. Signal / TP1 notifications are not
+    affected. Takes effect immediately."""
+    if body.enabled == _cfg.SYSTEM_ALERTS_ENABLED:
+        return {"system_alerts_enabled": _cfg.SYSTEM_ALERTS_ENABLED, "changed": False}
+
+    _cfg.SYSTEM_ALERTS_ENABLED = body.enabled
+    save_system_alerts_enabled(_cfg.SYSTEM_ALERTS_ENABLED)
+    await broadcast_event({
+        "type": "config_changed",
+        "key": "system_alerts_enabled",
+        "value": _cfg.SYSTEM_ALERTS_ENABLED,
+    })
+    return {"system_alerts_enabled": _cfg.SYSTEM_ALERTS_ENABLED, "changed": True}
 
 
 class ScanIntervalIn(BaseModel):
