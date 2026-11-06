@@ -624,7 +624,7 @@ async def _alert_onchain_anomaly(channel, bias: Optional[Dict]) -> None:
                 continue
             _alerted_anomaly_ts.add(ts)
             text = (
-                f"🚨 **ON-CHAIN ANOMALY** | `{ev.get('exchange')}` wallet {ev.get('kind')}: "
+                f"🚨 **ON-CHAIN ANOMALY** | `{ev.get('exchange')}` wallet `{ev.get('wallet')}` {ev.get('kind')}: "
                 f"`{ev.get('prev_eth', 0):,.0f} → {ev.get('curr_eth', 0):,.0f} ETH` "
                 f"({ev.get('change_pct', 0):+.1f}%)\n"
                 f"This is not read as market flow (no bullish/bearish bias from it) and leverage is "
@@ -634,7 +634,7 @@ async def _alert_onchain_anomaly(channel, bias: Optional[Dict]) -> None:
             await _send_system_alert(
                 channel, text,
                 push_title=f"🚨 {ev.get('exchange')} wallet anomaly",
-                push_body=f"{ev.get('change_pct', 0):+.0f}% ETH balance change — possible incident",
+                push_body=f"{ev.get('wallet')}: {ev.get('change_pct', 0):+.0f}% ETH balance change — possible incident",
                 event={"type": "onchain_anomaly", **ev},
             )
         # keep the set from growing forever

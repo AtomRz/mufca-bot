@@ -61,6 +61,11 @@ ONCHAIN_ENABLED               = bool(ETHERSCAN_API_KEY and COINGECKO_API_KEY)
 # and an alert is raised.
 ONCHAIN_ANOMALY_MIN_BALANCE_ETH = 5_000  # only judge wallets that held at least this much in the previous snapshot
 ONCHAIN_ANOMALY_CHANGE_FRACTION = 0.50   # |balance change| / previous balance at or above this = anomaly
+# Absolute floor on the wallet's own move. Binance hot wallets / hubs / custody
+# addresses routinely swing 10k-20k ETH (withdrawal batches, sweeps), which is
+# >=50% of a 14k wallet but nothing next to the 2026-10-30 drain (160k ETH).
+# Moves below this are logged as "large but below floor" and not alerted.
+ONCHAIN_ANOMALY_MIN_CHANGE_ETH  = 30_000
 ONCHAIN_ANOMALY_HOLD_SECONDS    = 4 * 3600  # keep on-chain flow neutralized this long after an anomaly
 ONCHAIN_ANOMALY_LEV_DELTA       = -1     # leverage adjustment while an anomaly is active (unknown risk -> less leverage)
 
