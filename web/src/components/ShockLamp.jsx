@@ -50,7 +50,7 @@ export default function ShockLamp({ shock, onClick }) {
     })
     anomalyEvents.forEach((ev) => {
       lines.push(
-        `${ev.exchange} wallet ${ev.kind}: ${Math.round(ev.prev_eth).toLocaleString()} → ${Math.round(ev.curr_eth).toLocaleString()} ETH (${ev.change_pct}%)`,
+        `${ev.exchange} ${ev.wallet} ${ev.kind}:${Math.round(ev.prev_eth).toLocaleString()} → ${Math.round(ev.curr_eth).toLocaleString()} ETH (${ev.change_pct}%)`,
       )
     })
     if (anomaly && anomalyEvents.length === 0) lines.push('On-chain anomaly active')

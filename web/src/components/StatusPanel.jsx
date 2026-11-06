@@ -113,8 +113,8 @@ export default function StatusPanel({ lastEvent }) {
             </div>
           ))}
           {anomaly && anomaly.active && (anomaly.events || []).map((ev) => (
-            <div className="row" key={`${ev.exchange}-${ev.detected_ts}`}>
-              <span className="row-label">{ev.exchange} wallet {ev.kind}</span>
+            <div className="row" key={`${ev.exchange}-${ev.wallet}-${ev.detected_ts}`}>
+              <span className="row-label">{ev.exchange} wallet {ev.kind} · {ev.wallet}</span>
               <span className="row-value">
                 {Math.round(ev.prev_eth).toLocaleString()} → {Math.round(ev.curr_eth).toLocaleString()} ETH ({ev.change_pct}%)
               </span>

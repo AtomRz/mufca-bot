@@ -445,11 +445,23 @@ async def get_eth_flow_delta() -> Dict:
         # really left/entered the tracked set (|net| vs the candidates' moves).
         # An anomalous exchange is excluded from the flow total as a whole, so a
         # half-visible transfer can't leak into it as fake inflow/outflow.
-        candidates = {
+        relative_hits = {
             label: v for label, v in wallet_deltas.items()
             if v[1] >= _cfg.ONCHAIN_ANOMALY_MIN_BALANCE_ETH
             and abs(v[0]) / v[1] >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION
         }
+        candidates = {
+            label: v for label, v in relative_hits.items()
+            if abs(v[0]) >= _cfg.ONCHAIN_ANOMALY_MIN_CHANGE_ETH
+        }
+        # Wallets that moved a lot relative to their size but below the absolute
+        # floor: not alerted, logged so the noisy ones are easy to spot.
+        for label, (delta, prev, curr) in relative_hits.items():
+            if label not in candidates:
+                logger.info(
+                    f"[ONCHAIN] {exchange} ({label}): {prev:.0f} -> {curr:.0f} ETH ({delta / prev * 100:+.1f}%) "
+                    f"— below the {_cfg.ONCHAIN_ANOMALY_MIN_CHANGE_ETH:,.0f} ETH anomaly floor, not alerted"
+                )
         if candidates:
             moved = sum(abs(v[0]) for v in candidates.values())
             if abs(net) >= _cfg.ONCHAIN_ANOMALY_CHANGE_FRACTION * moved:
