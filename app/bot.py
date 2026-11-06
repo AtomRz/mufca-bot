@@ -579,17 +579,25 @@ _alerted_anomaly_ts: set = set()
 async def _send_system_alert(channel, text: str, push_title: str, push_body: str, event: Dict) -> None:
     """Fan a system alert out to Discord, the web dashboard (WebSocket) and
     push. Every channel has its own try/except so one failing can't swallow
-    the others (same pattern as the TP1 notification)."""
-    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
-        try:
-            await channel.send(text)
-        except Exception as discord_err:
-            logger.error(f"[DISCORD] Failed to send system alert: {discord_err}", exc_info=True)
+    the others (same pattern as the TP1 notification).
+
+    The Settings → "Market shock / on-chain anomaly alerts" toggle
+    (_cfg.SYSTEM_ALERTS_ENABLED) mutes Discord and push only. The WebSocket
+    event still goes out, and the Status tab banner is built from /api/status,
+    so the web always shows the condition."""
     try:
         from web_api import broadcast_event
         await broadcast_event(event)
     except Exception as ws_err:
         logger.warning(f"[WS] broadcast failed: {ws_err}")
+    if not _cfg.SYSTEM_ALERTS_ENABLED:
+        logger.info(f"[ALERT] {event.get('type')} muted (system alerts toggle off) — web status only")
+        return
+    if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None:
+        try:
+            await channel.send(text)
+        except Exception as discord_err:
+            logger.error(f"[DISCORD] Failed to send system alert: {discord_err}", exc_info=True)
     try:
         import push as _push
         await asyncio.to_thread(

@@ -361,6 +361,20 @@ export default function SettingsPanel({ config, onChanged }) {
               Off = the bot stops posting signal/TP1 messages to the Discord channel. Scanning, the web
               dashboard, and Android push all keep working exactly the same either way.
             </p>
+            <div className="toggle-row">
+              <span className="row-label" title="Market shocks (5x ATR moves) and abnormal on-chain exchange-wallet moves. Off = no Discord message and no push for these two alert types; the 'Abnormal market conditions' banner on the Status tab still shows them. Signal / TP1 notifications are not affected.">
+                Market shock / on-chain anomaly alerts
+              </span>
+              <Toggle
+                checked={config.system_alerts_enabled ?? true}
+                disabled={busy === 'system_alerts'}
+                onChange={(v) => run('system_alerts', () => api.setSystemAlerts(v))}
+              />
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Off = no Discord message and no push about market shocks or abnormal on-chain activity.
+              The warning banner on the Status tab stays, so you still see it in the web.
+            </p>
           </div>
 
           <div className="panel">
