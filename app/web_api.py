@@ -700,6 +700,34 @@ async def run_filtersim(body: FilterSimIn):
     )
 
 
+class SmcSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(6000, ge=300, le=20000)
+
+
+@app.post("/api/smcsim")
+async def run_smcsim(body: SmcSimIn):
+    """Smart Money Concepts event study (same computation as the Discord !smcsim,
+    both call smc.run_smc_study()): liquidity sweeps, BOS/CHoCH, fair value gaps and
+    "sweep then structure shift" detected on every closed candle of real history,
+    each compared with the unconditional any-bar baseline over 6/12/24 bars
+    (directional return and a +-1 ATR race). Research only: it feeds no entry, filter
+    or setting, never writes to signals_history.json. See smc.py's docstring for the
+    method and analyze_smc()'s for the result shape.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    import smc
+    return _start_sim_job(
+        "smcsim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars},
+        lambda progress: smc.run_smc_study(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress),
+    )
+
+
 class AutoFilterIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
