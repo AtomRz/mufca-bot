@@ -648,7 +648,7 @@ export function BarCoverageWarning({ coverage, requested }) {
 // big (e.g. 6000 bars x several pairs), so the page just never showed a result.
 // The last job id per kind lives at module level so a finished result (or a running
 // job) is still there after switching sub-tabs, which unmounts this view.
-const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null }
+const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null, smcsim: null }
 
 export function useSimJob(kind) {
   const [job, setJob] = useState(null)
@@ -885,11 +885,139 @@ function CompSimSection({ pairs, timeframes }) {
   )
 }
 
+// 🆕 SMC event study — web twin of Discord's !smcsim (research only, trades nothing).
+const smcPp = (v) => (Number.isFinite(v) ? `${v > 0 ? '+' : ''}${(v * 100).toFixed(0)}pp` : '')
+
+// A cell is highlighted only when the event clearly beats (or trails) the any-bar baseline on BOTH
+// measures with enough samples — the same rule as the 💡 / 🔻 marks in Discord.
+function smcTone(h) {
+  if (h.n < 30 || !Number.isFinite(h.z_ret) || !Number.isFinite(h.z_win)) return null
+  if (h.z_ret >= 3 && h.z_win >= 2) return 'var(--long)'
+  if (h.z_ret <= -3 && h.z_win <= -2) return 'var(--short)'
+  return null
+}
+
+function SmcResultTable({ r, horizons }) {
+  const baseLine = (key) =>
+    r.baseline[key]
+      .filter((b) => Number.isFinite(b.avg_ret))
+      .map((b) => `${b.h}b ${pctSigned(b.avg_ret)} w${pctWhole(b.win_rate)}`)
+      .join(' · ')
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+        {r.ticker} {r.tf} <span style={{ fontWeight: 400, color: 'var(--text-faint)' }}>— {r.bars} closed bars</span>
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>
+        <div>baseline long (every bar): {baseLine('long')}</div>
+        <div>baseline short (every bar): {baseLine('short')}</div>
+      </div>
+      <div className="table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Event</th>
+              <th>Side</th>
+              <th>n</th>
+              {horizons.map((h) => <th key={h}>{h} bars</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {r.events.map((ev) => (
+              <tr key={ev.name} style={{ cursor: 'default' }} title={ev.meaning}>
+                <td>{ev.name}</td>
+                <td><span className={`tag ${ev.direction > 0 ? 'long' : 'short'}`}>{ev.direction > 0 ? 'long' : 'short'}</span></td>
+                <td>
+                  {ev.count}
+                  {ev.count < 30 && <span style={{ color: 'var(--accent)' }} title="tiny sample"> ⚠</span>}
+                </td>
+                {horizons.map((hz) => {
+                  const h = ev.horizons.find((x) => x.h === hz)
+                  if (!h || h.n === 0 || !Number.isFinite(h.d_ret)) return <td key={hz} style={{ color: 'var(--text-faint)' }}>—</td>
+                  const tone = smcTone(h)
+                  return (
+                    <td key={hz} style={tone ? { color: tone } : undefined}>
+                      Δ{pctSigned(h.d_ret)}{Number.isFinite(h.z_ret) ? ` (z${h.z_ret.toFixed(1)})` : ''}
+                      <div style={{ fontSize: 11, opacity: 0.85 }}>
+                        w{pctWhole(h.win_rate)} {smcPp(h.d_win)}
+                      </div>
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function SmcSimSection({ pairs, timeframes }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(6000)
+  const sim = useSimJob('smcsim')
+  const result = sim.job?.status === 'done' ? sim.job.result : null
+  const ranBars = sim.job?.params?.num_bars ?? numBars
+
+  const run = () => {
+    const bad = barsError(numBars)
+    if (bad) { sim.setError(bad); return }
+    sim.start(() => api.runSmcSim({ ticker, tf, numBars }))
+  }
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">SMC event study</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
+        Smart Money Concepts on real history: liquidity sweeps, break of structure (BOS), change of character
+        (CHoCH), fair value gaps (FVG) and "sweep then structure shift". After each event: does price do better than
+        after an arbitrary bar? Research only — nothing here trades, filters or changes a setting, and nothing is
+        written to history. Fast (no backtest). Parameters are fixed on purpose.
+      </p>
+      <SimScopeFields
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={run} disabled={sim.running}>{sim.running ? 'Running…' : 'Run'}</button>}
+      />
+      <SimStatus sim={sim} />
+      {result && !sim.running && (
+        <>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
+          {(result.skipped || []).map((s, i) => (
+            <p key={i} style={{ fontSize: 11, color: 'var(--accent)', marginBottom: 6 }}>
+              ⚠️ {s.ticker} {s.tf} skipped: {s.reason}
+            </p>
+          ))}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 10 }}>
+            Fixed params: swing {result.params.swing_n}/{result.params.swing_n} bars · sweep→shift window {result.params.mss_window} bars ·
+            FVG ≥ {result.params.fvg_min_atr} ATR · entry = {result.params.entry} · race = ±{result.params.race_atr} ATR ·
+            same event closer than {result.params.event_cooldown} bars is dropped. Hover an event name for its definition.
+          </p>
+          {result.results.map((r) => (
+            <SmcResultTable key={`${r.ticker}-${r.tf}`} r={r} horizons={result.params.horizons} />
+          ))}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            Δ = average directional return after the event minus the average for ANY bar in the same direction and
+            horizon (a rising market is not an edge). w = win rate of the ±1 ATR race, with the difference vs baseline in
+            points. Green / red = at least 3 se on return AND 2 z on win rate (n ≥ 30) better / worse than baseline.
+            A full run tests ~170 numbers, so a lone green cell can be luck — look for the SAME event holding on both
+            pairs and both timeframes. Events within 24 bars of each other share price moves, so the real sample is
+            smaller than n.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 function SimulateView({ pairs, timeframes }) {
   return (
     <div>
       <Tp1SimSection pairs={pairs} timeframes={timeframes} />
       <CompSimSection pairs={pairs} timeframes={timeframes} />
+      <SmcSimSection pairs={pairs} timeframes={timeframes} />
     </div>
   )
 }

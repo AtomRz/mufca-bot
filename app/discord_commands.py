@@ -55,6 +55,7 @@ from signals import (
     run_indicator_optimize, FILTER_KEYS,
 )
 import filter_stats
+import smc
 from onchain import (
     get_onchain_bias, format_onchain_report, clear_onchain_cache_full,
     trace_exchange_wallets, verify_exchange_wallets,
@@ -140,6 +141,7 @@ async def help_cmd(ctx):
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
+        "`!smcsim [pair] [tf] [bars]` — Smart Money Concepts event study (sweeps, BOS/CHoCH, FVG, sweep→shift) vs. any-bar baseline on real history; research only, trades nothing",
         "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
@@ -1380,6 +1382,115 @@ async def filtersim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 300
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"filtersim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _fmt_smc_event(ev: dict) -> str:
+    """One report line for one SMC event (see smc.analyze_smc()). Δ is the average
+    directional return minus the unconditional average for the same direction and
+    horizon; w is the win rate of the 1-ATR race (its difference vs baseline, in
+    percentage points, in brackets)."""
+    parts = []
+    flag = ""
+    for h in ev["horizons"]:
+        if h["n"] == 0 or h["d_ret"] is None:
+            parts.append(f"{h['h']}b —")
+            continue
+        wr = f"{h['win_rate']:.0%}" if h["win_rate"] is not None else "—"
+        dw = f"({h['d_win'] * 100:+.0f})" if h["d_win"] is not None else ""
+        parts.append(f"{h['h']}b Δ{h['d_ret']:+.2f}% w{wr}{dw}")
+        if h["n"] >= 30 and h["z_ret"] is not None and h["z_win"] is not None:
+            if h["z_ret"] >= 3 and h["z_win"] >= 2:
+                flag = " 💡"
+            elif h["z_ret"] <= -3 and h["z_win"] <= -2 and flag != " 💡":
+                flag = " 🔻"
+    tiny = " ⚠️" if ev["count"] < 30 else ""
+    side = "long" if ev["direction"] > 0 else "short"
+    return f"`{ev['name']}` ({side}) n={ev['count']}{tiny} | " + " | ".join(parts) + flag
+
+
+@core.bot.command(name="smcsim", aliases=["smcstudy"])
+async def smcsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 6000):
+    """
+    Smart Money Concepts event study (research only - nothing here trades, filters
+    or touches a setting, and nothing is written to signals_history.json).
+
+    Detects liquidity sweeps, break of structure (BOS), change of character (CHoCH),
+    fair value gaps (FVG) and "sweep then market-structure shift" on every closed
+    candle of real history, then asks: after such an event, does price do better
+    than after an arbitrary bar? Entry = next bar's open, held 6/12/24 bars;
+    measured by directional return and a 1-ATR race (+1 ATR vs -1 ATR first).
+
+    Usage: !smcsim [ticker] [tf] [num_bars]
+      no args                      - every tracked pair x timeframe, 6000 bars
+      !smcsim ETH/USDT 4h 8000     - just that pair/timeframe, more history
+
+    Fast (no backtest, just candles). Parameters are fixed on purpose - see smc.py.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+
+    num_bars = _clamp_bars(num_bars)
+    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in TICKERS:
+            await ctx.send(f"❌ `{t}` is not a tracked pair.")
+            return
+    for f in scope_tfs:
+        if f not in TIMEFRAMES:
+            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
+            return
+
+    try:
+        result = await _run_sim_job(
+            ctx, "smcsim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars},
+            lambda progress: smc.run_smc_study(exchange, scope_tickers, scope_tfs, num_bars, progress=progress),
+            intro=f"⏳ Running the SMC event study: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each.",
+        )
+        if result is None:
+            return
+
+        p = result["params"]
+        lines = [f"**🧠 SMC event study** (research only, {num_bars} bars requested — nothing written, nothing trades)\n",
+                 f"Fixed params: swing {p['swing_n']}/{p['swing_n']} bars, sweep→shift window {p['mss_window']} bars, "
+                 f"FVG ≥ {p['fvg_min_atr']} ATR, entry = {p['entry']}, race = ±{p['race_atr']:g} ATR, "
+                 f"same event closer than {p['event_cooldown']} bars is dropped.\n"]
+
+        short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
+        if short_pairs:
+            lines.append("⚠️ Bars requested vs. actually received (may reflect real available history):")
+            for c in short_pairs:
+                lines.append(f"  {c['ticker']} {c['tf']}: requested {c['requested']}, got {c['got']}")
+            lines.append("")
+        for s in result["skipped"]:
+            lines.append(f"⚠️ {s['ticker']} {s['tf']} skipped: {s['reason']}")
+
+        for r in result["results"]:
+            lines.append(f"\n**{r['ticker']} {r['tf']}** — {r['bars']} closed bars")
+            for key in ("long", "short"):
+                base = " | ".join(
+                    f"{b['h']}b {b['avg_ret']:+.2f}% w{b['win_rate']:.0%}"
+                    for b in r["baseline"][key] if b["avg_ret"] is not None and b["win_rate"] is not None
+                )
+                lines.append(f"baseline {key} (every bar): {base}")
+            for ev in r["events"]:
+                lines.append(_fmt_smc_event(ev))
+
+        lines.append(
+            "\nΔ = average directional return after the event minus the average for ANY bar in the same direction and "
+            "horizon (so a rising market doesn't count as an edge). w = win rate of the ±1 ATR race, in brackets the "
+            "difference vs baseline in points. 💡 = Δ at least 3 se AND win rate at least 2 z above baseline (n ≥ 30); "
+            "🔻 = the opposite, i.e. the event is a bad time to enter that way. "
+            "Roughly 170 numbers are tested per full run, so a lone 💡 can be luck - look for the SAME event holding on "
+            "both pairs and both timeframes. Events within 24 bars of each other share price moves, so the real sample "
+            "is smaller than n."
+        )
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"smcsim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 

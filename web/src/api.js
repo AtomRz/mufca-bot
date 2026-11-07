@@ -147,6 +147,8 @@ export const api = {
     request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runCompSim: ({ ticker, tf, numBars = 3000, minSamples = 30 } = {}) =>
     request('/api/compsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, min_samples: minSamples }) }),
+  runSmcSim: ({ ticker, tf, numBars = 6000 } = {}) =>
+    request('/api/smcsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runAutoFilter: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
     request('/api/autofilter', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
   runIndicatorOptimize: ({ ticker, tf, numBars = 3000, trials = 60 } = {}) =>
