@@ -23,6 +23,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 import config as _cfg
+import smc
 from utils import format_price
 from market_structure import (
     calc_support_resistance,
@@ -62,6 +63,11 @@ THEME = {
     "mfi_os": "#26a641",
     "demand": "#00d4a8",
     "supply": "#ff4d8d",
+    # 🆕 market-structure overlay (smc.py) - visual only
+    "smc_bos": "#8ab4f8",
+    "smc_choch": "#f0f6fc",
+    "smc_fvg_bull": "#4aa3ff",
+    "smc_fvg_bear": "#b07cff",
 }
 
 _VP_STRIP_FRAC = 0.16
@@ -168,6 +174,78 @@ def _draw_zones(
             )
 
 
+def _prepare_smc_positions(overlay: Dict[str, List[Dict]], display_start: int) -> Dict[str, List[Dict]]:
+    """Maps smc.structure_overlay() row indices onto the displayed window's x-axis."""
+    breaks: List[Dict] = []
+    for source in overlay.get("breaks", []):
+        item = dict(source)
+        item["chart_start"] = int(source["start_idx"] - display_start)
+        item["chart_end"] = int(source["end_idx"] - display_start)
+        if item["chart_end"] < 0:
+            continue  # the break happened before the visible window
+        breaks.append(item)
+    fvgs: List[Dict] = []
+    for source in overlay.get("fvgs", []):
+        item = dict(source)
+        item["chart_start"] = int(source["start_idx"] - display_start)
+        fvgs.append(item)  # an open gap runs to the right edge, so it is always visible
+    return {"breaks": breaks, "fvgs": fvgs}
+
+
+def _draw_smc_overlay(
+    ax,
+    overlay: Dict[str, List[Dict]],
+    x_start: float,
+    x_end: float,
+    theme: Dict,
+    y_lo: float,
+    y_hi: float,
+):
+    """BOS/CHoCH lines and still-open fair value gaps. Everything is kept inside the
+    visible candle price range [y_lo, y_hi]: a gap is clipped to it and a level outside
+    it is skipped, because patches/lines feed matplotlib's autoscale and a far-away
+    item would stretch the y-axis and squash the candles."""
+    lo, hi = y_lo, y_hi
+
+    for gap in overlay.get("fvgs", []):
+        low = float(gap.get("low", 0.0))
+        high = float(gap.get("high", 0.0))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            continue
+        low, high = max(low, lo), min(high, hi)
+        if high <= low:
+            continue  # nothing of it is inside the visible price range
+        color = theme["smc_fvg_bull"] if gap.get("direction", 1) > 0 else theme["smc_fvg_bear"]
+        start = max(x_start, min(float(gap.get("chart_start", 0)), x_end))
+        ax.add_patch(Rectangle(
+            (start, low), max(0.75, x_end - start), high - low,
+            facecolor=color, edgecolor=color, linewidth=0.6, alpha=0.16, zorder=1.7,
+        ))
+        ax.text(
+            start + 0.3, (low + high) / 2.0, "FVG", color=color, fontsize=6, va="center", ha="left",
+            fontweight="bold", zorder=9, clip_on=True,
+        )
+
+    for brk in overlay.get("breaks", []):
+        level = float(brk.get("level", 0.0))
+        if not np.isfinite(level) or level < lo or level > hi:
+            continue
+        start = max(x_start, float(brk.get("chart_start", 0)))
+        end = float(brk.get("chart_end", 0))
+        if end <= start:
+            continue
+        is_choch = brk.get("kind") == "choch"
+        color = theme["smc_choch"] if is_choch else theme["smc_bos"]
+        ax.hlines(level, start, end, colors=color, linewidth=1.0,
+                  linestyles=":" if is_choch else "--", alpha=0.95, zorder=7.5)
+        ax.text(
+            (start + end) / 2.0, level, "CHoCH" if is_choch else "BOS", color=color, fontsize=6.5,
+            ha="center", va="bottom" if brk.get("direction", 1) > 0 else "top", fontweight="bold",
+            bbox=dict(facecolor=theme["bg2"], edgecolor="none", pad=0.8, alpha=0.7),
+            zorder=9, clip_on=True,
+        )
+
+
 def _build_chart_impl(
     df: pd.DataFrame,
     symbol: str,
@@ -189,6 +267,7 @@ def _build_chart_impl(
     limit: int = 50,
     volume_profile: Optional[Dict] = None,
     demand_supply_zones: Optional[Dict[str, List[Dict]]] = None,
+    smc_overlay: Optional[Dict[str, List[Dict]]] = None,
 ) -> io.BytesIO:
     """Build the chart PNG and return it as a BytesIO object (see build_chart)."""
     original_display_len = len(df)
@@ -275,6 +354,12 @@ def _build_chart_impl(
 
     if demand_supply_zones:
         _draw_zones(ax_c, demand_supply_zones, n, x_start, x_end, T)
+
+    # 🆕 market-structure overlay (smc.py): BOS/CHoCH lines and open FVGs, visual only
+    has_smc_breaks = bool(smc_overlay and smc_overlay.get("breaks"))
+    has_smc_fvgs = bool(smc_overlay and smc_overlay.get("fvgs"))
+    if has_smc_breaks or has_smc_fvgs:
+        _draw_smc_overlay(ax_c, smc_overlay, x_start, x_end, T, float(df["low"].min()), float(df["high"].max()))
 
     vp_x_end = x_end - (x_end - x_start) * _VP_STRIP_FRAC
     if volume_profile and volume_profile.get("poc") is not None:
@@ -380,6 +465,12 @@ def _build_chart_impl(
         Line2D([0], [0], color=T["demand"], linewidth=5, alpha=0.55, label="Demand zone"),
         Line2D([0], [0], color=T["supply"], linewidth=5, alpha=0.55, label="Supply zone"),
     ]
+    if has_smc_breaks:
+        legend_elements.append(Line2D([0], [0], color=T["smc_bos"], linewidth=1.0, linestyle="--", label="BOS"))
+        legend_elements.append(Line2D([0], [0], color=T["smc_choch"], linewidth=1.0, linestyle=":", label="CHoCH"))
+    if has_smc_fvgs:
+        legend_elements.append(Line2D([0], [0], color=T["smc_fvg_bull"], linewidth=5, alpha=0.5, label="FVG (bull)"))
+        legend_elements.append(Line2D([0], [0], color=T["smc_fvg_bear"], linewidth=5, alpha=0.5, label="FVG (bear)"))
     if entry_price:
         legend_elements.append(Line2D([0], [0], color=T["entry"], linewidth=1.2, label="Entry"))
     if volume_profile and volume_profile.get("poc") is not None:
@@ -527,6 +618,15 @@ async def generate_chart(
     display_start = max(0, len(df) - limit)
     positioned_zones = _prepare_zone_positions(zone_data, len(df), display_start, zone_lookback)
 
+    # 🆕 BOS/CHoCH + open FVGs, from CLOSED bars (the forming candle isn't final) -
+    # same smc.overlay_from_config() the web chart uses, so both show the same lines.
+    smc_overlay = None
+    if _cfg_value("SMC_OVERLAY_ENABLED", False):
+        try:
+            smc_overlay = _prepare_smc_positions(smc.overlay_from_config(df.iloc[:-1], _cfg), display_start)
+        except Exception as e:
+            logger.warning(f"SMC overlay failed for {symbol} {timeframe}: {e}")
+
     entry_price = None
     tp_price = None
     tp1_price = None
@@ -586,4 +686,5 @@ async def generate_chart(
         limit=limit,
         volume_profile=volume_profile,
         demand_supply_zones=positioned_zones,
+        smc_overlay=smc_overlay,
     )
