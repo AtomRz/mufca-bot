@@ -1352,6 +1352,7 @@ async def get_config():
             "min_displacement_atr": _cfg.ZONE_MIN_DISPLACEMENT_ATR,
             "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
         },
+        "smc_overlay": _smc_overlay_settings(),
         "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
         "pairs": _cfg.TICKERS,
@@ -2155,6 +2156,72 @@ async def set_zones(body: ZonesIn):
         "min_displacement_atr": _cfg.ZONE_MIN_DISPLACEMENT_ATR,
         "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
     }
+
+
+# =====================================================================
+# 🧭  SMC OVERLAY — BOS/CHoCH lines and open FVGs on the charts, purely visual
+# =====================================================================
+def _smc_overlay_settings() -> dict:
+    return {
+        "enabled": _cfg.SMC_OVERLAY_ENABLED,
+        "show_breaks": _cfg.SMC_OVERLAY_SHOW_BREAKS,
+        "show_fvg": _cfg.SMC_OVERLAY_SHOW_FVG,
+        "swing_n": _cfg.SMC_OVERLAY_SWING_N,
+        "lookback": _cfg.SMC_OVERLAY_LOOKBACK,
+        "max_breaks": _cfg.SMC_OVERLAY_MAX_BREAKS,
+        "max_fvgs": _cfg.SMC_OVERLAY_MAX_FVGS,
+    }
+
+
+class SmcOverlayIn(BaseModel):
+    enabled: Optional[bool] = None
+    show_breaks: Optional[bool] = None
+    show_fvg: Optional[bool] = None
+    swing_n: Optional[int] = None
+    lookback: Optional[int] = None
+    max_breaks: Optional[int] = None
+    max_fvgs: Optional[int] = None
+
+
+@app.post("/api/config/smc-overlay")
+async def set_smc_overlay(body: SmcOverlayIn):
+    """Chart overlay of smc.structure_overlay(): BOS/CHoCH break lines and still-open
+    fair value gaps on the web chart and the Discord !chart picture. VISUAL ONLY - the
+    !smcsim study found no tradable edge, so nothing here affects entries, filters,
+    TP/SL or confidence, and nothing needs a state reset: the next chart request
+    simply uses the new values."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+
+    # Validate everything first, apply only once everything passes
+    if "swing_n" in updates and not (2 <= updates["swing_n"] <= 10):
+        raise HTTPException(400, "swing_n must be between 2 and 10")
+    if "lookback" in updates and not (50 <= updates["lookback"] <= 1000):
+        raise HTTPException(400, "lookback must be between 50 and 1000")
+    if "max_breaks" in updates and not (1 <= updates["max_breaks"] <= 20):
+        raise HTTPException(400, "max_breaks must be between 1 and 20")
+    if "max_fvgs" in updates and not (1 <= updates["max_fvgs"] <= 20):
+        raise HTTPException(400, "max_fvgs must be between 1 and 20")
+
+    if "enabled" in updates:
+        _cfg.SMC_OVERLAY_ENABLED = updates["enabled"]
+    if "show_breaks" in updates:
+        _cfg.SMC_OVERLAY_SHOW_BREAKS = updates["show_breaks"]
+    if "show_fvg" in updates:
+        _cfg.SMC_OVERLAY_SHOW_FVG = updates["show_fvg"]
+    if "swing_n" in updates:
+        _cfg.SMC_OVERLAY_SWING_N = updates["swing_n"]
+    if "lookback" in updates:
+        _cfg.SMC_OVERLAY_LOOKBACK = updates["lookback"]
+    if "max_breaks" in updates:
+        _cfg.SMC_OVERLAY_MAX_BREAKS = updates["max_breaks"]
+    if "max_fvgs" in updates:
+        _cfg.SMC_OVERLAY_MAX_FVGS = updates["max_fvgs"]
+
+    _cfg.save_smc_overlay_config(_smc_overlay_settings())
+    await broadcast_event({"type": "config_changed", "key": "smc_overlay"})
+    return _smc_overlay_settings()
 
 
 # =====================================================================

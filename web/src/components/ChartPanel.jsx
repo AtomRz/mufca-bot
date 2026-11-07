@@ -21,6 +21,11 @@ const DEFAULT_COLORS = {
   signal_short: '#f2637a',
   demand_zone: '#45d0a5',
   supply_zone: '#f2637a',
+  // 🆕 market-structure overlay (smc.py) — visual only, same colours as the Discord picture
+  smc_bos: '#8ab4f8',
+  smc_choch: '#f0f6fc',
+  smc_fvg_bull: '#4aa3ff',
+  smc_fvg_bear: '#b07cff',
 }
 
 function hexToRgba(hex, alpha) {
@@ -47,6 +52,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
   const canvasRef = useRef(null) // 🆕 overlay canvas for the volume-profile histogram
   const vpDataRef = useRef(null) // 🆕 latest { poc, vah, val, bins } for on-demand redraw
   const zonesDataRef = useRef(null) // 🆕 latest { demand, supply } for on-demand label redraw
+  const smcLabelsRef = useRef(null) // 🆕 latest { breaks: [...], fvgs: [...] } label anchors for the SMC overlay
   const lastSelectionKeyRef = useRef(null) // 🆕 only changes on ticker/tf/track change
   const [track, setTrack] = useState('a')
   const [barsLimit, setBarsLimit] = useState(100)
@@ -199,6 +205,35 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
       zones?.demand?.forEach((z) => drawZoneLabel(z, 'demand'))
       zones?.supply?.forEach((z) => drawZoneLabel(z, 'supply'))
     }
+
+    // 🆕 SMC overlay labels (BOS / CHoCH centred on their line, FVG at the gap's left end)
+    const smcLabels = smcLabelsRef.current
+    if (s.candle && chartRef.current && (smcLabels?.breaks?.length || smcLabels?.fvgs?.length)) {
+      const timeScale = chartRef.current.timeScale()
+      ctx.font = '600 9px system-ui, sans-serif'
+      ctx.textBaseline = 'middle'
+      smcLabels.breaks.forEach((b) => {
+        const y = s.candle.priceToCoordinate(b.level)
+        const x1 = timeScale.timeToCoordinate(b.t1)
+        const x2 = timeScale.timeToCoordinate(b.t2)
+        if (y === null || x1 === null || x2 === null || y < 0 || y > height) return
+        const x = (Math.max(0, x1) + Math.min(width, x2)) / 2
+        const textWidth = ctx.measureText(b.text).width
+        ctx.textAlign = 'center'
+        ctx.fillStyle = 'rgba(19,25,34,0.75)'
+        ctx.fillRect(x - textWidth / 2 - 3, (b.up ? y - 15 : y + 3), textWidth + 6, 12)
+        ctx.fillStyle = b.color
+        ctx.fillText(b.text, x, b.up ? y - 9 : y + 9)
+      })
+      ctx.textAlign = 'left'
+      smcLabels.fvgs.forEach((g) => {
+        const y = s.candle.priceToCoordinate(g.mid)
+        const x = timeScale.timeToCoordinate(g.time)
+        if (y === null || x === null || y < 0 || y > height) return
+        ctx.fillStyle = g.color
+        ctx.fillText('FVG', Math.max(0, x) + 4, y)
+      })
+    }
   }, [C])
 
   // Always-fresh ref so mount-once chart subscriptions (below) call the
@@ -313,7 +348,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     })
     mfi.priceScale().applyOptions({ scaleMargins: { top: 0.66, bottom: 0 }, visible: true })
 
-    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [], vpZone: null, vpLine: null, dsZones: [] }
+    seriesRef.current = { candle, framaMid, framaUpper, framaLower, bbUpper, bbLower, volume, mfi, srLines: [], srZones: [], tradeLines: [], mfiLines: [], vpZone: null, vpLine: null, dsZones: [], smcLines: [], smcZones: [] }
 
     const handleResize = () => {
       if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth })
@@ -456,6 +491,11 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     s.dsZones?.forEach((zone) => {
       try { chartRef.current.removeSeries(zone) } catch (_) {}
     })
+    ;[...(s.smcLines || []), ...(s.smcZones || [])].forEach((series) => {
+      try { chartRef.current.removeSeries(series) } catch (_) {}
+    })
+    s.smcLines = []
+    s.smcZones = []
     if (s.vpLine) {
       try { s.candle.removePriceLine(s.vpLine) } catch (_) {}
       s.vpLine = null
@@ -517,6 +557,44 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     dsz?.supply?.forEach((z) => {
       s.dsZones.push(bandZone(z.low, z.high, hexToRgba(C.supply_zone, zoneAlpha(z.score, z.state)), z.start_time))
     })
+
+    // 🆕 Market-structure overlay (smc.py, visual only — the !smcsim study found no tradable
+    // edge in these events). data.smc_overlay is null when the feature is off. Open fair
+    // value gaps are bands running to the right edge (same bandZone as the zones above);
+    // BOS/CHoCH are short horizontal lines from the swing that formed the level to the bar
+    // that closed beyond it. The label anchors are kept for the canvas overlay, clamped to
+    // the candles actually shown.
+    const smc = data.smc_overlay
+    const smcLabels = { breaks: [], fvgs: [] }
+    smc?.fvgs?.forEach((g) => {
+      const color = g.direction > 0 ? C.smc_fvg_bull : C.smc_fvg_bear
+      s.smcZones.push(bandZone(g.low, g.high, hexToRgba(color, 0.16), g.start_time))
+      const firstShown = times.find((t) => t >= g.start_time)
+      if (firstShown != null) smcLabels.fvgs.push({ time: firstShown, mid: (g.low + g.high) / 2, color })
+    })
+    smc?.breaks?.forEach((b) => {
+      const seg = times.filter((t) => t >= b.start_time && t <= b.end_time)
+      if (seg.length < 2) return // the break lies outside the shown candles
+      const isChoch = b.kind === 'choch'
+      const color = isChoch ? C.smc_choch : C.smc_bos
+      const line = chartRef.current.addLineSeries({
+        color,
+        lineWidth: 1,
+        lineStyle: isChoch ? LineStyle.Dotted : LineStyle.Dashed,
+        priceScaleId: 'right',
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        autoscaleInfoProvider: () => null, // context, not data: must not stretch the price scale
+      })
+      line.setData(seg.map((t) => ({ time: t, value: b.level })))
+      s.smcLines.push(line)
+      smcLabels.breaks.push({
+        t1: seg[0], t2: seg[seg.length - 1], level: b.level, color,
+        text: isChoch ? 'CHoCH' : 'BOS', up: b.direction > 0,
+      })
+    })
+    smcLabelsRef.current = smcLabels
 
     // 🆕 Volume Profile: Value Area band + POC line. Deliberately drawn with
     // its own distinct color (C.poc), not reusing the support/resistance
@@ -623,6 +701,14 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
         <span><span className="legend-dot" style={{ background: C.demand_zone }} />Demand Zone</span>
         <span><span className="legend-dot" style={{ background: C.supply_zone }} />Supply Zone</span>
+        {data?.smc_overlay && (
+          <>
+            <span><span className="legend-dot" style={{ background: C.smc_bos }} />BOS</span>
+            <span><span className="legend-dot" style={{ background: C.smc_choch }} />CHoCH</span>
+            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bull, 0.6) }} />FVG (bull)</span>
+            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bear, 0.6) }} />FVG (bear)</span>
+          </>
+        )}
         <span><span className="legend-dot" style={{ background: C.poc }} />POC / Value Area</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>

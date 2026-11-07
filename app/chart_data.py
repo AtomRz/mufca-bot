@@ -25,6 +25,7 @@ from indicators import (
 )
 from chart import calc_bollinger_bands, calc_support_resistance, calc_volume_profile
 from market_structure import detect_demand_supply_zones, zone_absolute_index
+import smc
 # 🆕 Signal/filter lamps in the top bar: reuses the exact same crossover/
 # bars_since helpers and get_htf_bias that signals.check_signals uses, so the
 # UI lamps match EXACTLY the logic that actually decides whether a trade
@@ -177,6 +178,32 @@ async def get_chart_data(
         except Exception as e:
             logger.warning(f"[CHART_DATA] {symbol} {timeframe}: demand/supply zone detection failed: {e}")
 
+    # 🆕 Market-structure overlay (smc.py): BOS/CHoCH lines and still-open fair value
+    # gaps. VISUAL ONLY - the !smcsim study found no edge in these events, so nothing
+    # reads this for entries/filters. None = feature off, which also hides its legend
+    # entries on the web chart. Calculated on CLOSED bars (the forming candle's
+    # high/low/close are not final); lightweight-charts plots by time, so indices
+    # become unix seconds here, like the zones above.
+    smc_overlay: Optional[Dict[str, List[Dict]]] = None
+    if config.SMC_OVERLAY_ENABLED:
+        smc_overlay = {"breaks": [], "fvgs": []}
+        try:
+            closed = df.iloc[:-1]
+            ov = smc.overlay_from_config(closed, config)
+            ts = closed["timestamp"].to_numpy()
+            for b in ov["breaks"]:
+                smc_overlay["breaks"].append({
+                    "kind": b["kind"], "direction": b["direction"], "level": round(float(b["level"]), 8),
+                    "start_time": int(ts[b["start_idx"]] // 1000), "end_time": int(ts[b["end_idx"]] // 1000),
+                })
+            for g in ov["fvgs"]:
+                smc_overlay["fvgs"].append({
+                    "direction": g["direction"], "low": round(float(g["low"]), 8), "high": round(float(g["high"]), 8),
+                    "start_time": int(ts[g["start_idx"]] // 1000),
+                })
+        except Exception as e:
+            logger.warning(f"[CHART_DATA] {symbol} {timeframe}: SMC overlay failed: {e}")
+
     candles = [
         {
             "time": int(row.timestamp // 1000),  # unix seconds — for lightweight-charts
@@ -206,6 +233,7 @@ async def get_chart_data(
         "resistance": sr["resistance"],
         "volume_profile": vp,
         "demand_supply_zones": demand_supply_zones,
+        "smc_overlay": smc_overlay,
     }
 
     # ── Active trade (if state_snapshot was passed from !status/state) ──

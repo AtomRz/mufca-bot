@@ -184,6 +184,8 @@ export const api = {
     request('/api/config/volume-profile', { method: 'POST', body: JSON.stringify(patch) }),
   setZones: (patch) =>
     request('/api/config/zones', { method: 'POST', body: JSON.stringify(patch) }),
+  setSmcOverlay: (patch) =>
+    request('/api/config/smc-overlay', { method: 'POST', body: JSON.stringify(patch) }),
   getHistorySummary: () => request('/api/history/summary'),
   getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30) =>
     request(

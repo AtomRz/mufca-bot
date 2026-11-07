@@ -216,6 +216,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const saveColor = (field, value) => run(`col_${field}`, () => api.setColors({ [field]: value }))
   const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
   const saveZones = (field, value) => run(`zones_${field}`, () => api.setZones({ [field]: value }))
+  const saveSmc = (field, value) => run(`smc_${field}`, () => api.setSmcOverlay({ [field]: value }))
 
   return (
     <div>
@@ -810,6 +811,69 @@ export default function SettingsPanel({ config, onChanged }) {
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               Shown on the Chart tab (Discord and web) as colored bands with a state label (fresh/tested/weakened/broken).
               Not yet read by confidence scoring or TP capping — informational only, same as Volume Profile above.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">Market structure (BOS / CHoCH / FVG)</h3>
+            <div className="toggle-row">
+              <span className="row-label" title="Draws break-of-structure / change-of-character lines and still-open fair value gaps on the chart. Off by default.">
+                Enabled
+              </span>
+              <Toggle
+                checked={config.smc_overlay?.enabled ?? false}
+                disabled={busy === 'smc_enabled'}
+                onChange={(v) => saveSmc('enabled', v)}
+              />
+            </div>
+            <div className="toggle-row">
+              <span className="row-label" title="BOS = close beyond the last swing high/low in the direction of the prevailing structure; CHoCH = the same break against it.">
+                BOS / CHoCH lines
+              </span>
+              <Toggle
+                checked={config.smc_overlay?.show_breaks ?? true}
+                disabled={busy === 'smc_show_breaks'}
+                onChange={(v) => saveSmc('show_breaks', v)}
+              />
+            </div>
+            <div className="toggle-row">
+              <span className="row-label" title="A three-candle gap that price has not fully traded back through since; a partly filled gap shows only the part still open.">
+                Open fair value gaps
+              </span>
+              <Toggle
+                checked={config.smc_overlay?.show_fvg ?? true}
+                disabled={busy === 'smc_show_fvg'}
+                onChange={(v) => saveSmc('show_fvg', v)}
+              />
+            </div>
+            <NumberField
+              label="Swing length" hint="2–10 bars on each side that confirm a swing high/low; bigger = fewer, more significant breaks"
+              value={config.smc_overlay?.swing_n ?? 5}
+              min={2} max={10} busyKey="smc_swing_n" busy={busy}
+              onSave={(v) => saveSmc('swing_n', v)}
+            />
+            <NumberField
+              label="Lookback" hint="50–1000 closed bars the structure is calculated over"
+              value={config.smc_overlay?.lookback ?? 300}
+              min={50} max={1000} busyKey="smc_lookback" busy={busy}
+              onSave={(v) => saveSmc('lookback', v)}
+            />
+            <NumberField
+              label="Max break lines" hint="1–20, most recent kept"
+              value={config.smc_overlay?.max_breaks ?? 6}
+              min={1} max={20} busyKey="smc_max_breaks" busy={busy}
+              onSave={(v) => saveSmc('max_breaks', v)}
+            />
+            <NumberField
+              label="Max open gaps" hint="1–20, most recent kept"
+              value={config.smc_overlay?.max_fvgs ?? 6}
+              min={1} max={20} busyKey="smc_max_fvgs" busy={busy}
+              onSave={(v) => saveSmc('max_fvgs', v)}
+            />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              Shown on the Chart tab (Discord and web), calculated on closed candles only. Purely visual: the Insights →
+              Simulate "SMC event study" found no tradable edge in these events, so nothing here is read by signals,
+              filters, TP/SL or confidence.
             </p>
           </div>
 

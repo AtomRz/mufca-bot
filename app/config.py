@@ -800,6 +800,38 @@ ZONE_MAX_BASE_ATR = _zone_config["max_base_atr"]
 ZONE_MIN_DISPLACEMENT_ATR = _zone_config["min_displacement_atr"]
 ZONE_MIN_VOLUME_RATIO = _zone_config["min_volume_ratio"]
 
+# 🆕 Market-structure overlay (smc.structure_overlay()): BOS/CHoCH break lines and
+# still-open fair value gaps on the web chart and the Discord !chart picture.
+# VISUAL ONLY - the !smcsim event study found no tradable edge in these events, so
+# nothing here feeds entries, filters, TP/SL or confidence. Off by default; same
+# persisted-JSON pattern as the zones above, editable at runtime via
+# /api/config/smc-overlay, applied on the next chart request (no restart, no state reset).
+SMC_OVERLAY_FILE = os.path.join(DATA_DIR, "smc_overlay.json")
+_SMC_OVERLAY_DEFAULTS = {
+    "enabled": False,
+    "show_breaks": True,    # BOS / CHoCH lines
+    "show_fvg": True,       # still-open fair value gaps
+    "swing_n": 5,           # bars on each side that confirm a swing high/low (bigger = fewer, more significant breaks)
+    "lookback": 300,        # closed bars the structure is calculated over
+    "max_breaks": 6,        # most recent break lines kept
+    "max_fvgs": 6,          # most recent open gaps kept
+}
+
+def load_smc_overlay_config() -> dict:
+    return _load_typed(SMC_OVERLAY_FILE, _SMC_OVERLAY_DEFAULTS)
+
+def save_smc_overlay_config(data: dict):
+    safe_json_save(SMC_OVERLAY_FILE, data)
+
+_smc_overlay_config = load_smc_overlay_config()
+SMC_OVERLAY_ENABLED = _smc_overlay_config["enabled"]
+SMC_OVERLAY_SHOW_BREAKS = _smc_overlay_config["show_breaks"]
+SMC_OVERLAY_SHOW_FVG = _smc_overlay_config["show_fvg"]
+SMC_OVERLAY_SWING_N = _smc_overlay_config["swing_n"]
+SMC_OVERLAY_LOOKBACK = _smc_overlay_config["lookback"]
+SMC_OVERLAY_MAX_BREAKS = _smc_overlay_config["max_breaks"]
+SMC_OVERLAY_MAX_FVGS = _smc_overlay_config["max_fvgs"]
+
 # =====================================================================
 # 📊  VOLUME PROFILE (POC / Value Area)
 # =====================================================================

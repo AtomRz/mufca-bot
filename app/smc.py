@@ -7,6 +7,10 @@ TP/SL, confidence or any filter. It answers one question: do SMC events
 shift after a sweep, fair value gaps) carry any forward edge on OUR pairs and
 timeframes, compared with simply being in the market?
 
+The same detection also drives structure_overlay(): a purely visual BOS/CHoCH-line
+and open-FVG overlay for the web and Discord charts, added after the study found no
+tradable edge in these events (so it is drawing, not signalling).
+
 How the study works
   1. detect_events() walks the candles once, bar by bar, keeping only what a
      live bot would know at that bar's close (see "No look-ahead" below).
@@ -115,7 +119,8 @@ def _num(x, digits: int = 4):
 # =====================================================================
 
 def detect_events(df: pd.DataFrame, swing_n: int = SWING_N, mss_window: int = MSS_WINDOW,
-                  fvg_min_atr: float = FVG_MIN_ATR) -> Tuple[List[Tuple[int, str, float]], np.ndarray]:
+                  fvg_min_atr: float = FVG_MIN_ATR,
+                  collect: Optional[Dict[str, list]] = None) -> Tuple[List[Tuple[int, str, float]], np.ndarray]:
     """Returns ([(bar_index, event_name, dealing_range_position), ...], atr).
 
     dealing_range_position = (close - last swing low) / (last swing high - last swing low),
@@ -123,7 +128,15 @@ def detect_events(df: pd.DataFrame, swing_n: int = SWING_N, mss_window: int = MS
     exists yet. < 0.5 is "discount", >= 0.5 is "premium".
 
     Only closed candles may be passed in (the caller drops the forming bar).
+
+    `collect`: optional dict used by structure_overlay() to also receive the
+    geometry needed for drawing - it gets "breaks" (kind, direction, level,
+    origin_idx, break_idx) and "fvgs" (direction, low, high, idx) lists. Passing
+    it changes nothing about the returned events, so the study is unaffected.
     """
+    if collect is not None:
+        collect.setdefault("breaks", [])
+        collect.setdefault("fvgs", [])
     high = df["high"].to_numpy(dtype=float)
     low = df["low"].to_numpy(dtype=float)
     close = df["close"].to_numpy(dtype=float)
@@ -132,6 +145,7 @@ def detect_events(df: pd.DataFrame, swing_n: int = SWING_N, mss_window: int = MS
 
     events: List[Tuple[int, str, float]] = []
     last_sh = last_sl = np.nan
+    last_sh_idx = last_sl_idx = -1     # bar index of the pivot that formed each level
     sh_broken = sl_broken = True      # nothing to break until a pivot exists
     sh_swept = sl_swept = True
     trend = 0                          # +1 last break was up, -1 down, 0 unknown
@@ -155,13 +169,21 @@ def detect_events(df: pd.DataFrame, swing_n: int = SWING_N, mss_window: int = MS
         # 2) breaks (close beyond the level)
         if not sh_broken and close[t] > last_sh:
             sh_broken = True
-            events.append((t, "choch_up" if trend < 0 else "bos_up", pos))
+            kind = "choch" if trend < 0 else "bos"
+            events.append((t, f"{kind}_up", pos))
+            if collect is not None:
+                collect["breaks"].append({"kind": kind, "direction": 1, "level": float(last_sh),
+                                          "origin_idx": last_sh_idx, "break_idx": t})
             trend = 1
             if 0 <= t - last_sweep_lo <= mss_window:
                 events.append((t, "sweep_mss_long", pos))
         if not sl_broken and close[t] < last_sl:
             sl_broken = True
-            events.append((t, "choch_down" if trend > 0 else "bos_down", pos))
+            kind = "choch" if trend > 0 else "bos"
+            events.append((t, f"{kind}_down", pos))
+            if collect is not None:
+                collect["breaks"].append({"kind": kind, "direction": -1, "level": float(last_sl),
+                                          "origin_idx": last_sl_idx, "break_idx": t})
             trend = -1
             if 0 <= t - last_sweep_hi <= mss_window:
                 events.append((t, "sweep_mss_short", pos))
@@ -170,18 +192,118 @@ def detect_events(df: pd.DataFrame, swing_n: int = SWING_N, mss_window: int = MS
         if t >= 2 and np.isfinite(atr[t]) and atr[t] > 0:
             if low[t] - high[t - 2] > fvg_min_atr * atr[t]:
                 events.append((t, "fvg_bull", pos))
+                if collect is not None:
+                    collect["fvgs"].append({"direction": 1, "low": float(high[t - 2]), "high": float(low[t]), "idx": t})
             if low[t - 2] - high[t] > fvg_min_atr * atr[t]:
                 events.append((t, "fvg_bear", pos))
+                if collect is not None:
+                    collect["fvgs"].append({"direction": -1, "low": float(high[t]), "high": float(low[t - 2]), "idx": t})
 
         # 4) register the pivot that THIS bar confirms (pivot bar = t - swing_n)
         p = t - swing_n
         if p >= swing_n:
             if high[p] > high[p - swing_n:p].max() and high[p] >= high[p + 1:t + 1].max():
-                last_sh, sh_broken, sh_swept = high[p], False, False
+                last_sh, sh_broken, sh_swept, last_sh_idx = high[p], False, False, p
             if low[p] < low[p - swing_n:p].min() and low[p] <= low[p + 1:t + 1].min():
-                last_sl, sl_broken, sl_swept = low[p], False, False
+                last_sl, sl_broken, sl_swept, last_sl_idx = low[p], False, False, p
 
     return events, atr
+
+
+# =====================================================================
+# Chart overlay: BOS/CHoCH lines and unfilled fair value gaps
+# =====================================================================
+# Purely visual. The event study found no tradable edge in these events, so
+# nothing here feeds entries, filters, TP/SL or confidence - it only gives the
+# charts (web and Discord) something to draw. Defaults live in config.py's
+# smc_overlay.json; these are the fallbacks for callers that pass nothing.
+OVERLAY_SWING_N = 5
+OVERLAY_LOOKBACK = 300
+OVERLAY_MAX_BREAKS = 6
+OVERLAY_MAX_FVGS = 6
+
+
+def structure_overlay(df: pd.DataFrame, swing_n: int = OVERLAY_SWING_N, lookback: int = OVERLAY_LOOKBACK,
+                      max_breaks: int = OVERLAY_MAX_BREAKS, max_fvgs: int = OVERLAY_MAX_FVGS,
+                      fvg_min_atr: float = FVG_MIN_ATR) -> Dict[str, List[Dict]]:
+    """Drawing data for the chart, from CLOSED candles only (drop the forming bar).
+
+    Returns {"breaks": [...], "fvgs": [...]} with indices into the rows of `df`:
+      breaks: {"kind": "bos"|"choch", "direction": +1|-1, "level",
+               "start_idx" (bar of the swing that formed the level), "end_idx" (bar that closed beyond it)}
+              - the last `max_breaks`, oldest first. BOS = break in the direction of the
+              prevailing structure (or the first one seen), CHoCH = break against it.
+      fvgs:   {"direction": +1|-1, "low", "high", "start_idx" (middle candle of the gap)}
+              - only gaps price has not fully traded back through since; a partly
+              filled gap is shrunk to the part still open. The last `max_fvgs`, oldest first.
+
+    Structure state starts fresh at the first bar of the `lookback` window, so the
+    first break inside it may be labelled BOS even if it was a CHoCH in the longer
+    picture. Same no-look-ahead rules as the study (see module docstring); the FVG
+    "still open" test of course looks at the bars after the gap - that is drawing
+    history, not a signal."""
+    n_all = len(df)
+    swing_n = max(1, int(swing_n))
+    if n_all < max(30, 2 * swing_n + 5):
+        return {"breaks": [], "fvgs": []}
+
+    offset = max(0, n_all - max(30, int(lookback)))
+    sub = df.iloc[offset:].reset_index(drop=True)
+    collect: Dict[str, list] = {}
+    detect_events(sub, swing_n=swing_n, fvg_min_atr=fvg_min_atr, collect=collect)
+    high = sub["high"].to_numpy(dtype=float)
+    low = sub["low"].to_numpy(dtype=float)
+
+    breaks: List[Dict] = []
+    for b in collect["breaks"]:
+        if b["origin_idx"] < 0:
+            continue
+        breaks.append({
+            "kind": b["kind"], "direction": b["direction"], "level": b["level"],
+            "start_idx": b["origin_idx"] + offset, "end_idx": b["break_idx"] + offset,
+        })
+    breaks = breaks[-max(0, int(max_breaks)):] if max_breaks else []
+
+    fvgs: List[Dict] = []
+    for g in collect["fvgs"]:
+        t = g["idx"]
+        bottom, top = g["low"], g["high"]
+        if g["direction"] > 0:
+            later = low[t + 1:]
+            if len(later):
+                if later.min() <= bottom:
+                    continue                        # fully traded back through
+                top = min(top, float(later.min()))  # partly filled: keep the open part
+        else:
+            later = high[t + 1:]
+            if len(later):
+                if later.max() >= top:
+                    continue
+                bottom = max(bottom, float(later.max()))
+        if top <= bottom:
+            continue
+        fvgs.append({"direction": g["direction"], "low": bottom, "high": top, "start_idx": t - 1 + offset})
+    fvgs = fvgs[-max(0, int(max_fvgs)):] if max_fvgs else []
+
+    return {"breaks": breaks, "fvgs": fvgs}
+
+
+def overlay_from_config(df: pd.DataFrame, cfg) -> Dict[str, List[Dict]]:
+    """structure_overlay() driven by the SMC_OVERLAY_* settings of the config module
+    `cfg`, so the web chart and the Discord picture read one set of switches and
+    show the same lines. `df` = closed candles. Disabled -> empty overlay."""
+    empty: Dict[str, List[Dict]] = {"breaks": [], "fvgs": []}
+    if not cfg.SMC_OVERLAY_ENABLED:
+        return empty
+    ov = structure_overlay(
+        df, swing_n=cfg.SMC_OVERLAY_SWING_N, lookback=cfg.SMC_OVERLAY_LOOKBACK,
+        max_breaks=cfg.SMC_OVERLAY_MAX_BREAKS, max_fvgs=cfg.SMC_OVERLAY_MAX_FVGS,
+    )
+    if not cfg.SMC_OVERLAY_SHOW_BREAKS:
+        ov["breaks"] = []
+    if not cfg.SMC_OVERLAY_SHOW_FVG:
+        ov["fvgs"] = []
+    return ov
 
 
 # =====================================================================
