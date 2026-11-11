@@ -361,14 +361,20 @@ def _build_chart_impl(
     if has_smc_breaks or has_smc_fvgs:
         _draw_smc_overlay(ax_c, smc_overlay, x_start, x_end, T, float(df["low"].min()), float(df["high"].max()))
 
-    vp_x_end = x_end - (x_end - x_start) * _VP_STRIP_FRAC
+    # 🆕 histogram side: the POC line / Value Area band stop short of the strip the
+    # histogram occupies, so they span x_start..vp_x_end on the right and
+    # vp_x_start..x_end on the left
+    vp_left = bool(volume_profile and volume_profile.get("side") == "left")
+    strip = (x_end - x_start) * _VP_STRIP_FRAC
+    vp_x_start = x_start + strip if vp_left else x_start
+    vp_x_end = x_end if vp_left else x_end - strip
     if volume_profile and volume_profile.get("poc") is not None:
         vah = volume_profile.get("vah")
         val = volume_profile.get("val")
         poc = volume_profile["poc"]
         if vah is not None and val is not None:
-            ax_c.fill_between([x_start, vp_x_end], val, vah, alpha=0.06, color=T["poc"], zorder=1)
-        ax_c.hlines(poc, x_start, vp_x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
+            ax_c.fill_between([vp_x_start, vp_x_end], val, vah, alpha=0.06, color=T["poc"], zorder=1)
+        ax_c.hlines(poc, vp_x_start, vp_x_end, colors=T["poc"], linewidth=2.0, zorder=7, alpha=0.95)
         ax_c.text(
             n - 0.5, poc, f"POC {format_price(poc)}", color=T["poc"],
             fontsize=8, va="bottom", ha="right", fontweight="bold",
@@ -477,7 +483,8 @@ def _build_chart_impl(
         legend_elements.append(Line2D([0], [0], color=T["poc"], linewidth=1.6, label="POC / Value Area"))
     ax_c.legend(
         handles=legend_elements,
-        loc="upper left", fontsize=7,
+        # keep the legend off the histogram when the bars are on the left
+        loc="upper right" if (vp_left and volume_profile.get("bins")) else "upper left", fontsize=7,
         facecolor=T["bg"], edgecolor=T["grid"],
         labelcolor=T["text_dim"], framealpha=0.8,
         ncol=2,
@@ -490,7 +497,7 @@ def _build_chart_impl(
         if max_vol > 0:
             bbox = ax_c.get_position()
             profile_width = bbox.width * _VP_STRIP_FRAC
-            ax_vp = fig.add_axes([bbox.x1 - profile_width, bbox.y0, profile_width, bbox.height])
+            ax_vp = fig.add_axes([bbox.x0 if vp_left else bbox.x1 - profile_width, bbox.y0, profile_width, bbox.height])
             ax_vp.set_ylim(ax_c.get_ylim())
             ax_vp.axis("off")
             ax_vp.patch.set_alpha(0)
@@ -507,7 +514,7 @@ def _build_chart_impl(
                 width = (vol / max_vol) * 0.94
                 bar_color = T["poc"] if in_value_area else T["text_dim"]
                 bar_alpha = 0.55 if in_value_area else 0.18
-                ax_vp.barh(price, width, height=bin_height * 0.6, left=1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none")
+                ax_vp.barh(price, width, height=bin_height * 0.6, left=0.0 if vp_left else 1 - width, color=bar_color, alpha=bar_alpha, zorder=3, edgecolor="none")
             ax_vp.set_xlim(0, 1)
 
     vol_colors = [T["bull"] if df["close"].iloc[i] >= df["open"].iloc[i] else T["bear"] for i in range(n)]
@@ -597,6 +604,7 @@ async def generate_chart(
             bins=_cfg_value("VP_BINS", 50),
             value_area_pct=_cfg_value("VP_VALUE_AREA_PCT", 0.70),
         )
+        volume_profile["side"] = _cfg_value("VP_HISTOGRAM_SIDE", "right")
         if not _cfg_value("VP_SHOW_HISTOGRAM", True):
             volume_profile["bins"] = []
 

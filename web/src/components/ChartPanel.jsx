@@ -162,7 +162,10 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
       const maxVol = Math.max(...vp.bins.map((b) => b.volume))
       if (maxVol > 0) {
         const profileWidth = width * 0.14
-        const rightEdge = width - 2
+        // Settings → Volume Profile → Histogram side: bars grow from the left
+        // edge (rightwards) or from the right edge (leftwards)
+        const fromLeft = vp.side === 'left'
+        const edge = fromLeft ? 2 : width - 2
         const barHeight = Math.max(2, height / (vp.bins.length * 3))
         for (const b of vp.bins) {
           const y = s.candle.priceToCoordinate(b.price)
@@ -170,7 +173,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
           const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
           const barWidth = (b.volume / maxVol) * profileWidth
           ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : 'rgba(110,118,129,0.28)'
-          ctx.fillRect(rightEdge - barWidth, y - barHeight / 2, barWidth, barHeight)
+          ctx.fillRect(fromLeft ? edge : edge - barWidth, y - barHeight / 2, barWidth, barHeight)
         }
       }
     }

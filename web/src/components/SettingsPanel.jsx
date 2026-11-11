@@ -742,6 +742,19 @@ export default function SettingsPanel({ config, onChanged }) {
                 onChange={(v) => saveVp('show_histogram', v)}
               />
             </div>
+            <div className="field">
+              <label title="Which edge of the chart the histogram bars grow from — web chart and Discord !chart image.">
+                Histogram side
+              </label>
+              <select
+                value={config.volume_profile?.histogram_side ?? 'right'}
+                disabled={busy === 'vp_histogram_side'}
+                onChange={(e) => saveVp('histogram_side', e.target.value)}
+              >
+                <option value="left">Left</option>
+                <option value="right">Right</option>
+              </select>
+            </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               POC (Point of Control) and Value Area are a different kind of level from pivot support/resistance
               above — they mark where volume actually concentrated, not local price extremes. Complementary, not a replacement.

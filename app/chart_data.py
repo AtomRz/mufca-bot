@@ -124,6 +124,7 @@ async def get_chart_data(
         confirmed_df = df.iloc[:-1]
         vp_window = confirmed_df.tail(min(config.VP_LOOKBACK, len(confirmed_df)))
         vp = calc_volume_profile(vp_window, bins=config.VP_BINS, value_area_pct=config.VP_VALUE_AREA_PCT)
+        vp["side"] = config.VP_HISTOGRAM_SIDE  # which edge the web canvas anchors the bars to
         if not config.VP_SHOW_HISTOGRAM:
             vp["bins"] = []
         elif vp["bins"]:
