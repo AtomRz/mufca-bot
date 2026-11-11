@@ -1350,6 +1350,7 @@ async def get_config():
             "lookback": _cfg.VP_LOOKBACK,
             "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
             "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+            "histogram_side": _cfg.VP_HISTOGRAM_SIDE,
         },
         "zones": {
             "enabled": _cfg.ZONE_ENABLED,
@@ -2032,6 +2033,7 @@ class VolumeProfileIn(BaseModel):
     lookback: Optional[int] = None
     value_area_pct: Optional[float] = None
     show_histogram: Optional[bool] = None
+    histogram_side: Optional[str] = None  # "left" | "right"
 
 
 @app.post("/api/config/volume-profile")
@@ -2051,6 +2053,8 @@ async def set_volume_profile(body: VolumeProfileIn):
         raise HTTPException(400, "lookback must be between 50 and 2000")
     if "value_area_pct" in updates and not (0.5 <= updates["value_area_pct"] <= 0.95):
         raise HTTPException(400, "value_area_pct must be between 0.5 and 0.95")
+    if "histogram_side" in updates and updates["histogram_side"] not in _cfg.VP_HISTOGRAM_SIDES:
+        raise HTTPException(400, "histogram_side must be 'left' or 'right'")
 
     if "enabled" in updates:
         _cfg.VP_ENABLED = updates["enabled"]
@@ -2062,6 +2066,8 @@ async def set_volume_profile(body: VolumeProfileIn):
         _cfg.VP_VALUE_AREA_PCT = updates["value_area_pct"]
     if "show_histogram" in updates:
         _cfg.VP_SHOW_HISTOGRAM = updates["show_histogram"]
+    if "histogram_side" in updates:
+        _cfg.VP_HISTOGRAM_SIDE = updates["histogram_side"]
 
     _cfg.save_vp_config({
         "enabled": _cfg.VP_ENABLED,
@@ -2069,6 +2075,7 @@ async def set_volume_profile(body: VolumeProfileIn):
         "lookback": _cfg.VP_LOOKBACK,
         "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
         "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+        "histogram_side": _cfg.VP_HISTOGRAM_SIDE,
     })
     await broadcast_event({"type": "config_changed", "key": "volume_profile"})
     return {
@@ -2077,6 +2084,7 @@ async def set_volume_profile(body: VolumeProfileIn):
         "lookback": _cfg.VP_LOOKBACK,
         "value_area_pct": _cfg.VP_VALUE_AREA_PCT,
         "show_histogram": _cfg.VP_SHOW_HISTOGRAM,
+        "histogram_side": _cfg.VP_HISTOGRAM_SIDE,
     }
 
 

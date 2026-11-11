@@ -844,7 +844,10 @@ _VP_DEFAULTS = {
     "lookback": 300,          # bars used to build the profile (independent of chart display limit)
     "value_area_pct": 0.70,   # fraction of volume that defines the Value Area around POC
     "show_histogram": True,   # False = keep the POC line + Value Area band, drop the histogram bars
+    "histogram_side": "right",  # which edge of the chart the histogram bars grow from: "left" | "right"
 }
+
+VP_HISTOGRAM_SIDES = ("left", "right")
 
 def load_vp_config() -> dict:
     return _load_typed(VP_FILE, _VP_DEFAULTS)
@@ -858,6 +861,8 @@ VP_BINS = _vp_config["bins"]
 VP_LOOKBACK = _vp_config["lookback"]
 VP_VALUE_AREA_PCT = _vp_config["value_area_pct"]
 VP_SHOW_HISTOGRAM = _vp_config["show_histogram"]
+# any other string in the file (hand edit) falls back to the old behaviour
+VP_HISTOGRAM_SIDE = _vp_config["histogram_side"] if _vp_config["histogram_side"] in VP_HISTOGRAM_SIDES else "right"
 
 COOLDOWN_BARS = 2
 MAX_ALLOWED_LEV = 10
