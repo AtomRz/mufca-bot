@@ -48,6 +48,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
 - **Entry switches + shadow tracking** — Settings → *Entry: A/U-track long/short* turns one track+side off (in TREND only, or in every regime) without a redeploy; open trades are untouched. A blocked signal is not forgotten: it is run through the normal SL/TP/R:R pipeline as a dry run and stored in `data/shadow_signals.json` (never in `signals_history.json`, so it can't train adaptive TP/SL or skew hit-rate stats), then its outcome is replayed from the bars that follow (closed-bar model like the backtest, one position per track + `COOLDOWN_BARS`). `!components shadow` / the Components tab's *Include shadow* box report those outcomes as separate rows, never pooled with real trades — so a switched-off combination can still be re-checked on live data. A **SHDW** lamp in the web top bar shows it at a glance: amber = an Entry switch is active (glows with the number of open shadow positions, flashes when a new one is recorded), dim = switches off again but records kept, hidden = nothing to show; hover for per-track counts and the last record time, click to jump to Insights The backtests (`!compsim`/`!tp1sim`) ignore the switches
 - **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Status, Chart, History, and Insights tabs (all live-updated over WebSocket) — Insights groups on-chain/derivatives bias, order book spread, confidence-component analysis, and the historical-experiment tools (`!tp1sim`/`!compsim` equivalents) under one tab with a sub-nav — plus a Settings panel to edit market mode, HTF bias, CHOP thresholds, adaptive TP, SL-after-TP1 mode, Discord notification toggle, scan/on-chain refresh intervals, all indicator parameters (FRAMA/MFI/Andean/UT Bot), Volume Profile, demand/supply zones, and chart colors — no redeploy needed
 - **Signal & filter lamps** — top-bar indicator showing live MFI/Andean/UT Bot signal state plus every filter's pass/block direction (including an R:R lamp), computed with the exact same functions the scanner itself uses, so the lamps never disagree with what actually opens a trade
+- **NYSE lamp** — top-bar indicator (`GET /api/nyse`, `app/market_hours.py`) for the New York trading day: blue = pre-market (04:00-09:30 ET), green = regular session, yellow = after-hours (to 20:00 ET), dim = closed. Uses the `pandas_market_calendars` NYSE calendar, so exchange holidays, early closes (13:00 ET session / 17:00 ET after-hours) and US daylight saving are handled automatically; the tooltip shows when the state changes next, in your local time and in ET. Informational only — nothing in the signal logic reads it
 - **Android push notifications** — Firebase Cloud Messaging, device registration/dedup via the web dashboard's Settings panel or the Android app, test-push endpoint to verify the full server → Firebase → device pipeline
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.5 (configurable via `MIN_RR`) or SL already hit by bar
 - **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording (saved immediately on every change, not throttled), force-close after N bars
@@ -100,6 +101,7 @@ mufca-bot/
 │   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
 │   ├── smc.py                 # Smart Money Concepts: the !smcsim event study (sweeps, BOS/CHoCH, FVG vs. any-bar baseline) and the chart overlay of BOS/CHoCH lines and open FVGs; research / visual only
 │   ├── shadow.py              # Shadow tracking of entries an Entry switch blocked (outcome replay, kept out of signals_history)
+│   ├── market_hours.py        # NYSE session state (pre / open / after-hours / closed, holidays, early closes) for the top-bar NYSE lamp
 │   ├── filter_stats.py        # Live entry-filter funnel counters (which filter rejected how many raw triggers)
 │   ├── sim_jobs.py            # Background jobs for !tp1sim/!compsim/!filtersim/!smcsim and /api/tp1sim, /api/compsim, /api/filtersim, /api/smcsim (one at a time, progress, cancel)
 │   ├── sim_pool.py            # Process pool that runs those backtests on all CPU cores (SIM_WORKERS)
@@ -118,7 +120,7 @@ mufca-bot/
 │   │   ├── api.js             # REST + WebSocket client
 │   │   └── components/        # StatusPanel, ChartPanel, HistoryPanel, InsightsPanel
 │   │                           # (Bias/Spread/Components/Simulate sub-views),
-│   │                           # SettingsPanel, SignalLamps, LoginScreen
+│   │                           # SettingsPanel, SignalLamps, NyseLamp, LoginScreen
 │   └── package.json
 ├── requirements.txt
 ├── Dockerfile                 # multi-stage: builds web/ with Node, copies dist/ into the Python image

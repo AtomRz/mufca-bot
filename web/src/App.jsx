@@ -9,6 +9,7 @@ import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
 import ShadowLamp from './components/ShadowLamp'
 import ShockLamp from './components/ShockLamp'
+import NyseLamp from './components/NyseLamp'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -212,6 +213,7 @@ export default function App() {
           </span>
         )}
         {pulse && <SignalLamps lamps={pulse.lamps} />}
+        <NyseLamp />
         <ShockLamp shock={shock} onClick={() => setTab('status')} />
         <ShadowLamp shadow={shadow} onClick={() => setTab('insights')} />
         <div className="spacer" />

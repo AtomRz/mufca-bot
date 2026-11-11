@@ -68,6 +68,7 @@ import derivatives
 import onchain as _onchain
 import spread
 import shock_guard
+import market_hours
 import shadow as shadow_mod
 import filter_stats as filter_stats_mod
 import sim_jobs
@@ -550,6 +551,15 @@ async def get_shock_status():
         "blocks_entries": bool(_cfg.SHOCK_GUARD_BLOCK_ENTRIES),
         "alerts_muted": not _cfg.SYSTEM_ALERTS_ENABLED,
     }
+
+
+@app.get("/api/nyse")
+async def get_nyse_status():
+    """Top-bar "NYSE" lamp: pre-market / open / after-hours / closed, and when
+    the state changes next. Informational only — nothing in the signal logic
+    reads it. Light: the schedule is cached per New York day, no network calls.
+    See market_hours.py for the exact response shape."""
+    return market_hours.get_nyse_status()
 
 
 @app.get("/api/components")
