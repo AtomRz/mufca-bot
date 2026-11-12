@@ -788,9 +788,14 @@ def _weighted_percentile(values: List[float], weights: List[float], percentile: 
     return sorted_values[-1]
 
 
-def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
+def _calculate_hit_rate(records: List[Dict], metric: str = "tp2") -> Tuple[float, int, int]:
     """
     Returns (tp_hit_rate, tp_count, total_exits) for the given records.
+
+    metric="tp2" (default, legacy): hit = exit_type "tp"; sl_after_tp1 = 0.5.
+    metric="tp1": hit = TP1 reached, i.e. exit_type "tp" or "sl_after_tp1"
+    (a TP2 exit necessarily passed through TP1); see config.TP_HIT_RATE_METRIC
+    for why the percentile feedback loop may want this one.
 
     🆕 FIX BUG-LO008: "sl_after_tp1" (TP1 gave profit on 50%, the remainder
     closed at the moved SL — breakeven/half_tp1) used to be counted as a
@@ -805,6 +810,8 @@ def _calculate_hit_rate(records: List[Dict]) -> Tuple[float, int, int]:
     total = tp_hits + sl_hits + partial
     if total == 0:
         return 0.0, 0, 0
+    if metric == "tp1":
+        return (tp_hits + partial) / total, tp_hits + partial, total
     weighted_hits = tp_hits + 0.5 * partial
     return weighted_hits / total, tp_hits, total
 
@@ -960,14 +967,35 @@ def calculate_adaptive_tp(
 
     # Only if there's enough data for a statistically meaningful estimate
     if len(recent) >= 15 and _cfg.TP_AUTO_ADJUST:
-        tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent)
-        adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
-            base_percentile,
-            tp_hit_rate,
-            target_hit_rate=_cfg.TP_HIT_RATE_TARGET,
-            min_pct=_cfg.TP_ADJUST_MIN_PCT,
-            max_pct=_cfg.TP_ADJUST_MAX_PCT,
-        )
+        metric = getattr(_cfg, "TP_HIT_RATE_METRIC", "tp2")
+        tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent, metric=metric)
+
+        target_hit_rate = _cfg.TP_HIT_RATE_TARGET
+        if getattr(_cfg, "TP_HIT_RATE_TARGET_AUTO", False):
+            # Self-calibrating target: the hit rate this same ticker/tf/side
+            # (and regime pool) achieved BEFORE the recent window. The loop
+            # then only corrects drift away from the series' own long-run
+            # level, so no hand-picked number can be structurally wrong for
+            # the metric. Without enough older history there is no baseline
+            # yet, so the percentile is left alone instead of guessing.
+            older = use_records[:-_cfg.SIGNAL_HISTORY_LIMIT]
+            base_rate, _base_hits, base_total = _calculate_hit_rate(older, metric=metric)
+            if base_total >= _cfg.TP_AUTO_TARGET_MIN_BASELINE:
+                target_hit_rate = min(0.95, max(0.05, base_rate))
+            else:
+                target_hit_rate = None
+                hit_rate_info = (f"hit_rate={tp_hit_rate:.1%} ({metric}), auto target needs "
+                                 f"{_cfg.TP_AUTO_TARGET_MIN_BASELINE}+ older exits (have {base_total}), pct unchanged")
+
+        if target_hit_rate is not None:
+            adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
+                base_percentile,
+                tp_hit_rate,
+                target_hit_rate=target_hit_rate,
+                min_pct=_cfg.TP_ADJUST_MIN_PCT,
+                max_pct=_cfg.TP_ADJUST_MAX_PCT,
+            )
+            hit_rate_info += f" [{metric}, target={target_hit_rate:.0%}{' auto' if getattr(_cfg, 'TP_HIT_RATE_TARGET_AUTO', False) else ''}]"
         logger.info(f"[TP-HIT-RATE] {ticker} {tf} {side}: {hit_rate_info}")
 
     weighted_mfes = _extract_weighted_mfes(recent)
@@ -1008,6 +1036,9 @@ def calculate_adaptive_tp(
                 logger.debug(f"[TP] ATR cap 2x: {tp_pct:.2f}% → capped at {atr_tp_pct:.2f}%")
                 tp_pct = atr_tp_pct
 
+    # NOTE: MIN_TP_PCT is applied AFTER the ATR cap on purpose (treated as the smallest sensible TP
+    # distance), so on very low volatility (2×ATR < MIN_TP_PCT)
+    # the minimum wins and TP can exceed 2×ATR.
     tp_pct = max(_cfg.MIN_TP_PCT, min(_cfg.MAX_TP_PCT, tp_pct))
 
     tp = entry * (1 + tp_pct / 100) if side == "long" else entry * (1 - tp_pct / 100)

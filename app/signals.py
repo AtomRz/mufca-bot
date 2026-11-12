@@ -646,6 +646,14 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
             new_sl = _tp1_moved_sl(trade["entry"], tp1_price, side)
             trade["tp1_hit"] = True
             trade["sl"] = new_sl
+            # Same guard bot.py's _apply_tp1 sets: the moved stop must never
+            # be tested against this bar or earlier ones on a later call. The
+            # current flow always closes the trade in this same call (the
+            # moved SL lies inside this bar's range), so this is a no-op
+            # today — it just keeps BUG-LO009's guard from silently
+            # depending on that.
+            if bar_time is not None:
+                trade["sl_moved_after_bar"] = bar_time
             # 🆕 FIX (Kimi audit, dedup pass 2): the live-poll TP1 credit in
             # bot.py always logs (see [TP1]/[TP1-SL]/[LIVE-SL] there) — this
             # closed-bar credit path used to be silent, so comparing the
@@ -662,16 +670,33 @@ def check_tp_sl_hit(state: Dict, high: float, low: float, track: str = "a",
 
     sl = trade["sl"]
 
+    tp2_reached = (high >= tp) if side == "long" else (low <= tp)
+    if tp2_reached and not (sl_applicable and ((low <= sl) if side == "long" else (high >= sl))):
+        # 🆕 FIX (Kimi audit): reaching TP2 necessarily passed through TP1
+        # (tp1 sits strictly between entry and tp2). If neither the 1m-candle
+        # check nor the live poll credited TP1 beforehand, close_trade() would
+        # book the whole position at TP2 instead of the 50/50 TP1+TP2 blend
+        # backtest_history() records for the identical price path
+        # (tp1_reached is set there on a direct TP2 touch) — live and
+        # backtest moved_pct would stop being comparable in
+        # signals_history.json, the very sample adaptive TP learns from.
+        if not trade.get("tp1_hit") and tp1_price is not None:
+            trade["tp1_hit"] = True
+            trade["sl"] = _tp1_moved_sl(trade["entry"], tp1_price, side)
+            if bar_time is not None:
+                trade["sl_moved_after_bar"] = bar_time
+            logger.info(
+                f"[TP1-CLOSEDBAR] {ticker or '?'} {tf or '?'} {track.upper()}-track | "
+                f"bar (high={high}, low={low}) reached TP2={tp} directly → TP1={tp1_price} credited first"
+            )
+        return "tp"
+
     if side == "long":
         if sl_applicable and low <= sl:
             return "sl"
-        if high >= tp:
-            return "tp"
     else:
         if sl_applicable and high >= sl:
             return "sl"
-        if low <= tp:
-            return "tp"
     return None
 
 def close_trade(state: Dict, exit_price: float, result: str, ticker: str, tf: str, track: str = "a",
