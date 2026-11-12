@@ -383,6 +383,21 @@ def update_signal_record(
     rec["tp1_hit"] = bool(tp1_hit)
     entry = rec["entry"]
 
+    # 🆕 FIX: max_favorable_pct is only updated from closed-bar highs/lows
+    # (update_signal_mae_mfe), so a trade closed by the live poll or the 1m
+    # check can end with an MFE BELOW the price it provably reached (e.g. a TP
+    # at +1.28% recorded with MFE 0.17%) — and the adaptive TP percentile is
+    # built from this field, so that understated MFE pulled TP1 too close. The
+    # exit price (for a TP exit) and the TP1 price (once TP1 was hit) are
+    # lower bounds on how far price went in our favor.
+    mfe_floor = 0.0
+    if exit_type == "tp":
+        mfe_floor = max(mfe_floor, _pct_move(side, entry, exit_price))
+    if tp1_hit and tp1_price is not None:
+        mfe_floor = max(mfe_floor, _pct_move(side, entry, tp1_price))
+    if mfe_floor > rec.get("max_favorable_pct", 0.0):
+        rec["max_favorable_pct"] = round(mfe_floor, 4)
+
     # 🆕 (external review, TP-obstacle stage): seed the raw-outcome
     # tracking fields at close — see update_raw_outcome()'s docstring for
     # why max_favorable_pct/max_adverse_pct alone aren't a policy-free
