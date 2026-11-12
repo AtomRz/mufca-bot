@@ -967,15 +967,35 @@ def calculate_adaptive_tp(
 
     # Only if there's enough data for a statistically meaningful estimate
     if len(recent) >= 15 and _cfg.TP_AUTO_ADJUST:
-        tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(
-            recent, metric=getattr(_cfg, "TP_HIT_RATE_METRIC", "tp2"))
-        adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
-            base_percentile,
-            tp_hit_rate,
-            target_hit_rate=_cfg.TP_HIT_RATE_TARGET,
-            min_pct=_cfg.TP_ADJUST_MIN_PCT,
-            max_pct=_cfg.TP_ADJUST_MAX_PCT,
-        )
+        metric = getattr(_cfg, "TP_HIT_RATE_METRIC", "tp2")
+        tp_hit_rate, tp_count, total_exits = _calculate_hit_rate(recent, metric=metric)
+
+        target_hit_rate = _cfg.TP_HIT_RATE_TARGET
+        if getattr(_cfg, "TP_HIT_RATE_TARGET_AUTO", False):
+            # Self-calibrating target: the hit rate this same ticker/tf/side
+            # (and regime pool) achieved BEFORE the recent window. The loop
+            # then only corrects drift away from the series' own long-run
+            # level, so no hand-picked number can be structurally wrong for
+            # the metric. Without enough older history there is no baseline
+            # yet, so the percentile is left alone instead of guessing.
+            older = use_records[:-_cfg.SIGNAL_HISTORY_LIMIT]
+            base_rate, _base_hits, base_total = _calculate_hit_rate(older, metric=metric)
+            if base_total >= _cfg.TP_AUTO_TARGET_MIN_BASELINE:
+                target_hit_rate = min(0.95, max(0.05, base_rate))
+            else:
+                target_hit_rate = None
+                hit_rate_info = (f"hit_rate={tp_hit_rate:.1%} ({metric}), auto target needs "
+                                 f"{_cfg.TP_AUTO_TARGET_MIN_BASELINE}+ older exits (have {base_total}), pct unchanged")
+
+        if target_hit_rate is not None:
+            adjusted_percentile, hit_rate_info = _adjust_percentile_by_hit_rate(
+                base_percentile,
+                tp_hit_rate,
+                target_hit_rate=target_hit_rate,
+                min_pct=_cfg.TP_ADJUST_MIN_PCT,
+                max_pct=_cfg.TP_ADJUST_MAX_PCT,
+            )
+            hit_rate_info += f" [{metric}, target={target_hit_rate:.0%}{' auto' if getattr(_cfg, 'TP_HIT_RATE_TARGET_AUTO', False) else ''}]"
         logger.info(f"[TP-HIT-RATE] {ticker} {tf} {side}: {hit_rate_info}")
 
     weighted_mfes = _extract_weighted_mfes(recent)

@@ -1280,16 +1280,20 @@ SL_MIN_DISTANCE_PCT    = 0.001   # Minimum SL distance from entry (0.1%)
 # 🆕 TP FEEDBACK LOOP — auto-adjustment based on the real hit rate
 TP_HIT_RATE_TARGET = 0.35      # Target TP hit rate (35%)
 TP_AUTO_ADJUST = True          # Enable percentile auto-adjustment
-# Which hit rate the percentile feedback loop compares against TP_HIT_RATE_TARGET.
-#   "tp2" (legacy default): share of exits that reached TP2 (sl_after_tp1 counts 0.5).
+# Which hit rate the percentile feedback loop measures.
 #   "tp1": share of exits that reached TP1 (exit_type tp or sl_after_tp1).
+#   "tp2" (legacy): share of exits that reached TP2 (sl_after_tp1 counts 0.5).
 # The percentile this loop adjusts sets TP1, but live TP2 is max(tp1, MIN_RR*R) and is then
 # cut further by apply_tp_obstacle_cap (which backtest records are NOT trained with), so the
 # "tp2" metric sits structurally below what the TP1 distribution implies and keeps pulling
-# the percentile down. "tp1" calibrates the target against the level it actually moves.
-# A TP1 hit rate is higher than a TP2 one: if you switch, re-tune TP_HIT_RATE_TARGET too
-# (35% was chosen for the "tp2" metric).
-TP_HIT_RATE_METRIC = "tp2"
+# the percentile down. "tp1" measures the level the percentile actually moves.
+TP_HIT_RATE_METRIC = "tp1"
+# True: the target is not a hand-picked number but the hit rate this ticker/tf/side achieved
+# BEFORE the recent SIGNAL_HISTORY_LIMIT window (so the loop only corrects drift against the
+# series' own baseline). TP_HIT_RATE_TARGET is then ignored. False: use TP_HIT_RATE_TARGET
+# (a fixed value is only meaningful for one specific metric — 35% was chosen for "tp2").
+TP_HIT_RATE_TARGET_AUTO = True
+TP_AUTO_TARGET_MIN_BASELINE = 15   # older exits required to trust the baseline; fewer = no adjustment
 TP_CAPTURE_RATE = 0.70         # Realistic MFE capture rate (0.5-0.8)
 TP_ADJUST_MIN_PCT = 0.30       # Minimum percentile after adjustment
 TP_ADJUST_MAX_PCT = 0.85       # Maximum percentile after adjustment
