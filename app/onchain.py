@@ -963,46 +963,49 @@ def _fg_label_from_value(value: int) -> str:
     return "Extreme Greed"
 
 
-async def _fetch_fear_greed(session: aiohttp.ClientSession) -> tuple:
+def _parse_cg_fear_greed(global_data: dict) -> Optional[tuple]:
+    """
+    Extracts the Fear & Greed Index from a CoinGecko /global response.
+
+    Since 2026-10-28 CoinGecko returns it as
+    data.fear_and_greed_index = {"value": 44, "sentiment": "fear"}
+    (all plans, including Demo). There is no standalone /fear-greed-index
+    endpoint, which the previous implementation called.
+
+    Returns (value, label), or None if the field is missing/invalid so the
+    caller falls through to the next source (a missing value must never
+    default to 0 — that would look like a genuine "Extreme Fear").
+    """
+    try:
+        item = ((global_data or {}).get("data") or {}).get("fear_and_greed_index")
+        if not isinstance(item, dict):
+            return None
+        val = int(item["value"])
+        if not (0 <= val <= 100):
+            raise ValueError(f"F&G value out of range: {val}")
+        # CoinGecko's "sentiment" is lower-case ("fear"); derive the label
+        # from the value so the format matches alternative.me / the rest of the bot.
+        return val, _fg_label_from_value(val)
+    except Exception as e:
+        logger.warning(f"[ONCHAIN] CoinGecko F&G parse failed: {e}")
+        return None
+
+
+async def _fetch_fear_greed(session: aiohttp.ClientSession, cg_fg: Optional[tuple] = None) -> tuple:
     """
     Fetches the Fear & Greed Index with a fallback chain:
-      1. CoinGecko Pro/Demo API (/fear-greed-index) — if a key is present
+      1. CoinGecko /global (fear_and_greed_index) — already fetched by the
+         caller, passed in as cg_fg = (value, label)
       2. alternative.me/fng — public, but flaky
       3. Default 50 (Neutral) — if both fail
 
     Returns: (value: int, label: str)
     """
-    # ── Source 1: CoinGecko Fear & Greed (paid/demo endpoint) ──
-    if COINGECKO_API_KEY:
-        try:
-            async with session.get(
-                "https://pro-api.coingecko.com/api/v3/fear-greed-index"
-                if not COINGECKO_API_KEY.startswith("CG-") else
-                "https://api.coingecko.com/api/v3/fear-greed-index",
-                headers={
-                    "x-cg-demo-api-key": COINGECKO_API_KEY
-                } if COINGECKO_API_KEY.startswith("CG-") else {
-                    "x-cg-pro-api-key": COINGECKO_API_KEY
-                },
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # 🆕 FIX: a missing "value" used to default to 0 — i.e. a
-                    # genuine-looking "Extreme Fear" that boosted long bias
-                    # and TP/SL multipliers. Missing/out-of-range = failure,
-                    # fall through to the next source.
-                    item = (data.get("data") or [{}])[0]
-                    val = int(item["value"])
-                    if not (0 <= val <= 100):
-                        raise ValueError(f"F&G value out of range: {val}")
-                    lbl = item.get("value_classification") or _fg_label_from_value(val)
-                    logger.info(f"[ONCHAIN] F&G from CoinGecko: {val} ({lbl})")
-                    return val, lbl
-                else:
-                    logger.warning(f"[ONCHAIN] CoinGecko F&G status={resp.status}, trying fallback")
-        except Exception as e:
-            logger.warning(f"[ONCHAIN] CoinGecko F&G failed: {e}, trying fallback")
+    # ── Source 1: CoinGecko (taken from the /global response) ──
+    if cg_fg is not None:
+        logger.info(f"[ONCHAIN] F&G from CoinGecko: {cg_fg[0]} ({cg_fg[1]})")
+        return cg_fg
+    logger.warning("[ONCHAIN] CoinGecko /global had no usable fear_and_greed_index, trying fallback")
 
     # ── Source 2: alternative.me ──────────────────────────────────
     try:
@@ -1071,8 +1074,9 @@ async def get_coingecko_data() -> Dict:
     # silently stayed at the default 50 although alternative.me was reachable.
     # Each step now fails on its own.
     errors = []
+    cg_fg = None  # (value, label) from /global, filled in step 1
     async with aiohttp.ClientSession(headers=headers) as session:
-        # 1. Global market data (dominance)
+        # 1. Global market data (dominance + Fear & Greed)
         try:
             async with session.get(
                 f"{base}/global",
@@ -1083,6 +1087,7 @@ async def get_coingecko_data() -> Dict:
                 # might not be a dict with the expected structure — .get() on
                 # a non-dict would raise.
                 if resp.status == 200 and isinstance(data, dict):
+                    cg_fg = _parse_cg_fear_greed(data)
                     mcp = (data.get("data") or {}).get("market_cap_percentage") or {}
                     btc_dom = mcp.get("btc")
                     if isinstance(btc_dom, (int, float)) and 0 < btc_dom < 100:
@@ -1131,9 +1136,9 @@ async def get_coingecko_data() -> Dict:
             logger.warning(f"[ONCHAIN] CoinGecko /coins/markets failed: {e}")
 
         # 3. Fear & Greed Index
-        # Source chain: CoinGecko → alternative.me → default 50
+        # Source chain: CoinGecko (/global) → alternative.me → default 50
         try:
-            fg_value, fg_label = await _fetch_fear_greed(session)
+            fg_value, fg_label = await _fetch_fear_greed(session, cg_fg)
             result["fear_and_greed"] = fg_value
             result["fg_label"] = fg_label
         except Exception as e:
