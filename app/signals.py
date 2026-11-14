@@ -1445,11 +1445,12 @@ async def check_signals(
         # so a signal already blocked there is not counted twice. Wrapped: a
         # failure here must fail OPEN (never block) and never break the scan.
         _vol_blocked: Dict[Tuple[str, str], Optional[float]] = {}
+        _vmetric = _cfg.VOLUME_GATE["metric"]
         if _cfg.VOLUME_GATE["enabled"] and (sig_a_long or sig_a_short or sig_u_long or sig_u_short):
             try:
-                _vthr = _cfg.volume_gate_threshold(ticker, timeframe)
+                _vmetric, _vthr = _cfg.volume_gate_rule(ticker, timeframe)
                 if _vthr > 0:
-                    _vratio = volume_gate.ratio_at(df, idx, tf_ms, _cfg.VOLUME_GATE["baseline_days"])
+                    _vratio = volume_gate.metric_at(df, idx, tf_ms, _cfg.VOLUME_GATE["baseline_days"], _vmetric)
                     if not volume_gate.passes(_vratio, _vthr):
                         for _trk, _sd, _active in (
                             ("a", "long", sig_a_long), ("a", "short", sig_a_short),
@@ -1459,7 +1460,7 @@ async def check_signals(
                                 continue
                             logger.info(
                                 f"[VOLUME_GATE] {ticker} {timeframe} {_trk.upper()}-{_sd.upper()} skipped — "
-                                f"volume ratio {_vratio:.2f} < {_vthr:.2f} (thin liquidity)"
+                                f"volume [{_vmetric}] {_vratio:.2f} < {_vthr:.2f} (thin liquidity)"
                             )
                             _entry_blocked.append((_trk, _sd))
                             _vol_blocked[(_trk, _sd)] = _vratio
@@ -1671,6 +1672,7 @@ async def check_signals(
                                 bar_time, _shadow_comps,
                                 blocked_by="low_volume" if (_trk, _sd) in _vol_blocked else "entry_switch",
                                 vol_ratio=volume_gate.ratio_or_none(_vol_blocked.get((_trk, _sd))),
+                                vol_metric=_vmetric if (_trk, _sd) in _vol_blocked else None,
                             )
                     finally:
                         _set_sig(_trk, _sd, False)
@@ -1803,7 +1805,8 @@ def backtest_history(
     """Backtest for accumulating signal history.
 
     volume_baseline_days - trigger_table only: baseline window of the low-volume
-    gate's ratio (volume_gate.py) recorded on every trigger as "vol_ratio" (plus the
+    gate's metrics (volume_gate.py) recorded on every trigger as "vm" {metric: value}
+    ("vol_ratio" = the bar metric, kept for old callers; plus the
     bar time as "ts"). None = config.VOLUME_GATE["baseline_days"]. Passed explicitly
     so a long-lived sim worker never works from a stale copy of the setting. The
     gate itself is NOT applied in the backtest (like ENTRY_BLOCK); the table only
@@ -2062,12 +2065,17 @@ def backtest_history(
         _trig_tbl = bool(trigger_table and _stats is not None)
         # Low-volume gate ratio of every bar (trigger table only - nothing else
         # needs it, and the rolling median costs a little on long histories).
-        _vr_arr = None
+        _vm_arr = None
         if _trig_tbl:
-            _vr_arr = volume_gate.ratio_series(
-                df, volume_gate.infer_tf_ms(df),
-                _cfg.VOLUME_GATE["baseline_days"] if volume_baseline_days is None else volume_baseline_days,
-            ).to_numpy()
+            _vm_tf_ms = volume_gate.infer_tf_ms(df)
+            _vm_arr = {
+                _m: volume_gate.metric_series(
+                    df, _vm_tf_ms,
+                    _cfg.VOLUME_GATE["baseline_days"] if volume_baseline_days is None else volume_baseline_days,
+                    _m,
+                ).to_numpy()
+                for _m in volume_gate.METRICS
+            }
         _all_on = {k: True for k in FILTER_KEYS}
 
         # Hurst is always computed above (unlike check_signals, not gated
@@ -2535,7 +2543,8 @@ def backtest_history(
                         "moved_pct": round(moved_pct, 4), "regime": bt_regime,
                         "tp1_reached": bool(tp1_reached), "bars_held": bars_held,
                         **({"idx": idx, "exit_idx": exit_idx, "fails": _tbl_fails,
-                            "vol_ratio": volume_gate.ratio_or_none(_vr_arr[idx]),
+                            "vol_ratio": volume_gate.ratio_or_none(_vm_arr["bar"][idx]),
+                            "vm": {_m: volume_gate.ratio_or_none(_a[idx]) for _m, _a in _vm_arr.items()},
                             "ts": int(df["timestamp"].iloc[idx])} if _trig_tbl else {}),
                     })
                 signals_found += 1
@@ -2969,8 +2978,17 @@ async def run_filter_ablation(exchange: ccxt.Exchange, tickers: List[str], tfs: 
 # ---------------------------------------------------------------------
 # Auto-tuner: best filter set per (ticker, timeframe)
 # ---------------------------------------------------------------------
+def trigger_vol_value(t: Dict, metric: str = "bar") -> Optional[float]:
+    """Value of one volume metric on a trigger-table row (None = not measurable)."""
+    vm = t.get("vm")
+    if isinstance(vm, dict):
+        return vm.get(metric)
+    return t.get("vol_ratio") if metric == "bar" else None
+
+
 def replay_filter_set(triggers: List[Dict], flags: Dict[str, bool], tf: str,
-                      cooldown: Optional[int] = None, min_vol_ratio: Optional[float] = None) -> List[Dict]:
+                      cooldown: Optional[int] = None, min_vol_ratio: Optional[float] = None,
+                      vol_metric: str = "bar") -> List[Dict]:
     """The trades a backtest with `flags` would have taken, rebuilt from a
     trigger table (backtest_history(trigger_table=True) -> stats["trades"]).
     A trigger is taken when it is past the loop's start bar, its track is free
@@ -2978,7 +2996,8 @@ def replay_filter_set(triggers: List[Dict], flags: Dict[str, bool], tf: str,
     the ENABLED filters rejected it. `triggers` must be in backtest loop order
     (by bar, then A-long, A-short, U-long, U-short), which is how they are recorded.
 
-    min_vol_ratio - the low-volume gate: a trigger whose recorded "vol_ratio" is
+    min_vol_ratio / vol_metric - the low-volume gate: a trigger whose recorded value of
+    that metric (trigger_vol_value) is
     below it is rejected like a failed filter (it does NOT occupy the track, so
     the next trigger can take its place - exactly what the live gate does). A
     trigger with no ratio (baseline not available) passes. None = gate off."""
@@ -2993,7 +3012,7 @@ def replay_filter_set(triggers: List[Dict], flags: Dict[str, bool], tf: str,
         fails = t["fails"]
         if any(k in fails for k in enabled):
             continue
-        if min_vol_ratio is not None and not volume_gate.passes(t.get("vol_ratio"), min_vol_ratio):
+        if min_vol_ratio is not None and not volume_gate.passes(trigger_vol_value(t, vol_metric), min_vol_ratio):
             continue
         taken.append(t)
         next_free[t["track"]] = t["exit_idx"] + cd
@@ -3229,80 +3248,24 @@ def _is_weekend_ts(ts_ms: Optional[int]) -> bool:
     return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).weekday() >= 5
 
 
-def choose_volume_threshold(triggers: List[Dict], tf: str, flags: Dict[str, bool], cutoff_idx: Optional[int],
-                            fee_pct: float, current: float, validate: bool = True) -> Dict:
-    """Picks the volume-ratio threshold for one pair/timeframe from its trigger table.
-
-    The baseline is what the live filter set `flags` takes WITHOUT the gate. Every
-    threshold of volume_threshold_grid() is replayed on top of it
-    (replay_filter_set(min_vol_ratio=...)) and scored by the change in NET total PnL
-    (moved_pct minus fee_pct per trade), split into a train window (trades entered
-    before cutoff_idx) and a test window. Guards against fitting noise - the sample
-    is small and the winner of a grid is biased upward:
-
-      - the gain must exceed AUTOTUNE_MIN_GAIN_SE x noise (noise = spread of the trades
-        only one of the two variants takes, as in choose_filter_set);
-      - it must block at least VOLFIT_MIN_BLOCKED_TRAIN trades in the train window -
-        a threshold that removes a handful of trades proves nothing;
-      - PLATEAU: its neighbouring thresholds must gain too, so one lucky spike is
-        not chosen; among the eligible ones, the LOWEST threshold whose 3-point
-        average gain is within VOLFIT_NEAR_BEST_SHARE of the best one wins (the least
-        aggressive threshold that still captures most of the gain);
-      - (validate) the test window must CONFIRM it: at least VOLFIT_MIN_BLOCKED_TEST
-        blocked trades and a gain above VOLFIT_MIN_TEST_GAIN_SE x noise - not just
-        "not worse". (Stricter than the filter auto-tuner's AUTOTUNE_MIN_TEST_GAIN_SE:
-        a grid of ~13 thresholds gives noise more chances to look like an edge.)
-    Only the single winner is tested on the test window (no second chances).
-
-    No threshold passes -> recommended 0.0 = the gate is OFF for this pair/timeframe.
-    Too few trades carry a ratio to judge at all -> recommended None (leave as is).
-
-    Returns {"current", "recommended", "changed", "reason", "rows": [per-threshold
-    table], "base_stats", "chosen_stats", "by_daytype", "weekend_blocked", ...}.
-    """
-    min_bt, min_be = _cfg.VOLFIT_MIN_BLOCKED_TRAIN, _cfg.VOLFIT_MIN_BLOCKED_TEST
-    gain_k, test_k = _cfg.AUTOTUNE_MIN_GAIN_SE, _cfg.VOLFIT_MIN_TEST_GAIN_SE
-    if not validate:
-        cutoff_idx = None
-
-    def split(trades):
-        if cutoff_idx is None:
-            return trades, []
-        return ([t for t in trades if t["idx"] < cutoff_idx], [t for t in trades if t["idx"] >= cutoff_idx])
-
-    base = replay_filter_set(triggers, flags, tf)
-    base_tr, base_te = split(base)
-    with_ratio = sum(1 for t in base if t.get("vol_ratio") is not None)
-    wk = [t for t in base if _is_weekend_ts(t.get("ts"))]
-    wd = [t for t in base if not _is_weekend_ts(t.get("ts"))]
-
-    result: Dict = {
-        "current": round(float(current), 4),
-        "n_triggers": len(triggers), "n_base_trades": len(base), "n_with_ratio": with_ratio,
-        "validated": validate,
-        "base_stats": {"train": _window_stats(base_tr, fee_pct), "test": _window_stats(base_te, fee_pct),
-                       "all": _window_stats(base, fee_pct)},
-        # does the "weekends are worse" idea hold for the trades this pair actually takes?
-        "by_daytype": {"weekend": _window_stats(wk, fee_pct), "weekday": _window_stats(wd, fee_pct)},
-        "rows": [], "recommended": None, "changed": False, "reason": "",
-        "chosen_stats": None, "weekend_blocked": None,
-    }
-    if with_ratio < min_bt:
-        result["reason"] = (f"only {with_ratio} trades have a volume ratio (needs {min_bt}+) - "
-                            f"too little history to judge, left as is")
-        return result
-
+def _scan_volume_metric(triggers: List[Dict], tf: str, flags: Dict[str, bool], metric: str,
+                        base_tr: List[Dict], base_te: List[Dict], split, fee_pct: float, gain_k: float) -> Dict:
+    """Threshold grid of ONE metric on top of the live filter set (training window
+    only decides eligibility). Returns {"rows", "best" (the row picked on the training
+    window, or None), "why"}; rows still carry the test-window numbers so the winner
+    can be judged afterwards - but nothing here looks at them to choose."""
+    min_bt = _cfg.VOLFIT_MIN_BLOCKED_TRAIN
     rows: List[Dict] = []
     for thr in volume_threshold_grid():
-        trades = replay_filter_set(triggers, flags, tf, min_vol_ratio=thr)
+        trades = replay_filter_set(triggers, flags, tf, min_vol_ratio=thr, vol_metric=metric)
         tr, te = split(trades)
         gain_tr, noise_tr = _diff_gain_noise(base_tr, tr, fee_pct)
         gain_te, noise_te = _diff_gain_noise(base_te, te, fee_pct)
         rows.append({
             "threshold": thr,
             "n_all": len(trades),
-            "blocked_train": sum(1 for t in base_tr if not volume_gate.passes(t.get("vol_ratio"), thr)),
-            "blocked_test": sum(1 for t in base_te if not volume_gate.passes(t.get("vol_ratio"), thr)),
+            "blocked_train": sum(1 for t in base_tr if not volume_gate.passes(trigger_vol_value(t, metric), thr)),
+            "blocked_test": sum(1 for t in base_te if not volume_gate.passes(trigger_vol_value(t, metric), thr)),
             "gain_train": round(gain_tr, 4), "gain_test": round(gain_te, 4),
             "_noise_train": noise_tr, "_noise_test": noise_te, "_trades": (tr, te, trades),
         })
@@ -3324,66 +3287,176 @@ def choose_volume_threshold(triggers: List[Dict], tf: str, flags: Dict[str, bool
         top_smooth = max(r["smooth"] for r in eligible)
         near_top = [r for r in eligible if r["smooth"] >= _cfg.VOLFIT_NEAR_BEST_SHARE * top_smooth]
         best = min(near_top, key=lambda r: r["threshold"])
-
-    why_not = ""
+    why = ""
     if best is None:
         top = max(rows, key=lambda r: r["gain_train"])
-        why_not = (f"no threshold beats noise with a stable neighbourhood on the training window "
-                   f"(best single point {top['threshold']:.2f}: {top['gain_train']:+.2f}%, "
-                   f"blocks {top['blocked_train']} trades)")
+        why = (f"no threshold beats noise with a stable neighbourhood on the training window "
+               f"(best single point {top['threshold']:.2f}: {top['gain_train']:+.2f}%, "
+               f"blocks {top['blocked_train']} trades)")
+    return {"rows": rows, "best": best, "why": why}
+
+
+def choose_volume_rule(triggers: List[Dict], tf: str, flags: Dict[str, bool], cutoff_idx: Optional[int],
+                       fee_pct: float, current: Optional[Dict] = None, validate: bool = True,
+                       metrics: Optional[List[str]] = None, tf_ms: Optional[int] = None) -> Dict:
+    """Picks the volume METRIC and threshold for one pair/timeframe from its trigger table.
+
+    The baseline is what the live filter set `flags` takes WITHOUT the gate. For every
+    metric (volume_gate.METRICS that the live window can compute) every threshold of
+    volume_threshold_grid() is replayed on top of it (replay_filter_set) and scored by
+    the change in NET total PnL (moved_pct minus fee_pct per trade), split into a train
+    window (trades entered before cutoff_idx) and a test window. The sample is small and
+    trying several metrics x ~13 thresholds makes the best-looking one biased upward,
+    so the guards are strict:
+
+      - the gain must exceed (AUTOTUNE_MIN_GAIN_SE + VOLFIT_METRIC_SE_STEP x (M-1)) x noise,
+        M = number of metrics tried (noise = spread of the trades only one of the two
+        variants takes, as in choose_filter_set) - the more candidates, the higher the bar;
+      - it must block at least VOLFIT_MIN_BLOCKED_TRAIN trades in the train window;
+      - PLATEAU: its neighbouring thresholds must gain too; among the eligible ones the
+        LOWEST threshold within VOLFIT_NEAR_BEST_SHARE of the best 3-point-average gain wins;
+      - ONE winner overall (the metric with the highest training gain) is tested on the
+        test window - no second chances with the runner-up - and must block at least
+        VOLFIT_MIN_BLOCKED_TEST trades there and gain more than
+        (VOLFIT_MIN_TEST_GAIN_SE + VOLFIT_METRIC_SE_STEP x (M-1)) x noise (validate=True).
+
+    No candidate passes -> recommended {"metric": <current metric>, "threshold": 0.0}: the
+    gate is OFF for this pair/timeframe. Too few trades carry any value to judge ->
+    recommended None (leave as is).
+
+    `current` = {"metric", "threshold"} in force now (threshold 0 = off).
+    Returns {"current", "recommended", "changed", "reason", "metrics": {m: {...}},
+    "rows" (of the winner, else of the best-looking metric), "base_stats",
+    "chosen_stats", "by_daytype", "weekend_blocked", ...}.
+    """
+    cur = {"metric": (current or {}).get("metric", "bar"), "threshold": float((current or {}).get("threshold", 0.0))}
+    min_bt, min_be = _cfg.VOLFIT_MIN_BLOCKED_TRAIN, _cfg.VOLFIT_MIN_BLOCKED_TEST
+    if not validate:
+        cutoff_idx = None
+
+    candidates = [m for m in (metrics or list(volume_gate.METRICS)) if m in volume_gate.METRICS]
+    unavailable: Dict[str, str] = {}
+    if tf_ms:
+        for m in list(candidates):
+            if not volume_gate.metric_available(m, tf_ms):
+                candidates.remove(m)
+                unavailable[m] = "needs more weeks of history than the live window holds on this timeframe"
+    n_m = max(len(candidates), 1)
+    extra = _cfg.VOLFIT_METRIC_SE_STEP * (n_m - 1)
+    gain_k = _cfg.AUTOTUNE_MIN_GAIN_SE + extra
+    test_k = _cfg.VOLFIT_MIN_TEST_GAIN_SE + extra
+
+    def split(trades):
+        if cutoff_idx is None:
+            return trades, []
+        return ([t for t in trades if t["idx"] < cutoff_idx], [t for t in trades if t["idx"] >= cutoff_idx])
+
+    base = replay_filter_set(triggers, flags, tf)
+    base_tr, base_te = split(base)
+    wk = [t for t in base if _is_weekend_ts(t.get("ts"))]
+    wd = [t for t in base if not _is_weekend_ts(t.get("ts"))]
+    counts = {m: sum(1 for t in base if trigger_vol_value(t, m) is not None) for m in candidates}
+
+    result: Dict = {
+        "current": {"metric": cur["metric"], "threshold": round(cur["threshold"], 4)},
+        "n_triggers": len(triggers), "n_base_trades": len(base),
+        "n_with_ratio": counts.get("bar", max(counts.values(), default=0)),
+        "validated": validate, "metrics_tried": candidates, "metrics_unavailable": unavailable,
+        "gain_k": round(gain_k, 2), "test_k": round(test_k, 2),
+        "base_stats": {"train": _window_stats(base_tr, fee_pct), "test": _window_stats(base_te, fee_pct),
+                       "all": _window_stats(base, fee_pct)},
+        # does the "weekends are worse" idea hold for the trades this pair actually takes?
+        "by_daytype": {"weekend": _window_stats(wk, fee_pct), "weekday": _window_stats(wd, fee_pct)},
+        "metrics": {}, "rows": [], "recommended": None, "changed": False, "reason": "",
+        "chosen_stats": None, "weekend_blocked": None,
+    }
+    usable = [m for m in candidates if counts[m] >= min_bt]
+    if not usable:
+        result["reason"] = (f"too few trades carry a volume value (needs {min_bt}+ per metric) - "
+                            f"too little history to judge, left as is")
+        return result
+
+    scans = {m: _scan_volume_metric(triggers, tf, flags, m, base_tr, base_te, split, fee_pct, gain_k) for m in usable}
+    for m, sc in scans.items():
+        b = sc["best"]
+        result["metrics"][m] = {
+            "n_with_value": counts[m],
+            "best_threshold": b["threshold"] if b else None,
+            "best_gain_train": b["gain_train"] if b else None,
+            "best_smooth": b["smooth"] if b else None,
+            "top_point": max(sc["rows"], key=lambda r: r["gain_train"])["threshold"],
+            "top_gain_train": max(r["gain_train"] for r in sc["rows"]),
+            "why": sc["why"],
+        }
+
+    # ONE winner across metrics, by training evidence only (smoothed gain)
+    winners = [(m, sc["best"]) for m, sc in scans.items() if sc["best"] is not None]
+    win_m, best = (max(winners, key=lambda w: w[1]["smooth"]) if winners else (None, None))
+    show_m = win_m or max(scans, key=lambda m: result["metrics"][m]["top_gain_train"])
+    why_not = ""
+    if best is None:
+        why_not = "; ".join(f"[{m}] {scans[m]['why']}" for m in scans)
     elif validate:
         if best["blocked_test"] < min_be:
-            why_not = (f"{best['threshold']:.2f} blocks only {best['blocked_test']} trades in the test window "
-                       f"(needs {min_be}) - cannot be confirmed")
+            why_not = (f"[{win_m}] {best['threshold']:.2f} blocks only {best['blocked_test']} trades in the test "
+                       f"window (needs {min_be}) - cannot be confirmed")
             best = None
         elif best["gain_test"] <= 0 or best["gain_test"] <= test_k * best["_noise_test"]:
-            why_not = (f"{best['threshold']:.2f} did not hold up on the test window "
+            why_not = (f"[{win_m}] {best['threshold']:.2f} did not hold up on the test window "
                        f"({best['gain_test']:+.2f}% vs {best['gain_train']:+.2f}% in training)")
             best = None
 
-    for r in rows:
-        tr_t, te_t, all_t = r.pop("_trades")
-        r.pop("_noise_train"), r.pop("_noise_test")
-        r["_stats"] = {"train": _window_stats(tr_t, fee_pct), "test": _window_stats(te_t, fee_pct),
-                       "all": _window_stats(all_t, fee_pct)}
-    result["rows"] = [{k: v for k, v in r.items() if k != "_stats"} for r in rows]
+    for m, sc in scans.items():
+        for r in sc["rows"]:
+            tr_t, te_t, all_t = r.pop("_trades")
+            r.pop("_noise_train"), r.pop("_noise_test")
+            r["_stats"] = {"train": _window_stats(tr_t, fee_pct), "test": _window_stats(te_t, fee_pct),
+                           "all": _window_stats(all_t, fee_pct)}
+    result["rows"] = [{k: v for k, v in r.items() if k != "_stats"} for r in scans[show_m]["rows"]]
+    result["rows_metric"] = show_m
+    for m, sc in scans.items():
+        result["metrics"][m]["rows"] = [{k: v for k, v in r.items() if k != "_stats"} for r in sc["rows"]]
 
-    # reference threshold for the "how many weekend trades does it remove" line
-    ref_thr = best["threshold"] if best is not None else float(_cfg.VOLUME_GATE["threshold"])
-    gone = [t for t in base if not volume_gate.passes(t.get("vol_ratio"), ref_thr)]
-    result["weekend_blocked"] = {"threshold": ref_thr, "blocked": len(gone),
+    # reference for the "how many weekend trades does it remove" line
+    ref_m = win_m if best is not None else cur["metric"]
+    ref_thr = best["threshold"] if best is not None else (cur["threshold"] or float(_cfg.VOLUME_GATE["threshold"]))
+    gone = [t for t in base if not volume_gate.passes(trigger_vol_value(t, ref_m), ref_thr)]
+    result["weekend_blocked"] = {"metric": ref_m, "threshold": ref_thr, "blocked": len(gone),
                                  "weekend": sum(1 for t in gone if _is_weekend_ts(t.get("ts")))}
 
     if best is None:
-        result["recommended"] = 0.0
-        result["changed"] = float(current) > 0
+        result["recommended"] = {"metric": cur["metric"], "threshold": 0.0}
+        result["changed"] = cur["threshold"] > 0
         result["reason"] = why_not + " - gate stays OFF for this pair/timeframe"
         return result
 
-    result["recommended"] = best["threshold"]
-    result["changed"] = abs(best["threshold"] - float(current)) > 1e-9
-    result["chosen_stats"] = next(r["_stats"] for r in rows if r["threshold"] == best["threshold"])
-    result["reason"] = (f"{best['threshold']:.2f}: blocks {best['blocked_train']} trades in training "
+    result["recommended"] = {"metric": win_m, "threshold": best["threshold"]}
+    result["changed"] = win_m != cur["metric"] or abs(best["threshold"] - cur["threshold"]) > 1e-9
+    result["chosen_stats"] = next(r["_stats"] for r in scans[win_m]["rows"] if r["threshold"] == best["threshold"])
+    result["reason"] = (f"[{win_m}] {best['threshold']:.2f}: blocks {best['blocked_train']} trades in training "
                         f"({best['gain_train']:+.2f}%)"
-                        + (f", confirmed on the test window ({best['gain_test']:+.2f}%)" if validate else ""))
+                        + (f", confirmed on the test window ({best['gain_test']:+.2f}%)" if validate else "")
+                        + (f"; best of {len(scans)} metrics" if len(scans) > 1 else ""))
     return result
 
 
 async def run_volume_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
                               progress: Optional[Callable[[int, int, str], None]] = None,
                               workers: Optional[int] = None, validate: bool = True,
-                              fee_pct: Optional[float] = None, apply: bool = False) -> Dict:
-    """Finds the low-volume gate threshold for every (ticker, tf): one trigger-table
-    backtest each (shared fetched data, the pair's CURRENT filter set decides which
-    triggers are taken), then choose_volume_threshold(). With apply=False nothing is
-    written (preview); with apply=True the changed thresholds are pinned via
+                              fee_pct: Optional[float] = None, apply: bool = False,
+                              metrics: Optional[List[str]] = None) -> Dict:
+    """Finds the low-volume gate metric + threshold for every (ticker, tf): one
+    trigger-table backtest each (shared fetched data, the pair's CURRENT filter set
+    decides which triggers are taken), then choose_volume_rule(). `metrics` limits the
+    candidates (default: all of volume_gate.METRICS). With apply=False nothing is
+    written (preview); with apply=True the changed rules are pinned via
     config.apply_volume_thresholds (previous state kept for revert).
 
     The gate's own on/off switch is NOT touched - pins are inert while the gate is off.
 
     Returns {"fee_pct", "validate", "gate_enabled", "baseline_days", "bar_coverage",
-             "skipped", "results": {ticker: {tf: choose_volume_threshold(...)}},
-             "assignments": {ticker: {tf: threshold}}, "meta": {...}, "applied": bool}
+             "skipped", "results": {ticker: {tf: choose_volume_rule(...)}},
+             "assignments": {ticker: {tf: {"metric", "threshold"}}}, "meta": {...}, "applied": bool}
     """
     fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
     baseline_days = _cfg.VOLUME_GATE["baseline_days"]
@@ -3393,6 +3466,7 @@ async def run_volume_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     skipped: List[Dict] = []
     submitted: List[tuple] = []  # (ticker, tf, bars, future)
     off = {k: False for k in FILTER_KEYS}  # the filter set is applied in the replay, like autotune
+    tf_ms_by_pair: Dict[tuple, int] = {}
 
     def _on_done(label: str):
         def cb(_fut):
@@ -3418,6 +3492,7 @@ async def run_volume_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
                                     "reason": f"not enough history (got {inputs['bars_fetched']} bars)"})
                     counters["total"] -= 1
                     continue
+                tf_ms_by_pair[(t, f)] = volume_gate.infer_tf_ms(inputs["df"])
                 fut = pool.submit({
                     "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
                     "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
@@ -3446,13 +3521,16 @@ async def run_volume_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
         last_idx = n_bars - _cfg.MAX_HOLD_BARS
         cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
         # what is in force now: the pinned/default threshold, or 0 while the gate is off
-        current = _cfg.volume_gate_threshold(t, f) if gate_enabled else 0.0
-        res = choose_volume_threshold(triggers, f, current_filter_flags(t, f), cutoff, fee, current, validate=validate)
+        _m_now, _thr_now = _cfg.volume_gate_rule(t, f)
+        current = {"metric": _m_now, "threshold": _thr_now if gate_enabled else 0.0}
+        res = choose_volume_rule(triggers, f, current_filter_flags(t, f), cutoff, fee, current,
+                                 validate=validate, metrics=metrics, tf_ms=tf_ms_by_pair.get((t, f)))
         results.setdefault(t, {})[f] = res
         if res["changed"] and res["recommended"] is not None:
             assignments.setdefault(t, {})[f] = res["recommended"]
             meta.setdefault(t, {})[f] = {
                 "at": now, "bars": n_bars, "fee_pct": fee, "validated": validate, "baseline_days": baseline_days,
+                "metric": res["recommended"]["metric"],
                 "train": res["base_stats"]["train"], "test": res["base_stats"]["test"],
                 "previous_all": res["base_stats"]["all"],
                 "new_all": (res["chosen_stats"] or res["base_stats"])["all"],

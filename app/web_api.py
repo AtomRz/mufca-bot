@@ -772,7 +772,7 @@ async def run_autofilter(body: AutoFilterIn):
     return _start_sim_job(
         "autofilter",
         {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars,
-         "apply": body.apply, "validate": body.validate_oos},
+         "apply": body.apply, "validate": body.validate_oos, "metrics": body.metrics},
         _run,
     )
 
@@ -783,17 +783,20 @@ class VolFitIn(BaseModel):
     num_bars: int = Field(3000, ge=300, le=20000)
     apply: bool = True         # False = preview: report only, nothing pinned
     validate_oos: bool = True  # False = skip the out-of-sample check (max in-sample gain, overfits)
+    metrics: Optional[List[str]] = None  # candidates among bar/smooth/thin/how (default: all four)
 
 
 @app.post("/api/volfit")
 async def run_volfit(body: VolFitIn):
-    """Auto-tunes the low-volume gate's threshold per pair and timeframe (same
+    """Auto-tunes the low-volume gate's metric AND threshold per pair and timeframe (same
     computation as the Discord !volfit, both call signals.run_volume_autotune()):
     one dry-run backtest per pair/timeframe recording every raw trigger with its
-    volume ratio, then a grid of thresholds replayed on top of the pair's current
-    filter set, guarded by a train/test split, a noise gate, a minimum number of
-    blocked trades and a plateau check. No threshold that proves itself = the gate
-    is OFF for that pair/timeframe. With apply=true the changed thresholds are
+    value of each volume metric (bar / smooth / thin / how), then a grid of thresholds
+    per metric replayed on top of the pair's current filter set, guarded by a
+    train/test split, a noise gate that gets stricter with every extra metric, a
+    minimum number of blocked trades and a plateau check; only the single best metric
+    is tested out of sample. Nothing that proves itself = the gate is OFF for that
+    pair/timeframe. With apply=true the changed thresholds are
     pinned (GET /api/volume-gate shows them, POST /api/volume-gate/revert undoes the
     last apply); apply=false is a preview. The gate's own switch is not touched.
 
@@ -801,11 +804,15 @@ async def run_volfit(body: VolFitIn):
     GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
     exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
     from signals import run_volume_autotune
+    if body.metrics is not None:
+        bad = [m for m in body.metrics if m not in _cfg.VOLUME_GATE_METRICS]
+        if bad or not body.metrics:
+            raise HTTPException(400, f"metrics must be a non-empty subset of {', '.join(_cfg.VOLUME_GATE_METRICS)}")
 
     async def _run(progress):
         result = await run_volume_autotune(
             exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress,
-            validate=body.validate_oos, apply=body.apply)
+            validate=body.validate_oos, apply=body.apply, metrics=body.metrics)
         if result["applied"]:
             await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
         return result
@@ -842,7 +849,8 @@ async def get_volume_gate_live():
 
 class VolumeGateIn(BaseModel):
     enabled: Optional[bool] = None
-    threshold: Optional[float] = None       # default minimum ratio
+    threshold: Optional[float] = None       # default minimum value
+    metric: Optional[str] = None            # default metric: bar / smooth / thin / how
     baseline_days: Optional[int] = None     # baseline window length
 
 
@@ -852,14 +860,14 @@ async def set_volume_gate(body: VolumeGateIn):
     baseline window, live (no restart). Open trades are not touched - this only stops
     NEW entries (blocked signals are tracked as shadow records). Pins from the
     auto-tuner keep winning over the default threshold for their pair/timeframe."""
-    if body.enabled is None and body.threshold is None and body.baseline_days is None:
-        raise HTTPException(400, "nothing to change: send enabled, threshold and/or baseline_days")
+    if body.enabled is None and body.threshold is None and body.baseline_days is None and body.metric is None:
+        raise HTTPException(400, "nothing to change: send enabled, metric, threshold and/or baseline_days")
     before = _cfg.get_volume_gate()
     try:
-        after = _cfg.set_volume_gate(body.enabled, body.threshold, body.baseline_days)
+        after = _cfg.set_volume_gate(body.enabled, body.threshold, body.baseline_days, body.metric)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    changed = any(before[k] != after[k] for k in ("enabled", "threshold", "baseline_days"))
+    changed = any(before[k] != after[k] for k in ("enabled", "metric", "threshold", "baseline_days"))
     if changed:
         await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
     return {"volume_gate": after, "changed": changed}

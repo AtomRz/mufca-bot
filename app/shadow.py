@@ -212,6 +212,7 @@ def add_shadow_record(
     confidence_components: Optional[Dict[str, float]],
     blocked_by: str = "entry_switch",
     vol_ratio: Optional[float] = None,
+    vol_metric: Optional[str] = None,
 ):
     """blocked_by - what kept the real trade out: "entry_switch" (Settings -> Entry)
     or "low_volume" (the volume gate, volume_gate.py). vol_ratio - the signal bar's
@@ -232,6 +233,7 @@ def add_shadow_record(
         "confidence_components": confidence_components,
         "blocked_by": blocked_by,
         "vol_ratio": vol_ratio,
+        "vol_metric": vol_metric,
         "exit": None,
         "exit_type": "open",
         "exit_bar_ts": None,

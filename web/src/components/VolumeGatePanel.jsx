@@ -5,16 +5,28 @@ import { SimScopeFields, SimStatus, BarCoverageWarning, useSimJob, barsError } f
 const pct = (v) => (Number.isFinite(v) ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}%` : '—')
 const statText = (st) => (st ? `n=${st.n} avg ${pct(st.avg)} total ${pct(st.total)}` : '—')
 const thrText = (v) => (!v ? 'off' : Number(v).toFixed(2))
+const METRICS = ['bar', 'smooth', 'thin', 'how']
+const METRIC_HELP = {
+  bar: 'this bar ÷ median of the baseline',
+  smooth: 'mean of the last 3 bars ÷ median of the baseline',
+  thin: 'normal price move per unit of volume ÷ this bar\'s (low = big move on thin volume)',
+  how: 'this bar ÷ same hour of the week over the past weeks',
+}
+// {metric, threshold} (or a bare number = bar) -> "smooth ≥ 0.55" / "off"
+const ruleText = (r) => {
+  if (r && typeof r === 'object') return !r.threshold ? 'off' : `${r.metric} ≥ ${Number(r.threshold).toFixed(2)}`
+  return thrText(r)
+}
 
-function GridTable({ rows, recommended }) {
+function GridTable({ rows, recommended, metric }) {
   if (!rows || rows.length === 0) return null
   return (
     <details style={{ marginTop: 4 }}>
-      <summary style={{ cursor: 'pointer', color: 'var(--text-faint)' }}>threshold grid</summary>
+      <summary style={{ cursor: 'pointer', color: 'var(--text-faint)' }}>threshold grid{metric ? ` (${metric})` : ''}</summary>
       <table style={{ fontSize: 11, marginTop: 4, borderCollapse: 'collapse' }}>
         <thead>
           <tr style={{ color: 'var(--text-faint)', textAlign: 'right' }}>
-            <th style={{ textAlign: 'left', paddingRight: 10 }}>min ratio</th>
+            <th style={{ textAlign: 'left', paddingRight: 10 }}>min value</th>
             <th style={{ paddingRight: 10 }}>blocked (train)</th>
             <th style={{ paddingRight: 10 }}>gain (train)</th>
             <th style={{ paddingRight: 10 }}>blocked (test)</th>
@@ -53,15 +65,30 @@ function ResultRows({ result }) {
           <div key={`${ticker}-${tf}`} style={{ fontSize: 12, marginBottom: 10 }}>
             <div style={{ fontWeight: 600 }}>
               {ticker} {tf}{' '}
-              {r.recommended === null && <span style={{ color: 'var(--text-faint)' }}>➖ left as is ({thrText(r.current)})</span>}
+              {r.recommended === null && <span style={{ color: 'var(--text-faint)' }}>➖ left as is ({ruleText(r.current)})</span>}
               {r.recommended !== null && r.changed && (
                 <span style={{ color: 'var(--long)' }}>
-                  {result.applied ? '✅ pinned' : '✅ would pin'}: min ratio {thrText(r.recommended)} (was {thrText(r.current)})
+                  {result.applied ? '✅ pinned' : '✅ would pin'}: {r.recommended.threshold ? ruleText(r.recommended) : 'gate off for this pair'} (was {ruleText(r.current)})
                 </span>
               )}
-              {r.recommended !== null && !r.changed && <span style={{ color: 'var(--text-faint)' }}>unchanged ({thrText(r.current)})</span>}
+              {r.recommended !== null && !r.changed && <span style={{ color: 'var(--text-faint)' }}>unchanged ({ruleText(r.current)})</span>}
             </div>
             <div style={{ color: 'var(--text-faint)' }}>{r.reason}</div>
+            {r.metrics && Object.keys(r.metrics).length > 0 && (
+              <div style={{ color: 'var(--text-faint)' }}>
+                best on training:{' '}
+                {Object.entries(r.metrics).map(([m, mr], i) => (
+                  <span key={m}>
+                    {i > 0 && ' · '}
+                    {mr.best_threshold !== null && mr.best_threshold !== undefined
+                      ? `${m} ≥${mr.best_threshold.toFixed(2)} (${pct(mr.best_gain_train)})`
+                      : `${m} ✗ (top ${pct(mr.top_gain_train)})`}
+                  </span>
+                ))}
+                {' '}— noise bar {r.gain_k}σ train / {r.test_k}σ test
+                {Object.entries(r.metrics_unavailable || {}).map(([m, why]) => <span key={m}><br />{m}: skipped — {why}</span>)}
+              </div>
+            )}
             {r.chosen_stats && (
               <div style={{ color: 'var(--text-faint)' }}>
                 with gate {statText(r.chosen_stats.all)} · without {statText(r.base_stats.all)}
@@ -75,10 +102,10 @@ function ResultRows({ result }) {
             )}
             {wb && wb.blocked > 0 && (
               <div style={{ color: 'var(--text-faint)' }}>
-                at {wb.threshold.toFixed(2)} the gate removes {wb.blocked} trades, {wb.weekend} of them on weekends (UTC)
+                with {wb.metric} ≥ {wb.threshold.toFixed(2)} the gate removes {wb.blocked} trades, {wb.weekend} of them on weekends (UTC)
               </div>
             )}
-            <GridTable rows={r.rows} recommended={r.recommended} />
+            <GridTable rows={r.rows} recommended={r.recommended?.threshold} metric={r.rows_metric} />
           </div>
         )
       })}
@@ -90,7 +117,7 @@ function LiveRatios({ live, loading, error, onCheck }) {
   return (
     <div style={{ marginTop: 14 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>Live volume ratio</span>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Live volume (bar / smooth / thin / how)</span>
         <button className="btn" disabled={loading} onClick={onCheck}>{loading ? 'Checking…' : 'Check now'}</button>
       </div>
       {error && <p style={{ color: 'var(--short)', fontSize: 12 }}>Failed: {error}</p>}
@@ -98,10 +125,18 @@ function LiveRatios({ live, loading, error, onCheck }) {
         <div className="row" key={`${r.ticker}-${r.tf}`} style={{ fontSize: 12 }}>
           <span className="row-label">{r.ticker} {r.tf}</span>
           <span className="row-value">
-            {r.ratio === null || r.ratio === undefined
+            {!r.values || Object.values(r.values).every((v) => v === null || v === undefined)
               ? 'n/a'
               : <>
-                  <b>{r.ratio.toFixed(2)}</b> vs min {thrText(r.threshold)}{' '}
+                  {METRICS.map((m, i) => (
+                    <span key={m}>
+                      {i > 0 && ' / '}
+                      {r.values[m] === null || r.values[m] === undefined
+                        ? '–'
+                        : (m === r.metric ? <b>{r.values[m].toFixed(2)}</b> : r.values[m].toFixed(2))}
+                    </span>
+                  ))}
+                  {' '}· rule {r.metric} ≥ {thrText(r.threshold)}{' '}
                   <span style={{ color: r.would_block ? 'var(--short)' : 'var(--long)' }}>{r.would_block ? '🔻 below' : '✅ ok'}</span>
                 </>}
           </span>
@@ -122,9 +157,9 @@ function PinnedThresholds({ gate, tracked, busy, onRevert, onClear }) {
   const canRevert = rows.length > 0 || Object.keys(gate.previous || {}).length > 0
   return (
     <div style={{ marginTop: 14 }}>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Pinned thresholds</div>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Pinned rules</div>
       {rows.length === 0 ? (
-        <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>None — every pair/timeframe uses the default threshold.</p>
+        <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>None — every pair/timeframe uses the default rule.</p>
       ) : (
         rows.map(({ ticker, tf, v }) => (
           <div className="row" key={`${ticker}-${tf}`} style={{ fontSize: 12 }}>
@@ -132,7 +167,7 @@ function PinnedThresholds({ gate, tracked, busy, onRevert, onClear }) {
               {ticker} {tf}
               {tracked && !tracked.includes(ticker) && <span style={{ color: 'var(--accent)' }}> · pair no longer tracked</span>}
             </span>
-            <span className="row-value">{v === 0 ? 'off for this pair' : `min ratio ${v.toFixed(2)}`}</span>
+            <span className="row-value">{!v?.threshold ? 'gate off for this pair' : ruleText(v)}</span>
           </div>
         ))
       )}
@@ -145,11 +180,12 @@ function PinnedThresholds({ gate, tracked, busy, onRevert, onClear }) {
 }
 
 export default function VolumeGatePanel({ config, onChanged }) {
-  const gate = config.volume_gate || { enabled: false, threshold: 0.5, baseline_days: 14, overrides: {}, previous: {} }
+  const gate = config.volume_gate || { enabled: false, metric: 'bar', threshold: 0.5, baseline_days: 14, overrides: {}, previous: {} }
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
   const [skipOos, setSkipOos] = useState(false)
+  const [fitMetrics, setFitMetrics] = useState(METRICS)
   const [thrDraft, setThrDraft] = useState(null)
   const [daysDraft, setDaysDraft] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -164,8 +200,9 @@ export default function VolumeGatePanel({ config, onChanged }) {
   const start = (apply) => {
     const bad = barsError(numBars)
     if (bad) { sim.setError(bad); return }
+    if (fitMetrics.length === 0) { sim.setError('Pick at least one metric to compare'); return }
     setLocalError(null)
-    sim.start(() => api.runVolumeFit({ ticker, tf, numBars, apply, validateOos: !skipOos }))
+    sim.start(() => api.runVolumeFit({ ticker, tf, numBars, apply, validateOos: !skipOos, metrics: fitMetrics }))
   }
 
   // refresh the pinned list (config.volume_gate) once an applying run finishes
@@ -206,8 +243,10 @@ export default function VolumeGatePanel({ config, onChanged }) {
       <h3 className="panel-title">Low-volume gate</h3>
       <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
         Stops NEW entries while the signal bar's volume is far below what is normal for the pair/timeframe — thin trading
-        (weekends, holidays, dead hours) is easy to push around. ratio = bar volume ÷ median volume of the prior baseline
-        window, so weekends and holidays show up low on their own, no calendar. Blocked signals are not lost: they are
+        (weekends, holidays, dead hours) is easy to push around. Four ways to read "thin" (all: higher = more liquid, the
+        entry is blocked below the threshold): bar — this bar vs the baseline median; smooth — the last 3 bars; thin — price
+        move per unit of volume; how — vs the same hour of the week. Weekends and holidays show up low on their own, no
+        calendar. Blocked signals are not lost: they are
         tracked as shadow records so you can check what they would have done. Open trades are not affected.
       </p>
 
@@ -222,7 +261,14 @@ export default function VolumeGatePanel({ config, onChanged }) {
 
       <div style={{ display: 'flex', gap: 14, alignItems: 'flex-end', flexWrap: 'wrap', margin: '10px 0' }}>
         <div className="field" style={{ marginBottom: 0 }}>
-          <label title="Default minimum ratio, used wherever no pair/timeframe threshold is pinned. 0.5 = block when the bar's volume is under half of normal.">Default min ratio</label>
+          <label title={`How "thin" is measured by default (wherever no pair/timeframe rule is pinned): ${METRIC_HELP[gate.metric] || ''}`}>Default metric</label>
+          <select value={gate.metric || 'bar'} disabled={busy}
+                  onChange={(e) => act(() => api.setVolumeGate({ metric: e.target.value }))}>
+            {METRICS.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+        <div className="field" style={{ marginBottom: 0 }}>
+          <label title="Default minimum ratio, used wherever no pair/timeframe threshold is pinned. 0.5 = block when the bar's volume is under half of normal.">Default min value</label>
           <input type="number" step="0.05" min="0" max="5" value={thrValue} disabled={busy}
                  onChange={(e) => setThrDraft(e.target.value)} style={{ width: 90 }} />
         </div>
@@ -238,11 +284,22 @@ export default function VolumeGatePanel({ config, onChanged }) {
 
       <div style={{ fontSize: 13, fontWeight: 600, margin: '16px 0 6px' }}>Auto-tune thresholds</div>
       <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 10 }}>
-        Backtests every pair × timeframe, records the volume ratio of every signal and tries thresholds 0.30–0.90 on top of
-        the current filter set, scoring net PnL (after fees). It is picked on the older 60% of history and kept only if it
-        beats noise, blocks enough trades to be measurable, sits on a plateau (neighbouring thresholds gain too) and is
+        Backtests every pair × timeframe, records all four volume readings of every signal and tries thresholds 0.30–0.90
+        for each on top of the current filter set, scoring net PnL (after fees). The more metrics are compared, the higher the
+        noise bar, and only the single best one is tested on the newest 40% (no second chances). A rule is picked on the
+        older 60% of history and kept only if it beats noise, blocks enough trades to be measurable, sits on a plateau (neighbouring thresholds gain too) and is
         confirmed on the newest 40%. If nothing proves itself the gate stays off for that pair/timeframe — a normal result.
       </p>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, marginBottom: 8 }}>
+        <span style={{ color: 'var(--text-faint)' }}>Compare:</span>
+        {METRICS.map((m) => (
+          <label key={m} title={METRIC_HELP[m]} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            <input type="checkbox" checked={fitMetrics.includes(m)} disabled={sim.running}
+                   onChange={(e) => setFitMetrics((cur) => (e.target.checked ? METRICS.filter((x) => x === m || cur.includes(x)) : cur.filter((x) => x !== m)))} />
+            {m}
+          </label>
+        ))}
+      </div>
       <SimScopeFields
         pairs={config.pairs} timeframes={config.timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
         numBars={numBars} setNumBars={setNumBars}
@@ -267,7 +324,7 @@ export default function VolumeGatePanel({ config, onChanged }) {
           </p>
           {result.applied && !result.gate_enabled && (
             <p style={{ fontSize: 12, color: 'var(--accent)', marginBottom: 8 }}>
-              ⚠️ The gate is off — the pinned thresholds do nothing until you switch it on above.
+              ⚠️ The gate is off — the pinned rules do nothing until you switch it on above.
             </p>
           )}
           {(result.skipped || []).map((sk) => (
@@ -286,7 +343,7 @@ export default function VolumeGatePanel({ config, onChanged }) {
         onClear={() => act(() => api.clearVolumeGate())}
       />
       <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-        Pinned thresholds win over the default for that pair/timeframe (off = no gate there). Also available in Discord: !volume, !volfit.
+        Pinned rules win over the default for that pair/timeframe (off = no gate there). Also available in Discord: !volume, !volfit.
       </p>
     </div>
   )
