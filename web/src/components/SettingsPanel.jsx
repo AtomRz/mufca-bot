@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 import AutoFilterPanel from './AutoFilterPanel'
+import VolumeGatePanel from './VolumeGatePanel'
 import IndicatorOptimizerPanel from './IndicatorOptimizerPanel'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
@@ -414,6 +415,8 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <AutoFilterPanel config={config} onChanged={onChanged} />
+
+          <VolumeGatePanel config={config} onChanged={onChanged} />
 
           <IndicatorOptimizerPanel config={config} />
 

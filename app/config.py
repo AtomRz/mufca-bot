@@ -1081,6 +1081,184 @@ def is_entry_blocked(track: str, side: str, regime: str) -> bool:
     return mode == "block_trend" and regime == "TREND"
 
 # =====================================================================
+# 📉  LOW-VOLUME (THIN-LIQUIDITY) ENTRY GATE
+# =====================================================================
+# Blocks NEW entries while the volume of the signal bar is far below what is
+# normal for the pair/timeframe (weekends, holidays, dead hours - thin books are
+# easy to push around and breakouts fail more often). The metric and its
+# reasoning are in volume_gate.py: ratio = quote volume of the signal bar /
+# median quote volume of the prior `baseline_days` on the same timeframe.
+#
+# Stored in one JSON file:
+#   enabled        - master switch (OFF by default: opt-in until validated)
+#   threshold      - default minimum ratio; below it the entry is blocked
+#   baseline_days  - length of the baseline window
+#   overrides      - {ticker: {tf: threshold}} pinned by the auto-tuner
+#                    (!volfit / POST /api/volfit); 0.0 = gate OFF for that pair/tf
+#   previous       - the overrides before the last apply (for revert)
+#   applied_at / meta - when and on what evidence the overrides were applied
+#
+# Applied in check_signals() as an extra entry block: a blocked signal opens
+# nothing and is stored as a SHADOW record (blocked_by="low_volume"), so its
+# outcome stays measurable. Live only - backtest_history() does not apply it
+# (the sims keep showing the unfiltered picture); the auto-tuner reads the
+# ratio of every trigger from the trigger table instead.
+VOLUME_GATE_FILE = os.path.join(DATA_DIR, "volume_filter.json")
+VOLUME_GATE_DEFAULT_THRESHOLD = 0.5
+VOLUME_GATE_DEFAULT_BASELINE_DAYS = 14
+VOLUME_GATE_THRESHOLD_RANGE = (0.0, 5.0)
+VOLUME_GATE_BASELINE_RANGE = (3, 60)
+
+# Auto-tuner (!volfit / POST /api/volfit, signals.run_volume_autotune) - reuses the
+# AUTOTUNE_* fee / train fraction / noise multiples defined below.
+VOLFIT_GRID_MIN = 0.30
+VOLFIT_GRID_MAX = 0.90
+VOLFIT_GRID_STEP = 0.05
+VOLFIT_MIN_BLOCKED_TRAIN = 10   # a threshold must block at least this many trades in the train window...
+VOLFIT_MIN_BLOCKED_TEST = 4     # ...and this many in the test window, or it cannot be judged
+VOLFIT_MIN_TEST_GAIN_SE = 1.0   # the test window must confirm the gain by this many standard errors (stricter than AUTOTUNE_MIN_TEST_GAIN_SE: ~13 thresholds are tried)
+VOLFIT_NEAR_BEST_SHARE = 0.8    # among eligible thresholds take the lowest one within this share of the best 3-point-average gain
+
+_volume_gate_lock = threading.RLock()
+
+
+def _clean_volume_thresholds(raw) -> dict:
+    """{ticker: {tf: threshold}} with only finite numbers inside the allowed range."""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    lo, hi = VOLUME_GATE_THRESHOLD_RANGE
+    for tk, tfs in raw.items():
+        if not isinstance(tfs, dict):
+            continue
+        for tf, v in tfs.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            f = float(v)
+            if f == f and lo <= f <= hi:
+                out.setdefault(str(tk), {})[str(tf)] = round(f, 4)
+    return out
+
+
+def load_volume_gate() -> dict:
+    data = safe_json_load(VOLUME_GATE_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    lo, hi = VOLUME_GATE_THRESHOLD_RANGE
+    thr = data.get("threshold")
+    if isinstance(thr, bool) or not isinstance(thr, (int, float)) or not (lo <= float(thr) <= hi):
+        thr = VOLUME_GATE_DEFAULT_THRESHOLD
+    days = data.get("baseline_days")
+    blo, bhi = VOLUME_GATE_BASELINE_RANGE
+    if isinstance(days, bool) or not isinstance(days, int) or not (blo <= days <= bhi):
+        days = VOLUME_GATE_DEFAULT_BASELINE_DAYS
+    applied = data.get("applied_at")
+    meta = data.get("meta")
+    return {
+        "enabled": data.get("enabled") is True,
+        "threshold": float(thr),
+        "baseline_days": int(days),
+        "overrides": _clean_volume_thresholds(data.get("overrides")),
+        "previous": _clean_volume_thresholds(data.get("previous")),
+        "applied_at": applied if isinstance(applied, (int, float)) and not isinstance(applied, bool) else 0,
+        "meta": meta if isinstance(meta, dict) else {},
+    }
+
+
+# Mutated IN PLACE by the setters below (the web endpoint / Discord command), so
+# check_signals() - which reads it at call time - sees a change on the next scan.
+VOLUME_GATE = load_volume_gate()
+
+
+def _save_volume_gate():
+    safe_json_save(VOLUME_GATE_FILE, VOLUME_GATE)
+
+
+def get_volume_gate() -> dict:
+    with _volume_gate_lock:
+        return copy.deepcopy(VOLUME_GATE)
+
+
+def volume_gate_threshold(ticker: Optional[str], timeframe: Optional[str]) -> float:
+    """Minimum ratio in force for one (ticker, tf): the auto-tuner's pin if any
+    (0.0 = off for that pair/tf), else the default. Does NOT look at `enabled`."""
+    with _volume_gate_lock:
+        pinned = VOLUME_GATE["overrides"].get(ticker, {}).get(timeframe) if ticker and timeframe else None
+        return float(VOLUME_GATE["threshold"] if pinned is None else pinned)
+
+
+def set_volume_gate(enabled: Optional[bool] = None, threshold: Optional[float] = None,
+                    baseline_days: Optional[int] = None) -> dict:
+    """Updates the global switch / default threshold / baseline window (None = leave as is).
+    Raises ValueError on an out-of-range value. Returns the settings afterwards."""
+    with _volume_gate_lock:
+        if threshold is not None:
+            lo, hi = VOLUME_GATE_THRESHOLD_RANGE
+            if isinstance(threshold, bool) or not (lo <= float(threshold) <= hi):
+                raise ValueError(f"threshold must be between {lo} and {hi}")
+        if baseline_days is not None:
+            blo, bhi = VOLUME_GATE_BASELINE_RANGE
+            if isinstance(baseline_days, bool) or int(baseline_days) != baseline_days or not (blo <= int(baseline_days) <= bhi):
+                raise ValueError(f"baseline_days must be a whole number between {blo} and {bhi}")
+        if enabled is not None:
+            VOLUME_GATE["enabled"] = bool(enabled)
+        if threshold is not None:
+            VOLUME_GATE["threshold"] = round(float(threshold), 4)
+        if baseline_days is not None:
+            VOLUME_GATE["baseline_days"] = int(baseline_days)
+        _save_volume_gate()
+        return copy.deepcopy(VOLUME_GATE)
+
+
+def apply_volume_thresholds(new_map: dict, meta: Optional[dict] = None):
+    """Merges the auto-tuner's {ticker: {tf: threshold}} into the pins (keeping the
+    state before it for revert). Entries of other pairs/timeframes are untouched."""
+    clean = _clean_volume_thresholds(new_map)
+    with _volume_gate_lock:
+        VOLUME_GATE["previous"] = copy.deepcopy(VOLUME_GATE["overrides"])
+        for tk, tfs in clean.items():
+            for tf, thr in tfs.items():
+                VOLUME_GATE["overrides"].setdefault(tk, {})[tf] = thr
+                if meta and tk in meta and tf in meta[tk]:
+                    VOLUME_GATE["meta"].setdefault(tk, {})[tf] = meta[tk][tf]
+        VOLUME_GATE["applied_at"] = int(time.time())
+        _save_volume_gate()
+
+
+def revert_volume_thresholds() -> bool:
+    with _volume_gate_lock:
+        if not VOLUME_GATE["previous"] and not VOLUME_GATE["overrides"]:
+            return False
+        VOLUME_GATE["overrides"], VOLUME_GATE["previous"] = VOLUME_GATE["previous"], VOLUME_GATE["overrides"]
+        VOLUME_GATE["applied_at"] = int(time.time())
+        _save_volume_gate()
+        return True
+
+
+def clear_volume_thresholds():
+    """Drops every pin - all pairs/timeframes use the default threshold again."""
+    with _volume_gate_lock:
+        VOLUME_GATE["previous"] = copy.deepcopy(VOLUME_GATE["overrides"])
+        VOLUME_GATE["overrides"] = {}
+        VOLUME_GATE["meta"] = {}
+        VOLUME_GATE["applied_at"] = int(time.time())
+        _save_volume_gate()
+
+
+def drop_ticker_volume_thresholds(ticker: str) -> bool:
+    """Housekeeping when a pair is removed from scanning (same reasoning as
+    drop_ticker_filter_overrides): a re-add must not inherit an old tuning."""
+    with _volume_gate_lock:
+        found = False
+        for key in ("overrides", "previous", "meta"):
+            if VOLUME_GATE[key].pop(ticker, None) is not None:
+                found = True
+        if found:
+            VOLUME_GATE["applied_at"] = int(time.time())
+            _save_volume_gate()
+        return found
+
+# =====================================================================
 # 📈  HURST ANIS-LLOYD BIAS CORRECTION
 # =====================================================================
 # ON  (default) — the R/S Hurst estimate is Anis-Lloyd bias-corrected, so pure

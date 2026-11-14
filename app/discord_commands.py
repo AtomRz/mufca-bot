@@ -52,9 +52,10 @@ from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
-    run_indicator_optimize, FILTER_KEYS,
+    run_indicator_optimize, run_volume_autotune, FILTER_KEYS,
 )
 import filter_stats
+import volume_gate
 import smc
 from onchain import (
     get_onchain_bias, format_onchain_report, clear_onchain_cache_full,
@@ -143,6 +144,8 @@ async def help_cmd(ctx):
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!smcsim [pair] [tf] [bars]` — Smart Money Concepts event study (sweeps, BOS/CHoCH, FVG, sweep→shift) vs. any-bar baseline on real history; research only, trades nothing",
         "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
+        "`!volume [on|off|thr <x>|days <n>|live]` — low-volume (thin-liquidity) entry gate: status, switch, default threshold, baseline window, live volume ratio per pair",
+        "`!volfit [preview|run] [pair] [tf] [bars]` — find the volume-ratio threshold per pair × timeframe from history (train/test checked; no proven threshold = gate off for that pair); `!volfit show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
@@ -427,9 +430,11 @@ async def remove_cmd(ctx, ticker: str = ""):
     derivatives.clear_ticker_cache(ticker)
     spread.clear_ticker_cache(ticker)
     dropped_pins = _cfg.drop_ticker_filter_overrides(ticker)
+    dropped_vol = _cfg.drop_ticker_volume_thresholds(ticker)
 
     await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}"
-                   + (" Its pinned filter sets were dropped too." if dropped_pins else ""))
+                   + (" Its pinned filter sets were dropped too." if dropped_pins else "")
+                   + (" Its pinned volume thresholds were dropped too." if dropped_vol else ""))
 
 @core.bot.command(name="delsignals")
 async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = ""):
@@ -1658,6 +1663,215 @@ async def autofilter_cmd(ctx, *args):
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"autofilter command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _fmt_vol_thr(thr) -> str:
+    return "off" if not thr else f"{float(thr):.2f}"
+
+
+def _volume_status_lines() -> list:
+    g = _cfg.get_volume_gate()
+    lines = [
+        f"**📉 Low-volume gate: {'ON' if g['enabled'] else 'OFF'}**",
+        f"default threshold `{g['threshold']:.2f}` · baseline `{g['baseline_days']}` days "
+        f"(ratio = bar volume / median volume of the prior baseline, same timeframe)",
+    ]
+    pins = g["overrides"]
+    if pins:
+        lines.append("pinned per pair/timeframe: " + ", ".join(
+            f"`{t} {tf}` {_fmt_vol_thr(v)}" for t, per in sorted(pins.items()) for tf, v in sorted(per.items())))
+    else:
+        lines.append("no pinned thresholds — every pair/timeframe uses the default (`!volfit` finds them from history)")
+    return lines
+
+
+@core.bot.command(name="volume", aliases=["volgate"])
+async def volume_cmd(ctx, *args):
+    """
+    Low-volume (thin-liquidity) entry gate. Blocks NEW entries while the signal bar's
+    volume is far below the pair's normal (weekends, holidays, dead hours show up as
+    a low ratio by themselves - no calendar). Blocked signals are not lost: they are
+    tracked as shadow records so you can check later what they would have done.
+
+      !volume                 - status + live ratio of every pair/timeframe
+      !volume on | off        - switch the gate
+      !volume thr <x>         - default minimum ratio (0 - 5, e.g. 0.5)
+      !volume days <n>        - baseline window in days (3 - 60)
+      !volume live            - only the live ratios
+    The gate is OFF by default. Per-pair thresholds come from !volfit.
+    """
+    try:
+        action = args[0].lower() if args else "show"
+        if action in ("on", "off"):
+            _cfg.set_volume_gate(enabled=(action == "on"))
+            await ctx.send(f"📉 Low-volume gate switched **{action.upper()}**.")
+            return
+        if action in ("thr", "threshold", "days"):
+            if len(args) < 2:
+                await ctx.send(f"❌ Usage: `!volume {action} <number>`")
+                return
+            try:
+                num = float(args[1].replace(",", "."))
+            except ValueError:
+                await ctx.send(f"❌ `{args[1]}` is not a number.")
+                return
+            try:
+                if action == "days":
+                    _cfg.set_volume_gate(baseline_days=int(num) if num == int(num) else -1)
+                else:
+                    _cfg.set_volume_gate(threshold=num)
+            except ValueError as e:
+                await ctx.send(f"❌ {e}")
+                return
+            await ctx.send("\n".join(_volume_status_lines()))
+            return
+        if action not in ("show", "status", "live"):
+            await ctx.send("❌ Usage: `!volume [on|off|thr <x>|days <n>|live]`")
+            return
+
+        lines = [] if action == "live" else _volume_status_lines()
+        exchange = core._exchange_ref
+        if exchange is None:
+            lines.append("❌ Not connected to the exchange yet — live ratios are not available.")
+        else:
+            g = _cfg.get_volume_gate()
+            rows = await volume_gate.current_ratios(exchange, list(TICKERS), list(TIMEFRAMES), g["baseline_days"])
+            lines.append("\n**Live volume ratio (last closed bar)**")
+            for r in rows:
+                if r.get("error") or r["ratio"] is None:
+                    lines.append(f"`{r['ticker']} {r['tf']}`: n/a ({r.get('error', 'not enough history')})")
+                    continue
+                mark = "🔻 below" if r["would_block"] else "✅ ok  "
+                lines.append(f"`{r['ticker']} {r['tf']}`: **{r['ratio']:.2f}** vs min {_fmt_vol_thr(r['threshold'])} {mark}")
+            if not g["enabled"]:
+                lines.append("_The gate is OFF, so nothing is blocked — this is only the preview._")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"volume command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _volfit_lines(result: dict, applied: bool) -> list:
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            rec = r["recommended"]
+            if rec is None:
+                lines.append(f"**{ticker} {tf}** ➖ left as is ({_fmt_vol_thr(r['current'])}) — {r['reason']}")
+            elif r["changed"]:
+                head = "✅ " + ("pinned" if applied else "would pin")
+                lines.append(f"**{ticker} {tf}** {head}: min ratio **{_fmt_vol_thr(rec)}** (was {_fmt_vol_thr(r['current'])}) — {r['reason']}")
+                cs, bs = r.get("chosen_stats"), r["base_stats"]
+                if cs:
+                    lines.append(f"   {_fmt_autotune_stats('with gate', cs['all'])} | {_fmt_autotune_stats('without ', bs['all'])}")
+                    if r["validated"]:
+                        lines.append(f"   out-of-sample: {_fmt_autotune_stats('with gate', cs['test'])} | {_fmt_autotune_stats('without ', bs['test'])}")
+            else:
+                lines.append(f"**{ticker} {tf}** unchanged ({_fmt_vol_thr(r['current'])}) — {r['reason']}")
+            dt = r["by_daytype"]
+            if dt["weekend"]["n"] and dt["weekday"]["n"]:
+                lines.append(f"   weekend trades: n={dt['weekend']['n']} avg={dt['weekend']['avg']:+.2f}% · "
+                             f"weekdays: n={dt['weekday']['n']} avg={dt['weekday']['avg']:+.2f}% (net of fee)")
+            wb = r.get("weekend_blocked")
+            if wb and wb["blocked"]:
+                lines.append(f"   at {wb['threshold']:.2f} the gate would have removed {wb['blocked']} trades, "
+                             f"{wb['weekend']} of them on weekends (UTC)")
+    return lines
+
+
+@core.bot.command(name="volfit", aliases=["voltune"])
+async def volfit_cmd(ctx, *args):
+    """
+    Finds the low-volume gate's threshold per pair AND timeframe from history. For
+    every tracked pair x timeframe it runs one dry-run backtest that records every
+    raw trigger with its volume ratio, replays a grid of thresholds (0.30 - 0.90) on
+    top of the pair's CURRENT filter set and compares the net PnL (fee deducted).
+
+    Overfitting guard (the sample is small): the threshold is chosen on the oldest
+    60% of the history and must (1) beat noise, (2) block enough trades to be
+    measurable, (3) sit on a plateau - its neighbours must gain too, and (4) be
+    confirmed on the newest 40%. Otherwise the gate stays OFF for that pair/timeframe
+    - "no threshold helps" is a normal, honest result.
+
+    Usage:
+      !volfit [pair] [tf] [bars]          - run + pin (default 3000 bars)
+      !volfit preview [pair] [tf] [bars]  - same report, nothing pinned
+      !volfit full [pair] [tf] [bars]     - pin WITHOUT the out-of-sample check (overfits)
+      !volfit show                        - pinned thresholds
+      !volfit revert                      - back to the state before the last apply
+      !volfit clear                       - drop every pin (default threshold again)
+    Pins do nothing while the gate is off (`!volume on`).
+    """
+    args = list(args)
+    action = "run"
+    if args and args[0].lower() in ("run", "preview", "full", "show", "revert", "clear"):
+        action = args.pop(0).lower()
+
+    if action == "show":
+        await _send_chunked(ctx, "\n".join(_volume_status_lines()))
+        return
+    if action in ("revert", "clear"):
+        if action == "revert":
+            ok = _cfg.revert_volume_thresholds()
+            await ctx.send("↩️ Reverted to the previous volume thresholds." if ok else "Nothing to revert.")
+        else:
+            _cfg.clear_volume_thresholds()
+            await ctx.send("🧹 Cleared all pinned volume thresholds — the default applies everywhere (`!volfit revert` undoes this).")
+        return
+
+    ticker = tf = ""
+    num_bars = 3000
+    for a in args:
+        if a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe or bar count.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+    apply = action in ("run", "full")
+    validate = action != "full"
+
+    try:
+        result = await _run_sim_job(
+            ctx, "volfit", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars,
+                            "apply": apply, "validate": validate},
+            lambda progress: run_volume_autotune(exchange, scope_tickers, scope_tfs, num_bars, progress=progress,
+                                                 validate=validate, apply=apply),
+            intro=(f"⏳ Fitting the low-volume threshold: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each"
+                   f" ({'applying' if apply else 'preview only'}). This takes a while."),
+        )
+        if result is None:
+            return
+        applied = result["applied"]
+        n_changed = sum(len(v) for v in result["assignments"].values())
+        head = [f"**📉 Volume threshold fit** — baseline {result['baseline_days']} days, net of {result['fee_pct']}% fee per trade, "
+                f"{'validated on the newest 40%' if result['validate'] else 'NO out-of-sample check'}; "
+                f"{n_changed} threshold(s) {'pinned' if applied else 'would change'}\n"]
+        for c in [c for c in result["bar_coverage"] if c["got"] < c["requested"]]:
+            head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
+        lines = head + _volfit_lines(result, applied)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above (the exchange may not serve that many bars; try fewer).")
+        if applied and not result["gate_enabled"]:
+            lines.append("\n⚠️ The gate is **OFF** — the pinned thresholds do nothing until you run `!volume on`.")
+        lines.append("\nPnL = unlevered % moves of simulated trades. Small samples can still overfit — "
+                     "`!volfit revert` undoes the last apply; re-run with more `bars` to check stability.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"volfit command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 
