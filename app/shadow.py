@@ -1,7 +1,8 @@
 """Shadow signals — "what would this blocked entry have done?"
 
-When a track/side is switched off in Settings → Entry (config.ENTRY_BLOCK),
-the signal is no longer opened, so it would normally leave no trace and its
+When a track/side is switched off in Settings → Entry (config.ENTRY_BLOCK), or
+the low-volume gate (volume_gate.py) rejects the signal bar, the signal is no
+longer opened, so it would normally leave no trace and its
 quality could never be re-checked on live data. Instead the signal is run
 through the same SL/TP/R:R/spread pipeline as a real one (signals.open_position
 with dry_run=True) and, if it would have opened, stored here as a *shadow*
@@ -209,7 +210,12 @@ def add_shadow_record(
     tp: float,
     entry_bar_ts: int,
     confidence_components: Optional[Dict[str, float]],
+    blocked_by: str = "entry_switch",
+    vol_ratio: Optional[float] = None,
 ):
+    """blocked_by - what kept the real trade out: "entry_switch" (Settings -> Entry)
+    or "low_volume" (the volume gate, volume_gate.py). vol_ratio - the signal bar's
+    volume ratio when known, so the gate's verdict can be re-checked later."""
     history = load_shadow_history()
     recs = history.setdefault(ticker, {}).setdefault(tf, {}).setdefault(side, [])
     recs.append({
@@ -224,6 +230,8 @@ def add_shadow_record(
         "track": track,
         "synthetic": False,
         "confidence_components": confidence_components,
+        "blocked_by": blocked_by,
+        "vol_ratio": vol_ratio,
         "exit": None,
         "exit_type": "open",
         "exit_bar_ts": None,
@@ -240,7 +248,8 @@ def add_shadow_record(
     _save(history)
     logger.info(
         f"[SHADOW] recorded {track.upper()}-{side.upper()} {ticker} {tf} @ {entry} "
-        f"(regime={regime}, SL={sl}, TP1={tp1}, TP2={tp}) — blocked by Entry switch, tracking only"
+        f"(regime={regime}, SL={sl}, TP1={tp1}, TP2={tp}) — blocked by "
+        f"{'low-volume gate' if blocked_by == 'low_volume' else 'Entry switch'}, tracking only"
     )
 
 

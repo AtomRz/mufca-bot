@@ -777,6 +777,112 @@ async def run_autofilter(body: AutoFilterIn):
     )
 
 
+class VolFitIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)
+    apply: bool = True         # False = preview: report only, nothing pinned
+    validate_oos: bool = True  # False = skip the out-of-sample check (max in-sample gain, overfits)
+
+
+@app.post("/api/volfit")
+async def run_volfit(body: VolFitIn):
+    """Auto-tunes the low-volume gate's threshold per pair and timeframe (same
+    computation as the Discord !volfit, both call signals.run_volume_autotune()):
+    one dry-run backtest per pair/timeframe recording every raw trigger with its
+    volume ratio, then a grid of thresholds replayed on top of the pair's current
+    filter set, guarded by a train/test split, a noise gate, a minimum number of
+    blocked trades and a plateau check. No threshold that proves itself = the gate
+    is OFF for that pair/timeframe. With apply=true the changed thresholds are
+    pinned (GET /api/volume-gate shows them, POST /api/volume-gate/revert undoes the
+    last apply); apply=false is a preview. The gate's own switch is not touched.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_volume_autotune
+
+    async def _run(progress):
+        result = await run_volume_autotune(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress,
+            validate=body.validate_oos, apply=body.apply)
+        if result["applied"]:
+            await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
+        return result
+
+    return _start_sim_job(
+        "volfit",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars,
+         "apply": body.apply, "validate": body.validate_oos},
+        _run,
+    )
+
+
+@app.get("/api/volume-gate")
+async def get_volume_gate():
+    """The low-volume gate's settings: switch, default threshold, baseline window and
+    the per-pair/timeframe thresholds pinned by the auto-tuner (with the stats that
+    justified each). Cheap - no exchange calls; live ratios are GET /api/volume-gate/live."""
+    return _cfg.get_volume_gate()
+
+
+@app.get("/api/volume-gate/live")
+async def get_volume_gate_live():
+    """Current volume ratio of the last closed bar for every tracked pair/timeframe,
+    the threshold in force and whether the gate would block right now. One OHLCV
+    fetch per pair/timeframe, so call it on demand rather than polling."""
+    import volume_gate
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+    gate = _cfg.get_volume_gate()
+    rows = await volume_gate.current_ratios(exchange, list(_cfg.TICKERS), list(_cfg.TIMEFRAMES), gate["baseline_days"])
+    return {"enabled": gate["enabled"], "baseline_days": gate["baseline_days"], "rows": rows}
+
+
+class VolumeGateIn(BaseModel):
+    enabled: Optional[bool] = None
+    threshold: Optional[float] = None       # default minimum ratio
+    baseline_days: Optional[int] = None     # baseline window length
+
+
+@app.post("/api/config/volume-gate")
+async def set_volume_gate(body: VolumeGateIn):
+    """Switches the low-volume gate on/off and/or changes the default threshold and the
+    baseline window, live (no restart). Open trades are not touched - this only stops
+    NEW entries (blocked signals are tracked as shadow records). Pins from the
+    auto-tuner keep winning over the default threshold for their pair/timeframe."""
+    if body.enabled is None and body.threshold is None and body.baseline_days is None:
+        raise HTTPException(400, "nothing to change: send enabled, threshold and/or baseline_days")
+    before = _cfg.get_volume_gate()
+    try:
+        after = _cfg.set_volume_gate(body.enabled, body.threshold, body.baseline_days)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    changed = any(before[k] != after[k] for k in ("enabled", "threshold", "baseline_days"))
+    if changed:
+        await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
+    return {"volume_gate": after, "changed": changed}
+
+
+@app.post("/api/volume-gate/revert")
+async def revert_volume_gate_pins():
+    """Swaps back to the pinned thresholds from before the last apply/clear (calling it
+    again re-applies them)."""
+    if not _cfg.revert_volume_thresholds():
+        raise HTTPException(409, "Nothing to revert")
+    await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
+    return _cfg.get_volume_gate()
+
+
+@app.delete("/api/volume-gate/overrides")
+async def clear_volume_gate_pins():
+    """Drops every pinned threshold - all pairs/timeframes use the default threshold."""
+    _cfg.clear_volume_thresholds()
+    await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
+    return _cfg.get_volume_gate()
+
+
 class IndOptIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
@@ -1082,6 +1188,8 @@ async def remove_pair(ticker: str, purge_history: bool = False):
     # filter_overrides.json forever (and a re-add would inherit them).
     if _cfg.drop_ticker_filter_overrides(ticker):
         await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
+    if _cfg.drop_ticker_volume_thresholds(ticker):
+        await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
 
     purged = 0
     if purge_history:
@@ -1296,6 +1404,7 @@ async def get_config():
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
         "entry_block": dict(_cfg.ENTRY_BLOCK),
+        "volume_gate": _cfg.get_volume_gate(),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
         "system_alerts_enabled": _cfg.SYSTEM_ALERTS_ENABLED,

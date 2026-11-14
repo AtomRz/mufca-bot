@@ -152,6 +152,14 @@ export const api = {
     request('/api/smcsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runAutoFilter: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
     request('/api/autofilter', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
+  runVolumeFit: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
+    request('/api/volfit', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
+  getVolumeGate: () => request('/api/volume-gate'),
+  getVolumeGateLive: () => request('/api/volume-gate/live'),
+  setVolumeGate: (patch) =>
+    request('/api/config/volume-gate', { method: 'POST', body: JSON.stringify(patch) }),
+  revertVolumeGate: () => request('/api/volume-gate/revert', { method: 'POST' }),
+  clearVolumeGate: () => request('/api/volume-gate/overrides', { method: 'DELETE' }),
   runIndicatorOptimize: ({ ticker, tf, numBars = 3000, trials = 60 } = {}) =>
     request('/api/indoptim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, trials }) }),
   pinFilters: (ticker, tf, filters) =>
