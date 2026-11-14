@@ -5,7 +5,7 @@ import math
 import time
 import threading
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1091,10 +1091,14 @@ def is_entry_blocked(track: str, side: str, regime: str) -> bool:
 #
 # Stored in one JSON file:
 #   enabled        - master switch (OFF by default: opt-in until validated)
-#   threshold      - default minimum ratio; below it the entry is blocked
+#   metric         - default volume metric (volume_gate.METRICS: bar / smooth /
+#                    thin / how); all read "high = liquid"
+#   threshold      - default minimum value; below it the entry is blocked
 #   baseline_days  - length of the baseline window
-#   overrides      - {ticker: {tf: threshold}} pinned by the auto-tuner
-#                    (!volfit / POST /api/volfit); 0.0 = gate OFF for that pair/tf
+#   overrides      - {ticker: {tf: {"metric": m, "threshold": t}}} pinned by the
+#                    auto-tuner (!volfit / POST /api/volfit); threshold 0.0 = gate
+#                    OFF for that pair/tf. (Old files hold a bare number = the
+#                    "bar" metric; it is read as such.)
 #   previous       - the overrides before the last apply (for revert)
 #   applied_at / meta - when and on what evidence the overrides were applied
 #
@@ -1106,6 +1110,8 @@ def is_entry_blocked(track: str, side: str, regime: str) -> bool:
 VOLUME_GATE_FILE = os.path.join(DATA_DIR, "volume_filter.json")
 VOLUME_GATE_DEFAULT_THRESHOLD = 0.5
 VOLUME_GATE_DEFAULT_BASELINE_DAYS = 14
+VOLUME_GATE_METRICS = ("bar", "smooth", "thin", "how")  # keep in step with volume_gate.METRICS
+VOLUME_GATE_DEFAULT_METRIC = "bar"
 VOLUME_GATE_THRESHOLD_RANGE = (0.0, 5.0)
 VOLUME_GATE_BASELINE_RANGE = (3, 60)
 
@@ -1117,26 +1123,42 @@ VOLFIT_GRID_STEP = 0.05
 VOLFIT_MIN_BLOCKED_TRAIN = 10   # a threshold must block at least this many trades in the train window...
 VOLFIT_MIN_BLOCKED_TEST = 4     # ...and this many in the test window, or it cannot be judged
 VOLFIT_MIN_TEST_GAIN_SE = 1.0   # the test window must confirm the gain by this many standard errors (stricter than AUTOTUNE_MIN_TEST_GAIN_SE: ~13 thresholds are tried)
+VOLFIT_METRIC_SE_STEP = 0.25    # every extra metric tried raises both the train and the test noise multiple by this much (multiple-comparison cost)
 VOLFIT_NEAR_BEST_SHARE = 0.8    # among eligible thresholds take the lowest one within this share of the best 3-point-average gain
 
 _volume_gate_lock = threading.RLock()
 
 
+def _clean_rule(v):
+    """A pin -> {"metric", "threshold"} or None. A bare number is the legacy form
+    (the "bar" metric)."""
+    lo, hi = VOLUME_GATE_THRESHOLD_RANGE
+    metric = VOLUME_GATE_DEFAULT_METRIC
+    if isinstance(v, dict):
+        metric = v.get("metric", VOLUME_GATE_DEFAULT_METRIC)
+        v = v.get("threshold")
+        if metric not in VOLUME_GATE_METRICS:
+            return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    if f == f and lo <= f <= hi:
+        return {"metric": metric, "threshold": round(f, 4)}
+    return None
+
+
 def _clean_volume_thresholds(raw) -> dict:
-    """{ticker: {tf: threshold}} with only finite numbers inside the allowed range."""
+    """{ticker: {tf: {"metric", "threshold"}}} with only valid rules inside."""
     out: dict = {}
     if not isinstance(raw, dict):
         return out
-    lo, hi = VOLUME_GATE_THRESHOLD_RANGE
     for tk, tfs in raw.items():
         if not isinstance(tfs, dict):
             continue
         for tf, v in tfs.items():
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                continue
-            f = float(v)
-            if f == f and lo <= f <= hi:
-                out.setdefault(str(tk), {})[str(tf)] = round(f, 4)
+            rule = _clean_rule(v)
+            if rule:
+                out.setdefault(str(tk), {})[str(tf)] = rule
     return out
 
 
@@ -1152,10 +1174,14 @@ def load_volume_gate() -> dict:
     blo, bhi = VOLUME_GATE_BASELINE_RANGE
     if isinstance(days, bool) or not isinstance(days, int) or not (blo <= days <= bhi):
         days = VOLUME_GATE_DEFAULT_BASELINE_DAYS
+    metric = data.get("metric")
+    if metric not in VOLUME_GATE_METRICS:
+        metric = VOLUME_GATE_DEFAULT_METRIC
     applied = data.get("applied_at")
     meta = data.get("meta")
     return {
         "enabled": data.get("enabled") is True,
+        "metric": metric,
         "threshold": float(thr),
         "baseline_days": int(days),
         "overrides": _clean_volume_thresholds(data.get("overrides")),
@@ -1179,19 +1205,30 @@ def get_volume_gate() -> dict:
         return copy.deepcopy(VOLUME_GATE)
 
 
-def volume_gate_threshold(ticker: Optional[str], timeframe: Optional[str]) -> float:
-    """Minimum ratio in force for one (ticker, tf): the auto-tuner's pin if any
-    (0.0 = off for that pair/tf), else the default. Does NOT look at `enabled`."""
+def volume_gate_rule(ticker: Optional[str], timeframe: Optional[str]) -> Tuple[str, float]:
+    """(metric, minimum value) in force for one (ticker, tf): the auto-tuner's pin
+    if any (threshold 0.0 = off for that pair/tf), else the global default. Does NOT
+    look at `enabled`."""
     with _volume_gate_lock:
         pinned = VOLUME_GATE["overrides"].get(ticker, {}).get(timeframe) if ticker and timeframe else None
-        return float(VOLUME_GATE["threshold"] if pinned is None else pinned)
+        if pinned:
+            return pinned["metric"], float(pinned["threshold"])
+        return VOLUME_GATE["metric"], float(VOLUME_GATE["threshold"])
+
+
+def volume_gate_threshold(ticker: Optional[str], timeframe: Optional[str]) -> float:
+    """Minimum value in force for one (ticker, tf) - see volume_gate_rule."""
+    return volume_gate_rule(ticker, timeframe)[1]
 
 
 def set_volume_gate(enabled: Optional[bool] = None, threshold: Optional[float] = None,
-                    baseline_days: Optional[int] = None) -> dict:
-    """Updates the global switch / default threshold / baseline window (None = leave as is).
-    Raises ValueError on an out-of-range value. Returns the settings afterwards."""
+                    baseline_days: Optional[int] = None, metric: Optional[str] = None) -> dict:
+    """Updates the global switch / default threshold / baseline window / default
+    metric (None = leave as is). Raises ValueError on an invalid value. Returns the
+    settings afterwards."""
     with _volume_gate_lock:
+        if metric is not None and metric not in VOLUME_GATE_METRICS:
+            raise ValueError(f"metric must be one of {', '.join(VOLUME_GATE_METRICS)}")
         if threshold is not None:
             lo, hi = VOLUME_GATE_THRESHOLD_RANGE
             if isinstance(threshold, bool) or not (lo <= float(threshold) <= hi):
@@ -1202,6 +1239,8 @@ def set_volume_gate(enabled: Optional[bool] = None, threshold: Optional[float] =
                 raise ValueError(f"baseline_days must be a whole number between {blo} and {bhi}")
         if enabled is not None:
             VOLUME_GATE["enabled"] = bool(enabled)
+        if metric is not None:
+            VOLUME_GATE["metric"] = metric
         if threshold is not None:
             VOLUME_GATE["threshold"] = round(float(threshold), 4)
         if baseline_days is not None:
@@ -1211,14 +1250,15 @@ def set_volume_gate(enabled: Optional[bool] = None, threshold: Optional[float] =
 
 
 def apply_volume_thresholds(new_map: dict, meta: Optional[dict] = None):
-    """Merges the auto-tuner's {ticker: {tf: threshold}} into the pins (keeping the
+    """Merges the auto-tuner's {ticker: {tf: {"metric", "threshold"}}} (a bare number
+    = the "bar" metric) into the pins (keeping the
     state before it for revert). Entries of other pairs/timeframes are untouched."""
     clean = _clean_volume_thresholds(new_map)
     with _volume_gate_lock:
         VOLUME_GATE["previous"] = copy.deepcopy(VOLUME_GATE["overrides"])
         for tk, tfs in clean.items():
-            for tf, thr in tfs.items():
-                VOLUME_GATE["overrides"].setdefault(tk, {})[tf] = thr
+            for tf, rule in tfs.items():
+                VOLUME_GATE["overrides"].setdefault(tk, {})[tf] = rule
                 if meta and tk in meta and tf in meta[tk]:
                     VOLUME_GATE["meta"].setdefault(tk, {})[tf] = meta[tk][tf]
         VOLUME_GATE["applied_at"] = int(time.time())
