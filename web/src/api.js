@@ -136,8 +136,8 @@ export const api = {
   getShadow: () => request('/api/shadow'),
   getShock: () => request('/api/shock'),
   getNyse: () => request('/api/nyse'),
-  getComponents: (minSamples = 30, split = false, shadow = false) =>
-    request(`/api/components?min_samples=${minSamples}&split=${split}&shadow=${shadow}`),
+  getComponents: (minSamples = 30, split = false, shadow = false, origin = 'all') =>
+    request(`/api/components?min_samples=${minSamples}&split=${split}&shadow=${shadow}&origin=${origin}`),
   // 🆕 Simulations are background jobs: run* returns {id, status, progress, ...}
   // at once (HTTP 202); getSimJob(id) is polled for progress and the final result.
   // A single long request used to be cut off by the Cloudflare Tunnel (~100 s).
@@ -231,10 +231,10 @@ export const api = {
     request('/api/config/zones', { method: 'POST', body: JSON.stringify(patch) }),
   setSmcOverlay: (patch) =>
     request('/api/config/smc-overlay', { method: 'POST', body: JSON.stringify(patch) }),
-  getHistorySummary: () => request('/api/history/summary'),
-  getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30) =>
+  getHistorySummary: (origin = 'all') => request(`/api/history/summary?origin=${origin}`),
+  getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30, origin = 'all') =>
     request(
-      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}`,
+      `/api/history/records?ticker=${encodeURIComponent(ticker)}&tf=${tf}&side=${side}&track=${track}&limit=${limit}&origin=${origin}`,
     ),
   // timestamp/entry fingerprint the clicked row so the server refuses the delete
   // if the list shifted since it was loaded (stale idx would hit another record).

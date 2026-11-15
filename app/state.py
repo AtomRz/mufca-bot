@@ -1261,16 +1261,41 @@ WIN_EXIT_TYPES = ("tp", "sl_after_tp1")  # sl_after_tp1 = TP1 hit before SL, a p
 DEFAULT_COMPONENT_MIN_SAMPLES = 30
 
 
-def _iter_closed_records(history: Dict):
+ORIGIN_FILTERS = ("all", "live", "backtest")
+
+
+def normalize_origin(origin: Optional[str]) -> str:
+    """'all' | 'live' | 'backtest' (anything else -> ValueError)."""
+    o = (origin or "all").strip().lower()
+    if o not in ORIGIN_FILTERS:
+        raise ValueError(f"origin must be one of {', '.join(ORIGIN_FILTERS)}")
+    return o
+
+
+def record_matches_origin(rec: Dict, origin: str) -> bool:
+    """Does a stored record belong to the origin filter? 'live' = records the real
+    scanner produced, 'backtest' = backtest / backtest_fill / backtest_backfill
+    (history_tools.classify_record_source decides, tag first, then inference)."""
+    if origin == "all":
+        return True
+    import history_tools  # lazy: history_tools imports this module
+    src = history_tools.classify_record_source(rec)[0]
+    if origin == "live":
+        return src == "live"
+    return src in history_tools.BACKTEST_SOURCES
+
+
+def _iter_closed_records(history: Dict, origin: str = "all"):
     """Yields (ticker, tf, side, record) for every real (non-synthetic),
-    closed record across the whole history file."""
+    closed record across the whole history file (optionally only one origin)."""
     for ticker, tfs in history.items():
         for tf, sides in tfs.items():
             for side, records in sides.items():
                 for rec in records:
                     # "unfilled" = legacy record from the removed limit-entry feature
                     if rec.get("exit_type") not in (None, "open", "unfilled") and not rec.get("synthetic", False):
-                        yield ticker, tf, side, rec
+                        if origin == "all" or record_matches_origin(rec, origin):
+                            yield ticker, tf, side, rec
 
 
 def analyze_confidence_components(
@@ -1278,6 +1303,7 @@ def analyze_confidence_components(
     min_samples: int = DEFAULT_COMPONENT_MIN_SAMPLES,
     group_by: Optional[List[str]] = None,
     include_shadow: bool = False,
+    origin: str = "all",
 ) -> Dict:
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
@@ -1318,9 +1344,16 @@ def analyze_confidence_components(
     pooled with real trades — a shadow outcome is a closed-bar replay, not
     a fill. Default False: existing callers get exactly the same report.
 
+    origin — "all" (default, unchanged behaviour) | "live" | "backtest": only
+    stored records of that origin (record_matches_origin). Only "live" and "all"
+    also read shadow records (those come from live blocked signals).
+    Backtest-origin records carry no raw_mfe_pct, so with "backtest" the
+    raw_mfe columns stay empty by construction.
+
     Returns a JSON-serializable dict:
         {
             "total_closed": int,
+            "origin": str,
             "min_samples": int,
             "components": {
                 "relative_strength": [
@@ -1340,8 +1373,9 @@ def analyze_confidence_components(
         history = load_signals_history()
     group_by = list(group_by or [])
 
+    origin = normalize_origin(origin)
     sources = [("live", history)]
-    if include_shadow:
+    if include_shadow and origin != "backtest":
         from shadow import load_shadow_history  # lazy: keeps state.py importable without it
         sources.append(("shadow", load_shadow_history()))
         if "src" not in group_by:
@@ -1352,7 +1386,7 @@ def analyze_confidence_components(
     shadow_closed = 0
 
     for src, src_history in sources:
-        for ticker, tf, side, rec in _iter_closed_records(src_history):
+        for ticker, tf, side, rec in _iter_closed_records(src_history, origin if src == "live" else "all"):
             if src == "live":
                 total_closed += 1
             else:
@@ -1399,6 +1433,7 @@ def analyze_confidence_components(
 
     return {
         "total_closed": total_closed,
+        "origin": origin,
         "shadow_closed": shadow_closed,
         "min_samples": min_samples,
         "components": components_out,

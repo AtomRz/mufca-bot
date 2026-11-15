@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { api } from '../api'
+import { OriginSwitch, useOrigin } from './HistoryPanel'
 
 // 🆕 Merged tab (external review follow-up): Onchain and Spread used to be
 // separate top-level tabs, and there was nowhere at all to see whether the
@@ -518,10 +519,11 @@ function ComponentsView({ lastEvent }) {
   const minSamples = 30
   const [split, setSplit] = useState(false)
   const [shadow, setShadow] = useState(false)
+  const [origin, setOrigin] = useOrigin()
   // This only changes when a trade closes, not every scan tick — a slow poll is enough.
   const { data: report, error: loadError } = usePolled(
-    () => api.getComponents(minSamples, split, shadow),
-    `components-${split}-${shadow}`,
+    () => api.getComponents(minSamples, split, shadow, origin),
+    `components-${split}-${shadow}-${origin}`,
     60000,
     lastEvent,
   )
@@ -539,7 +541,7 @@ function ComponentsView({ lastEvent }) {
       <div className="panel">
         <h3 className="panel-title">Confidence component analysis</h3>
         <p style={{ fontSize: 13, color: 'var(--text)', marginBottom: 4 }}>
-          {report.total_closed} closed records total. Does relative_strength / volume_profile
+          {report.total_closed} closed {origin === 'all' ? '' : `${origin} `}records total. Does relative_strength / volume_profile
           (see <code>calc_confidence()</code>) actually correlate with outcome, or just add noise?
         </p>
         <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
@@ -547,6 +549,12 @@ function ComponentsView({ lastEvent }) {
           it's not truncated by whatever TP/SL policy closed the trade, so it's the number worth
           trusting once it has enough samples of its own. win_rate/avg_mfe are only a first look.
         </p>
+        <div style={{ marginTop: 10 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
+        {origin === 'backtest' && (
+          <p style={{ fontSize: 11, color: 'var(--accent)', marginTop: 6 }}>
+            Backtest records carry no raw_mfe, so the raw_mfe column stays empty here by design.
+          </p>
+        )}
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginTop: 10, fontSize: 13 }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 6 }} title="Bucket every row by track (A/U) and regime (TREND/NORMAL) as well — the same split !compsim uses. Live samples per bucket are small, so expect many ⚠ rows.">
             <input type="checkbox" checked={split} onChange={(e) => setSplit(e.target.checked)} />
