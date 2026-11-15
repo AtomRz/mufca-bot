@@ -19,6 +19,7 @@ Endpoints:
   GET/POST/DELETE /api/backups[/{id}[/download|/restore]] — backups of signals_history.json (Backup tab)
   GET /api/history/sources, POST /api/history/sources/tag — origin of stored records
   POST /api/history/reconcile (job) + /api/history/reconcile/apply — backtest audit / fill / backfill
+  GET /api/history/duplicates, POST /api/history/duplicates/remove — duplicates an audit added
   WS   /ws/live                         — broadcasts new bars/signals/trade closures
 """
 
@@ -1531,6 +1532,29 @@ async def tag_history_sources():
     if result["tagged"]:
         save_signals_history(history)
     return {**result, "backup_id": pre["id"]}
+
+
+@app.get("/api/history/duplicates")
+async def get_history_duplicates():
+    """Records an audit ADDED (backtest_fill / backtest_backfill) although the history
+    already held the same signal. Read-only preview for the Backup tab."""
+    return history_tools.count_added_duplicates(load_signals_history())
+
+
+@app.post("/api/history/duplicates/remove")
+async def remove_history_duplicates():
+    """Removes those duplicate audit additions (never the original record). A
+    "pre-dedupe" safety backup is taken first; if it fails nothing is changed."""
+    try:
+        pre = history_backup.create_backup("pre-dedupe", "before removing duplicate audit additions")
+    except history_backup.BackupError as e:
+        raise HTTPException(500, f"Safety backup failed, nothing changed: {e}")
+    history = load_signals_history()
+    removed = history_tools.remove_added_duplicates(history)
+    if removed:
+        save_signals_history(history)
+        await broadcast_event({"type": "history_changed"})
+    return {"removed": removed, "backup_id": pre["id"]}
 
 
 class ReconcileIn(BaseModel):

@@ -28,6 +28,34 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from state import _parse_ts
 
+
+def parse_record_ts(value: Any) -> Optional[datetime]:
+    """Timestamp of a stored record as an aware UTC datetime. Besides ISO strings it
+    reads epoch values - the first bootstrap backtests stored the bar open as a string
+    of digits ("1721260800000", milliseconds; see the History tab's fmtDate) and
+    state._parse_ts cannot read those: such a record used to look 'unparseable', so it
+    was classed "unknown" and the audit did not see it at all. Epoch seconds are read
+    too; anything else falls back to state._parse_ts."""
+    if isinstance(value, bool):
+        return None
+    num: Optional[float] = None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        txt = value.strip()
+        if txt.replace(".", "", 1).isdigit():
+            num = float(txt)
+    if num is not None:
+        if num >= 1e12:
+            num /= 1000.0          # milliseconds
+        elif num < 1e9:
+            return None            # neither: not a plausible epoch
+        try:
+            return datetime.fromtimestamp(num, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _parse_ts(value)
+
 SOURCES = ("live", "sim", "backtest", "backtest_fill", "backtest_backfill", "unknown")
 BACKTEST_SOURCES = ("backtest", "backtest_fill", "backtest_backfill")
 
@@ -49,7 +77,7 @@ def tf_to_ms(tf: str) -> Optional[int]:
 
 
 def record_ts_ms(rec: Dict[str, Any]) -> Optional[int]:
-    dt = _parse_ts(rec.get("timestamp"))
+    dt = parse_record_ts(rec.get("timestamp"))
     return int(dt.timestamp() * 1000) if dt is not None else None
 
 
@@ -69,7 +97,7 @@ def classify_record_source(rec: Dict[str, Any]) -> Tuple[str, str]:
         return "live", "open"
     if any(k in rec for k in _LIVE_ONLY_KEYS):
         return "live", "live_fields"
-    dt = _parse_ts(rec.get("timestamp"))
+    dt = parse_record_ts(rec.get("timestamp"))
     if dt is None:
         return "unknown", "unparseable"
     if dt.second == 0 and dt.microsecond == 0:
@@ -336,3 +364,69 @@ def merge_missing(history: Dict, slot_report: Dict[str, Any], keep: int,
             room -= 1
             result["filled" if source == "backtest_fill" else "backfilled"] += 1
     return result
+
+
+# =====================================================================
+# 🧹  DUPLICATES ADDED BY AN AUDIT
+# =====================================================================
+ADDED_SOURCES = ("backtest_fill", "backtest_backfill")
+
+
+def _duplicate_positions(history: Dict) -> List[Tuple[str, str, str, int]]:
+    """(ticker, tf, side, index) of every record an audit ADDED (backtest_fill /
+    backtest_backfill) although the history already held the same signal: another
+    record of the same track, not itself an audit addition, stamped in
+    [b, b + 2 bars) of the added record's bar open b - the same rule
+    merge_missing() uses to decide a signal is already stored."""
+    out: List[Tuple[str, str, str, int]] = []
+    for ticker, tfs in history.items():
+        if not isinstance(tfs, dict) or ticker.startswith("__"):
+            continue
+        for tf, sides in tfs.items():
+            if not isinstance(sides, dict):
+                continue
+            tf_ms = tf_to_ms(tf) or 3_600_000
+            for side in ("long", "short"):
+                recs = sides.get(side) or []
+                originals: Dict[str, List[int]] = {}
+                for r in recs:
+                    if not isinstance(r, dict):
+                        continue
+                    src = classify_record_source(r)[0]
+                    ts = record_ts_ms(r)
+                    if src in ADDED_SOURCES or src == "sim" or ts is None:
+                        continue
+                    originals.setdefault(r.get("track", "a"), []).append(ts)
+                for i, r in enumerate(recs):
+                    if not isinstance(r, dict) or r.get("source") not in ADDED_SOURCES:
+                        continue
+                    b = record_ts_ms(r)
+                    if b is None:
+                        continue
+                    if any(b <= ts < b + 2 * tf_ms for ts in originals.get(r.get("track", "a"), [])):
+                        out.append((ticker, tf, side, i))
+    return out
+
+
+def count_added_duplicates(history: Dict) -> Dict[str, Any]:
+    """Preview for remove_added_duplicates(): how many, and where. Writes nothing."""
+    dups = _duplicate_positions(history)
+    per: Dict[Tuple[str, str, str], int] = {}
+    for t, f, s, _i in dups:
+        per[(t, f, s)] = per.get((t, f, s), 0) + 1
+    return {"duplicates": len(dups),
+            "rows": [{"ticker": t, "tf": f, "side": s, "n": n} for (t, f, s), n in sorted(per.items())]}
+
+
+def remove_added_duplicates(history: Dict) -> int:
+    """Deletes (in place) the audit-added copies found by count_added_duplicates().
+    The ORIGINAL record always stays; only records tagged backtest_fill /
+    backtest_backfill are ever removed. Returns how many were removed."""
+    dups = _duplicate_positions(history)
+    by_slot: Dict[Tuple[str, str, str], set] = {}
+    for t, f, s, i in dups:
+        by_slot.setdefault((t, f, s), set()).add(i)
+    for (t, f, s), idxs in by_slot.items():
+        lst = history[t][f][s]
+        history[t][f][s] = [r for i, r in enumerate(lst) if i not in idxs]
+    return len(dups)

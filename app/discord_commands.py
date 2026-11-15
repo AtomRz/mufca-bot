@@ -186,6 +186,7 @@ async def help_cmd(ctx):
         "`!btaudit [pair] [tf] [bars]` — replay the current logic over real history and compare with the stored history (dry-run, writes nothing)",
         "`!btfill [fill|backfill|all] [yes]` — add the signals the last `!btaudit` found missing / older than the stored window (add-only, backup first)",
         "`!sources [tag yes]` — how many stored records are live / backtest; `tag` writes that origin into old records",
+        "`!histdedupe [yes]` — find (and with `yes` remove) records an audit added although the signal was already stored",
         "",
 
         "**📋 Pairs**",
@@ -620,6 +621,31 @@ async def sources_cmd(ctx, action: str = "", confirm: str = ""):
     except Exception as e:
         logger.error(f"sources command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="histdedupe")
+async def histdedupe_cmd(ctx, confirm: str = ""):
+    """!histdedupe [yes] - duplicates an audit added (never touches the original record)."""
+    try:
+        info = history_tools.count_added_duplicates(load_signals_history())
+        if not info["duplicates"]:
+            await ctx.send("✅ No duplicate audit additions found.")
+            return
+        if confirm.lower() != "yes":
+            rows = ", ".join(f"{r['ticker']} {r['tf']} {r['side']}: {r['n']}" for r in info["rows"][:12])
+            await ctx.send(f"Found **{info['duplicates']}** record(s) added by an audit although the same signal was already stored "
+                           f"({rows}). Only those copies would be removed, the originals stay; a safety backup is taken first.\n"
+                           f"To confirm: `!histdedupe yes`")
+            return
+        pre = history_backup.create_backup("pre-dedupe", "before removing duplicate audit additions")
+        history = load_signals_history()
+        removed = history_tools.remove_added_duplicates(history)
+        if removed:
+            save_signals_history(history)
+        await ctx.send(f"🧹 Removed {removed} duplicate(s). Safety backup: `{pre['id']}`.")
+    except Exception as e:
+        logger.error(f"histdedupe command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Nothing changed: {e}")
 
 
 @core.bot.command(name="btaudit", aliases=["histaudit"])
