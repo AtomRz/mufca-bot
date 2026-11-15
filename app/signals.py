@@ -1801,8 +1801,16 @@ def backtest_history(
     trigger_table: bool = False,
     indicator_overrides: Optional[Dict[str, float]] = None,
     volume_baseline_days: Optional[float] = None,
+    collect_records: bool = False,
 ):
     """Backtest for accumulating signal history.
+
+    collect_records - dry_run + collect_stats only, not with trigger_table: every
+    entry of history["__stats__"]["trades"] also carries "ts" (the signal bar's
+    open, ms) and "rec" (the full history record exactly as a real run would have
+    stored it), and "__stats__" gets "coverage" - the bar timestamps the
+    simulation really evaluated. run_history_reconcile() compares those with the
+    stored history. Off by default: it only adds payload.
 
     volume_baseline_days - trigger_table only: baseline window of the low-volume
     gate's metrics (volume_gate.py) recorded on every trigger as "vm" {metric: value}
@@ -2507,7 +2515,7 @@ def backtest_history(
                     }
                     confidence_components_bt.update(_rs_vp_components(is_long, rs_this_bar, ms_this_bar))
 
-                history[ticker][tf][side].append({
+                rec_bt = {
                     "entry": round_price(close_v),
                     "exit": round_price(exit_price),
                     "exit_type": exit_type,
@@ -2535,8 +2543,12 @@ def backtest_history(
                     # trades instead of having that asymmetric dropout
                     # quietly bias a cross-fraction comparison.
                     "tp1_reached": bool(tp1_reached),
-                })
-                history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
+                    # origin tag (history_tools.classify_record_source); a real
+                    # bootstrap run writes plain "backtest"
+                    "source": "backtest",
+                }
+                history[ticker][tf][side].append(rec_bt)
+                history[ticker][tf][side] = history[ticker][tf][side][-_cfg.history_keep():]
                 if _stats is not None:
                     _stats["trades"].append({
                         "track": track, "side": side, "exit_type": exit_type,
@@ -2546,12 +2558,30 @@ def backtest_history(
                             "vol_ratio": volume_gate.ratio_or_none(_vm_arr["bar"][idx]),
                             "vm": {_m: volume_gate.ratio_or_none(_a[idx]) for _m, _a in _vm_arr.items()},
                             "ts": int(df["timestamp"].iloc[idx])} if _trig_tbl else {}),
+                        **({"ts": int(df["timestamp"].iloc[idx]), "rec": rec_bt}
+                           if (collect_records and not _trig_tbl) else {}),
                     })
                 signals_found += 1
 
         if dry_run:
             logger.info(f"[BACKTEST] {ticker} {tf}: (dry run, tp1_sl_fraction={tp1_sl_fraction}) found {signals_found} historical signals")
             if _stats is not None:
+                if collect_records and not _trig_tbl:
+                    # What the loop above really evaluated: signals can only exist from
+                    # start_idx on (A-track from its MFI warm-up on) and up to the last
+                    # bar that still has MAX_HOLD_BARS of future behind it.
+                    _ts_all = df["timestamp"].to_numpy()
+                    _a_first = int(np.argmax(mfi_valid_cumcount.to_numpy() >= _cfg.MFI_TRAINING)) \
+                        if bool((mfi_valid_cumcount.to_numpy() >= _cfg.MFI_TRAINING).any()) else len(df)
+                    _last = max(start_idx, len(df) - _tail_reserve - 1)
+                    _stats["coverage"] = {
+                        "bars": int(len(df)),
+                        "first_ts": int(_ts_all[0]),
+                        "last_ts": int(_ts_all[-1]),
+                        "eval_from_ts": int(_ts_all[min(start_idx, len(df) - 1)]),
+                        "a_eval_from_ts": int(_ts_all[min(max(start_idx, _a_first), len(df) - 1)]),
+                        "eval_to_ts": int(_ts_all[min(_last, len(df) - 1)]),
+                    }
                 history["__stats__"] = _stats
             return signals_found, history, bars_fetched
 
@@ -2806,6 +2836,141 @@ async def run_component_backtest(exchange: ccxt.Exchange, tickers: List[str], tf
     report = analyze_confidence_components(history=combined_history, min_samples=min_samples, group_by=group_by)
     report["bar_coverage"] = bar_coverage
     return report
+
+
+# =====================================================================
+# 🔍  HISTORY RECONCILE (!btaudit / !btfill, web Backup tab)
+# =====================================================================
+# The last audit's signals, kept so "apply" does not have to run the backtest again.
+# Only one (the newest) is kept; it expires after an hour - the market (and the stored
+# history) moves on, and applying a stale audit would be a guess.
+_RECONCILE_CACHE: Dict[str, Any] = {}
+_RECONCILE_TTL_SECONDS = 3600
+
+
+async def run_history_reconcile(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 6000,
+                                tolerance_bars: int = 2,
+                                progress: Optional[Callable[[int, int, str], None]] = None,
+                                workers: Optional[int] = None) -> Dict:
+    """Replays the CURRENT signal logic over real history (dry-run backtests, one per
+    pair/timeframe) and compares every simulated signal with what signals_history.json
+    holds - see history_tools.reconcile_slot() for exactly what is reported. Never
+    writes anything; the signals that could be added are remembered for
+    apply_history_reconcile().
+
+    Returns {"slots": [report per pair/tf], "totals": {...}, "bar_coverage": [...],
+    "apply_id": str|None, "keep": int, "tolerance_bars": int}."""
+    import history_tools
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    submitted: List[tuple] = []
+    bar_coverage: List[Dict] = []
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+                except Exception as e:
+                    logger.error(f"run_history_reconcile: fetch error for {t} {f}: {e}")
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    counters["total"] -= 1
+                    continue
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                    "collect_stats": True, "collect_records": True,
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, fut))
+        outcomes = await asyncio.gather(*(item[2] for item in submitted), return_exceptions=True)
+
+    history_now = load_signals_history()
+    slots: List[Dict] = []
+    for (t, f, _), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_history_reconcile: backtest error for {t} {f}: {outcome!r}")
+            continue
+        _count, bt_history, _bars = outcome
+        stats = bt_history.get("__stats__") or {}
+        slots.append(history_tools.reconcile_slot(
+            t, f, stats.get("trades", []), history_now, stats.get("coverage"), tolerance_bars))
+
+    totals = {"backtest": 0, "matched": 0, "missed": 0, "older": 0, "live_only": 0,
+              "stale_backtest": 0, "outside": 0, "changed": 0}
+    for sl in slots:
+        for row in sl["rows"]:
+            for k in totals:
+                totals[k] += row.get(k, 0)
+
+    apply_id = None
+    if slots:
+        import uuid
+        apply_id = uuid.uuid4().hex[:12]
+        _RECONCILE_CACHE.clear()
+        _RECONCILE_CACHE.update({"id": apply_id, "created": time.time(), "slots": slots})
+    return {
+        "slots": [history_tools.public_report(sl) for sl in slots],
+        "totals": totals,
+        "bar_coverage": bar_coverage,
+        "apply_id": apply_id,
+        "keep": _cfg.history_keep(),
+        "tolerance_bars": tolerance_bars,
+    }
+
+
+def apply_history_reconcile(apply_id: str, do_fill: bool, do_backfill: bool) -> Dict:
+    """Adds the signals found by the audit `apply_id` to signals_history.json:
+    do_fill = those missing INSIDE the stored window, do_backfill = those older than
+    its start. Add-only (nothing stored is removed or changed) and capped by
+    config.history_keep(). A safety backup of the history is taken first - if that
+    fails nothing is written. Synchronous on purpose: no await between reading the
+    history and saving it, so the scanner cannot interleave.
+
+    Raises ValueError for a stale/unknown apply_id."""
+    import history_tools
+    import history_backup
+    if not (do_fill or do_backfill):
+        raise ValueError("nothing selected: choose fill and/or backfill")
+    cache = _RECONCILE_CACHE
+    if not cache or cache.get("id") != apply_id:
+        raise ValueError("This audit is no longer available - run the audit again")
+    if time.time() - cache.get("created", 0) > _RECONCILE_TTL_SECONDS:
+        _RECONCILE_CACHE.clear()
+        raise ValueError("This audit is older than an hour - run it again")
+
+    pre = history_backup.create_backup(
+        "pre-fill" if do_fill else "pre-backfill",
+        f"before {'fill' if do_fill else ''}{' + ' if do_fill and do_backfill else ''}{'backfill' if do_backfill else ''} of audit {apply_id}")
+    history = load_signals_history()
+    keep = _cfg.history_keep()
+    results = [history_tools.merge_missing(history, sl, keep, do_fill, do_backfill) for sl in cache["slots"]]
+    added = sum(r["filled"] + r["backfilled"] for r in results)
+    if added:
+        save_signals_history(history)
+    _RECONCILE_CACHE.clear()
+    logger.info(f"[RECONCILE] applied audit {apply_id}: {added} signals added (backup {pre['id']})")
+    return {
+        "added": added,
+        "filled": sum(r["filled"] for r in results),
+        "backfilled": sum(r["backfilled"] for r in results),
+        "no_room": sum(r["no_room"] for r in results),
+        "already_there": sum(r["already_there"] for r in results),
+        "slots": [r for r in results if r["filled"] or r["backfilled"] or r["no_room"]],
+        "backup_id": pre["id"],
+        "keep": keep,
+    }
 
 
 _ABLATION_WIN_TYPES = ("tp", "sl_after_tp1")  # same convention as state.WIN_EXIT_TYPES (sl_after_tp1 = partial win)

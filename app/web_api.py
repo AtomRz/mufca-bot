@@ -15,7 +15,10 @@ Endpoints:
   POST /api/config/htf                  — {"htf": "4h"}
   POST /api/config/utha                 — {"enabled": true}
   POST /api/config/chop                 — {"tf": "1h", "value": 55.0}
-  POST /api/config/tpconfig             — {"param": "mode"|"limit"|"percentile"|"safe", "value": ...}
+  POST /api/config/tpconfig             — {"param": "mode"|"limit"|"keep"|"percentile"|"safe", "value": ...}
+  GET/POST/DELETE /api/backups[/{id}[/download|/restore]] — backups of signals_history.json (Backup tab)
+  GET /api/history/sources, POST /api/history/sources/tag — origin of stored records
+  POST /api/history/reconcile (job) + /api/history/reconcile/apply — backtest audit / fill / backfill
   WS   /ws/live                         — broadcasts new bars/signals/trade closures
 """
 
@@ -72,6 +75,8 @@ import market_hours
 import shadow as shadow_mod
 import filter_stats as filter_stats_mod
 import sim_jobs
+import history_backup
+import history_tools
 
 
 # =====================================================================
@@ -1200,9 +1205,11 @@ async def remove_pair(ticker: str, purge_history: bool = False):
         await broadcast_event({"type": "config_changed", "key": "volume_gate", "value": None})
 
     purged = 0
+    backup_id = None
     if purge_history:
         history = load_signals_history()
         if ticker in history:
+            backup_id = history_backup.safe_pre_backup("pre-delete", f"before purging {ticker} history")
             purged = sum(
                 len(v.get("long", [])) + len(v.get("short", []))
                 for v in history[ticker].values()
@@ -1210,7 +1217,7 @@ async def remove_pair(ticker: str, purge_history: bool = False):
             del history[ticker]
             save_signals_history(history)
 
-    return {"tickers": _cfg.TICKERS, "purged_signals": purged}
+    return {"tickers": _cfg.TICKERS, "purged_signals": purged, "backup_id": backup_id}
 
 
 # =====================================================================
@@ -1400,6 +1407,168 @@ async def delete_history_record(ticker: str, tf: str, side: str, idx: int, track
 
 
 # =====================================================================
+# 💾  BACKUPS OF signals_history.json + HISTORY AUDIT (web "Backup" tab)
+# Discord twins: !backup / !backups / !restore, !btaudit / !btfill.
+# =====================================================================
+class BackupCreateIn(BaseModel):
+    label: str = Field("", max_length=200)
+
+
+class BackupRestoreIn(BaseModel):
+    ticker: Optional[str] = None   # omit = restore everything
+    tf: Optional[str] = None       # needs a ticker
+
+
+def _backup_error(e: Exception) -> HTTPException:
+    msg = str(e)
+    return HTTPException(404 if "not found" in msg.lower() else 400, msg)
+
+
+@app.get("/api/backups")
+async def get_backups():
+    """Saved backups (newest first), the settings that govern them, and what the
+    history holds right now (to compare against)."""
+    return {
+        "backups": history_backup.list_backups(),
+        "dir": _cfg.HISTORY_BACKUP_DIR,
+        "keep_auto": _cfg.HISTORY_BACKUP_KEEP_AUTO,
+        "interval_hours": _cfg.HISTORY_BACKUP_INTERVAL_HOURS,
+        "current": history_backup.current_counts(),
+    }
+
+
+@app.post("/api/backups")
+async def create_backup(body: BackupCreateIn):
+    """Takes a manual backup of the history as it is right now (never deleted automatically)."""
+    try:
+        return history_backup.create_backup("manual", body.label)
+    except history_backup.BackupError as e:
+        raise _backup_error(e)
+
+
+@app.get("/api/backups/{backup_id}")
+async def get_backup_detail(backup_id: str):
+    """Records per pair/timeframe/side: in this backup vs in the history now."""
+    try:
+        return history_backup.backup_detail(backup_id)
+    except history_backup.BackupError as e:
+        raise _backup_error(e)
+
+
+@app.get("/api/backups/{backup_id}/download")
+async def download_backup(backup_id: str):
+    """The raw backup file - an off-box copy (the backups live on the same volume as the history)."""
+    try:
+        data = history_backup.read_backup_bytes(backup_id)
+    except history_backup.BackupError as e:
+        raise _backup_error(e)
+    return Response(
+        content=data, media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="mufca-history-{backup_id}.json"'},
+    )
+
+
+@app.post("/api/backups/{backup_id}/restore")
+async def restore_backup(backup_id: str, body: BackupRestoreIn):
+    """Replaces the stored history with this backup (everything, or one pair /
+    pair+timeframe). Open trades are left exactly as they are. A "pre-restore"
+    safety backup of the current history is taken first, so this can be undone."""
+    ticker = unquote(body.ticker).upper().strip() if body.ticker else None
+    tf = body.tf.strip() if body.tf else None
+    try:
+        result = history_backup.restore_backup(backup_id, ticker, tf)
+    except history_backup.BackupError as e:
+        raise _backup_error(e)
+    await broadcast_event({"type": "history_changed"})
+    return result
+
+
+@app.delete("/api/backups/{backup_id}")
+async def delete_backup(backup_id: str):
+    try:
+        history_backup.delete_backup(backup_id)
+    except history_backup.BackupError as e:
+        raise _backup_error(e)
+    return {"deleted": True}
+
+
+@app.get("/api/history/sources")
+async def get_history_sources():
+    """How many stored records are real (live), backtest, backtest_fill/backfill or
+    synthetic - overall, per pair/timeframe/side, and how each was decided
+    (history_tools.classify_record_source). Read-only."""
+    return history_tools.source_summary(load_signals_history())
+
+
+@app.post("/api/history/sources/tag")
+async def tag_history_sources():
+    """Writes the inferred "source" into every record that has none yet, so the
+    origin of old records stays known whatever the code does later. Changes
+    nothing else. A "pre-tag" safety backup is taken first."""
+    try:
+        pre = history_backup.create_backup("pre-tag", "before tagging record sources")
+    except history_backup.BackupError as e:
+        raise HTTPException(500, f"Safety backup failed, nothing changed: {e}")
+    history = load_signals_history()
+    result = history_tools.tag_sources(history)
+    if result["tagged"]:
+        save_signals_history(history)
+    return {**result, "backup_id": pre["id"]}
+
+
+class ReconcileIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(6000, ge=300, le=20000)
+    tolerance_bars: int = Field(2, ge=1, le=6)
+
+
+@app.post("/api/history/reconcile")
+async def run_reconcile(body: ReconcileIn):
+    """Audit: replays the CURRENT signal logic over real history and compares every
+    simulated signal with the stored history (same computation as the Discord
+    !btaudit, both call signals.run_history_reconcile()). Writes nothing. The
+    result lists, per pair/timeframe/side/track, what matched, what is missing
+    inside the stored window (fill candidates), what is older than it (backfill
+    candidates) and which stored records the backtest does not reproduce.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id}. Apply the result with POST /api/history/reconcile/apply."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_history_reconcile
+    return _start_sim_job(
+        "reconcile",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "tolerance_bars": body.tolerance_bars},
+        lambda progress: run_history_reconcile(
+            exchange, scope_tickers, scope_tfs, body.num_bars, body.tolerance_bars, progress=progress),
+    )
+
+
+class ReconcileApplyIn(BaseModel):
+    apply_id: str
+    fill: bool = False       # add the signals missing INSIDE the stored window
+    backfill: bool = False   # add the signals older than the oldest stored record
+
+
+@app.post("/api/history/reconcile/apply")
+async def apply_reconcile(body: ReconcileApplyIn):
+    """Adds the signals found by the audit `apply_id` to the history. Add-only:
+    nothing stored is removed or changed, a "pre-fill"/"pre-backfill" safety backup is
+    taken first, and each side list stays within the stored-history limit
+    (signal_history_keep) - the newest signals go in first when it does not fit."""
+    from signals import apply_history_reconcile
+    try:
+        result = apply_history_reconcile(body.apply_id, body.fill, body.backfill)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except history_backup.BackupError as e:
+        raise HTTPException(500, f"Safety backup failed, nothing changed: {e}")
+    if result["added"]:
+        await broadcast_event({"type": "history_changed"})
+    return result
+
+
+# =====================================================================
 # ⚙️  CONFIG — get all settings + set one at a time, logic 1-to-1 with the
 # Discord commands.
 # =====================================================================
@@ -1435,6 +1604,8 @@ async def get_config():
             "tp_percentile": _cfg.TP_PERCENTILE,
             "safe_tp_percentile": _cfg.SAFE_TP_PERCENTILE,
             "signal_history_limit": _cfg.SIGNAL_HISTORY_LIMIT,
+            "signal_history_keep": _cfg.SIGNAL_HISTORY_KEEP,
+            "signal_history_keep_effective": _cfg.history_keep(),
             "min_tp_pct": _cfg.MIN_TP_PCT,
             "max_tp_pct": _cfg.MAX_TP_PCT,
             "max_hold_bars": _cfg.MAX_HOLD_BARS,
@@ -2012,6 +2183,17 @@ async def set_tpconfig(body: TpConfigIn):
             raise HTTPException(400, "limit must be between 5 and 200")
         _cfg.SIGNAL_HISTORY_LIMIT = new_limit
         save_tp_config()
+    elif param == "keep":
+        # how many records are STORED per side (0 = automatic, 3 x limit) - see
+        # config.history_keep(); it never changes the calibration window (limit)
+        try:
+            new_keep = int(body.value)
+        except ValueError:
+            raise HTTPException(400, "value must be a number")
+        if not (0 <= new_keep <= 2000):
+            raise HTTPException(400, "keep must be 0 (automatic) or up to 2000")
+        _cfg.SIGNAL_HISTORY_KEEP = new_keep
+        save_tp_config()
     elif param in ("percentile", "safe"):
         try:
             new_pct = float(body.value)
@@ -2025,13 +2207,15 @@ async def set_tpconfig(body: TpConfigIn):
             _cfg.SAFE_TP_PERCENTILE = new_pct / 100
         save_tp_config()
     else:
-        raise HTTPException(400, "param must be mode|limit|percentile|safe")
+        raise HTTPException(400, "param must be mode|limit|keep|percentile|safe")
 
     return {
         "use_safe_tp": _cfg.USE_SAFE_TP,
         "tp_percentile": _cfg.TP_PERCENTILE,
         "safe_tp_percentile": _cfg.SAFE_TP_PERCENTILE,
         "signal_history_limit": _cfg.SIGNAL_HISTORY_LIMIT,
+        "signal_history_keep": _cfg.SIGNAL_HISTORY_KEEP,
+        "signal_history_keep_effective": _cfg.history_keep(),
     }
 
 

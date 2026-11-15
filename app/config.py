@@ -1469,6 +1469,22 @@ def save_devices(data: dict):
 # 🎯  ADAPTIVE TP
 # =====================================================================
 SIGNAL_HISTORY_LIMIT = 25
+# How many records signals_history.json keeps PER SIDE of every pair/timeframe.
+# 0 = automatic: 3 x SIGNAL_HISTORY_LIMIT (the historical behaviour: the last
+# LIMIT records calibrate adaptive TP/SL, the ones before them are only the
+# baseline for the hit-rate feedback loop). A larger value lets a deepened
+# history (Backup tab -> backtest backfill) stay stored; the calibration window
+# itself (SIGNAL_HISTORY_LIMIT) is NOT changed by it.
+SIGNAL_HISTORY_KEEP = 0
+
+
+def history_keep() -> int:
+    """Effective per-side cap of stored history records (never below the
+    automatic 3 x SIGNAL_HISTORY_LIMIT). Read at call time - both values are
+    live-editable."""
+    return max(SIGNAL_HISTORY_LIMIT * 3, int(SIGNAL_HISTORY_KEEP or 0))
+
+
 TP_PERCENTILE = 0.75
 SAFE_TP_PERCENTILE = 0.50
 USE_SAFE_TP = False
@@ -1526,7 +1542,7 @@ def load_tp_config():
     tp_percentile of 75 instead of 0.75, or a string, used to be loaded
     verbatim and then blow up (or silently produce nonsense TPs) inside the
     percentile maths on the first signal."""
-    global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT
+    global TP_PERCENTILE, SAFE_TP_PERCENTILE, USE_SAFE_TP, SIGNAL_HISTORY_LIMIT, SIGNAL_HISTORY_KEEP
     global TP_HIT_RATE_TARGET, TP_AUTO_ADJUST, TP_CAPTURE_RATE
     global TP_ADJUST_MIN_PCT, TP_ADJUST_MAX_PCT
     data = safe_json_load(TP_CONFIG_FILE, {})
@@ -1546,6 +1562,7 @@ def load_tp_config():
     SAFE_TP_PERCENTILE   = pick("safe_tp_percentile",   SAFE_TP_PERCENTILE,   0.10, 0.99)
     USE_SAFE_TP          = pick("use_safe_tp",          USE_SAFE_TP)
     SIGNAL_HISTORY_LIMIT = pick("signal_history_limit", SIGNAL_HISTORY_LIMIT, 5, 200)
+    SIGNAL_HISTORY_KEEP  = pick("signal_history_keep",  SIGNAL_HISTORY_KEEP,  0, 2000)
     TP_HIT_RATE_TARGET   = pick("tp_hit_rate_target",   TP_HIT_RATE_TARGET,   0.01, 0.99)
     TP_AUTO_ADJUST       = pick("tp_auto_adjust",       TP_AUTO_ADJUST)
     TP_CAPTURE_RATE      = pick("tp_capture_rate",      TP_CAPTURE_RATE,      0.10, 1.0)
@@ -1562,6 +1579,7 @@ def save_tp_config():
         "safe_tp_percentile":   SAFE_TP_PERCENTILE,
         "use_safe_tp":          USE_SAFE_TP,
         "signal_history_limit": SIGNAL_HISTORY_LIMIT,
+        "signal_history_keep":  SIGNAL_HISTORY_KEEP,
         "tp_hit_rate_target":   TP_HIT_RATE_TARGET,
         "tp_auto_adjust":       TP_AUTO_ADJUST,
         "tp_capture_rate":      TP_CAPTURE_RATE,
@@ -1668,6 +1686,14 @@ MARKET_MODE = load_mode()
 # 📊  HISTORY FILES
 # =====================================================================
 SIGNALS_HISTORY_FILE = os.path.join(DATA_DIR, "signals_history.json")
+
+# 🆕 Backups of signals_history.json (history_backup.py, web "Backup" tab,
+# Discord !backup/!backups/!restore). Lives next to the history file, so it is
+# on the same volume: protects against a bad reset/merge, not against losing
+# the volume itself - use the tab's Download button for an off-box copy.
+HISTORY_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+HISTORY_BACKUP_KEEP_AUTO = 30        # newest automatic/safety backups kept; manual ones are never auto-deleted
+HISTORY_BACKUP_INTERVAL_HOURS = 12   # periodic automatic backup (skipped when nothing changed since the last one)
 
 # 🆕 Snapshot of bot.state (active positions a_active_trade/u_active_trade,
 # etc.) — separate from signals_history.json. Signal history already survived
