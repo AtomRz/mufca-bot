@@ -186,6 +186,7 @@ async def help_cmd(ctx):
         "`!btaudit [pair] [tf] [bars]` — replay the current logic over real history and compare with the stored history (dry-run, writes nothing)",
         "`!btfill [fill|backfill|all] [yes]` — add the signals the last `!btaudit` found missing / older than the stored window (add-only, backup first)",
         "`!sources [tag yes]` — how many stored records are live / backtest; `tag` writes that origin into old records",
+        "`!histsort [yes]` — put the history in date order (only reorders)",
         "`!histdedupe [yes]` — find (and with `yes` remove) records an audit added although the signal was already stored",
         "",
 
@@ -645,6 +646,29 @@ async def histdedupe_cmd(ctx, confirm: str = ""):
         await ctx.send(f"🧹 Removed {removed} duplicate(s). Safety backup: `{pre['id']}`.")
     except Exception as e:
         logger.error(f"histdedupe command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Nothing changed: {e}")
+
+
+@core.bot.command(name="histsort")
+async def histsort_cmd(ctx, confirm: str = ""):
+    """!histsort [yes] - put the history in date order (only reorders, nothing is removed)."""
+    try:
+        info = history_tools.count_unsorted(load_signals_history())
+        if not info["slots"]:
+            await ctx.send("✅ History is already in date order.")
+            return
+        if confirm.lower() != "yes":
+            await ctx.send(f"**{info['slots']}** side list(s) are not in date order. Sorting only reorders them; "
+                           f"a safety backup is taken first.\nTo confirm: `!histsort yes`")
+            return
+        pre = history_backup.create_backup("pre-sort", "before sorting the history by date")
+        history = load_signals_history()
+        n = history_tools.sort_history(history)
+        if n:
+            save_signals_history(history)
+        await ctx.send(f"🗓️ Sorted {n} list(s). Safety backup: `{pre['id']}`.")
+    except Exception as e:
+        logger.error(f"histsort command error: {e}", exc_info=True)
         await ctx.send(f"❌ Nothing changed: {e}")
 
 
