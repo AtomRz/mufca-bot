@@ -53,8 +53,11 @@ from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
     run_indicator_optimize, run_volume_autotune, FILTER_KEYS,
+    run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE,
 )
 import filter_stats
+import history_backup
+import history_tools
 import volume_gate
 import smc
 from onchain import (
@@ -173,6 +176,16 @@ async def help_cmd(ctx):
         "`!tpconfig percentile 70` — change the aggressive %ile",
         "`!tpconfig safe 45`   — change the safe %ile",
         "`!tpconfig limit 30`  — number of signals used for training",
+        "`!tpconfig keep 150`  — records STORED per side (0 = automatic, 3 x limit); needed to deepen the history",
+        "",
+
+        "**💾 History backups / audit**",
+        "`!backup [note]` — save a backup of the signal history now",
+        "`!backups`       — list saved backups",
+        "`!restore <id> [pair] [tf] [yes]` — restore a backup (preview without `yes`; open trades are kept, a safety copy is taken first)",
+        "`!btaudit [pair] [tf] [bars]` — replay the current logic over real history and compare with the stored history (dry-run, writes nothing)",
+        "`!btfill [fill|backfill|all] [yes]` — add the signals the last `!btaudit` found missing / older than the stored window (add-only, backup first)",
+        "`!sources [tag yes]` — how many stored records are live / backtest; `tag` writes that origin into old records",
         "",
 
         "**📋 Pairs**",
@@ -484,6 +497,8 @@ async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = "")
         )
         return
 
+    backup_id = history_backup.safe_pre_backup("pre-delete", f"before !delsignals {ticker} {tf}".strip())
+
     if tf:
         del history[ticker][tf]
         if not history[ticker]:
@@ -492,7 +507,230 @@ async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = "")
         del history[ticker]
 
     save_signals_history(history)
-    await ctx.send(f"🗑️ Signal history for {scope} deleted.")
+    await ctx.send(f"🗑️ Signal history for {scope} deleted. "
+                   + (f"Safety backup: `{backup_id}` (`!restore {backup_id}`)." if backup_id
+                      else "⚠️ The safety backup could NOT be written."))
+
+# =====================================================================
+# 💾  HISTORY BACKUPS + BACKTEST AUDIT (web twin: the "Backup" tab)
+# =====================================================================
+async def _send_long(ctx, msg: str):
+    while msg:
+        chunk = msg[:1900]
+        if len(msg) > 1900:
+            chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+        await ctx.send(chunk)
+        msg = msg[len(chunk):].lstrip("\n")
+
+
+@core.bot.command(name="backup")
+async def backup_cmd(ctx, *, note: str = ""):
+    """Saves a manual backup of signals_history.json (never deleted automatically)."""
+    try:
+        meta = history_backup.create_backup("manual", note)
+    except Exception as e:
+        logger.error(f"backup command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Backup failed: {e}")
+        return
+    await ctx.send(f"💾 Backup `{meta['id']}` saved: {meta['records']} records "
+                   f"({meta['closed']} closed, {meta['open']} open), {meta['size_bytes'] // 1024} KB.\n"
+                   f"Restore with `!restore {meta['id']}`.")
+
+
+@core.bot.command(name="backups")
+async def backups_cmd(ctx):
+    """Lists saved backups, newest first."""
+    metas = history_backup.list_backups()
+    if not metas:
+        await ctx.send("No backups yet. `!backup [note]` makes one.")
+        return
+    lines = [f"**💾 History backups** ({len(metas)}; automatic ones: newest {_cfg.HISTORY_BACKUP_KEEP_AUTO} kept)"]
+    for m in metas[:15]:
+        note = f" — {m['label']}" if m.get("label") else ""
+        lines.append(f"`{m['id']}` · {m['kind']} · {m['records']} rec ({m['closed']} closed, {m['open']} open){note}")
+    if len(metas) > 15:
+        lines.append(f"…and {len(metas) - 15} older (see the web Backup tab)")
+    lines.append("Restore: `!restore <id>`")
+    await _send_long(ctx, "\n".join(lines))
+
+
+@core.bot.command(name="restore")
+async def restore_cmd(ctx, backup_id: str = "", *args):
+    """!restore <id> [pair] [tf] [yes] - preview without `yes`."""
+    if not backup_id:
+        await ctx.send("Usage: `!restore <id> [pair] [tf] [yes]` — ids: `!backups`")
+        return
+    confirm = any(a.lower() == "yes" for a in args)
+    ticker = next((a.upper() for a in args if "/" in a), None)
+    tf = next((a for a in args if a in TIMEFRAMES), None)
+    try:
+        detail = history_backup.backup_detail(backup_id)
+        rows = [r for r in detail["rows"]
+                if (not ticker or r["ticker"] == ticker) and (not tf or r["tf"] == tf)]
+        if not confirm:
+            lines = [f"⚠️ This replaces the stored history"
+                     f"{' of ' + ticker if ticker else ''}{' ' + tf if tf else ''} with backup `{backup_id}`.",
+                     "Open trades stay as they are; a safety copy of the current history is taken first.",
+                     "", "records now → in backup:"]
+            for r in rows:
+                if r["now"] != r["backup"] or r["now_live"] != r["backup_live"]:
+                    lines.append(f"`{r['ticker']} {r['tf']} {r['side']}`: {r['now']} → {r['backup']} "
+                                 f"(live {r['now_live']} → {r['backup_live']})")
+            if len(lines) == 4:
+                lines.append("no differences in record counts")
+            lines.append(f"\nTo confirm: `!restore {backup_id}{' ' + ticker if ticker else ''}{' ' + tf if tf else ''} yes`")
+            await _send_long(ctx, "\n".join(lines))
+            return
+        result = history_backup.restore_backup(backup_id, ticker, tf)
+        await ctx.send(f"♻️ Restored `{backup_id}`: {result['records']} records, {result['open_kept']} open trade record(s) kept.\n"
+                       f"Undo with `!restore {result['pre_restore_backup']} yes`.")
+    except history_backup.BackupError as e:
+        await ctx.send(f"❌ {e}")
+    except Exception as e:
+        logger.error(f"restore command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="sources")
+async def sources_cmd(ctx, action: str = "", confirm: str = ""):
+    """!sources - origin of the stored records; `!sources tag yes` writes the inferred origin into old records."""
+    try:
+        if action.lower() == "tag":
+            if confirm.lower() != "yes":
+                summ = history_tools.source_summary(load_signals_history())
+                await ctx.send(f"This writes the inferred origin into {summ['untagged']} record(s) that have none "
+                               f"(nothing else changes, a safety backup is taken first). To confirm: `!sources tag yes`")
+                return
+            pre = history_backup.create_backup("pre-tag", "before tagging record sources")
+            history = load_signals_history()
+            res = history_tools.tag_sources(history)
+            if res["tagged"]:
+                save_signals_history(history)
+            await ctx.send(f"🏷️ Tagged {res['tagged']} record(s) {res['by_source']}; {res['unknown']} could not be told. "
+                           f"Safety backup: `{pre['id']}`.")
+            return
+        summ = history_tools.source_summary(load_signals_history())
+        lines = ["**🏷️ Origin of stored records**",
+                 " · ".join(f"{k}: {v}" for k, v in sorted(summ["total"].items())) or "history is empty",
+                 f"{summ['untagged']} record(s) have no tag yet (origin inferred: "
+                 + ", ".join(f"{k} {v}" for k, v in sorted(summ['by_basis'].items()) if k != 'tag') + ")"]
+        if summ["untagged"]:
+            lines.append("`!sources tag yes` writes the inferred origin into them.")
+        await _send_long(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"sources command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="btaudit", aliases=["histaudit"])
+async def btaudit_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 6000):
+    """
+    Replays the CURRENT signal logic over real history (dry-run backtests) and compares
+    every simulated signal with the stored signal history. Writes nothing.
+
+      !btaudit                       every tracked pair x timeframe, 6000 bars
+      !btaudit ETH/USDT 4h 9000      one pair/timeframe, more history
+
+    Reports per pair/timeframe/side/track: matched, MISSED (inside the stored window - the
+    history lacks a signal the current logic gives), OLDER (before the stored window -
+    could deepen the history), and stored records the backtest does not reproduce.
+    Then `!btfill` can add the missing ones.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    num_bars = _clamp_bars(num_bars)
+    scope_tickers = [ticker.upper()] if ticker else list(TICKERS)
+    scope_tfs = [tf.lower()] if tf else list(TIMEFRAMES)
+    for t in scope_tickers:
+        if t not in TICKERS:
+            await ctx.send(f"❌ `{t}` is not a tracked pair.")
+            return
+    for f in scope_tfs:
+        if f not in TIMEFRAMES:
+            await ctx.send(f"❌ `{f}` is not a tracked timeframe.")
+            return
+    try:
+        report = await _run_sim_job(
+            ctx, "reconcile", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "tolerance_bars": 2},
+            lambda progress: run_history_reconcile(exchange, scope_tickers, scope_tfs, num_bars, 2, progress=progress),
+            intro=f"⏳ Auditing the history: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each. Nothing is written.",
+        )
+        if report is None:
+            return
+        tot = report["totals"]
+        lines = [f"**🔍 Backtest audit** ({num_bars} bars requested per pair/tf)",
+                 f"backtest signals **{tot['backtest']}** · matched **{tot['matched']}** · "
+                 f"MISSED inside the stored window **{tot['missed']}** · older than the window **{tot['older']}**",
+                 f"stored but not reproduced: live-only {tot['live_only']} · stale backtest {tot['stale_backtest']} · "
+                 f"outside the tested range {tot['outside']} · outcome changed {tot['changed']}", ""]
+        short = [c for c in report["bar_coverage"] if c["got"] < num_bars]
+        if short:
+            lines.append("⚠️ Bars requested vs received: " + ", ".join(f"{c['ticker']} {c['tf']} {c['got']}/{num_bars}" for c in short))
+        for sl in report["slots"]:
+            for row in sl["rows"]:
+                if row["missed"] or row["older"] or row["stale_backtest"] or row["changed"] or row["live_only"]:
+                    lines.append(f"`{sl['ticker']} {sl['tf']} {row['side']} {row['track']}`: bt {row['backtest']} · stored {row['stored']} · "
+                                 f"matched {row['matched']} · missed {row['missed']} · older {row['older']} · "
+                                 f"live-only {row['live_only']} · stale {row['stale_backtest']} · changed {row['changed']}")
+            for m in sl["missed"][:5]:
+                lines.append(f"   missed: {m['ts'][:16]} {m['track']} → {m['exit_type']} {m['moved_pct']:+.2f}%")
+        if tot["missed"] or tot["older"]:
+            lines.append("")
+            if tot["missed"]:
+                lines.append("`!btfill fill yes` adds the MISSED ones inside the stored window.")
+            if tot["older"]:
+                lines.append(f"`!btfill backfill yes` adds the OLDER ones — needs room: {report['keep']} records are stored per side "
+                             f"(`!tpconfig keep N` raises it; the training window does not change).")
+            lines.append("Add-only, a safety backup is taken first. The audit stays available for 1 hour.")
+        else:
+            lines.append("Nothing to add.")
+        lines.append("Note: live records differ from a backtest by design (spread/derivatives gates, intrabar check, exact entry moment) — "
+                     "'live-only' is not an error. Signals found later in time can shift after an earlier difference (one position per track).")
+        await _send_long(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"btaudit command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="btfill")
+async def btfill_cmd(ctx, what: str = "", confirm: str = ""):
+    """!btfill [fill|backfill|all] [yes] - adds the signals the last !btaudit found (preview without `yes`)."""
+    what = what.lower()
+    if what == "yes":
+        what, confirm = "", "yes"
+    if what not in ("fill", "backfill", "all"):
+        await ctx.send("Usage: `!btfill fill|backfill|all [yes]` — run `!btaudit` first.")
+        return
+    cache = _RECONCILE_CACHE
+    if not cache:
+        await ctx.send("❌ No audit available — run `!btaudit` first (an audit stays valid for 1 hour).")
+        return
+    do_fill, do_backfill = what in ("fill", "all"), what in ("backfill", "all")
+    missed = sum(r["missed"] for sl in cache["slots"] for r in sl["rows"])
+    older = sum(r["older"] for sl in cache["slots"] for r in sl["rows"])
+    if confirm.lower() != "yes":
+        await ctx.send(f"This adds up to {missed if do_fill else 0} missed + {older if do_backfill else 0} older signal(s) "
+                       f"(add-only, max {_cfg.history_keep()} stored per side, a safety backup is taken first).\n"
+                       f"To confirm: `!btfill {what} yes`")
+        return
+    try:
+        res = apply_history_reconcile(cache.get("id"), do_fill, do_backfill)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.error(f"btfill command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Nothing changed: {e}")
+        return
+    msg = (f"✅ Added **{res['added']}** signal(s): {res['filled']} fill + {res['backfilled']} backfill. "
+           f"Safety backup: `{res['backup_id']}`.")
+    if res["no_room"]:
+        msg += (f"\n⚠️ {res['no_room']} more did not fit ({res['keep']} stored per side) — "
+                f"`!tpconfig keep N` raises the limit, then run `!btaudit` again.")
+    await ctx.send(msg)
+
 
 @core.bot.command(name="mode")
 async def mode_cmd(ctx, new_mode: str = ""):
@@ -609,11 +847,11 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
                 f"• Active mode: **{active_mode}** | Percentile: **{active_pct*100:.0f}th**\n"
                 f"• Aggressive percentile: **{_cfg.TP_PERCENTILE*100:.0f}th**\n"
                 f"• Safe percentile: **{_cfg.SAFE_TP_PERCENTILE*100:.0f}th**\n"
-                f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals\n"
+                f"• History limit: **{_cfg.SIGNAL_HISTORY_LIMIT}** signals (stored per side: **{_cfg.history_keep()}**)\n"
                 f"• Min TP: **{MIN_TP_PCT}%** | Max TP: **{MAX_TP_PCT}%**\n"
                 f"• Max hold: **{_cfg.MAX_HOLD_BARS}** bars\n"
                 "\nTo change: `!tpconfig mode safe` | `!tpconfig mode aggressive` | "
-                "`!tpconfig limit 30` | `!tpconfig percentile 70` | `!tpconfig safe 50`"
+                "`!tpconfig limit 30` | `!tpconfig keep 150` | `!tpconfig percentile 70` | `!tpconfig safe 50`"
             )
             return
 
@@ -641,6 +879,19 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
                 await ctx.send(f"✅ History limit changed: **{old}** → **{new_limit}** signals")
             except ValueError:
                 await ctx.send("❌ Invalid number")
+        elif param == "keep":
+            try:
+                new_keep = int(value)
+                if not (0 <= new_keep <= 2000):
+                    await ctx.send("❌ Keep must be 0 (automatic) or up to 2000")
+                    return
+                old = _cfg.history_keep()
+                _cfg.SIGNAL_HISTORY_KEEP = new_keep
+                save_tp_config()
+                await ctx.send(f"✅ Stored records per side: **{old}** → **{_cfg.history_keep()}** "
+                               f"(the training window stays at {_cfg.SIGNAL_HISTORY_LIMIT})")
+            except ValueError:
+                await ctx.send("❌ Invalid number")
         elif param == "percentile":
             try:
                 new_pct = float(value)
@@ -666,7 +917,7 @@ async def tpconfig_cmd(ctx, param: str = "", value: str = ""):
             except ValueError:
                 await ctx.send("❌ Invalid number")
         else:
-            await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `percentile`, or `safe`")
+            await ctx.send("❌ Unknown parameter. Use `mode`, `limit`, `keep`, `percentile`, or `safe`")
     except Exception as e:
         logger.error(f"TPConfig command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
@@ -2301,6 +2552,10 @@ async def reset_cmd(ctx, confirm: str = ""):
             _t.add_done_callback(_bg_tasks.discard)
             await ctx.send("❌ The scanner is still mid-scan after 10 minutes — nothing was deleted. It will resume on its own; try `!reset` again later.")
             return
+
+    reset_backup_id = history_backup.safe_pre_backup("pre-reset", "before !reset yes")
+    await ctx.send(f"💾 Safety backup of the history: `{reset_backup_id}` (`!restore {reset_backup_id}`)."
+                   if reset_backup_id else "⚠️ The safety backup of the history could NOT be written — continuing as confirmed.")
 
     if os.path.exists(SIGNALS_HISTORY_FILE):
         os.remove(SIGNALS_HISTORY_FILE)

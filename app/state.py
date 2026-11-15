@@ -276,13 +276,17 @@ def add_signal_record(
         "tp_raw": tp_raw,
         "cap_reason": cap_reason,
         "cap_level": cap_level,
+        # where the record came from (history_tools.classify_record_source):
+        # "live" = the real scanner, "sim" = synthetic (!sim); backtests write
+        # "backtest" / "backtest_fill" / "backtest_backfill" themselves.
+        "source": "sim" if synthetic else "live",
     }
     # optional additive fields supplied by the caller
     if extra:
         record.update(extra)
 
     history[ticker][tf][side].append(record)
-    history[ticker][tf][side] = history[ticker][tf][side][-(_cfg.SIGNAL_HISTORY_LIMIT * 3):]
+    history[ticker][tf][side] = history[ticker][tf][side][-_cfg.history_keep():]
     save_signals_history(history)
     logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Track: {track} | Regime: {regime}")
 

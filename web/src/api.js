@@ -143,6 +143,42 @@ export const api = {
   // A single long request used to be cut off by the Cloudflare Tunnel (~100 s).
   getActiveSim: () => request('/api/sim-jobs/active'),
   getSimJob: (id) => request(`/api/sim-jobs/${encodeURIComponent(id)}`),
+  // 🆕 History backups + backtest audit (Backup tab)
+  getBackups: () => request('/api/backups'),
+  createBackup: (label) => request('/api/backups', { method: 'POST', body: JSON.stringify({ label: label || '' }) }),
+  getBackupDetail: (id) => request(`/api/backups/${encodeURIComponent(id)}`),
+  restoreBackup: (id, ticker, tf) =>
+    request(`/api/backups/${encodeURIComponent(id)}/restore`, {
+      method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null }),
+    }),
+  deleteBackup: (id) => request(`/api/backups/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // the file needs the Authorization header, so it is fetched and saved as a blob
+  downloadBackup: async (id) => {
+    const token = getAuthToken()
+    const res = await fetch(`${BASE}/api/backups/${encodeURIComponent(id)}/download`, {
+      headers: token ? { Authorization: `Basic ${token}` } : {},
+    })
+    if (!res.ok) throw new Error(res.statusText || 'Download failed')
+    const url = URL.createObjectURL(await res.blob())
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `mufca-history-${id}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
+  },
+  getHistorySources: () => request('/api/history/sources'),
+  tagHistorySources: () => request('/api/history/sources/tag', { method: 'POST' }),
+  runReconcile: ({ ticker, tf, numBars = 6000, toleranceBars = 2 } = {}) =>
+    request('/api/history/reconcile', {
+      method: 'POST',
+      body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, tolerance_bars: toleranceBars }),
+    }),
+  applyReconcile: (applyId, fill, backfill) =>
+    request('/api/history/reconcile/apply', { method: 'POST', body: JSON.stringify({ apply_id: applyId, fill, backfill }) }),
+  setTpConfigKeep: (value) =>
+    request('/api/config/tpconfig', { method: 'POST', body: JSON.stringify({ param: 'keep', value: String(value) }) }),
   cancelSimJob: (id) => request(`/api/sim-jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   runTp1Sim: ({ ticker, tf, numBars = 3000 } = {}) =>
     request('/api/tp1sim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),

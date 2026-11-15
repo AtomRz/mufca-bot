@@ -26,6 +26,7 @@ from onchain import get_onchain_bias
 import derivatives
 import spread
 import shock_guard
+import history_backup
 from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,10 @@ async def startup_sequence(exchange: ccxt.Exchange):
     # history is already non-empty — we assume it was already accumulated
     # (by the first run or a backtest, or live trading). To force a rebuild
     # of the history — `!reset yes`.
+    # 🆕 Backups of signals_history.json: one now (skipped when unchanged), then
+    # periodic - see history_backup.py and the web "Backup" tab.
+    history_backup.start_auto_backups()
+
     history = load_signals_history()
     total = 0
     for ticker in TICKERS:

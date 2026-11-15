@@ -4,6 +4,7 @@ import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
 import InsightsPanel from './components/InsightsPanel'
+import BackupPanel from './components/BackupPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
@@ -16,6 +17,7 @@ const TABS = [
   { id: 'chart', label: 'Chart' },
   { id: 'history', label: 'History' },
   { id: 'insights', label: 'Insights' },
+  { id: 'backup', label: 'Backup' },
 ]
 
 const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 'var(--text-dim)' }
@@ -272,6 +274,7 @@ export default function App() {
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} />}
+        {tab === 'backup' && <BackupPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} config={config} onConfigChanged={loadConfig} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
         )}
