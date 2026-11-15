@@ -210,8 +210,8 @@ export default function App() {
           </span>
         )}
         {pulse && (
-          <span className="mode-badge" title="Rough informational estimate, not used for real position sizing">
-            {pulse.suggested_leverage}x lev
+          <span className="mode-badge" title="Estimate from the current adaptive SL, regime and on-chain delta (same formula as a real entry, without the volume step). The Discord signal shows the final leverage.">
+            ≈{pulse.suggested_leverage}x lev
           </span>
         )}
         {pulse && <SignalLamps lamps={pulse.lamps} />}

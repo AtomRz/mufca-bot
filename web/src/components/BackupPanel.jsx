@@ -10,6 +10,7 @@ const KIND_LABEL = {
   'pre-backfill': 'before backfill',
   'pre-tag': 'before tagging',
   'pre-dedupe': 'before dedupe',
+  'pre-sort': 'before sort',
   'pre-reset': 'before reset',
   'pre-delete': 'before delete',
 }
@@ -292,6 +293,47 @@ function DuplicatesBlock({ refreshKey, onHistoryChanged }) {
   )
 }
 
+function OrderBlock({ refreshKey, onHistoryChanged }) {
+  const [info, setInfo] = useState(null)
+  const [notice, setNotice] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(() => {
+    api.getHistoryOrder().then(setInfo).catch((e) => setNotice({ error: true, text: e.message }))
+  }, [])
+  useEffect(() => { load() }, [load, refreshKey])
+
+  const sort = async () => {
+    setBusy(true); setNotice(null)
+    try {
+      const r = await api.sortHistoryOrder()
+      setNotice({ text: `Sorted ${r.sorted} list(s). Safety backup: ${r.backup_id}.` })
+      load(); onHistoryChanged()
+    } catch (e) {
+      setNotice({ error: true, text: e.message })
+    } finally { setBusy(false) }
+  }
+
+  if (!info) return <Notice notice={notice} />
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border-soft)' }}>
+      {info.slots > 0 ? (
+        <>
+          <p style={{ fontSize: 13, marginBottom: 6, color: 'var(--accent)' }}>
+            {info.slots} list(s) are not in date order
+            ({info.rows.slice(0, 6).map((r) => `${r.ticker} ${r.tf} ${r.side}`).join(' · ')}{info.rows.length > 6 ? ' …' : ''}).
+          </p>
+          <button onClick={sort} disabled={busy}>Sort by date</button>
+          <p style={{ ...small, marginTop: 6 }}>Only reorders (oldest first) — nothing is added or removed. A safety backup is taken first.</p>
+        </>
+      ) : (
+        <p style={small}>History is in date order.</p>
+      )}
+      <Notice notice={notice} />
+    </div>
+  )
+}
+
 function SourcesSection({ refreshKey, onHistoryChanged }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -339,6 +381,7 @@ function SourcesSection({ refreshKey, onHistoryChanged }) {
           {data.untagged > 0 && <button onClick={tag} disabled={busy}>Tag untagged records</button>}
           <Notice notice={notice} />
           <DuplicatesBlock refreshKey={refreshKey} onHistoryChanged={onHistoryChanged} />
+          <OrderBlock refreshKey={refreshKey} onHistoryChanged={onHistoryChanged} />
           {data.rows.length > 0 && (
             <details style={{ marginTop: 10 }}>
               <summary style={{ cursor: 'pointer', fontSize: 12 }}>Per pair / timeframe / side</summary>

@@ -170,6 +170,8 @@ export const api = {
   },
   getHistorySources: () => request('/api/history/sources'),
   tagHistorySources: () => request('/api/history/sources/tag', { method: 'POST' }),
+  getHistoryOrder: () => request('/api/history/order'),
+  sortHistoryOrder: () => request('/api/history/order/sort', { method: 'POST' }),
   getHistoryDuplicates: () => request('/api/history/duplicates'),
   removeHistoryDuplicates: () => request('/api/history/duplicates/remove', { method: 'POST' }),
   runReconcile: ({ ticker, tf, numBars = 6000, toleranceBars = 2 } = {}) =>

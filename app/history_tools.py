@@ -26,34 +26,12 @@ from what they contain:
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from state import _parse_ts
+from state import _parse_ts, sort_records_chronological
 
 
 def parse_record_ts(value: Any) -> Optional[datetime]:
-    """Timestamp of a stored record as an aware UTC datetime. Besides ISO strings it
-    reads epoch values - the first bootstrap backtests stored the bar open as a string
-    of digits ("1721260800000", milliseconds; see the History tab's fmtDate) and
-    state._parse_ts cannot read those: such a record used to look 'unparseable', so it
-    was classed "unknown" and the audit did not see it at all. Epoch seconds are read
-    too; anything else falls back to state._parse_ts."""
-    if isinstance(value, bool):
-        return None
-    num: Optional[float] = None
-    if isinstance(value, (int, float)):
-        num = float(value)
-    elif isinstance(value, str):
-        txt = value.strip()
-        if txt.replace(".", "", 1).isdigit():
-            num = float(txt)
-    if num is not None:
-        if num >= 1e12:
-            num /= 1000.0          # milliseconds
-        elif num < 1e9:
-            return None            # neither: not a plausible epoch
-        try:
-            return datetime.fromtimestamp(num, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
+    """Timestamp of a stored record as an aware UTC datetime (ISO strings and epoch
+    seconds / milliseconds, also as digit strings - see state._parse_ts)."""
     return _parse_ts(value)
 
 SOURCES = ("live", "sim", "backtest", "backtest_fill", "backtest_backfill", "unknown")
@@ -430,3 +408,36 @@ def remove_added_duplicates(history: Dict) -> int:
         lst = history[t][f][s]
         history[t][f][s] = [r for i, r in enumerate(lst) if i not in idxs]
     return len(dups)
+
+
+# =====================================================================
+# 🗓️  CHRONOLOGICAL ORDER
+# =====================================================================
+
+def _unsorted_slots(history: Dict) -> List[Tuple[str, str, str]]:
+    out = []
+    for t, tfs in history.items():
+        for f, sides in (tfs or {}).items():
+            for side, lst in (sides or {}).items():
+                if isinstance(lst, list) and len(lst) > 1:
+                    probe = list(lst)
+                    if sort_records_chronological(probe):
+                        out.append((t, f, side))
+    return out
+
+
+def count_unsorted(history: Dict) -> Dict[str, Any]:
+    """Preview for sort_history(): which side lists are not in date order. Writes nothing."""
+    slots = _unsorted_slots(history)
+    return {"slots": len(slots),
+            "rows": [{"ticker": t, "tf": f, "side": s, "n": len(history[t][f][s])} for t, f, s in slots]}
+
+
+def sort_history(history: Dict) -> int:
+    """Puts every side list in date order (oldest first), IN PLACE. Nothing is added or
+    removed, only reordered. Returns how many side lists changed."""
+    n = 0
+    for t, f, s in _unsorted_slots(history):
+        sort_records_chronological(history[t][f][s])
+        n += 1
+    return n

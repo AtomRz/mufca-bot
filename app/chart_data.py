@@ -442,6 +442,24 @@ async def get_market_pulse(exchange, ticker: str, tf: str, onchain_bias: Optiona
         logger.warning(f"[PULSE] {ticker} {tf} R:R calc failed: {e}")
         rr_long = rr_short = None
 
+    # Leverage as open_position() sizes it: from the REAL adaptive SL (not the FRAMA
+    # width estimate above), regime multiplier and the on-chain delta. Only the volume
+    # adjustment (volume_leverage_adjustment_v3) is left out, so it can still differ
+    # from the Discord embed by that step.
+    try:
+        _side = "long" if dir_v >= 0 else "short"
+        _sl, _ = calculate_adaptive_sl(close_v, _side, ticker, tf, frama_s, frama_u, frama_l, atr_s, idx)
+        _mult = max(1.0, min(3.5, abs(close_v - _sl) / max(atr_v, 1e-8)))
+        _lev = max(1, min(config.MAX_ALLOWED_LEV, int(config.TARGET_RISK_DEP / max(_mult, 0.1))))
+        if regime == "CHAOS":
+            _lev = max(1, int(_lev * 0.5))
+        if regime == "TREND":
+            _lev = min(config.MAX_ALLOWED_LEV, int(_lev * 1.2))
+        _delta = int((onchain_bias or {}).get("lev_delta", 0) or 0)
+        sugg_lev = max(1, min(config.MAX_ALLOWED_LEV, _lev + _delta))
+    except Exception as e:
+        logger.warning(f"[PULSE] {ticker} {tf} leverage calc failed, using FRAMA estimate: {e}")
+
     # pass_long/pass_short mirror EXACTLY the filter_long/filter_short
     # formulas from signals.py — including the fact that liq_sweep_short
     # blocks LONG there, and liq_sweep_long blocks SHORT (that's how the

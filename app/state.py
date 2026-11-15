@@ -174,8 +174,26 @@ def _parse_ts(ts) -> Optional[datetime]:
     import/migration, or data from a different source than the rest.
     Returns None if the string can't be parsed (caller decides how to treat
     that — see _is_before)."""
-    if not ts:
+    if not ts or isinstance(ts, bool):
         return None
+    # epoch numbers: the first bootstrap backtests stored the bar open as a string of
+    # digits ("1721260800000" = milliseconds). 1e9..1e12 = seconds, >=1e12 = ms.
+    num = None
+    if isinstance(ts, (int, float)):
+        num = float(ts)
+    elif isinstance(ts, str):
+        txt = ts.strip()
+        if txt.replace(".", "", 1).isdigit():
+            num = float(txt)
+    if num is not None:
+        if num >= 1e12:
+            num /= 1000.0
+        elif num < 1e9:
+            return None
+        try:
+            return datetime.fromtimestamp(num, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
         ts_norm = ts.replace("Z", "+00:00") if isinstance(ts, str) else ts
         dt = datetime.fromisoformat(ts_norm) if isinstance(ts_norm, str) else ts_norm
@@ -186,6 +204,25 @@ def _parse_ts(ts) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+def sort_records_chronological(records: list) -> bool:
+    """Orders a side list of history records by timestamp (oldest first), IN PLACE and
+    stable: records with the same moment keep their order, and a record whose
+    timestamp cannot be read stays right after the record before it instead of jumping
+    to the front. Returns True when the order changed."""
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    keys, last = [], floor
+    for r in records:
+        dt = _parse_ts(r.get("timestamp")) if isinstance(r, dict) else None
+        if dt is not None:
+            last = dt
+        keys.append(last)
+    order = sorted(range(len(records)), key=lambda i: keys[i])
+    if order == list(range(len(records))):
+        return False
+    records[:] = [records[i] for i in order]
+    return True
 
 
 def is_before_ts(record_ts, as_of) -> bool:
@@ -286,6 +323,7 @@ def add_signal_record(
         record.update(extra)
 
     history[ticker][tf][side].append(record)
+    sort_records_chronological(history[ticker][tf][side])
     history[ticker][tf][side] = history[ticker][tf][side][-_cfg.history_keep():]
     save_signals_history(history)
     logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Track: {track} | Regime: {regime}")

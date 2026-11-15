@@ -1557,6 +1557,28 @@ async def remove_history_duplicates():
     return {"removed": removed, "backup_id": pre["id"]}
 
 
+@app.get("/api/history/order")
+async def get_history_order():
+    """Side lists of the history that are not in date order. Read-only preview."""
+    return history_tools.count_unsorted(load_signals_history())
+
+
+@app.post("/api/history/order/sort")
+async def sort_history_order():
+    """Sorts every side list by date (oldest first). Only reorders; a "pre-sort" safety
+    backup is taken first and if it fails nothing is changed."""
+    try:
+        pre = history_backup.create_backup("pre-sort", "before sorting the history by date")
+    except history_backup.BackupError as e:
+        raise HTTPException(500, f"Safety backup failed, nothing changed: {e}")
+    history = load_signals_history()
+    changed = history_tools.sort_history(history)
+    if changed:
+        save_signals_history(history)
+        await broadcast_event({"type": "history_changed"})
+    return {"sorted": changed, "backup_id": pre["id"]}
+
+
 class ReconcileIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
