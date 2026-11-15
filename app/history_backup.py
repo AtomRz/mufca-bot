@@ -37,7 +37,7 @@ import history_tools
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("manual", "auto", "pre-restore", "pre-fill", "pre-backfill", "pre-tag", "pre-reset", "pre-delete")
+KINDS = ("manual", "auto", "pre-restore", "pre-fill", "pre-backfill", "pre-tag", "pre-dedupe", "pre-reset", "pre-delete")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,100}$")
 _FORMAT = 1
 

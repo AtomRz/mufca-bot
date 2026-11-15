@@ -9,6 +9,7 @@ const KIND_LABEL = {
   'pre-fill': 'before fill',
   'pre-backfill': 'before backfill',
   'pre-tag': 'before tagging',
+  'pre-dedupe': 'before dedupe',
   'pre-reset': 'before reset',
   'pre-delete': 'before delete',
 }
@@ -242,6 +243,55 @@ function BackupsSection({ refreshKey, onHistoryChanged }) {
 // ---------------------------------------------------------------------
 // Where the stored records came from
 // ---------------------------------------------------------------------
+function DuplicatesBlock({ refreshKey, onHistoryChanged }) {
+  const [info, setInfo] = useState(null)
+  const [notice, setNotice] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [confirm, setConfirm] = useState(false)
+
+  const load = useCallback(() => {
+    api.getHistoryDuplicates().then(setInfo).catch((e) => setNotice({ error: true, text: e.message }))
+  }, [])
+  useEffect(() => { load() }, [load, refreshKey])
+
+  const remove = async () => {
+    if (!confirm) { setConfirm(true); setTimeout(() => setConfirm(false), 4000); return }
+    setConfirm(false); setBusy(true); setNotice(null)
+    try {
+      const r = await api.removeHistoryDuplicates()
+      setNotice({ text: `Removed ${r.removed} duplicate(s). Safety backup: ${r.backup_id}.` })
+      load(); onHistoryChanged()
+    } catch (e) {
+      setNotice({ error: true, text: e.message })
+    } finally { setBusy(false) }
+  }
+
+  if (!info) return <Notice notice={notice} />
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border-soft)' }}>
+      {info.duplicates > 0 ? (
+        <>
+          <p style={{ fontSize: 13, marginBottom: 6, color: 'var(--accent)' }}>
+            {info.duplicates} record(s) were added by an audit although the same signal was already stored
+            ({info.rows.slice(0, 6).map((r) => `${r.ticker} ${r.tf} ${r.side}: ${r.n}`).join(' · ')}
+            {info.rows.length > 6 ? ' …' : ''}).
+          </p>
+          <button className="btn danger" onClick={remove} disabled={busy}>
+            {confirm ? 'Sure? Click again' : `Remove ${info.duplicates} duplicate(s)`}
+          </button>
+          <p style={{ ...small, marginTop: 6 }}>
+            Only the audit-added copies are removed (tagged backtest_fill / backtest_backfill) — the original record always stays.
+            A safety backup is taken first.
+          </p>
+        </>
+      ) : (
+        <p style={small}>No duplicate audit additions.</p>
+      )}
+      <Notice notice={notice} />
+    </div>
+  )
+}
+
 function SourcesSection({ refreshKey, onHistoryChanged }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -288,6 +338,7 @@ function SourcesSection({ refreshKey, onHistoryChanged }) {
           </p>
           {data.untagged > 0 && <button onClick={tag} disabled={busy}>Tag untagged records</button>}
           <Notice notice={notice} />
+          <DuplicatesBlock refreshKey={refreshKey} onHistoryChanged={onHistoryChanged} />
           {data.rows.length > 0 && (
             <details style={{ marginTop: 10 }}>
               <summary style={{ cursor: 'pointer', fontSize: 12 }}>Per pair / timeframe / side</summary>
