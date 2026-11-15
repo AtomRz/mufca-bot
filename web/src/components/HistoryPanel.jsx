@@ -45,7 +45,46 @@ function fmtDate(ts) {
   }
 }
 
+// Which stored records a view counts: all of them, only the ones the real scanner
+// produced, or only backtest-origin ones (bootstrap / audit fill / backfill).
+// The choice is remembered per browser and shared by the History and Components views.
+const ORIGIN_KEY = 'mufca_history_origin'
+const ORIGIN_OPTIONS = [
+  { id: 'all', label: 'All' },
+  { id: 'live', label: 'Live only' },
+  { id: 'backtest', label: 'Backtest only' },
+]
+
+export function useOrigin() {
+  const [origin, setOriginState] = useState(() => {
+    try {
+      const v = localStorage.getItem(ORIGIN_KEY)
+      return ORIGIN_OPTIONS.some((o) => o.id === v) ? v : 'all'
+    } catch (_) { return 'all' }
+  })
+  const setOrigin = (v) => {
+    setOriginState(v)
+    try { localStorage.setItem(ORIGIN_KEY, v) } catch (_) { /* storage unavailable: per-session only */ }
+  }
+  return [origin, setOrigin]
+}
+
+export function OriginSwitch({ origin, onChange }) {
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 }}
+         title="Backtest-origin records (the first bootstrap and anything added from the Backup tab) are simulated: they have no raw_mfe and skip live-only gates. Live only = what the bot actually did.">
+      <span style={{ color: 'var(--text-faint)' }}>Records:</span>
+      {ORIGIN_OPTIONS.map((o) => (
+        <button key={o.id} className={`btn ${origin === o.id ? 'primary' : ''}`} onClick={() => onChange(o.id)}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export default function HistoryPanel({ lastEvent }) {
+  const [origin, setOrigin] = useOrigin()
   const [summary, setSummary] = useState(null)
   const [error, setError] = useState(null)
   const [selected, setSelected] = useState(null) // {ticker, tf, side, track}
@@ -59,10 +98,10 @@ export default function HistoryPanel({ lastEvent }) {
 
   const load = useCallback(() => {
     api
-      .getHistorySummary()
+      .getHistorySummary(origin)
       .then((d) => { setSummary(d); setError(null) }) // 🆕 a later success clears an earlier error
       .catch((e) => setError(e.message))
-  }, [])
+  }, [origin])
 
   useEffect(() => {
     load()
@@ -78,12 +117,12 @@ export default function HistoryPanel({ lastEvent }) {
     // title). Only the latest request may set the state.
     const seq = ++recordsSeq.current
     api
-      .getHistoryRecords(selected.ticker, selected.tf, selected.side, selected.track, 30)
+      .getHistoryRecords(selected.ticker, selected.tf, selected.side, selected.track, 30, origin)
       .then((d) => { if (seq === recordsSeq.current) { setRecords(d.records); setRecordsError(null) } })
       // 🆕 a failed request used to show "No closed trades for this combination"
       // — indistinguishable from a really empty list
       .catch((e) => { if (seq === recordsSeq.current) setRecordsError(e.message) })
-  }, [selected])
+  }, [selected, origin])
 
   // 🆕 FIX: switching to another row kept showing the previous row's trades
   // (and never showed "Loading…") until the new response arrived
@@ -137,7 +176,16 @@ export default function HistoryPanel({ lastEvent }) {
   const { rows, total } = summary
 
   if (rows.length === 0) {
-    return <div className="empty-state">No closed signals yet — stats will appear after the first TP/SL hit.</div>
+    return (
+      <div>
+        <div style={{ marginBottom: 12 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
+        <div className="empty-state">
+          {origin === 'all'
+            ? 'No closed signals yet — stats will appear after the first TP/SL hit.'
+            : `No closed ${origin} signals yet.`}
+        </div>
+      </div>
+    )
   }
 
   const isSelected = (r) =>
@@ -146,6 +194,7 @@ export default function HistoryPanel({ lastEvent }) {
   return (
     <div>
       {error && <div className="error-banner">{error}</div>}
+      <div style={{ marginBottom: 12 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
       {total && (
         <div className="panel">
           <h3 className="panel-title">Overall (all pairs)</h3>

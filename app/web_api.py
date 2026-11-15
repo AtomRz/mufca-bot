@@ -65,7 +65,8 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_shock_guard_block_entries, save_system_alerts_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
-from state import load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components
+from state import (load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components,
+                   normalize_origin, record_matches_origin)
 import push as _push
 import derivatives
 import onchain as _onchain
@@ -568,7 +569,7 @@ async def get_nyse_status():
 
 
 @app.get("/api/components")
-async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False):
+async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False, origin: str = "all"):
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
     with trade outcomes — same report as the Discord !components command,
@@ -580,11 +581,14 @@ async def get_components(min_samples: int = 30, split: bool = False, shadow: boo
     split=true  — additionally bucket by track and regime (like !compsim).
     shadow=true — add rows for entries an Entry switch blocked, replayed on
                   later bars (shadow.py); reported separately as src=shadow,
-                  never pooled with real trades."""
+                  never pooled with real trades.
+    origin=all|live|backtest — only stored records of that origin (backtest
+                  records have no raw_mfe_pct, so "live" is the one to trust)."""
     return analyze_confidence_components(
         min_samples=min_samples,
         group_by=["track", "regime"] if split else None,
         include_shadow=shadow,
+        origin=_origin_param(origin),
     )
 
 
@@ -1329,10 +1333,20 @@ def _aggregate_records(records: list) -> Optional[dict]:
     }
 
 
+def _origin_param(origin: str) -> str:
+    try:
+        return normalize_origin(origin)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/history/summary")
-async def history_summary():
+async def history_summary(origin: str = "all"):
     """Win rate/statistics for every ticker/tf/side/track combination that has
-    closed signals, plus a grand-total row across all of them."""
+    closed signals, plus a grand-total row across all of them.
+    origin = all | live | backtest: only stored records of that origin (backtest =
+    backtest / backtest_fill / backtest_backfill; see history_tools)."""
+    origin = _origin_param(origin)
     history = load_signals_history()
     rows = []
     all_closed_for_total: list = []
@@ -1343,6 +1357,8 @@ async def history_summary():
                 records = sides.get(side, [])
                 by_track: dict = {}
                 for r in records:
+                    if not record_matches_origin(r, origin):
+                        continue
                     by_track.setdefault(r.get("track", "a"), []).append(r)
                 for track, recs in by_track.items():
                     agg = _aggregate_records(recs)
@@ -1355,12 +1371,13 @@ async def history_summary():
 
     rows.sort(key=lambda r: (r["ticker"], r["tf"], r["side"], r["track"]))
     total = _aggregate_records(all_closed_for_total)
-    return {"rows": rows, "total": total}
+    return {"rows": rows, "total": total, "origin": origin}
 
 
 @app.get("/api/history/records")
-async def history_records(ticker: str, tf: str, side: str, track: str = "a", limit: int = 30):
+async def history_records(ticker: str, tf: str, side: str, track: str = "a", limit: int = 30, origin: str = "all"):
     ticker = unquote(ticker).upper().strip()
+    origin = _origin_param(origin)
     side = side.lower()
     if side not in ("long", "short"):
         raise HTTPException(400, "side must be 'long' or 'short'")
@@ -1377,7 +1394,7 @@ async def history_records(ticker: str, tf: str, side: str, track: str = "a", lim
     closed = [
         {**r, "idx": i}
         for i, r in enumerate(records)
-        if r.get("track") == track and r.get("exit_type") != "open"
+        if r.get("track") == track and r.get("exit_type") != "open" and record_matches_origin(r, origin)
     ]
     closed = list(reversed(closed[-limit:]))  # newest first
     return {"ticker": ticker, "tf": tf, "side": side, "track": track, "records": closed}

@@ -141,7 +141,7 @@ async def help_cmd(ctx):
         "`!scan <pair> <tf>` — manual scan (e.g. `!scan BTC/USDT 1h`)",
         "`!history <pair> <tf>` — trade history (e.g. `!history BTC/USDT 4h`)",
         "`!signals <pair> <tf>` — signal statistics for a pair",
-        "`!components [min_n]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
+        "`!components [min_n] [split] [shadow] [live|backtest]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
@@ -1209,23 +1209,28 @@ async def components_cmd(ctx, *args):
             a = str(a).lower()
             if a.isdigit():
                 min_samples = int(a)
-            elif a in ("split", "shadow"):
+            elif a in ("split", "shadow", "live", "backtest"):
                 opts.add(a)
             else:
                 bad.append(a)
         if bad:
-            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!components [min_samples] [split] [shadow]`")
+            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!components [min_samples] [split] [shadow] [live|backtest]`")
+            return
+        if {"live", "backtest"} <= opts:
+            await ctx.send("❌ Choose either `live` or `backtest`, not both (neither = all records).")
             return
         want_split = "split" in opts
         want_shadow = "shadow" in opts
+        origin = "live" if "live" in opts else ("backtest" if "backtest" in opts else "all")
 
         report = analyze_confidence_components(
             min_samples=min_samples,
             group_by=["track", "regime"] if want_split else None,
             include_shadow=want_shadow,
+            origin=origin,
         )
 
-        header = f"**🧪 Confidence component analysis** ({report['total_closed']} closed records total"
+        header = f"**🧪 Confidence component analysis** ({report['total_closed']} closed {origin if origin != 'all' else ''} records total"
         if want_shadow:
             header += f", {report.get('shadow_closed', 0)} closed shadow"
         lines = [header + ")\n"]
