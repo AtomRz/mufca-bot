@@ -229,6 +229,11 @@ def _walk_forward_verdict(agg: Dict, stab: Dict, test_gain_se: float, min_test: 
     if n_oos < min_test:
         return "inconclusive", f"only {n_oos} out-of-sample trades in total (needs {min_test})"
     if _is_better(g["gain"], g["noise"], test_gain_se) and pos * 2 > n_sw:
+        min_sw = _cfg.WALKFWD_MIN_SWITCHED_FOLDS
+        if n_sw < min_sw:
+            # one lucky block is not evidence that re-tuning keeps its edge
+            return "inconclusive", (f"re-tuning gained {g['gain']:+.2f}% out-of-sample, but it switched in only "
+                                    f"{n_sw} of {n_f} fold(s) - needs {min_sw} to be called robust")
         return "robust", (f"re-tuning gained {g['gain']:+.2f}% out-of-sample over keeping the current set, "
                           f"better in {pos} of {n_sw} folds where it switched")
     if g["gain"] <= 0:
