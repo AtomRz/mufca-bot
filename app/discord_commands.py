@@ -150,6 +150,7 @@ async def help_cmd(ctx):
         "`!volume [on|off|metric <bar|smooth|thin|how>|thr <x>|days <n>|live]` — low-volume (thin-liquidity) entry gate: status, switch, default metric/threshold, baseline window, live volume values per pair",
         "`!volfit [preview|run] [pair] [tf] [bars] [metric…]` — find the volume METRIC and threshold per pair × timeframe from history (bar/smooth/thin/how compared; train/test checked; nothing proven = gate off for that pair); `!volfit show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
+        "`!walkfwd [pair] [tf] [bars] [folds=N]` — rolling walk-forward check of the filter tuner (several train→test folds, stability of the pick) + audit of pinned sets on the bars since they were pinned; dry-run",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
         "`!tp <pair> <tf>` — current adaptive TP",
@@ -2335,6 +2336,126 @@ async def indoptim_cmd(ctx, *args):
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"indoptim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+_WF_VERDICT = {
+    "robust": "✅ robust", "stable": "🟦 stable (nothing to re-tune)", "not_robust": "❌ not robust",
+    "inconclusive": "🟨 inconclusive", "no_data": "⬜ no data",
+}
+
+
+def _wf_stat(label: str, st: dict) -> str:
+    return f"{label} n={st['n']} total={st['total']:+.1f}%"
+
+
+def _wf_audit_line(name: str, w: dict) -> str:
+    icon = {"holding": "✅", "worse": "❌", "no_difference": "➖", "too_early": "⏳"}.get(w["status"], "")
+    g = w["gain"]
+    return (f"   {icon} {name}: {_wf_stat('pinned', w['pinned'])} vs {_wf_stat('before', w['reference'])} "
+            f"→ {g['gain']:+.2f}% (noise {g['noise']:.2f}%) — {w['status'].replace('_', ' ')}")
+
+
+def _walkfwd_lines(result: dict) -> list:
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            wf = r["walk_forward"]
+            agg, stab = wf["aggregate"], wf["stability"]
+            pin = " (pinned)" if r["current_pinned"] else ""
+            lines.append(f"**{ticker} {tf}** {_WF_VERDICT.get(wf['verdict'], wf['verdict'])} — {wf['reason']}")
+            lines.append(f"   current{pin}: {_fmt_filter_set(r['current'])}")
+            lines.append("   out-of-sample, all folds: "
+                         f"{_wf_stat('re-tuned', agg['policy'])} | {_wf_stat('current', agg['current'])} | "
+                         f"{_wf_stat('all on', agg['all_on'])} | {_wf_stat('all off', agg['all_off'])}")
+            if agg["folds_switched"]:
+                lines.append(f"   switched in {agg['folds_switched']}/{agg['folds']} folds: it saw "
+                             f"{agg['in_sample_gain']:+.1f}% in training, got {agg['out_of_sample_gain']:+.1f}% on the next block")
+            if stab["folds_scored"]:
+                lines.append(f"   stability: {stab['distinct_picks']} distinct pick(s) in {stab['folds_scored']} folds; "
+                             f"most common ({int(stab['modal_share'] * 100)}%): {_fmt_filter_set(stab['modal_pick'])}")
+            thin = [i + 1 for i, f in enumerate(wf["folds"]) if f["thin"]]
+            if thin:
+                lines.append(f"   ⚠️ thin test block(s): {', '.join(map(str, thin))} (fewer than {_cfg.AUTOTUNE_MIN_TEST_TRADES} trades)")
+            audit = r.get("audit")
+            if audit:
+                kind = "set before the pin" if audit["reference_kind"] == "previous pin" else "global toggles"
+                lines.append(f"   📌 pinned-set audit vs {kind}:")
+                if audit.get("since_pin"):
+                    lines.append(_wf_audit_line("since it was pinned", audit["since_pin"]))
+                lines.append(_wf_audit_line(f"newest {int(_cfg.WALKFWD_RECENT_FRACTION * 100)}% of bars", audit["recent"]))
+            if r["current_pinned"]:
+                lines.append("   (the current set was itself tuned on this history, so its numbers here are optimistic)")
+    return lines
+
+
+@core.bot.command(name="walkfwd", aliases=["walkforward", "wf"])
+async def walkfwd_cmd(ctx, *args):
+    """
+    Rolling walk-forward check of the filter auto-tuner + audit of pinned filter sets.
+    `!autofilter` confirms its pick on ONE out-of-sample window; this cuts the history into
+    several expanding-train / rolling-test folds, applies the tuner's rule to each training
+    part only and trades the set it would have chosen on the next block it has never seen.
+    Summed over the folds that is the out-of-sample value of re-tuning, compared with keeping
+    the current set, everything on and everything off - plus how stable the choice is from
+    fold to fold. Pinned sets are also compared with the set they replaced on the bars after
+    they were pinned. Dry run: nothing is applied or written.
+
+    Usage: !walkfwd [pair] [tf] [bars] [folds=N]    (default 6000 bars, 4 folds)
+    """
+    ticker = tf = ""
+    num_bars = 6000
+    folds = None
+    for a in args:
+        if a.lower().startswith("folds="):
+            try:
+                folds = max(2, min(12, int(a.split("=", 1)[1])))
+            except ValueError:
+                await ctx.send(f"❌ `{a}` — use `folds=<number>`.")
+                return
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe, bar count or `folds=N`.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        import walk_forward
+        result = await _run_sim_job(
+            ctx, "walkfwd", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "folds": folds},
+            lambda progress: walk_forward.run_walk_forward(exchange, scope_tickers, scope_tfs, num_bars,
+                                                           progress=progress, folds=folds),
+            intro=(f"⏳ Walk-forward check: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each "
+                   f"(dry run, nothing is changed). This takes a while."),
+        )
+        if result is None:
+            return
+        head = [f"**🔁 Walk-forward check** — {result['folds']} test folds after the first "
+                f"{int(result['initial_fraction'] * 100)}% of the history, net of {result['fee_pct']}% fee per trade\n"]
+        for c in result["bar_coverage"]:
+            if c["got"] < c["requested"]:
+                head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
+        lines = head + _walkfwd_lines(result)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above (the exchange may not serve that many bars; try fewer).")
+        lines.append("\nPnL = unlevered % moves of simulated trades. ✅ robust means re-tuning kept its edge on data it never saw; "
+                     "❌ means the in-sample gains did not carry over - keep the current sets and re-check after more bars.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"walkfwd command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 

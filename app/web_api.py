@@ -787,6 +787,37 @@ async def run_autofilter(body: AutoFilterIn):
     )
 
 
+class WalkFwdIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(6000, ge=300, le=20000)
+    folds: Optional[int] = Field(None, ge=2, le=12)  # default: config.WALKFWD_FOLDS
+
+
+@app.post("/api/walkfwd")
+async def run_walkfwd(body: WalkFwdIn):
+    """Rolling walk-forward check of the filter auto-tuner plus an audit of the pinned
+    filter sets (same computation as the Discord !walkfwd, both call
+    walk_forward.run_walk_forward()): for every pair/timeframe the history is cut into
+    expanding-train / rolling-test folds, the tuner's own rule is applied to each training
+    part and the set it would have chosen is traded on the next unseen block - summed, that
+    is the out-of-sample value of re-tuning, against keeping the current set / everything on /
+    everything off. Pinned sets are also compared with the set they replaced on the bars
+    after they were pinned. Dry run: nothing is applied or written. See walk_forward.py's
+    docstring for the method and run_walk_forward()'s for the result shape.
+
+    Background job, same contract as /api/tp1sim: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    import walk_forward
+    return _start_sim_job(
+        "walkfwd",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "folds": body.folds},
+        lambda progress: walk_forward.run_walk_forward(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress, folds=body.folds),
+    )
+
+
 class VolFitIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
