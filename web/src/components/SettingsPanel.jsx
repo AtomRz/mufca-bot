@@ -3,6 +3,7 @@ import { api } from '../api'
 import AutoFilterPanel from './AutoFilterPanel'
 import VolumeGatePanel from './VolumeGatePanel'
 import IndicatorOptimizerPanel from './IndicatorOptimizerPanel'
+import WalkForwardPanel from './WalkForwardPanel'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
@@ -419,6 +420,8 @@ export default function SettingsPanel({ config, onChanged }) {
           <VolumeGatePanel config={config} onChanged={onChanged} />
 
           <IndicatorOptimizerPanel config={config} />
+
+          <WalkForwardPanel config={config} />
 
           <div className="panel">
             <h3 className="panel-title">CHOP Threshold</h3>

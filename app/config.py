@@ -483,6 +483,11 @@ AUTOTUNE_MIN_TEST_TRADES = 8      # ...and in the test window
 AUTOTUNE_MIN_GAIN_SE = 1.0        # train total-PnL gain over the current set must exceed this many standard errors
 AUTOTUNE_MIN_TEST_GAIN_SE = 0.5   # the test window must confirm the gain by at least this many standard errors
 
+# Walk-forward check (see walk_forward.py) - read-only, changes no setting
+WALKFWD_FOLDS = 4                    # test blocks after the initial training part (2-12)
+WALKFWD_INITIAL_TRAIN_FRACTION = 0.4 # share of the usable bars that is only ever training data
+WALKFWD_RECENT_FRACTION = 0.2        # newest share of the bars used for the pinned-set "recent" check
+
 # Indicator optimizer (!indoptim / POST /api/indoptim) - reuses the AUTOTUNE_* fee,
 # split and trade-count limits above; these three are its own.
 INDOPT_TRIALS = 60                # parameter sets tried per pair/timeframe (the live set is always one of them)

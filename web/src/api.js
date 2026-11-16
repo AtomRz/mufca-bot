@@ -192,6 +192,8 @@ export const api = {
     request('/api/smcsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars }) }),
   runAutoFilter: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true } = {}) =>
     request('/api/autofilter', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos }) }),
+  runWalkForward: ({ ticker, tf, numBars = 6000, folds = null } = {}) =>
+    request('/api/walkfwd', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, folds }) }),
   runVolumeFit: ({ ticker, tf, numBars = 3000, apply = true, validateOos = true, metrics = null } = {}) =>
     request('/api/volfit', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply, validate_oos: validateOos, metrics: metrics && metrics.length ? metrics : null }) }),
   getVolumeGate: () => request('/api/volume-gate'),
