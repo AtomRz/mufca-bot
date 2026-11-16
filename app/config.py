@@ -487,6 +487,7 @@ AUTOTUNE_MIN_TEST_GAIN_SE = 0.5   # the test window must confirm the gain by at 
 WALKFWD_FOLDS = 4                    # test blocks after the initial training part (2-12)
 WALKFWD_INITIAL_TRAIN_FRACTION = 0.4 # share of the usable bars that is only ever training data
 WALKFWD_RECENT_FRACTION = 0.2        # newest share of the bars used for the pinned-set "recent" check
+WALKFWD_MIN_SWITCHED_FOLDS = 2       # re-tuning must have switched the set in at least this many folds to be called "robust"
 
 # Indicator optimizer (!indoptim / POST /api/indoptim) - reuses the AUTOTUNE_* fee,
 # split and trade-count limits above; these three are its own.
