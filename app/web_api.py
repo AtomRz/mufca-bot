@@ -782,7 +782,7 @@ async def run_autofilter(body: AutoFilterIn):
     return _start_sim_job(
         "autofilter",
         {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars,
-         "apply": body.apply, "validate": body.validate_oos, "metrics": body.metrics},
+         "apply": body.apply, "validate": body.validate_oos},
         _run,
     )
 
