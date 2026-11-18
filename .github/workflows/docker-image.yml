@@ -51,3 +51,4 @@ jobs:
           package-type: 'container'
           older-than: '30d'
           delete-only-untagged-versions: 'true'
+          num-old-versions-to-delete: 600
