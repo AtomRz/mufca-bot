@@ -341,7 +341,13 @@ async def _apply_tp1(exchange, channel, st, trade, track, ticker, tf,
         # Threshold = Y's open time, so the bar-based check starts at the
         # first bar to close entirely after the move. Bar Y itself is covered
         # by the live ticker / 1m-candle check.
-        trade["sl_moved_after_bar"] = (st.get("last_processed_bar_time") or 0) + tf_ms
+        # Y is taken from the wall clock (phase-anchored on the trade's own bar, like the
+        # cooldown anchor), NOT from last_processed_bar_time + tf_ms: that value is None
+        # before the first successful scan (threshold collapsed to one bar length, so every
+        # bar counted as "after the move"), lags behind after a failed check_signals, and is
+        # one bar stale when a bar closes between check_signals and this poll - in all three
+        # cases the bar that holds the TP1 touch could be tested against the tighter stop.
+        trade["sl_moved_after_bar"] = _cooldown_anchor_ms(exchange, trade, tf)
         now_ms = int(time.time() * 1000)
         trade["intrabar_tp1_ts"] = now_ms - (now_ms % 60_000)
     else:
