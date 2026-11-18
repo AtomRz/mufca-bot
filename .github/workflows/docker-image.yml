@@ -43,3 +43,11 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Delete package versions older than 1 month
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: 'mufca-bot'
+          package-type: 'container'
+          older-than: '30d'
+          delete-only-untagged-versions: 'true'
