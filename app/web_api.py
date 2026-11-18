@@ -223,11 +223,15 @@ class BasicAuthASGIMiddleware:
             user, _, pwd = decoded.partition(":")
         except Exception:
             return False
-        # constant-time comparison — don't let response timing reveal correctness
-        return (
-            secrets.compare_digest(user, _cfg.WEB_USERNAME)
-            and secrets.compare_digest(pwd, _cfg.WEB_PASSWORD)
-        )
+        # constant-time comparison — don't let response timing reveal correctness.
+        # Compare BYTES: secrets.compare_digest() raises TypeError for a str that holds
+        # a non-ASCII character, which (a) made a login with a non-ASCII password
+        # impossible and (b) turned any request carrying such credentials into an
+        # unhandled 500 that was never counted as a failed attempt. Both halves are
+        # always evaluated (no short-circuit) so timing doesn't reveal a valid username.
+        user_ok = secrets.compare_digest(user.encode("utf-8"), _cfg.WEB_USERNAME.encode("utf-8"))
+        pwd_ok = secrets.compare_digest(pwd.encode("utf-8"), _cfg.WEB_PASSWORD.encode("utf-8"))
+        return user_ok and pwd_ok
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
