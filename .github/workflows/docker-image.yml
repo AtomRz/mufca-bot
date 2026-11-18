@@ -44,11 +44,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
 
-      - name: Delete package versions older than 1 month
-        uses: snok/container-retention-policy@v3
-        with:
-          image-names: mufca-bot
-          cut-off: 30d
-          untagged-only: true
-          account-type: personal
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Delete untagged versions older than 30 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CUTOFF=$(date -u -d "30 days ago" +"%Y-%m-%dT%H:%M:%SZ")
+          gh api --paginate /users/AtomRz/packages/container/mufca-bot/versions \
+            --jq ".[] | select(.metadata.container.tags | length == 0) | select(.created_at < \"$CUTOFF\") | .id" \
+            | xargs -r -I {} gh api -X DELETE /users/AtomRz/packages/container/mufca-bot/versions/{}
