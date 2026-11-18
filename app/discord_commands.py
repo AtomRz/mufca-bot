@@ -2182,15 +2182,20 @@ async def volfit_cmd(ctx, *args):
 
     ticker = tf = ""
     num_bars = 3000
+    metrics: list = []
     for a in args:
         if a.upper() in TICKERS:
             ticker = a.upper()
         elif a.lower() in TIMEFRAMES:
             tf = a.lower()
+        elif a.lower() in _cfg.VOLUME_GATE_METRICS:
+            if a.lower() not in metrics:
+                metrics.append(a.lower())
         elif a.isdigit():
             num_bars = _clamp_bars(int(a))
         else:
-            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe or bar count.")
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe, bar count "
+                           f"or metric ({', '.join(_cfg.VOLUME_GATE_METRICS)}).")
             return
 
     exchange = core._exchange_ref
