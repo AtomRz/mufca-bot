@@ -1069,8 +1069,8 @@ async def market_scanner():
                     try:
                         ticker_data = await asyncio.to_thread(exchange.fetch_ticker, ticker)
                         current_price = ticker_data.get("last")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[LIVE_TP_SL] {ticker} {tf}: fetch_ticker failed, live check skipped this scan: {e}")
                     if current_price is None:
                         continue
                     side = trade.get("side")
