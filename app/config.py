@@ -444,7 +444,10 @@ def set_filter_override(ticker: str, timeframe: str, changes: Optional[dict]) ->
                 if k in BACKTEST_FILTER_KEYS:
                     flags[k] = bool(v)
             _filter_overrides["active"].setdefault(ticker, {})[timeframe] = flags
-            _filter_overrides["meta"].setdefault(ticker, {})[timeframe] = {"manual": True}
+            # "at" = when THIS pin was made (unix seconds); the walk-forward audit anchors its
+            # "since pin" window on it. Without it the audit fell back to the global applied_at,
+            # which moves whenever any pair's pin changes.
+            _filter_overrides["meta"].setdefault(ticker, {})[timeframe] = {"manual": True, "at": int(time.time())}
         _filter_overrides["applied_at"] = int(time.time())
         _save_filter_overrides()
         return filter_flags_for(ticker, timeframe)
