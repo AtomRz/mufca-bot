@@ -45,10 +45,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
 
       - name: Delete package versions older than 1 month
-        uses: actions/delete-package-versions@v5
+        uses: snok/container-retention-policy@v3
         with:
-          package-name: 'mufca-bot'
-          package-type: 'container'
-          older-than: '30d'
-          delete-only-untagged-versions: 'true'
-          num-old-versions-to-delete: 600
+          image-names: mufca-bot
+          cut-off: 30d
+          untagged-only: true
+          account-type: personal
+          token: ${{ secrets.GITHUB_TOKEN }}
