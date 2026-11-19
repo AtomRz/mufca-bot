@@ -1926,18 +1926,18 @@ async def autofilter_cmd(ctx, *args):
 
     ticker = tf = ""
     num_bars = 3000
-    metrics = []
     for a in args:
-        if a.lower() in _cfg.VOLUME_GATE_METRICS:
-            metrics.append(a.lower())
-        elif a.upper() in TICKERS:
+        # (volume-gate metric names used to be accepted here and silently ignored -
+        # run_filter_autotune() doesn't tune the volume gate; that is !volfit)
+        if a.upper() in TICKERS:
             ticker = a.upper()
         elif a.lower() in TIMEFRAMES:
             tf = a.lower()
         elif a.isdigit():
             num_bars = _clamp_bars(int(a))
         else:
-            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe or bar count.")
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe or bar count "
+                           f"(volume-gate metrics belong to `!volfit`).")
             return
 
     exchange = core._exchange_ref
