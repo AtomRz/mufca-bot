@@ -1,7 +1,10 @@
 FROM node:20-alpine AS frontend
 WORKDIR /web
-COPY web/package.json ./
-RUN npm install
+# Lockfile + `npm ci`: reproducible frontend builds. Without it every CI run resolved the
+# newest Rollup/Vite, so a bad upstream release broke the image with no change in this repo.
+# To upgrade dependencies deliberately: `cd web && npm update`, commit package-lock.json.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 COPY web/ ./
 RUN npm run build
 
