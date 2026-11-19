@@ -104,6 +104,33 @@ def reconcile_orphaned_signals(state: Dict[str, Dict[str, dict]]):
     if changed:
         save_signals_history(history)
 
+
+def cancel_open_records_for_ticker(ticker: str) -> int:
+    """Marks every exit_type='open' record of ONE ticker as 'cancelled'. Called when a
+    pair is removed from scanning (web DELETE /api/pairs, Discord !remove): its live
+    state is dropped, so any open trade is no longer tracked and its record would stay
+    'open' until the next restart's reconcile. Same honest label as
+    reconcile_orphaned_signals ("we no longer know how this closed"). Deliberately
+    scoped to the removed ticker, unlike the startup reconcile, which compares against
+    live state and so must not run mid-scan. Returns how many records were changed."""
+    history = load_signals_history()
+    cancelled = 0
+    for tf, sides in history.get(ticker, {}).items():
+        for side, records in sides.items():
+            for rec in records:
+                if rec.get("exit_type") != "open" or rec.get("track", "a") == "sim":
+                    continue  # !sim synthetic records never mapped to live state
+                rec["exit_type"] = "cancelled"
+                rec["exit"] = None
+                cancelled += 1
+                logger.warning(
+                    f"[REMOVE] Open signal marked cancelled (pair removed): "
+                    f"{ticker} {tf} {side} track={rec.get('track', 'a')} entry={rec.get('entry')}"
+                )
+    if cancelled:
+        save_signals_history(history)
+    return cancelled
+
 # =====================================================================
 # 💾  SIGNAL HISTORY MANAGEMENT
 # =====================================================================

@@ -75,6 +75,7 @@ from state import (
     clear_history_cache,
     get_signal_stats,
     analyze_confidence_components,
+    cancel_open_records_for_ticker,
 )
 from embeds import build_embed, _flow_label
 
@@ -447,8 +448,12 @@ async def remove_cmd(ctx, ticker: str = ""):
     spread.clear_ticker_cache(ticker)
     dropped_pins = _cfg.drop_ticker_filter_overrides(ticker)
     dropped_vol = _cfg.drop_ticker_volume_thresholds(ticker)
+    # A trade open on this pair is no longer tracked once its state is gone: close its
+    # history record honestly as 'cancelled' (history itself is kept, see !delsignals).
+    cancelled_open = cancel_open_records_for_ticker(ticker)
 
     await ctx.send(f"🗑️ `{ticker}` removed. Remaining: {' | '.join(TICKERS)}"
+                   + (f" ⚠️ {cancelled_open} open signal(s) were no longer tracked and are marked cancelled." if cancelled_open else "")
                    + (" Its pinned filter sets were dropped too." if dropped_pins else "")
                    + (" Its pinned volume thresholds were dropped too." if dropped_vol else ""))
 
