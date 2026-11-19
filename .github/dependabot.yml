@@ -1,0 +1,22 @@
+# Dependabot: a monthly PR for the web dashboard dependencies (web/package-lock.json).
+# The lockfile pins every version, so nothing changes until one of these PRs is merged.
+# CI builds the image on each PR - merge it only if the build is green.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "monthly"
+      timezone: "Asia/Tbilisi"
+    open-pull-requests-limit: 1
+    # One combined PR instead of one per package (Vite/Rollup/React move together).
+    groups:
+      web-dependencies:
+        patterns:
+          - "*"
+    # Vite/React major upgrades can change the build; do those by hand, not via bot.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    labels:
+      - "dependencies"
