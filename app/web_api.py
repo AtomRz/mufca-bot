@@ -67,7 +67,7 @@ from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_conf
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
 from state import (load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components,
-                   normalize_origin, record_matches_origin)
+                   normalize_origin, record_matches_origin, cancel_open_records_for_ticker)
 import push as _push
 import derivatives
 import onchain as _onchain
@@ -1256,8 +1256,13 @@ async def remove_pair(ticker: str, purge_history: bool = False):
             )
             del history[ticker]
             save_signals_history(history)
+    # History kept: a trade that was open on the removed pair is no longer tracked (its
+    # live state is gone), so close its record honestly as 'cancelled' instead of leaving
+    # it 'open' until the next restart.
+    cancelled_open = 0 if purge_history else cancel_open_records_for_ticker(ticker)
 
-    return {"tickers": _cfg.TICKERS, "purged_signals": purged, "backup_id": backup_id}
+    return {"tickers": _cfg.TICKERS, "purged_signals": purged, "backup_id": backup_id,
+            "cancelled_open": cancelled_open}
 
 
 # =====================================================================
