@@ -624,6 +624,12 @@ function ComponentsView({ lastEvent }) {
           trusting once it has enough samples of its own. win_rate/avg_mfe are only a first look.
         </p>
         <div style={{ marginTop: 10 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
+        {report.components_in_score === false && (
+          <p style={{ fontSize: 11, color: 'var(--accent)', marginTop: 6 }}>
+            These two components no longer add to the displayed confidence score (no effect that held up). They are still
+            calculated and stored on every record, so this analysis keeps working.
+          </p>
+        )}
         {origin === 'backtest' && (
           <p style={{ fontSize: 11, color: 'var(--accent)', marginTop: 6 }}>
             Backtest records get raw_mfe from the bars after entry (the same MAX_HOLD_BARS window live tracks).

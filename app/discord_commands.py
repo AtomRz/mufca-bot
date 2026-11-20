@@ -1454,6 +1454,8 @@ async def components_cmd(ctx, *args):
         if want_shadow:
             header += f", {report.get('shadow_closed', 0)} closed shadow"
         lines = [header + ")\n"]
+        if not report.get("components_in_score", True):
+            lines.append("ℹ️ relative_strength / volume_profile no longer add to the displayed confidence score (no effect that held up) — still calculated and stored, so this analysis keeps working.\n")
 
         for comp_name in ("relative_strength", "volume_profile"):
             rows = report["components"][comp_name]

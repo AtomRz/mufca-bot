@@ -1530,6 +1530,7 @@ def analyze_confidence_components(
         "total_closed": total_closed,
         "origin": origin,
         "shadow_closed": shadow_closed,
+        "components_in_score": bool(getattr(_cfg, "COMPONENTS_IN_SCORE", True)),
         "min_samples": min_samples,
         "components": components_out,
     }

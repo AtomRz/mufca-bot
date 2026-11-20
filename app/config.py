@@ -1043,6 +1043,17 @@ def save_intrabar_check(enabled: bool):
 INTRABAR_CHECK_ENABLED = load_intrabar_check()
 
 # =====================================================================
+# relative_strength / volume_profile in the displayed confidence score
+# =====================================================================
+# The Components study (!components, !structcheck) found no PnL effect that holds up
+# (shorts: none; longs: only in one stretch of history), so the +-5 they add to the
+# displayed score is noise. False = the score ignores both, but calc_confidence() still
+# builds them and every record still stores them in confidence_components, so the
+# forward check (!structcheck on later trades) keeps working. Set True to restore the
+# old score.
+COMPONENTS_IN_SCORE = False
+
+# =====================================================================
 # 🚫  PER-TRACK / PER-SIDE ENTRY SWITCHES
 # =====================================================================
 # Component backtest (ETH+BTC, 8000 bars) showed some track/side/regime
