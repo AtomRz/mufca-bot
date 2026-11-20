@@ -138,6 +138,8 @@ export const api = {
   getNyse: () => request('/api/nyse'),
   getComponents: (minSamples = 30, split = false, shadow = false, origin = 'all', byTicker = false) =>
     request(`/api/components?min_samples=${minSamples}&split=${split}&shadow=${shadow}&origin=${origin}&by_ticker=${byTicker}`),
+  getStructCheck: (side = 'long', origin = 'all', regime = '') =>
+    request(`/api/structcheck?side=${side}&origin=${origin}&regime=${regime}`),
   // 🆕 Simulations are background jobs: run* returns {id, status, progress, ...}
   // at once (HTTP 202); getSimJob(id) is polled for progress and the final result.
   // A single long request used to be cut off by the Cloudflare Tunnel (~100 s).
