@@ -53,7 +53,7 @@ from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
     run_indicator_optimize, run_volume_autotune, FILTER_KEYS,
-    run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE, run_raw_outcome_fill,
+    run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE, run_raw_outcome_fill, run_components_fill,
 )
 import filter_stats
 import history_backup
@@ -188,6 +188,7 @@ async def help_cmd(ctx):
         "`!btaudit [pair] [tf] [bars]` — replay the current logic over real history and compare with the stored history (dry-run, writes nothing)",
         "`!btfill [fill|backfill|all] [yes]` — add the signals the last `!btaudit` found missing / older than the stored window (add-only, backup first)",
         "`!rawfill [pair] [tf] [bars] [yes]` — give stored backtest records raw_mfe/raw_mae from the real bars after entry (preview without `yes`, backup first)",
+        "`!compfill [pair] [tf] [bars] [yes]` — give stored backtest records their confidence components (relative_strength / volume_profile) by replaying the current logic over real history (preview without `yes`, backup first)",
         "`!sources [tag yes]` — how many stored records are live / backtest; `tag` writes that origin into old records",
         "`!histsort [yes]` — put the history in date order (only reorders)",
         "`!histdedupe [yes]` — find (and with `yes` remove) records an audit added although the signal was already stored",
@@ -789,6 +790,28 @@ async def btfill_cmd(ctx, what: str = "", confirm: str = ""):
     await ctx.send(msg)
 
 
+async def _parse_fill_args(ctx, args, cmd: str):
+    """Shared by !rawfill / !compfill: `[pair] [tf] [bars] [yes]` in any order.
+    Returns (apply, ticker, tf, num_bars), or None after telling the user what was wrong."""
+    apply = False
+    ticker = tf = ""
+    num_bars = 6000
+    for a in args:
+        low = a.lower()
+        if low == "yes":
+            apply = True
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif low in TIMEFRAMES:
+            tf = low
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}`. Usage: `!{cmd} [pair] [tf] [bars] [yes]`")
+            return None
+    return apply, ticker, tf, num_bars
+
+
 @core.bot.command(name="rawfill")
 async def rawfill_cmd(ctx, *args: str):
     """
@@ -811,22 +834,10 @@ async def rawfill_cmd(ctx, *args: str):
         await ctx.send("❌ Not connected to the exchange yet.")
         return
 
-    apply = False
-    ticker = tf = ""
-    num_bars = 6000
-    for a in args:
-        low = a.lower()
-        if low == "yes":
-            apply = True
-        elif a.upper() in TICKERS:
-            ticker = a.upper()
-        elif low in TIMEFRAMES:
-            tf = low
-        elif a.isdigit():
-            num_bars = _clamp_bars(int(a))
-        else:
-            await ctx.send(f"❌ Don't know `{a}`. Usage: `!rawfill [pair] [tf] [bars] [yes]`")
-            return
+    parsed = await _parse_fill_args(ctx, args, "rawfill")
+    if parsed is None:
+        return
+    apply, ticker, tf, num_bars = parsed
     scope_tickers = [ticker] if ticker else list(TICKERS)
     scope_tfs = [tf] if tf else list(TIMEFRAMES)
 
@@ -867,6 +878,75 @@ async def rawfill_cmd(ctx, *args: str):
         await _send_long(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"rawfill command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="compfill")
+async def compfill_cmd(ctx, *args: str):
+    """
+    !compfill [pair] [tf] [bars] [yes] - gives the STORED backtest records their confidence
+    components (relative_strength / volume_profile ...), so `!components backtest` and the
+    Components tab have rows to analyse. Without `yes` it only reports and writes nothing.
+
+      !compfill                      every tracked pair x timeframe, 6000 bars
+      !compfill ETH/USDT 4h 9000     one pair/timeframe, more history
+      !compfill yes                  apply (a safety backup is taken first)
+
+    How: replays the CURRENT logic over real history (like !compsim) and gives each stored
+    backtest record the components of the simulated signal at the same bar. A record the
+    current logic no longer produces stays empty. The components are what the current
+    logic and settings score that bar with. Only `confidence_components` is written, only
+    where missing; live records and everything adaptive TP/SL reads are never touched.
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    parsed = await _parse_fill_args(ctx, args, "compfill")
+    if parsed is None:
+        return
+    apply, ticker, tf, num_bars = parsed
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        report = await _run_sim_job(
+            ctx, "compfill", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "apply": apply},
+            lambda progress: run_components_fill(exchange, scope_tickers, scope_tfs, num_bars, apply, progress=progress),
+            intro=(f"⏳ {'Filling' if apply else 'Checking'} confidence components on stored backtest records: "
+                   f"{len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each."
+                   f"{'' if apply else ' Nothing is written.'}"),
+        )
+        if report is None:
+            return
+        tot = report["totals"]
+        lines = ["**🧩 Confidence components for backtest records**",
+                 f"backtest records without them: **{tot['candidates']}** · "
+                 f"{'filled' if report['applied'] else 'can be filled'}: **{tot['filled']}** · "
+                 f"already had them: {tot['already']}",
+                 f"skipped: no simulated signal at that bar {tot['unmatched']} (the current logic does not produce it, "
+                 f"or it is outside the fetched bars) · entry does not match {tot['mismatch']}"]
+        short = [c for c in report["bar_coverage"] if c["got"] < num_bars]
+        if short:
+            lines.append("⚠️ Bars requested vs received: " + ", ".join(f"{c['ticker']} {c['tf']} {c['got']}/{num_bars}" for c in short))
+        for s_ in report["slots"]:
+            if s_["candidates"]:
+                lines.append(f"`{s_['ticker']} {s_['tf']}`: {s_['candidates']} to fill · {s_['filled']} ok · "
+                             f"unmatched {s_['unmatched']} · mismatch {s_['mismatch']}")
+        lines.append("")
+        if report["applied"]:
+            lines.append(f"✅ Written. Safety backup: `{report['backup_id']}`. Run `!components backtest` to see it.")
+        elif tot["filled"]:
+            lines.append(f"To write it: `!compfill{' ' + ticker if ticker else ''}{' ' + tf if tf else ''} {num_bars} yes` "
+                         f"(only confidence_components is added, a safety backup is taken first).")
+        else:
+            lines.append("Nothing to fill.")
+        if tot["unmatched"]:
+            lines.append("Unmatched records older than the fetched bars can be reached with more `bars`; "
+                         "the rest are signals the current logic would not give today.")
+        await _send_long(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"compfill command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 

@@ -21,6 +21,7 @@ Endpoints:
   POST /api/history/reconcile (job) + /api/history/reconcile/apply — backtest audit / fill / backfill
   GET /api/history/duplicates, POST /api/history/duplicates/remove — duplicates an audit added
   POST /api/history/rawfill (job) — raw_mfe/raw_mae for stored backtest records, from the bars after entry
+  POST /api/history/compfill (job) — confidence_components for stored backtest records, by replaying the current logic
   WS   /ws/live                         — broadcasts new bars/signals/trade closures
 """
 
@@ -1683,6 +1684,38 @@ async def run_rawfill(body: RawFillIn):
 
     return _start_sim_job(
         "rawfill",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "apply": body.apply},
+        _run,
+    )
+
+
+@app.post("/api/history/compfill")
+async def run_compfill(body: RawFillIn):
+    """Gives the STORED backtest-origin records confidence_components (relative_strength /
+    volume_profile ...), so Insights -> Components -> Backtest only has rows to analyse.
+    Same computation as the Discord !compfill, both call signals.run_components_fill().
+
+    Replays the CURRENT logic over real history (like /api/compsim) and gives each stored
+    backtest record the components of the simulated signal at the same bar; a record the
+    current logic no longer produces stays empty. apply=false only reports. apply=true
+    takes a "pre-compfill" safety backup (nothing is changed if that fails) and then writes
+    ONLY confidence_components, only where missing; live records and the fields adaptive
+    TP/SL reads are never touched.
+
+    Background job, same contract as /api/history/rawfill: 202 + job now, poll
+    GET /api/sim-jobs/{id}."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_components_fill
+
+    async def _run(progress):
+        result = await run_components_fill(
+            exchange, scope_tickers, scope_tfs, body.num_bars, body.apply, progress=progress)
+        if result["applied"]:
+            await broadcast_event({"type": "history_changed"})
+        return result
+
+    return _start_sim_job(
+        "compfill",
         {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "apply": body.apply},
         _run,
     )

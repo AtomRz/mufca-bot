@@ -12,6 +12,7 @@ const KIND_LABEL = {
   'pre-dedupe': 'before dedupe',
   'pre-sort': 'before sort',
   'pre-rawfill': 'before raw_mfe fill',
+  'pre-compfill': 'before components fill',
   'pre-reset': 'before reset',
   'pre-delete': 'before delete',
 }
@@ -654,6 +655,90 @@ function RawFillSection({ pairs, timeframes }) {
   )
 }
 
+// ---------------------------------------------------------------------
+// confidence components for stored backtest records
+// ---------------------------------------------------------------------
+function CompFillSection({ pairs, timeframes }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(6000)
+  const sim = useSimJob('compfill')
+  const result = sim.job?.status === 'done' ? sim.job.result : null
+  const ran = sim.job?.params
+  const ranBars = ran?.num_bars ?? numBars
+  const tot = result?.totals
+
+  const start = () => {
+    const bad = barsError(numBars)
+    if (bad) { sim.setError(bad); return }
+    sim.start(() => api.runCompFill({ ticker, tf, numBars, apply: false }))
+  }
+  // writing re-uses the scope that was just previewed, so what is written is what was shown
+  const write = () => sim.start(() => api.runCompFill({ ticker: ran?.ticker || '', tf: ran?.tf || '', numBars: ran?.num_bars ?? numBars, apply: true }))
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Components for backtest records</h3>
+      <p style={{ ...small, marginBottom: 12 }}>
+        The stored backtest records (the first bootstrap and anything added by the audit) were saved without their confidence
+        components, so the Components analysis (Backtest only) has nothing to group by. This replays the <b>current</b> logic over real exchange
+        history, like Simulate does, and gives each stored backtest record the components of the simulated signal at the same bar.
+        A record the current logic no longer produces stays empty — it is never guessed. The components are what today&apos;s
+        logic and settings score that bar with. <b>Check</b> only reports. <b>Write</b> adds just <code>confidence_components</code> where
+        missing, after a safety backup — live records and the fields adaptive TP/SL reads are never touched. Heavy: it runs a backtest per pair and timeframe.
+      </p>
+      <SimScopeFields
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={start} disabled={sim.running}>{sim.running ? 'Running…' : 'Check'}</button>}
+      />
+      <SimStatus sim={sim} />
+
+      {result && !sim.running && (
+        <>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            Backtest records without components <b>{tot.candidates}</b> ·{' '}
+            <span style={{ color: result.applied ? 'var(--long)' : tot.filled ? 'var(--accent)' : undefined }}>
+              {result.applied ? 'filled' : 'can be filled'} <b>{tot.filled}</b>
+            </span>{' '}· already had them {tot.already}
+            <br />
+            <span style={small}>
+              skipped: no simulated signal at that bar {tot.unmatched} (the current logic does not produce it, or it is outside the fetched bars) · entry does not match {tot.mismatch}
+            </span>
+          </p>
+          {result.slots.some((s) => s.candidates) && (
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead><tr><th>Pair</th><th>TF</th><th>To fill</th><th>OK</th><th>Unmatched</th><th>Mismatch</th></tr></thead>
+                <tbody>
+                  {result.slots.filter((s) => s.candidates).map((s) => (
+                    <tr key={`${s.ticker}-${s.tf}`}>
+                      <td>{s.ticker}</td><td>{s.tf}</td><td>{s.candidates}</td><td>{s.filled}</td>
+                      <td style={s.unmatched ? { color: 'var(--accent)' } : undefined}>{s.unmatched}</td>
+                      <td style={s.mismatch ? { color: 'var(--short)' } : undefined}>{s.mismatch}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {result.applied ? (
+            <p style={{ fontSize: 13, marginTop: 10, color: 'var(--long)' }}>
+              Written. Safety backup: {result.backup_id}. Open Insights → Components → Backtest only to see it.
+            </p>
+          ) : (
+            <div style={{ marginTop: 12 }}>
+              <button onClick={write} disabled={sim.running || !tot.filled}>Write to {tot.filled} record(s)</button>
+              {tot.unmatched > 0 && <span style={{ ...small, marginLeft: 10 }}>More bars reach older records; the rest are signals today&apos;s logic would not give.</span>}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function BackupPanel({ lastEvent, pairs, timeframes, config, onConfigChanged }) {
   // bumped whenever history changed under us (restore / fill / tag / live signal) so the origin counts refresh
   const [refreshKey, setRefreshKey] = useState(0)
@@ -671,6 +756,7 @@ export default function BackupPanel({ lastEvent, pairs, timeframes, config, onCo
         onConfigChanged={onConfigChanged} onHistoryChanged={bump}
       />
       <RawFillSection pairs={pairs} timeframes={timeframes} />
+      <CompFillSection pairs={pairs} timeframes={timeframes} />
     </div>
   )
 }

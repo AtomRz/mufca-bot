@@ -3068,6 +3068,107 @@ async def run_raw_outcome_fill(exchange: ccxt.Exchange, tickers: List[str], tfs:
     }
 
 
+async def run_components_fill(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 6000,
+                              apply: bool = False,
+                              progress: Optional[Callable[[int, int, str], None]] = None,
+                              workers: Optional[int] = None) -> Dict:
+    """Gives the STORED backtest-origin records a confidence_components dict, so the
+    Components analysis (Insights -> Components -> Backtest only, `!components backtest`)
+    has something to group by. The bootstrap backtest and the audit's fill/backfill run
+    with compute_confidence=False, so those records were stored without any.
+
+    How: one dry-run backtest per pair/timeframe with compute_confidence=True (the same
+    run !compsim does, BTC benchmark included, on the process pool), then every
+    stored record without components is matched to the simulated signal at its bar
+    (history_tools.fill_components) and takes that signal's components. A record the
+    current logic no longer reproduces finds no partner and stays empty.
+
+    The components are what the CURRENT logic and settings score that bar with - not
+    what an older version would have. onchain_bias is omitted (as in !compsim).
+    Only "confidence_components" is written, only where missing; nothing else in any
+    record changes, live records are never touched, adaptive TP/SL reads none of it.
+
+    apply=False -> report only. apply=True -> a "pre-compfill" safety backup first (if
+    that fails nothing is changed), then a synchronous write (no await between reading
+    the history and saving it).
+
+    Returns {"slots": [...], "totals": {...}, "applied": bool, "backup_id": str|None,
+    "bar_coverage": [...]}."""
+    import history_tools
+    import history_backup
+
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    submitted: List[tuple] = []
+    bar_coverage: List[Dict] = []
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f} (+ benchmark)")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, True)
+                except Exception as e:
+                    logger.error(f"run_components_fill: fetch error for {t} {f}: {e}")
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    counters["total"] -= 1
+                    continue
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": True, "benchmark_df": inputs["benchmark_df"], "htf_df": inputs["htf_df"],
+                    "collect_stats": True, "collect_records": True,
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, fut))
+        outcomes = await asyncio.gather(*(item[2] for item in submitted), return_exceptions=True)
+
+    simulated: Dict[tuple, List[Dict]] = {}
+    for (t, f, _), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_components_fill: backtest error for {t} {f}: {outcome!r}")
+            continue
+        _count, bt_history, _bars = outcome
+        simulated[(t, f)] = (bt_history.get("__stats__") or {}).get("trades", [])
+
+    def _pass(history: Dict, write: bool) -> List[Dict]:
+        return [history_tools.fill_components(history, t, f, trades, apply=write)
+                for (t, f), trades in simulated.items()]
+
+    slots = _pass(load_signals_history(), False)  # dry pass: nothing is written
+    filled = sum(s["filled"] for s in slots)
+
+    backup_id = None
+    applied = False
+    if apply and filled:
+        pre = history_backup.create_backup("pre-compfill", f"before filling confidence_components on {filled} backtest record(s)")
+        history = load_signals_history()  # re-read: the backup took a moment
+        slots = _pass(history, True)
+        if sum(s["filled"] for s in slots):
+            save_signals_history(history)
+            applied = True
+        backup_id = pre["id"]
+        logger.info(f"[COMPFILL] confidence_components written to {sum(s['filled'] for s in slots)} backtest record(s) (backup {backup_id})")
+
+    totals = {k: sum(s[k] for s in slots) for k in ("candidates", "filled", "already", "unmatched", "mismatch")}
+    return {
+        "slots": [s for s in slots if s["candidates"] or s["already"]],
+        "totals": totals,
+        "applied": applied,
+        "backup_id": backup_id,
+        "bar_coverage": bar_coverage,
+    }
+
+
 _ABLATION_WIN_TYPES = ("tp", "sl_after_tp1")  # same convention as state.WIN_EXIT_TYPES (sl_after_tp1 = partial win)
 
 

@@ -529,3 +529,77 @@ def fill_raw_outcomes(history: Dict, ticker: str, tf: str, bars: List[List[float
                 rec["raw_mae_pct"] = max(ext[1], float(rec.get("max_adverse_pct") or 0.0))
             out["filled"] += 1
     return out
+
+
+# =====================================================================
+# 🧩  confidence_components FOR STORED BACKTEST RECORDS
+# =====================================================================
+def fill_components(history: Dict, ticker: str, tf: str, bt_trades: List[Dict],
+                    apply: bool = True) -> Dict[str, Any]:
+    """Gives the backtest-origin records of ticker/tf that have no
+    confidence_components the components a fresh backtest computes for the SAME signal.
+
+    `bt_trades` = a dry-run backtest_history(..., compute_confidence=True,
+    collect_records=True) "trades" list (each has "ts" = the signal bar's open in ms,
+    "side", "track" and "rec" with "confidence_components"). A stored record is matched
+    one-to-one to a simulated signal of the same side and track whose bar open equals
+    its timestamp (a backtest stamps exactly the bar open; the same greedy matching the
+    audit uses, with a window of one bar), and its entry must sit within
+    RAW_ENTRY_TOLERANCE of the simulated one.
+
+    The components are what the CURRENT logic scores that bar with (live filter
+    settings, current indicator parameters; onchain_bias is omitted in a backtest, as
+    in !compsim). A stored record the current logic no longer produces ("stale") finds
+    no partner and stays empty - it is never guessed.
+
+    Qualifying records: source in BACKTEST_SOURCES, closed, no confidence_components.
+      already     had components (not touched; still takes part in the matching so the
+                  pairing stays one-to-one)
+      unmatched   no simulated signal at its bar (stale record, or older / newer than
+                  the bars the backtest evaluated)
+      mismatch    matched a signal, but entries differ, or the simulated record carries
+                  no components
+    Only "confidence_components" is written. apply=False counts without writing.
+    Returns {"ticker", "tf", "candidates", "filled", "already", "unmatched", "mismatch"}."""
+    out = {"ticker": ticker, "tf": tf, "candidates": 0, "filled": 0,
+           "already": 0, "unmatched": 0, "mismatch": 0}
+    slot = (history.get(ticker) or {}).get(tf) or {}
+    if not isinstance(slot, dict):
+        return out
+    tf_ms = tf_to_ms(tf) or 3_600_000
+
+    for side in ("long", "short"):
+        stored = [r for r in (slot.get(side) or []) if isinstance(r, dict)
+                  and classify_record_source(r)[0] in BACKTEST_SOURCES
+                  and r.get("exit_type") not in (None, "open")]
+        tracks = sorted({r.get("track", "a") for r in stored})
+        for track in tracks:
+            hist = sorted(((record_ts_ms(r), r) for r in stored if r.get("track", "a") == track),
+                          key=lambda x: (x[0] is None, x[0]))
+            hist = [(ts, r) for ts, r in hist if ts is not None]
+            bt = sorted((t for t in bt_trades if t.get("side") == side and t.get("track", "a") == track),
+                        key=lambda t: t["ts"])
+            pairs, _bt_un, hist_un = _match(bt, hist, tf_ms)
+            partner = {j: i for i, j in pairs}
+            for j, (_ts, r) in enumerate(hist):
+                if r.get("confidence_components"):
+                    out["already"] += 1
+                    continue
+                out["candidates"] += 1
+                i = partner.get(j)
+                if i is None:
+                    out["unmatched"] += 1
+                    continue
+                sim = bt[i].get("rec") or {}
+                comps = sim.get("confidence_components")
+                try:
+                    e_stored, e_sim = float(r.get("entry")), float(sim.get("entry"))
+                except (TypeError, ValueError):
+                    e_stored = e_sim = 0.0
+                if not comps or not e_stored or not e_sim or abs(e_stored - e_sim) / e_sim > RAW_ENTRY_TOLERANCE:
+                    out["mismatch"] += 1
+                    continue
+                if apply:
+                    r["confidence_components"] = dict(comps)
+                out["filled"] += 1
+    return out
