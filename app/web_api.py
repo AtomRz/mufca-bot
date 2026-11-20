@@ -576,7 +576,7 @@ async def get_nyse_status():
 
 
 @app.get("/api/components")
-async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False, origin: str = "all"):
+async def get_components(min_samples: int = 30, split: bool = False, shadow: bool = False, origin: str = "all", by_ticker: bool = False):
     """Reports whether the relative_strength / volume_profile confidence
     components (see calc_confidence() in signals.py) actually correlate
     with trade outcomes — same report as the Discord !components command,
@@ -586,6 +586,8 @@ async def get_components(min_samples: int = 30, split: bool = False, shadow: boo
     win_rate/avg_mfe once it has enough samples of its own.
 
     split=true  — additionally bucket by track and regime (like !compsim).
+    by_ticker=true — additionally bucket by pair. relative_strength is never
+                  counted for BTC/USDT (it is the benchmark: its 0 means "n/a").
     shadow=true — add rows for entries an Entry switch blocked, replayed on
                   later bars (shadow.py); reported separately as src=shadow,
                   never pooled with real trades.
@@ -594,7 +596,7 @@ async def get_components(min_samples: int = 30, split: bool = False, shadow: boo
                   when created, stored ones via POST /api/history/rawfill)."""
     return analyze_confidence_components(
         min_samples=min_samples,
-        group_by=["track", "regime"] if split else None,
+        group_by=(["track", "regime"] if split else []) + (["ticker"] if by_ticker else []) or None,
         include_shadow=shadow,
         origin=_origin_param(origin),
     )

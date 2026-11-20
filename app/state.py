@@ -1371,6 +1371,9 @@ def record_matches_origin(rec: Dict, origin: str) -> bool:
     return src in history_tools.BACKTEST_SOURCES
 
 
+_RS_BENCHMARK = "BTC/USDT"  # relative_strength.default_benchmark_for() has no benchmark for it
+
+
 def _iter_closed_records(history: Dict, origin: str = "all"):
     """Yields (ticker, tf, side, record) for every real (non-synthetic),
     closed record across the whole history file (optionally only one origin)."""
@@ -1410,7 +1413,7 @@ def analyze_confidence_components(
     enough samples of its own; win_rate/avg_mfe are only a first look.
 
     group_by — 🆕 (external review, component-backtest follow-up):
-    optional extra grouping keys, any of "track"/"regime", e.g.
+    optional extra grouping keys, any of "track"/"regime"/"ticker", e.g.
     group_by=["track", "regime"]. None (the default) keeps the original,
     coarser (side, value) bucketing — every existing caller that doesn't
     pass this keeps getting exactly the same rows as before. Pooling
@@ -1482,8 +1485,12 @@ def analyze_confidence_components(
             comps = rec.get("confidence_components")
             if not comps:
                 continue
-            extra_key = tuple(src if g == "src" else rec.get(g, "?") for g in group_by)
+            extra_key = tuple(src if g == "src" else ticker if g == "ticker" else rec.get(g, "?") for g in group_by)
             for comp_name in ("relative_strength", "volume_profile"):
+                # the benchmark (BTC) has no relative-strength reading at all: its 0 means "n/a",
+                # not "neutral", and would pollute the neutral bucket of every other pair
+                if comp_name == "relative_strength" and ticker == _RS_BENCHMARK:
+                    continue
                 if comp_name in comps:
                     buckets.setdefault((comp_name, side, comps[comp_name]) + extra_key, []).append(rec)
 
