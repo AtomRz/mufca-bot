@@ -181,6 +181,11 @@ export const api = {
     }),
   applyReconcile: (applyId, fill, backfill) =>
     request('/api/history/reconcile/apply', { method: 'POST', body: JSON.stringify({ apply_id: applyId, fill, backfill }) }),
+  runRawFill: ({ ticker, tf, numBars = 6000, apply = false } = {}) =>
+    request('/api/history/rawfill', {
+      method: 'POST',
+      body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, apply }),
+    }),
   setTpConfigKeep: (value) =>
     request('/api/config/tpconfig', { method: 'POST', body: JSON.stringify({ param: 'keep', value: String(value) }) }),
   cancelSimJob: (id) => request(`/api/sim-jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),

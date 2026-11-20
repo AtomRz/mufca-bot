@@ -20,6 +20,7 @@ Endpoints:
   GET /api/history/sources, POST /api/history/sources/tag — origin of stored records
   POST /api/history/reconcile (job) + /api/history/reconcile/apply — backtest audit / fill / backfill
   GET /api/history/duplicates, POST /api/history/duplicates/remove — duplicates an audit added
+  POST /api/history/rawfill (job) — raw_mfe/raw_mae for stored backtest records, from the bars after entry
   WS   /ws/live                         — broadcasts new bars/signals/trade closures
 """
 
@@ -587,8 +588,9 @@ async def get_components(min_samples: int = 30, split: bool = False, shadow: boo
     shadow=true — add rows for entries an Entry switch blocked, replayed on
                   later bars (shadow.py); reported separately as src=shadow,
                   never pooled with real trades.
-    origin=all|live|backtest — only stored records of that origin (backtest
-                  records have no raw_mfe_pct, so "live" is the one to trust)."""
+    origin=all|live|backtest — only stored records of that origin. Backtest
+                  records get raw_mfe_pct from the bars after entry (new ones
+                  when created, stored ones via POST /api/history/rawfill)."""
     return analyze_confidence_components(
         min_samples=min_samples,
         group_by=["track", "regime"] if split else None,
@@ -1644,6 +1646,45 @@ async def run_reconcile(body: ReconcileIn):
         {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "tolerance_bars": body.tolerance_bars},
         lambda progress: run_history_reconcile(
             exchange, scope_tickers, scope_tfs, body.num_bars, body.tolerance_bars, progress=progress),
+    )
+
+
+class RawFillIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(6000, ge=300, le=20000)
+    apply: bool = False      # False = report only, nothing is written
+
+
+@app.post("/api/history/rawfill")
+async def run_rawfill(body: RawFillIn):
+    """Gives the STORED backtest-origin records (the bootstrap backtest and the audit's
+    fill/backfill additions) raw_mfe_pct / raw_mae_pct, computed from the real bars that
+    followed each entry - same computation as the Discord !rawfill, both call
+    signals.run_raw_outcome_fill(). New backtest records already get these fields when
+    they are created.
+
+    apply=false only reports what would be filled. apply=true takes a "pre-rawfill" safety
+    backup (nothing is changed if that fails) and then writes ONLY raw_mfe_pct /
+    raw_mae_pct, only where missing; live records and the fields adaptive TP/SL reads
+    (max_favorable_pct / max_adverse_pct) are never touched.
+
+    Background job, same contract as /api/history/reconcile: 202 + job now, poll
+    GET /api/sim-jobs/{id}."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_raw_outcome_fill
+
+    async def _run(progress):
+        result = await run_raw_outcome_fill(
+            exchange, scope_tickers, scope_tfs, body.num_bars, body.apply, progress=progress)
+        if result["applied"]:
+            await broadcast_event({"type": "history_changed"})
+        return result
+
+    return _start_sim_job(
+        "rawfill",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "apply": body.apply},
+        _run,
     )
 
 

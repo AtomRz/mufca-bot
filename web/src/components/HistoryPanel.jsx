@@ -72,7 +72,7 @@ export function useOrigin() {
 export function OriginSwitch({ origin, onChange }) {
   return (
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 }}
-         title="Backtest-origin records (the first bootstrap and anything added from the Backup tab) are simulated: they have no raw_mfe and skip live-only gates. Live only = what the bot actually did.">
+         title="Backtest-origin records (the first bootstrap and anything added from the Backup tab) are simulated: they skip live-only gates (spread/derivatives, intrabar check). Live only = what the bot actually did.">
       <span style={{ color: 'var(--text-faint)' }}>Records:</span>
       {ORIGIN_OPTIONS.map((o) => (
         <button key={o.id} className={`btn ${origin === o.id ? 'primary' : ''}`} onClick={() => onChange(o.id)}>

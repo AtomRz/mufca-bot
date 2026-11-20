@@ -53,7 +53,7 @@ from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
     run_indicator_optimize, run_volume_autotune, FILTER_KEYS,
-    run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE,
+    run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE, run_raw_outcome_fill,
 )
 import filter_stats
 import history_backup
@@ -187,6 +187,7 @@ async def help_cmd(ctx):
         "`!restore <id> [pair] [tf] [yes]` — restore a backup (preview without `yes`; open trades are kept, a safety copy is taken first)",
         "`!btaudit [pair] [tf] [bars]` — replay the current logic over real history and compare with the stored history (dry-run, writes nothing)",
         "`!btfill [fill|backfill|all] [yes]` — add the signals the last `!btaudit` found missing / older than the stored window (add-only, backup first)",
+        "`!rawfill [pair] [tf] [bars] [yes]` — give stored backtest records raw_mfe/raw_mae from the real bars after entry (preview without `yes`, backup first)",
         "`!sources [tag yes]` — how many stored records are live / backtest; `tag` writes that origin into old records",
         "`!histsort [yes]` — put the history in date order (only reorders)",
         "`!histdedupe [yes]` — find (and with `yes` remove) records an audit added although the signal was already stored",
@@ -786,6 +787,87 @@ async def btfill_cmd(ctx, what: str = "", confirm: str = ""):
         msg += (f"\n⚠️ {res['no_room']} more did not fit ({res['keep']} stored per side) — "
                 f"`!tpconfig keep N` raises the limit, then run `!btaudit` again.")
     await ctx.send(msg)
+
+
+@core.bot.command(name="rawfill")
+async def rawfill_cmd(ctx, *args: str):
+    """
+    !rawfill [pair] [tf] [bars] [yes] - gives the STORED backtest records (the bootstrap
+    backtest and anything added by !btfill) raw_mfe / raw_mae, computed from the real
+    bars that followed each entry. Without `yes` it only reports how many records
+    would get them and writes nothing.
+
+      !rawfill                      every tracked pair x timeframe, 6000 bars
+      !rawfill ETH/USDT 4h 9000     one pair/timeframe, more history
+      !rawfill yes                  apply (a safety backup is taken first)
+
+    Only the two raw_* fields are written, and only where missing; live records and
+    max_favorable_pct / max_adverse_pct (what adaptive TP/SL reads) are never touched.
+    `bars` must reach back past the oldest stored record, or those records are
+    reported as "no bars".
+    """
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+
+    apply = False
+    ticker = tf = ""
+    num_bars = 6000
+    for a in args:
+        low = a.lower()
+        if low == "yes":
+            apply = True
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif low in TIMEFRAMES:
+            tf = low
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}`. Usage: `!rawfill [pair] [tf] [bars] [yes]`")
+            return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        report = await _run_sim_job(
+            ctx, "rawfill", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "apply": apply},
+            lambda progress: run_raw_outcome_fill(exchange, scope_tickers, scope_tfs, num_bars, apply, progress=progress),
+            intro=(f"⏳ {'Filling' if apply else 'Checking'} raw_mfe/raw_mae on stored backtest records: "
+                   f"{len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each."
+                   f"{'' if apply else ' Nothing is written.'}"),
+        )
+        if report is None:
+            return
+        tot = report["totals"]
+        lines = [f"**📈 raw_mfe / raw_mae for backtest records** (window = {report['max_hold_bars']} bars after entry)",
+                 f"backtest records without them: **{tot['candidates']}** · "
+                 f"{'filled' if report['applied'] else 'can be filled'}: **{tot['filled']}** · "
+                 f"already had them: {tot['already']}",
+                 f"skipped: no bars {tot['no_bars']} (older than the fetched history) · "
+                 f"window not complete yet {tot['incomplete']} · entry does not match the bar {tot['mismatch']}"]
+        short = [c for c in report["bar_coverage"] if c["got"] < num_bars]
+        if short:
+            lines.append("⚠️ Bars requested vs received: " + ", ".join(f"{c['ticker']} {c['tf']} {c['got']}/{num_bars}" for c in short))
+        for s in report["slots"]:
+            if s["candidates"]:
+                lines.append(f"`{s['ticker']} {s['tf']}`: {s['candidates']} to fill · {s['filled']} ok · "
+                             f"no bars {s['no_bars']} · incomplete {s['incomplete']} · mismatch {s['mismatch']}")
+        lines.append("")
+        if report["applied"]:
+            lines.append(f"✅ Written. Safety backup: `{report['backup_id']}`. Run `!components backtest` to see it.")
+        elif tot["filled"]:
+            lines.append(f"To write it: `!rawfill{' ' + ticker if ticker else ''}{' ' + tf if tf else ''} {num_bars} yes` "
+                         f"(only raw_mfe/raw_mae are added, a safety backup is taken first).")
+        else:
+            lines.append("Nothing to fill.")
+        if tot["no_bars"]:
+            lines.append("Records with no bars are older than the fetched history — raise `bars` to reach them.")
+        await _send_long(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"rawfill command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
 
 
 @core.bot.command(name="mode")
@@ -1571,9 +1653,9 @@ async def compsim_cmd(ctx, ticker: str = "", tf: str = "", num_bars: int = 3000,
             lines.append("")
 
         lines.append(
-            f"Same report shape as !components. raw_mfe here comes from max_favorable_pct at simulation time "
-            f"(backtest records don't get the live raw-outcome extension — see update_raw_outcome() — so "
-            f"avg_raw_mfe will typically read n/a for these). Rule of thumb: trust a row once n >= {min_samples}."
+            f"Same report shape as !components. raw_mfe here is computed from the bars after each simulated entry "
+            f"(the whole MAX_HOLD_BARS window, whatever TP/SL closed the trade — the same horizon live "
+            f"update_raw_outcome() covers). Rule of thumb: trust a row once n >= {min_samples}."
         )
 
         msg = "\n".join(lines)

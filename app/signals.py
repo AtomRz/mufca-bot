@@ -56,6 +56,7 @@ from state import (
     update_signal_record,
     update_signal_mae_mfe,
     update_raw_outcome,
+    raw_extremes_over_bars,
     get_signal_stats,
     calculate_combined_tp,
     apply_tp_obstacle_cap,
@@ -2515,6 +2516,22 @@ def backtest_history(
                     }
                     confidence_components_bt.update(_rs_vp_components(is_long, rs_this_bar, ms_this_bar))
 
+                # 🆕 raw_mfe_pct / raw_mae_pct: what price did over the WHOLE
+                # MAX_HOLD_BARS window after entry, not just up to the TP/SL
+                # that closed the trade. A live record gets these from
+                # update_raw_outcome(), which keeps watching price after the
+                # exit; a backtest already holds those bars, so it takes the
+                # window's extremes directly (state.raw_extremes_over_bars —
+                # same formulas, same horizon: loop_range above). Without this
+                # the Components analysis could only trust live records for
+                # avg_raw_mfe. Never below max_favorable/adverse_pct, which
+                # cover the same bars up to the exit.
+                _raw = raw_extremes_over_bars(
+                    side, close_v,
+                    df["high"].iloc[loop_range.start:loop_range.stop].tolist(),
+                    df["low"].iloc[loop_range.start:loop_range.stop].tolist(),
+                )
+
                 rec_bt = {
                     "entry": round_price(close_v),
                     "exit": round_price(exit_price),
@@ -2524,6 +2541,8 @@ def backtest_history(
                     "timestamp": normalize_timestamp(int(df["timestamp"].iloc[idx])),
                     "max_favorable_pct": round(max_favorable, 4),
                     "max_adverse_pct": round(max_adverse, 4),
+                    **({"raw_mfe_pct": max(_raw[0], round(max_favorable, 4)),
+                        "raw_mae_pct": max(_raw[1], round(max_adverse, 4))} if _raw else {}),
                     "regime": bt_regime,
                     "track": track,
                     "confidence_components": confidence_components_bt,
@@ -2970,6 +2989,82 @@ def apply_history_reconcile(apply_id: str, do_fill: bool, do_backfill: bool) -> 
         "slots": [r for r in results if r["filled"] or r["backfilled"] or r["no_room"]],
         "backup_id": pre["id"],
         "keep": keep,
+    }
+
+
+async def run_raw_outcome_fill(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 6000,
+                               apply: bool = False,
+                               progress: Optional[Callable[[int, int, str], None]] = None) -> Dict:
+    """Gives the STORED backtest-origin records a raw_mfe_pct / raw_mae_pct, computed
+    from the real bars that followed each entry (see history_tools.fill_raw_outcomes
+    for exactly which records qualify and why some are skipped).
+
+    New backtest records get these fields when they are created
+    (backtest_history()); this is for the ones already in signals_history.json
+    (the bootstrap backtest and the audit fill/backfill additions), which were
+    stored without them. Only the two raw_* fields are written, and only where
+    missing - max_favorable_pct / max_adverse_pct and everything the adaptive
+    TP/SL calibration reads stay exactly as they are.
+
+    apply=False -> report only, nothing is written. apply=True -> a "pre-rawfill"
+    safety backup is taken first (if that fails nothing is changed), then the
+    fields are written. The write is synchronous (no await between reading the
+    history and saving it), so the scanner cannot interleave.
+
+    Returns {"slots": [per pair/tf counts], "totals": {...}, "applied": bool,
+    "backup_id": str|None, "bar_coverage": [...], "max_hold_bars": int}."""
+    import history_tools
+    import history_backup
+
+    total = len(tickers) * len(tfs)
+    fetched: Dict[tuple, list] = {}
+    bar_coverage: List[Dict] = []
+    done = 0
+    _report_progress(progress, 0, total, "starting")
+    for t in tickers:
+        for f in tfs:
+            _report_progress(progress, done, total, f"fetching {t} {f}")
+            try:
+                bars = await asyncio.to_thread(_fetch_ohlcv_paginated, exchange, t, f, num_bars)
+            except Exception as e:
+                logger.error(f"run_raw_outcome_fill: fetch error for {t} {f}: {e}")
+                bars = []
+            fetched[(t, f)] = bars
+            bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": len(bars)})
+            done += 1
+            _report_progress(progress, done, total, f"fetched {t} {f}")
+
+    max_hold = _cfg.MAX_HOLD_BARS
+
+    def _pass(history: Dict, write: bool) -> List[Dict]:
+        return [history_tools.fill_raw_outcomes(history, t, f, bars, max_hold, apply=write)
+                for (t, f), bars in fetched.items()]
+
+    # dry pass first: how many records would get the fields (nothing is written)
+    slots = _pass(load_signals_history(), False)
+    filled = sum(s["filled"] for s in slots)
+
+    backup_id = None
+    applied = False
+    if apply and filled:
+        pre = history_backup.create_backup("pre-rawfill", f"before filling raw_mfe/raw_mae on {filled} backtest record(s)")
+        history = load_signals_history()  # re-read: the backup took a moment
+        slots = _pass(history, True)
+        if sum(s["filled"] for s in slots):
+            save_signals_history(history)
+            applied = True
+        backup_id = pre["id"]
+        logger.info(f"[RAWFILL] raw_mfe/raw_mae written to {sum(s['filled'] for s in slots)} backtest record(s) (backup {backup_id})")
+
+    totals = {k: sum(s[k] for s in slots)
+              for k in ("candidates", "filled", "already", "no_bars", "incomplete", "mismatch")}
+    return {
+        "slots": [s for s in slots if s["candidates"] or s["already"]],
+        "totals": totals,
+        "applied": applied,
+        "backup_id": backup_id,
+        "bar_coverage": bar_coverage,
+        "max_hold_bars": max_hold,
     }
 
 

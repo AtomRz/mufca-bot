@@ -552,7 +552,9 @@ function ComponentsView({ lastEvent }) {
         <div style={{ marginTop: 10 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
         {origin === 'backtest' && (
           <p style={{ fontSize: 11, color: 'var(--accent)', marginTop: 6 }}>
-            Backtest records carry no raw_mfe, so the raw_mfe column stays empty here by design.
+            Backtest records get raw_mfe from the bars after entry (the same MAX_HOLD_BARS window live tracks).
+            Older stored ones are filled from the Backup tab (&quot;raw_mfe for backtest records&quot;) — rows still
+            reading n/a have not been filled yet.
           </p>
         )}
         <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginTop: 10, fontSize: 13 }}>
@@ -656,7 +658,7 @@ export function BarCoverageWarning({ coverage, requested }) {
 // big (e.g. 6000 bars x several pairs), so the page just never showed a result.
 // The last job id per kind lives at module level so a finished result (or a running
 // job) is still there after switching sub-tabs, which unmounts this view.
-const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null, smcsim: null, volfit: null, reconcile: null }
+const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null, smcsim: null, volfit: null, reconcile: null, rawfill: null }
 
 export function useSimJob(kind) {
   const [job, setJob] = useState(null)

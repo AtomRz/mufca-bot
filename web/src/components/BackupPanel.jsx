@@ -11,6 +11,7 @@ const KIND_LABEL = {
   'pre-tag': 'before tagging',
   'pre-dedupe': 'before dedupe',
   'pre-sort': 'before sort',
+  'pre-rawfill': 'before raw_mfe fill',
   'pre-reset': 'before reset',
   'pre-delete': 'before delete',
 }
@@ -362,7 +363,7 @@ function SourcesSection({ refreshKey, onHistoryChanged }) {
       <p style={{ ...small, marginBottom: 12 }}>
         Old records have no origin tag. It is inferred: a real (live) record is stamped with the moment the bot saw the
         signal, a backtest record with the exact open of the signal bar, and only live records carry fields such as
-        <code> tp_raw</code> / <code>tp1_hit</code> / <code>raw_mfe_pct</code>. Tagging writes that inference into the records so it stays known.
+        <code> tp_raw</code> / <code>tp1_hit</code>. Tagging writes that inference into the records so it stays known.
       </p>
       {error && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {error}</p>}
       {data && (
@@ -547,9 +548,9 @@ function AuditSection({ pairs, timeframes, config, onConfigChanged, onHistoryCha
             {applied && <span style={small}>Applied — run the audit again to see the new state.</span>}
           </div>
           <p style={{ ...small, marginTop: 8 }}>
-            Added records are tagged <code>backtest_fill</code> / <code>backtest_backfill</code>, kept in time order, and have no
-            <code> raw_mfe_pct</code> (a backtest does not track it) — so they are easy to exclude from analyses that need live data.
-            Adaptive TP/SL calibration uses only the newest {config?.tp_config?.signal_history_limit ?? 'N'} records of each side.
+            Added records are tagged <code>backtest_fill</code> / <code>backtest_backfill</code> and kept in time order, so they
+            are easy to exclude from analyses that need live data. They carry <code>raw_mfe_pct</code> computed from the bars after
+            entry. Adaptive TP/SL calibration uses only the newest {config?.tp_config?.signal_history_limit ?? 'N'} records of each side.
           </p>
         </>
       )}
@@ -565,6 +566,90 @@ function AuditSection({ pairs, timeframes, config, onConfigChanged, onHistoryCha
           <button className="btn" onClick={saveKeep} disabled={keepDraft === ''}>Set</button>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------
+// raw_mfe / raw_mae for stored backtest records
+// ---------------------------------------------------------------------
+function RawFillSection({ pairs, timeframes }) {
+  const [ticker, setTicker] = useState('')
+  const [tf, setTf] = useState('')
+  const [numBars, setNumBars] = useState(6000)
+  const sim = useSimJob('rawfill')
+  const result = sim.job?.status === 'done' ? sim.job.result : null
+  const ran = sim.job?.params
+  const ranBars = ran?.num_bars ?? numBars
+  const tot = result?.totals
+
+  const start = (apply) => {
+    const bad = barsError(numBars)
+    if (bad) { sim.setError(bad); return }
+    sim.start(() => api.runRawFill({ ticker, tf, numBars, apply }))
+  }
+  // writing re-uses the scope that was just previewed, so what is written is what was shown
+  const write = () => sim.start(() => api.runRawFill({ ticker: ran?.ticker || '', tf: ran?.tf || '', numBars: ran?.num_bars ?? numBars, apply: true }))
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">raw_mfe for backtest records</h3>
+      <p style={{ ...small, marginBottom: 12 }}>
+        <code>raw_mfe</code> / <code>raw_mae</code> is how far price really went over the next {result?.max_hold_bars ?? 'MAX_HOLD'} bars after
+        entry, whatever TP/SL closed the trade — the number the Components analysis trusts. New backtest records get it
+        automatically; this fills the ones already stored (the first bootstrap and anything added by the audit) from real
+        exchange bars. <b>Check</b> only reports. <b>Write</b> adds just those two fields where missing, after a safety backup —
+        live records and the fields adaptive TP/SL reads are never touched. Fetch enough bars to reach back past your oldest stored record.
+      </p>
+      <SimScopeFields
+        pairs={pairs} timeframes={timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
+        numBars={numBars} setNumBars={setNumBars}
+        extra={<button onClick={() => start(false)} disabled={sim.running}>{sim.running ? 'Running…' : 'Check'}</button>}
+      />
+      <SimStatus sim={sim} />
+
+      {result && !sim.running && (
+        <>
+          <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
+          <p style={{ fontSize: 13, marginBottom: 10 }}>
+            Backtest records without it <b>{tot.candidates}</b> ·{' '}
+            <span style={{ color: result.applied ? 'var(--long)' : tot.filled ? 'var(--accent)' : undefined }}>
+              {result.applied ? 'filled' : 'can be filled'} <b>{tot.filled}</b>
+            </span>{' '}· already had it {tot.already}
+            <br />
+            <span style={small}>
+              skipped: no bars {tot.no_bars} (older than the fetched history) · window not complete yet {tot.incomplete} · entry does not match the bar {tot.mismatch}
+            </span>
+          </p>
+          {result.slots.length > 0 && (
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead><tr><th>Pair</th><th>TF</th><th>To fill</th><th>OK</th><th>No bars</th><th>Incomplete</th><th>Mismatch</th></tr></thead>
+                <tbody>
+                  {result.slots.filter((s) => s.candidates).map((s) => (
+                    <tr key={`${s.ticker}-${s.tf}`}>
+                      <td>{s.ticker}</td><td>{s.tf}</td><td>{s.candidates}</td><td>{s.filled}</td>
+                      <td style={s.no_bars ? { color: 'var(--accent)' } : undefined}>{s.no_bars}</td>
+                      <td>{s.incomplete}</td>
+                      <td style={s.mismatch ? { color: 'var(--short)' } : undefined}>{s.mismatch}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {result.applied ? (
+            <p style={{ fontSize: 13, marginTop: 10, color: 'var(--long)' }}>
+              Written. Safety backup: {result.backup_id}. Open Insights → Components → Backtest only to see it.
+            </p>
+          ) : (
+            <div style={{ marginTop: 12 }}>
+              <button onClick={write} disabled={sim.running || !tot.filled}>Write to {tot.filled} record(s)</button>
+              {tot.no_bars > 0 && <span style={{ ...small, marginLeft: 10 }}>Raise the bars above to reach the {tot.no_bars} older record(s).</span>}
+            </div>
+          )}
+        </>
+      )}
     </div>
   )
 }
@@ -585,6 +670,7 @@ export default function BackupPanel({ lastEvent, pairs, timeframes, config, onCo
         pairs={pairs} timeframes={timeframes} config={config}
         onConfigChanged={onConfigChanged} onHistoryChanged={bump}
       />
+      <RawFillSection pairs={pairs} timeframes={timeframes} />
     </div>
   )
 }
