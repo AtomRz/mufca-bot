@@ -1427,23 +1427,24 @@ async def components_cmd(ctx, *args):
             a = str(a).lower()
             if a.isdigit():
                 min_samples = int(a)
-            elif a in ("split", "shadow", "live", "backtest"):
+            elif a in ("split", "shadow", "pair", "live", "backtest"):
                 opts.add(a)
             else:
                 bad.append(a)
         if bad:
-            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!components [min_samples] [split] [shadow] [live|backtest]`")
+            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!components [min_samples] [split] [pair] [shadow] [live|backtest]`")
             return
         if {"live", "backtest"} <= opts:
             await ctx.send("❌ Choose either `live` or `backtest`, not both (neither = all records).")
             return
         want_split = "split" in opts
         want_shadow = "shadow" in opts
+        want_pair = "pair" in opts
         origin = "live" if "live" in opts else ("backtest" if "backtest" in opts else "all")
 
         report = analyze_confidence_components(
             min_samples=min_samples,
-            group_by=["track", "regime"] if want_split else None,
+            group_by=(["track", "regime"] if want_split else []) + (["ticker"] if want_pair else []) or None,
             include_shadow=want_shadow,
             origin=origin,
         )
@@ -1463,7 +1464,7 @@ async def components_cmd(ctx, *args):
                 raw_str = f", raw_mfe={row['avg_raw_mfe']:.2f}% (n={row['raw_mfe_n']})" if row["avg_raw_mfe"] is not None else ", raw_mfe=n/a"
                 flag = "" if row["enough_samples"] else f" ⚠️ only {row['n']}/{min_samples}"
                 exit_str = " ".join(f"{et}={c}" for et, c in sorted(row["exit_counts"].items()))
-                slice_str = ""
+                slice_str = f" {row['ticker']}" if "ticker" in row else ""
                 if "track" in row or "regime" in row:
                     slice_str += f" track={row.get('track', '?')} regime={row.get('regime', '?')}"
                 if row.get("src") == "shadow":

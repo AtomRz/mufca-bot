@@ -482,9 +482,9 @@ function ComponentRow({ row, minSamples }) {
           {row.side}
         </span>
         value {row.value > 0 ? `+${row.value}` : row.value}
-        {(row.track || row.regime) && (
+        {(row.track || row.regime || row.ticker) && (
           <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
-            {row.track ? `track=${row.track}` : ''}{row.track && row.regime ? ' ' : ''}{row.regime ? `regime=${row.regime}` : ''}
+            {row.ticker ? `${row.ticker} ` : ''}{row.track ? `track=${row.track}` : ''}{row.track && row.regime ? ' ' : ''}{row.regime ? `regime=${row.regime}` : ''}
           </span>
         )}
         {row.src === 'shadow' && (
@@ -519,11 +519,12 @@ function ComponentsView({ lastEvent }) {
   const minSamples = 30
   const [split, setSplit] = useState(false)
   const [shadow, setShadow] = useState(false)
+  const [byTicker, setByTicker] = useState(false)
   const [origin, setOrigin] = useOrigin()
   // This only changes when a trade closes, not every scan tick — a slow poll is enough.
   const { data: report, error: loadError } = usePolled(
-    () => api.getComponents(minSamples, split, shadow, origin),
-    `components-${split}-${shadow}-${origin}`,
+    () => api.getComponents(minSamples, split, shadow, origin, byTicker),
+    `components-${split}-${shadow}-${origin}-${byTicker}`,
     60000,
     lastEvent,
   )
@@ -563,6 +564,10 @@ function ComponentsView({ lastEvent }) {
             <input type="checkbox" checked={split} onChange={(e) => setSplit(e.target.checked)} />
             Split by track / regime
           </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }} title="Bucket every row by pair as well. relative_strength is never counted for BTC/USDT (it is the benchmark, so its 0 means n/a, not neutral).">
+            <input type="checkbox" checked={byTicker} onChange={(e) => setByTicker(e.target.checked)} />
+            Split by pair
+          </label>
           <label style={{ display: 'flex', alignItems: 'center', gap: 6 }} title="Adds rows for signals an Entry switch (Settings) stopped from opening, replayed on the bars that followed. Shown separately, never pooled with real trades.">
             <input type="checkbox" checked={shadow} onChange={(e) => setShadow(e.target.checked)} />
             Include shadow (blocked entries){report.shadow_closed ? ` — ${report.shadow_closed} closed` : ''}
@@ -580,7 +585,7 @@ function ComponentsView({ lastEvent }) {
             ) : (
               rows.map((row) => (
                 <ComponentRow
-                  key={`${row.side}-${row.value}-${row.track ?? ''}-${row.regime ?? ''}-${row.src ?? ''}`}
+                  key={`${row.side}-${row.value}-${row.track ?? ''}-${row.regime ?? ''}-${row.src ?? ''}-${row.ticker ?? ''}`}
                   row={row}
                   minSamples={minSamples}
                 />
