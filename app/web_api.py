@@ -17,6 +17,7 @@ Endpoints:
   POST /api/config/chop                 — {"tf": "1h", "value": 55.0}
   POST /api/config/tpconfig             — {"param": "mode"|"limit"|"keep"|"percentile"|"safe", "value": ...}
   GET/POST/DELETE /api/backups[/{id}[/download|/restore]] — backups of signals_history.json (Backup tab)
+  GET /api/structcheck — read-only: would taking only structure-confirmed trades have paid in net PnL
   GET /api/history/sources, POST /api/history/sources/tag — origin of stored records
   POST /api/history/reconcile (job) + /api/history/reconcile/apply — backtest audit / fill / backfill
   GET /api/history/duplicates, POST /api/history/duplicates/remove — duplicates an audit added
@@ -600,6 +601,18 @@ async def get_components(min_samples: int = 30, split: bool = False, shadow: boo
         include_shadow=shadow,
         origin=_origin_param(origin),
     )
+
+
+@app.get("/api/structcheck")
+async def structcheck(side: str = "long", origin: str = "all", regime: str = ""):
+    """Would an entry filter "only structure-confirmed trades" have paid in net PnL?
+    Same read-only computation as the Discord !structcheck (structure_study.py).
+    side = long | short; origin = all | live | backtest; regime = "" (any) | TREND | NORMAL."""
+    import structure_study
+    if side not in ("long", "short"):
+        raise HTTPException(400, "side must be long or short")
+    return await asyncio.to_thread(structure_study.analyze_structure_confirm, None, side,
+                                   _origin_param(origin), regime or None)
 
 
 class Tp1SimIn(BaseModel):

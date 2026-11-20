@@ -144,6 +144,7 @@ async def help_cmd(ctx):
         "`!signals <pair> <tf>` — signal statistics for a pair",
         "`!components [min_n] [split] [shadow] [live|backtest]` — does relative_strength/volume_profile actually correlate with outcome? (default min_n=30)",
         "`!tp1sim [pair] [tf] [bars]` — compare breakeven/25%/50%/75% SL-after-TP1 on real historical data (dry-run, doesn't touch live history/settings)",
+        "`!structcheck [long|short] [live|backtest] [trend]` — would taking only structure-confirmed trades (volume_profile/relative_strength +5) have paid in net PnL? kept vs rejected, older/newer half, per pair",
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!smcsim [pair] [tf] [bars]` — Smart Money Concepts event study (sweeps, BOS/CHoCH, FVG, sweep→shift) vs. any-bar baseline on real history; research only, trades nothing",
@@ -1486,6 +1487,55 @@ async def components_cmd(ctx, *args):
             msg = msg[len(chunk):].lstrip("\n")
     except Exception as e:
         logger.error(f"Components command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="structcheck", aliases=["structconfirm"])
+async def structcheck_cmd(ctx, *args):
+    """!structcheck [long|short] [live|backtest] [trend]
+
+    Read-only: would an entry filter "only trades whose market structure confirms the side"
+    have paid, in NET PnL (moved_pct minus the assumed fee), not raw_mfe? For each rule
+    (vp+5, rs>=0, rs+5, vp+5 or rs+5, vp+5 and rs+5) it compares the trades the rule would
+    keep with the ones it would reject: n, total, average, win rate, a bootstrap 95%
+    interval of the difference, the same split into an older and a newer half of the
+    history, and per pair. A rule is called "supported" only when the interval is above 0,
+    both halves agree and most pairs agree. Needs confidence_components on the records
+    (`!compfill` fills the backtest ones). Changes nothing."""
+    import structure_study
+    try:
+        opts = [str(a).lower() for a in args]
+        bad = [a for a in opts if a not in ("long", "short", "live", "backtest", "trend")]
+        if bad:
+            await ctx.send(f"❌ Unknown option(s): {', '.join(bad)}. Usage: `!structcheck [long|short] [live|backtest] [trend]`")
+            return
+        side = "short" if "short" in opts else "long"
+        origin = "live" if "live" in opts else ("backtest" if "backtest" in opts else "all")
+        regime = "TREND" if "trend" in opts else None
+        rep = await asyncio.to_thread(structure_study.analyze_structure_confirm, None, side, origin, regime)
+        lines = [f"**🧭 Structure confirm check** — {side}s, {origin} records, regime {rep['regime']}, fee {rep['fee_pct']}%/trade",
+                 f"{rep['n']} closed trades with components (skipped: {rep['skipped']['cancelled']} cancelled, "
+                 f"{rep['skipped']['no_components']} without components). Baseline: n={rep['baseline']['n']} "
+                 f"total={rep['baseline']['total']}% avg={rep['baseline']['avg']}%", ""]
+        icon = {"supported": "✅", "mixed": "🟡", "not_supported": "❌", "too_few": "⚠️"}
+        for r in rep["rules"]:
+            k, j = r["kept"], r["rejected"]
+            ci = f"[{r['ci95'][0]:+.2f}, {r['ci95'][1]:+.2f}]" if r["ci95"] else "n/a"
+            halves = " / ".join(f"{h['half']} {h['diff']:+.2f}" if h["diff"] is not None else f"{h['half']} n/a" for h in r["halves"])
+            lines.append(f"{icon[r['verdict']]} `{r['rule']}` ({r['verdict']}) keeps {r['kept_share']:.0%}: "
+                         f"kept n={k['n']} avg={k['avg']} total={k['total']} | rejected n={j['n']} avg={j['avg']}")
+            lines.append(f"   diff avg {r['diff_avg']} CI95 {ci} · halves {halves} · pairs positive {r['pairs_pos']}/{r['pairs_n']}")
+        lines += ["", "Trades of different pairs share one market phase and A/U trades often share a bar, so the intervals are optimistic. "
+                      "Only a rule marked supported is worth turning into a filter."]
+        msg = "\n".join(lines)
+        while msg:
+            chunk = msg[:1900]
+            if len(msg) > 1900:
+                chunk = chunk[:chunk.rfind("\n")] if "\n" in chunk else chunk
+            await ctx.send(chunk)
+            msg = msg[len(chunk):].lstrip("\n")
+    except Exception as e:
+        logger.error(f"structcheck command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 async def _run_sim_job(ctx, kind: str, params: dict, run, intro: str):

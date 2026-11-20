@@ -515,6 +515,79 @@ function ComponentRow({ row, minSamples }) {
   )
 }
 
+const VERDICT_STYLE = {
+  supported: { icon: '✅', color: 'var(--long)', text: 'supported' },
+  mixed: { icon: '🟡', color: 'var(--accent)', text: 'mixed' },
+  not_supported: { icon: '❌', color: 'var(--short)', text: 'not supported' },
+  too_few: { icon: '⚠️', color: 'var(--text-faint)', text: 'too few trades' },
+}
+const fmt = (v, d = 2) => (v === null || v === undefined ? 'n/a' : `${v > 0 ? '+' : ''}${Number(v).toFixed(d)}`)
+
+// Would an entry filter "only structure-confirmed trades" have paid in NET PnL? Read-only.
+function StructCheckPanel({ origin }) {
+  const [side, setSide] = useState('long')
+  const [trendOnly, setTrendOnly] = useState(false)
+  const [rep, setRep] = useState(null)
+  const [err, setErr] = useState(null)
+  useEffect(() => {
+    let alive = true
+    setErr(null)
+    api.getStructCheck(side, origin, trendOnly ? 'TREND' : '')
+      .then((r) => { if (alive) setRep(r) })
+      .catch((e) => { if (alive) { setRep(null); setErr(String(e.message || e)) } })
+    return () => { alive = false }
+  }, [side, origin, trendOnly])
+
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Structure confirm — would it have paid?</h3>
+      <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>
+        Net PnL (after the assumed fee) of the trades a rule would keep vs reject. A rule is “supported” only when the
+        bootstrap interval of the difference is above 0, the older and the newer half of the history both agree and most
+        pairs agree. Backtest records need their components filled first (Backup tab). Changes nothing.
+      </p>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10, fontSize: 13 }}>
+        <select value={side} onChange={(e) => setSide(e.target.value)}>
+          <option value="long">long</option>
+          <option value="short">short</option>
+        </select>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input type="checkbox" checked={trendOnly} onChange={(e) => setTrendOnly(e.target.checked)} />
+          TREND only
+        </label>
+      </div>
+      {err && <p style={{ color: 'var(--short)' }}>Failed to load: {err}</p>}
+      {!err && !rep && <p style={{ color: 'var(--text-faint)' }}>Loading…</p>}
+      {rep && (
+        <div>
+          <p style={{ fontSize: 12, color: 'var(--text)', marginBottom: 8 }}>
+            {rep.n} closed {rep.side}s with components (skipped {rep.skipped.cancelled} cancelled, {rep.skipped.no_components} without
+            components) · baseline total {fmt(rep.baseline.total)}% · avg {fmt(rep.baseline.avg, 3)}% · fee {rep.fee_pct}%
+          </p>
+          {rep.rules.map((r) => {
+            const v = VERDICT_STYLE[r.verdict] || VERDICT_STYLE.too_few
+            return (
+              <div className="row" key={r.rule} style={{ alignItems: 'flex-start' }}>
+                <span className="row-label"><code>{r.rule}</code> <span style={{ color: v.color, fontSize: 11 }}>{v.icon} {v.text}</span></span>
+                <span style={{ fontSize: 12 }}>
+                  keeps {r.kept_share === null ? 'n/a' : `${Math.round(r.kept_share * 100)}%`} · kept n={r.kept.n} avg {fmt(r.kept.avg, 3)} total {fmt(r.kept.total)} ·
+                  rejected n={r.rejected.n} avg {fmt(r.rejected.avg, 3)}
+                  <br />
+                  diff {fmt(r.diff_avg, 3)} CI95 {r.ci95 ? `[${fmt(r.ci95[0])}, ${fmt(r.ci95[1])}]` : 'n/a'} ·
+                  {' '}{r.halves.map((h) => `${h.half} ${fmt(h.diff)}`).join(' / ')} · pairs positive {r.pairs_pos}/{r.pairs_n}
+                </span>
+              </div>
+            )
+          })}
+          <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 8 }}>
+            Pairs share one market phase and A/U trades often share a bar, so the intervals are optimistic — a floor on the uncertainty, not a guarantee.
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ComponentsView({ lastEvent }) {
   const minSamples = 30
   const [split, setSplit] = useState(false)
@@ -594,6 +667,8 @@ function ComponentsView({ lastEvent }) {
           </div>
         )
       })}
+
+      <StructCheckPanel origin={origin} />
 
       <div className="panel">
         <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
