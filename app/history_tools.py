@@ -19,14 +19,16 @@ from what they contain:
   - the real scanner stamps its records with timestamp = datetime.now(), which
     has seconds and microseconds; a backtest stamps the OPEN of the signal bar,
     which is a whole minute (seconds == 0, microsecond == 0);
-  - only live records ever carry tp1_hit / raw_mfe_pct / tp_raw / cap_* /
-    synthetic, and only they can still be "open".
+  - only live records ever carry tp1_hit / raw_tracking_bars_remaining / tp_raw /
+    cap_* / synthetic, and only they can still be "open". (raw_mfe_pct /
+    raw_mae_pct are NOT on that list any more: a backtest computes them from the
+    bars after entry too, see fill_raw_outcomes().)
 """
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from state import _parse_ts, sort_records_chronological
+from state import _parse_ts, sort_records_chronological, raw_extremes_over_bars
 
 
 def parse_record_ts(value: Any) -> Optional[datetime]:
@@ -39,7 +41,7 @@ BACKTEST_SOURCES = ("backtest", "backtest_fill", "backtest_backfill")
 
 # keys the real scanner writes and a backtest never does
 _LIVE_ONLY_KEYS = (
-    "tp1_hit", "raw_mfe_pct", "raw_mae_pct", "raw_tracking_bars_remaining",
+    "tp1_hit", "raw_tracking_bars_remaining",
     "tp_raw", "cap_reason", "cap_level", "synthetic",
 )
 
@@ -441,3 +443,163 @@ def sort_history(history: Dict) -> int:
         sort_records_chronological(history[t][f][s])
         n += 1
     return n
+
+
+# =====================================================================
+# 📈  raw_mfe_pct / raw_mae_pct FOR STORED BACKTEST RECORDS
+# =====================================================================
+# A stored entry must sit within this relative distance of the matched bar's close
+# (a backtest enters at the close of its signal bar). It guards against matching a
+# record to the wrong bar - e.g. a record from a different timeframe's history, or
+# candles the exchange has since revised.
+RAW_ENTRY_TOLERANCE = 5e-4
+
+
+def fill_raw_outcomes(history: Dict, ticker: str, tf: str, bars: List[List[float]], max_hold: int,
+                      apply: bool = True) -> Dict[str, Any]:
+    """Gives the backtest-origin records of ticker/tf that lack raw_mfe_pct /
+    raw_mae_pct those two fields, computed from the real bars after the entry.
+
+    `bars` are exchange candles [ts_ms, open, high, low, close, volume], oldest
+    first; the last one may still be forming, so it is never used. A backtest
+    signal is stamped with the OPEN of its signal bar and enters at that bar's
+    close, so the window is the `max_hold` bars right after it - the same horizon
+    live tracking covers (state.update_raw_outcome) and the one the backtest
+    itself simulates.
+
+    Qualifying records: source in BACKTEST_SOURCES, closed (exit_type not open),
+    missing raw_mfe_pct or raw_mae_pct. Skipped, and counted:
+      already     already has both fields
+      no_bars     its signal bar is not in `bars` (older than what was fetched)
+      incomplete  fewer than max_hold CLOSED bars exist after it yet (a partial
+                  window would understate MFE, so it waits)
+      mismatch    stored entry is not within RAW_ENTRY_TOLERANCE of that bar's close
+    Live and synthetic records are never touched.
+
+    Only raw_mfe_pct / raw_mae_pct are written, never below the record's own
+    max_favorable_pct / max_adverse_pct. apply=False counts without writing.
+    Returns {"ticker", "tf", "candidates", "filled", "already", "no_bars",
+    "incomplete", "mismatch"} (filled counts would-be writes when apply=False)."""
+    out = {"ticker": ticker, "tf": tf, "candidates": 0, "filled": 0,
+           "already": 0, "no_bars": 0, "incomplete": 0, "mismatch": 0}
+    slot = (history.get(ticker) or {}).get(tf) or {}
+    if not isinstance(slot, dict):
+        return out
+    index = {int(b[0]): i for i, b in enumerate(bars or [])}
+    last_closed = len(bars or []) - 2  # index of the last bar known to be closed
+
+    for side in ("long", "short"):
+        for rec in slot.get(side) or []:
+            if not isinstance(rec, dict):
+                continue
+            if classify_record_source(rec)[0] not in BACKTEST_SOURCES:
+                continue
+            if rec.get("exit_type") in (None, "open"):
+                continue
+            if rec.get("raw_mfe_pct") is not None and rec.get("raw_mae_pct") is not None:
+                out["already"] += 1
+                continue
+            out["candidates"] += 1
+
+            ts = record_ts_ms(rec)
+            i = index.get(ts) if ts is not None else None
+            if i is None:
+                out["no_bars"] += 1
+                continue
+            if i + max_hold > last_closed:
+                out["incomplete"] += 1
+                continue
+            try:
+                entry = float(rec.get("entry"))
+                close = float(bars[i][4])
+            except (TypeError, ValueError):
+                out["mismatch"] += 1
+                continue
+            if not entry or not close or abs(entry - close) / close > RAW_ENTRY_TOLERANCE:
+                out["mismatch"] += 1
+                continue
+
+            window = bars[i + 1:i + 1 + max_hold]
+            ext = raw_extremes_over_bars(side, entry, [b[2] for b in window], [b[3] for b in window])
+            if ext is None:
+                out["incomplete"] += 1
+                continue
+            if apply:
+                rec["raw_mfe_pct"] = max(ext[0], float(rec.get("max_favorable_pct") or 0.0))
+                rec["raw_mae_pct"] = max(ext[1], float(rec.get("max_adverse_pct") or 0.0))
+            out["filled"] += 1
+    return out
+
+
+# =====================================================================
+# 🧩  confidence_components FOR STORED BACKTEST RECORDS
+# =====================================================================
+def fill_components(history: Dict, ticker: str, tf: str, bt_trades: List[Dict],
+                    apply: bool = True) -> Dict[str, Any]:
+    """Gives the backtest-origin records of ticker/tf that have no
+    confidence_components the components a fresh backtest computes for the SAME signal.
+
+    `bt_trades` = a dry-run backtest_history(..., compute_confidence=True,
+    collect_records=True) "trades" list (each has "ts" = the signal bar's open in ms,
+    "side", "track" and "rec" with "confidence_components"). A stored record is matched
+    one-to-one to a simulated signal of the same side and track whose bar open equals
+    its timestamp (a backtest stamps exactly the bar open; the same greedy matching the
+    audit uses, with a window of one bar), and its entry must sit within
+    RAW_ENTRY_TOLERANCE of the simulated one.
+
+    The components are what the CURRENT logic scores that bar with (live filter
+    settings, current indicator parameters; onchain_bias is omitted in a backtest, as
+    in !compsim). A stored record the current logic no longer produces ("stale") finds
+    no partner and stays empty - it is never guessed.
+
+    Qualifying records: source in BACKTEST_SOURCES, closed, no confidence_components.
+      already     had components (not touched; still takes part in the matching so the
+                  pairing stays one-to-one)
+      unmatched   no simulated signal at its bar (stale record, or older / newer than
+                  the bars the backtest evaluated)
+      mismatch    matched a signal, but entries differ, or the simulated record carries
+                  no components
+    Only "confidence_components" is written. apply=False counts without writing.
+    Returns {"ticker", "tf", "candidates", "filled", "already", "unmatched", "mismatch"}."""
+    out = {"ticker": ticker, "tf": tf, "candidates": 0, "filled": 0,
+           "already": 0, "unmatched": 0, "mismatch": 0}
+    slot = (history.get(ticker) or {}).get(tf) or {}
+    if not isinstance(slot, dict):
+        return out
+    tf_ms = tf_to_ms(tf) or 3_600_000
+
+    for side in ("long", "short"):
+        stored = [r for r in (slot.get(side) or []) if isinstance(r, dict)
+                  and classify_record_source(r)[0] in BACKTEST_SOURCES
+                  and r.get("exit_type") not in (None, "open")]
+        tracks = sorted({r.get("track", "a") for r in stored})
+        for track in tracks:
+            hist = sorted(((record_ts_ms(r), r) for r in stored if r.get("track", "a") == track),
+                          key=lambda x: (x[0] is None, x[0]))
+            hist = [(ts, r) for ts, r in hist if ts is not None]
+            bt = sorted((t for t in bt_trades if t.get("side") == side and t.get("track", "a") == track),
+                        key=lambda t: t["ts"])
+            pairs, _bt_un, hist_un = _match(bt, hist, tf_ms)
+            partner = {j: i for i, j in pairs}
+            for j, (_ts, r) in enumerate(hist):
+                if r.get("confidence_components"):
+                    out["already"] += 1
+                    continue
+                out["candidates"] += 1
+                i = partner.get(j)
+                if i is None:
+                    out["unmatched"] += 1
+                    continue
+                sim = bt[i].get("rec") or {}
+                comps = sim.get("confidence_components")
+                try:
+                    e_stored, e_sim = float(r.get("entry")), float(sim.get("entry"))
+                except (TypeError, ValueError):
+                    e_stored = e_sim = 0.0
+                if not comps or not e_stored or not e_sim or abs(e_stored - e_sim) / e_sim > RAW_ENTRY_TOLERANCE:
+                    out["mismatch"] += 1
+                    continue
+                if apply:
+                    r["confidence_components"] = dict(comps)
+                out["filled"] += 1
+    return out

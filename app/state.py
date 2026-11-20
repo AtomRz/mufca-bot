@@ -418,6 +418,27 @@ def _fav_adv_pct(side: str, entry: float, fav_price: float, adv_price: float) ->
     return favorable, adverse
 
 
+def raw_extremes_over_bars(side: str, entry: float, highs, lows) -> Optional[Tuple[float, float]]:
+    """(raw_mfe_pct, raw_mae_pct) of a position over a window of CLOSED bars,
+    whatever TP/SL did inside that window.
+
+    Same formulas as the live path (update_raw_outcome(): _fav_adv_prices +
+    _fav_adv_pct, never below 0), applied to a whole window at once. A
+    backtest knows the bars after the entry, so it can take the extremes of the
+    full MAX_HOLD_BARS window directly instead of waiting for them to print —
+    that is the same horizon live tracking covers (bars_held + the
+    max(0, MAX_HOLD_BARS - bars_held) bars it keeps watching after the exit).
+
+    Returns None when there is nothing to measure (empty window / no entry)."""
+    highs = list(highs)
+    lows = list(lows)
+    if not highs or not lows or not entry:
+        return None
+    fav_price, adv_price = (max(highs), min(lows)) if side == "long" else (min(lows), max(highs))
+    favorable, adverse = _fav_adv_pct(side, float(entry), float(fav_price), float(adv_price))
+    return round(max(favorable, 0.0), 4), round(max(adverse, 0.0), 4)
+
+
 def update_signal_record(
     ticker: str, tf: str, side: str, exit_price: float, exit_type: str, bars_held: int,
     track: str = "a", tp1_hit: bool = False, tp1_price: Optional[float] = None,
@@ -1412,8 +1433,10 @@ def analyze_confidence_components(
     origin — "all" (default, unchanged behaviour) | "live" | "backtest": only
     stored records of that origin (record_matches_origin). Only "live" and "all"
     also read shadow records (those come from live blocked signals).
-    Backtest-origin records carry no raw_mfe_pct, so with "backtest" the
-    raw_mfe columns stay empty by construction.
+    Backtest-origin records get raw_mfe_pct from the bars after entry
+    (backtest_history() writes it for new ones, `!rawfill` / Backup tab for
+    stored ones); a backtest row can still read n/a when its window was not
+    complete yet or its bars could not be matched.
 
     Returns a JSON-serializable dict:
         {
