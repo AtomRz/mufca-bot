@@ -1562,7 +1562,10 @@ async def check_signals(
             # one implementation, not two that could quietly drift apart.
             components.update(_rs_vp_components(is_long, rel_strength, market_structure))
 
-            score = max(0, min(100, sum(components.values())))
+            # relative_strength / volume_profile are always recorded (components dict), but only
+            # count towards the displayed score while config.COMPONENTS_IN_SCORE is on
+            score = max(0, min(100, sum(v for k, v in components.items()
+                                        if _cfg.COMPONENTS_IN_SCORE or k not in ("relative_strength", "volume_profile"))))
             return score, components
 
         async def _safe_open_position(track: str, side: str):
