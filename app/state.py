@@ -356,6 +356,26 @@ def add_signal_record(
     logger.info(f"[SIGNAL] ADDED {side} signal for {ticker} {tf} @ {entry} | Track: {track} | Regime: {regime}")
 
 
+def set_signal_ai(ticker: str, tf: str, side: str, track: str, entry: float, ai: Dict[str, Any]) -> bool:
+    """Attaches an AI verdict (ai_filter.evaluate()'s dict) to the history record of a
+    signal that was opened moments ago. Informational: nothing reads it back to affect
+    trading, only the History tab and !aistats.
+
+    The verdict arrives seconds after the record was written, so the trade may already
+    be closed — the record is found by track + entry price among the newest few of that
+    side (not by exit_type == "open"), skipping records that already carry a verdict.
+    Returns False when no such record exists (e.g. the pair was removed meanwhile)."""
+    history = load_signals_history()
+    records = history.get(ticker, {}).get(tf, {}).get(side, [])
+    for rec in reversed(records[-8:]):
+        if (rec.get("track") == track and not rec.get("synthetic", False)
+                and "ai" not in rec and _same_price(rec.get("entry"), entry)):
+            rec["ai"] = ai
+            save_signals_history(history)
+            return True
+    return False
+
+
 def _find_open_record(records: List[Dict], track: str) -> Optional[Dict]:
     """
     Finds the open record for the given track.

@@ -27,7 +27,8 @@ import derivatives
 import spread
 import shock_guard
 import history_backup
-from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals
+import ai_filter
+from state import load_signals_history, load_bot_state, save_bot_state, reconcile_orphaned_signals, set_signal_ai
 
 logger = logging.getLogger(__name__)
 
@@ -587,6 +588,84 @@ async def _intrabar_check(exchange, channel, lock, st, trade, track, ticker, tf)
 _alerted_anomaly_ts: set = set()
 
 
+# =====================================================================
+# 🤖  AI VERDICT (Gemini second opinion — informational, see ai_filter.py)
+# =====================================================================
+# Runs as a background task AFTER the signal's Discord/WS/push notifications went out,
+# so a slow or failing Gemini request can never delay a signal. The verdict is written
+# onto the history record, appended to the already-sent Discord embed, and announced
+# to the web UI. It gates nothing.
+_ai_tasks: set = set()                      # strong refs so running tasks are not garbage-collected
+_ai_semaphore = asyncio.Semaphore(2)        # at most 2 requests in flight (signals can bunch up on a bar close)
+
+
+def _spawn_ai_verdict(*args, **kwargs) -> None:
+    task = asyncio.create_task(_run_ai_verdict(*args, **kwargs))
+    _ai_tasks.add(task)
+    task.add_done_callback(_ai_tasks.discard)
+
+
+async def _run_ai_verdict(exchange, message, embed, ticker, tf, sig_type, price, regime, leverage,
+                          sl, tp, tp1, risk, market_bias) -> None:
+    try:
+        is_long = "BUY" in sig_type or "LONG" in sig_type
+        side = "long" if is_long else "short"
+        track = sig_type.strip()[:1].lower()
+        bars = await safe_fetch_ohlcv(exchange, ticker, tf, limit=200)
+        df = parse_ohlcv(bars) if bars else None
+
+        # The bot's own confidence score is deliberately NOT sent: it would anchor the model,
+        # and the point of the second opinion is that it is independent of the bot's scoring.
+        deriv = (market_bias or {}).get("derivatives") or {}
+        ctx = {
+            "pair": ticker, "timeframe": tf, "market": _cfg.MARKET_MODE,
+            "side": side, "track": _cfg.TRACK_LABELS.get(track, track.upper()),
+            "entry": price, "stop_loss": sl, "tp1": tp1, "tp2": tp,
+            "sl_distance_pct": round(abs(price - sl) / price * 100, 2),
+            "tp1_distance_pct": round(abs(tp1 - price) / price * 100, 2),
+            "tp2_distance_pct": round(abs(tp - price) / price * 100, 2),
+            "risk_reward_to_tp2": round(abs(tp - price) / max(risk, 1e-8), 2),
+            "leverage": leverage, "regime": regime,
+            "higher_timeframe_trend_filter": f"{_cfg.HTF_BIAS} FRAMA agrees with the trade direction",
+            "funding_rate": deriv.get("funding_rate"),
+            "open_interest_change_pct": deriv.get("oi_delta_pct"),
+            "open_interest_direction": deriv.get("oi_direction"),
+        }
+        async with _ai_semaphore:
+            ai = await ai_filter.evaluate(ctx, df)
+
+        status = ai.get("status")
+        if status == "no_key":
+            return  # key removed meanwhile — leave the record untouched
+        set_signal_ai(ticker, tf, side, track, price, ai)
+
+        if message is not None and embed is not None:
+            try:
+                if status == "ok":
+                    embed.add_field(name="🤖 AI Verdict", value=ai_filter.format_for_embed(ai), inline=False)
+                else:
+                    embed.add_field(name="🤖 AI Verdict", value=f"⚪ no data ({status})", inline=False)
+                await message.edit(embed=embed)
+            except Exception as edit_err:
+                logger.warning(f"[AI] could not add the verdict to the Discord message for {ticker} {tf}: {edit_err}")
+
+        try:
+            from web_api import broadcast_event
+            await broadcast_event({
+                "type": "ai_verdict", "ticker": ticker, "tf": tf, "sig_type": sig_type,
+                "status": status, "verdict": ai.get("verdict"), "confidence": ai.get("confidence"),
+                "news_risk": ai.get("news_risk"),
+            })
+        except Exception as ws_err:
+            logger.warning(f"[WS] broadcast failed: {ws_err}")
+
+        if status == "ok":
+            logger.info(f"[AI] {ticker} {tf} {sig_type.strip()} -> {ai['verdict']} ({ai['confidence']}%), "
+                        f"news={ai['news_risk']}, {ai['latency_s']}s")
+    except Exception as e:
+        logger.warning(f"[AI] verdict task failed for {ticker} {tf}: {e}", exc_info=True)
+
+
 async def _send_system_alert(channel, text: str, push_title: str, push_body: str, event: Dict) -> None:
     """Fan a system alert out to Discord, the web dashboard (WebSocket) and
     push. Every channel has its own try/except so one failing can't swallow
@@ -888,12 +967,13 @@ async def market_scanner():
 
                         # 🆕 discord_notifications toggle (Settings → web) — gateway stays
                         # connected either way, this only skips the channel message itself.
+                        sent_msg = None
                         if _cfg.DISCORD_NOTIFICATIONS_ENABLED and channel is not None and embed is not None:
                             try:
                                 if chart_file:
-                                    await channel.send(embed=embed, file=chart_file)
+                                    sent_msg = await channel.send(embed=embed, file=chart_file)
                                 else:
-                                    await channel.send(embed=embed)
+                                    sent_msg = await channel.send(embed=embed)
                             except Exception as discord_err:
                                 logger.error(f"[DISCORD] Failed to send signal for {ticker} {tf}: {discord_err}", exc_info=True)
                         scan_stats["signals_generated"] += 1
@@ -929,6 +1009,11 @@ async def market_scanner():
                         except Exception as push_err:
                             logger.warning(f"[PUSH] send failed: {push_err}")
                         logger.info(f"[SIGNAL] {ticker} {tf} | {sig_type} @ {price:.4f}")
+
+                        # 🤖 AI second opinion — background task, informational only (see _run_ai_verdict)
+                        if _cfg.AI_FILTER_ENABLED and _cfg.GEMINI_API_KEY:
+                            _spawn_ai_verdict(exchange, sent_msg, embed, ticker, tf, sig_type, price, reg,
+                                              leverage, sl, tp, tp1, risk, combined_bias)
 
                 # 🆕 FIX: Check ALL tracks for closures independently
                 for track in _cfg.TRACKS:

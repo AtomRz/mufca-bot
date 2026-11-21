@@ -45,6 +45,24 @@ function fmtDate(ts) {
   }
 }
 
+// Gemini second opinion stored on a record (record.ai) — a coloured dot with the details in the tooltip.
+const AI_DOT = { approve: 'var(--long)', neutral: 'var(--accent)', reject: 'var(--short)' }
+
+function AiCell({ ai }) {
+  if (!ai) return <span style={{ color: 'var(--text-faint)' }}>—</span>
+  if (ai.status !== 'ok') {
+    return <span style={{ color: 'var(--text-faint)' }} title={`AI had no answer (${ai.status}${ai.detail ? `, ${ai.detail}` : ''})`}>n/a</span>
+  }
+  const news = ai.news_risk && ai.news_risk !== 'unknown' ? ` · news risk: ${ai.news_risk}` : ''
+  const tip = `${ai.verdict} (${ai.confidence}%)${news}${ai.reason ? `\n${ai.reason}` : ''}`
+  return (
+    <span title={tip} style={{ whiteSpace: 'nowrap' }}>
+      <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: '50%', background: AI_DOT[ai.verdict] || 'var(--text-faint)', marginRight: 6 }} />
+      {ai.verdict}
+    </span>
+  )
+}
+
 // Which stored records a view counts: all of them, only the ones the real scanner
 // produced, or only backtest-origin ones (bootstrap / audit fill / backfill).
 // The choice is remembered per browser and shared by the History and Components views.
@@ -136,7 +154,7 @@ export default function HistoryPanel({ lastEvent }) {
 
   // a signal just closed — refresh the summary, and the open trades list too
   useEffect(() => {
-    if (lastEvent?.type === 'signal') { load(); loadRecords() }
+    if (lastEvent?.type === 'signal' || lastEvent?.type === 'ai_verdict') { load(); loadRecords() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent])
 
@@ -285,6 +303,7 @@ export default function HistoryPanel({ lastEvent }) {
                     <th>MAE</th>
                     <th>Result</th>
                     <th>Regime</th>
+                    <th title="Gemini second opinion (informational) — hover for the reason">AI</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -305,6 +324,7 @@ export default function HistoryPanel({ lastEvent }) {
                         {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>sim</span>}
                       </td>
                       <td style={{ color: 'var(--text-dim)' }}>{rec.regime || '—'}</td>
+                      <td><AiCell ai={rec.ai} /></td>
                       <td>
                         <button
                           className="row-delete-btn"

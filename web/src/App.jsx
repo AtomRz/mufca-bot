@@ -5,6 +5,7 @@ import ChartPanel from './components/ChartPanel'
 import HistoryPanel from './components/HistoryPanel'
 import InsightsPanel from './components/InsightsPanel'
 import BackupPanel from './components/BackupPanel'
+import AiPanel from './components/AiPanel'
 import SettingsPanel from './components/SettingsPanel'
 import LoginScreen from './components/LoginScreen'
 import SignalLamps from './components/SignalLamps'
@@ -17,6 +18,7 @@ const TABS = [
   { id: 'chart', label: 'Chart' },
   { id: 'history', label: 'History' },
   { id: 'insights', label: 'Insights' },
+  { id: 'ai', label: 'AI' },
   { id: 'backup', label: 'Backup' },
 ]
 
@@ -274,6 +276,7 @@ export default function App() {
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} />}
+        {tab === 'ai' && <AiPanel lastEvent={lastEvent} config={config} onConfigChanged={loadConfig} />}
         {tab === 'backup' && <BackupPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} config={config} onConfigChanged={loadConfig} />}
         {tab === 'settings' && (
           <SettingsPanel config={config} onChanged={loadConfig} />
