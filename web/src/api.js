@@ -109,6 +109,9 @@ export const api = {
     request('/api/config/tp1-sl-mode', { method: 'POST', body: JSON.stringify({ tp1_sl_mode: tp1SlMode }) }),
   setIntrabarCheck: (enabled) =>
     request('/api/config/intrabar-check', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  getAiStats: (origin = 'live') => request(`/api/ai/stats?origin=${origin}`),
+  setAiFilter: (changes) =>
+    request('/api/config/ai-filter', { method: 'POST', body: JSON.stringify(changes) }),
   setEntryBlock: (key, mode) =>
     request('/api/config/entry-block', { method: 'POST', body: JSON.stringify({ key, mode }) }),
   setHurstBiasCorrection: (enabled) =>

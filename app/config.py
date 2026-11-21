@@ -43,6 +43,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # =====================================================================
 ETHERSCAN_API_KEY  = os.getenv("ETHERSCAN_API_KEY", "")
 COINGECKO_API_KEY  = os.getenv("COINGECKO_API_KEY", "")   # Demo key (free)
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")      # optional — AI second opinion (see AI VERDICT below)
 
 # =====================================================================
 # 📡  ON-CHAIN SETTINGS
@@ -1041,6 +1042,70 @@ def save_intrabar_check(enabled: bool):
     safe_json_save(INTRABAR_CHECK_FILE, {"enabled": bool(enabled)})
 
 INTRABAR_CHECK_ENABLED = load_intrabar_check()
+
+# =====================================================================
+# 🤖  AI VERDICT (Gemini second opinion — INFORMATIONAL ONLY)
+# =====================================================================
+# After a signal has been opened and its notifications are out, a background
+# task sends a compact market snapshot + the signal's own levels to Gemini and
+# stores the answer on the history record (record["ai"]): verdict
+# approve / neutral / reject, confidence, news_risk, a short reason. It is shown
+# next to the signal (Discord embed, web History tab) and aggregated by !aistats
+# / the web AI tab so the verdict can be checked against real trade results.
+# NOTHING gates entry on it — a missing key, a timeout or an API error just
+# leaves the signal without a verdict ("no data").
+#
+# enabled    — master switch (no effect without GEMINI_API_KEY in the environment)
+# model      — Gemini model code; see ai.google.dev/gemini-api/docs/models
+# timeout_s  — hard limit for the whole request (grounded requests are slower)
+# grounding  — let Gemini use Google Search for news/events (the news_risk field).
+#              Billed per search query by Google (see their pricing page).
+AI_FILTER_FILE = os.path.join(DATA_DIR, "ai_filter.json")
+AI_FILTER_DEFAULTS = {"enabled": True, "model": "gemini-3.8-flash", "timeout_s": 25, "grounding": True}
+AI_TIMEOUT_OPTIONS = (10, 15, 25, 40, 60)
+
+def load_ai_filter() -> dict:
+    cfg = _load_typed(AI_FILTER_FILE, AI_FILTER_DEFAULTS)
+    cfg["model"] = cfg["model"].strip() or AI_FILTER_DEFAULTS["model"]
+    cfg["timeout_s"] = max(5, min(120, int(cfg["timeout_s"])))
+    return cfg
+
+def save_ai_filter(cfg: dict):
+    safe_json_save(AI_FILTER_FILE, {
+        "enabled": bool(cfg["enabled"]),
+        "model": str(cfg["model"]).strip() or AI_FILTER_DEFAULTS["model"],
+        "timeout_s": int(cfg["timeout_s"]),
+        "grounding": bool(cfg["grounding"]),
+    })
+
+_ai_cfg = load_ai_filter()
+AI_FILTER_ENABLED = _ai_cfg["enabled"]
+AI_MODEL = _ai_cfg["model"]
+AI_TIMEOUT_S = _ai_cfg["timeout_s"]
+AI_GROUNDING = _ai_cfg["grounding"]
+
+def ai_filter_settings() -> dict:
+    """Current AI verdict settings as one dict (what the web API returns)."""
+    return {
+        "enabled": AI_FILTER_ENABLED, "model": AI_MODEL, "timeout_s": AI_TIMEOUT_S,
+        "grounding": AI_GROUNDING, "has_key": bool(GEMINI_API_KEY),
+    }
+
+def update_ai_filter(enabled=None, model=None, timeout_s=None, grounding=None) -> dict:
+    """Changes the AI verdict settings live (None = leave as is), persists them and
+    returns the new settings. Shared by the web endpoint and the !ai command."""
+    global AI_FILTER_ENABLED, AI_MODEL, AI_TIMEOUT_S, AI_GROUNDING
+    if enabled is not None:
+        AI_FILTER_ENABLED = bool(enabled)
+    if model is not None and str(model).strip():
+        AI_MODEL = str(model).strip()
+    if timeout_s is not None:
+        AI_TIMEOUT_S = max(5, min(120, int(timeout_s)))
+    if grounding is not None:
+        AI_GROUNDING = bool(grounding)
+    save_ai_filter({"enabled": AI_FILTER_ENABLED, "model": AI_MODEL,
+                    "timeout_s": AI_TIMEOUT_S, "grounding": AI_GROUNDING})
+    return ai_filter_settings()
 
 # =====================================================================
 # relative_strength / volume_profile in the displayed confidence score

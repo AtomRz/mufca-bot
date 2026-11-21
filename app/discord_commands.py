@@ -24,6 +24,7 @@ reliably for both reading and writing.
 
 import asyncio
 import os
+import re
 import time
 import logging
 from datetime import datetime, timezone
@@ -67,6 +68,7 @@ from onchain import (
 import derivatives
 import spread
 import sim_jobs
+import ai_filter
 from state import (
     load_signals_history,
     save_signals_history,
@@ -163,6 +165,8 @@ async def help_cmd(ctx):
         "`!ethverify [exchange] [min_eth]` — health check of an exchange's tracked wallets (active / stale) + add/review/skip verdicts for new candidates",
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
+        "`!aistats [live|backtest|all]` — win rate / PnL of closed trades by Gemini verdict (approve / neutral / reject / none) and by news risk",
+        "`!ai [on|off|grounding on|off|model <code>|timeout <s>]` — Gemini second-opinion settings (informational only, never blocks a signal)",
         "",
 
         "**⚙️ Settings**",
@@ -3399,6 +3403,76 @@ async def spread_cmd(ctx, ticker: str = "BTC/USDT", action: str = "", confirm: s
         await msg.edit(content=report)
     except Exception as e:
         await msg.edit(content=f"❌ Spread error: `{e}`")
+
+
+# =====================================================================
+# 🤖  AI VERDICT (Gemini second opinion — informational, see ai_filter.py)
+# =====================================================================
+def _ai_status_text() -> str:
+    s = _cfg.ai_filter_settings()
+    key = "set" if s["has_key"] else "**missing** (add GEMINI_API_KEY to .env and restart)"
+    return (
+        f"🤖 **AI verdict** — {'ON' if s['enabled'] else 'OFF'} (informational only, gates nothing)\n"
+        f"API key: {key}\n"
+        f"Model: `{s['model']}` · timeout: {s['timeout_s']}s · Google Search grounding (news): "
+        f"{'on' if s['grounding'] else 'off'}\n"
+        f"Change: `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>` · results: `!aistats`"
+    )
+
+
+@core.bot.command(name="ai")
+async def ai_cmd(ctx, action: str = "", value: str = ""):
+    """!ai — status; !ai on|off; !ai grounding on|off; !ai model <code>; !ai timeout <seconds>.
+    Settings of the Gemini second opinion shown next to each signal (see ai_filter.py)."""
+    a, v = action.lower(), value.lower()
+    try:
+        if a in ("on", "off"):
+            _cfg.update_ai_filter(enabled=(a == "on"))
+        elif a == "grounding" and v in ("on", "off"):
+            _cfg.update_ai_filter(grounding=(v == "on"))
+        elif a == "model" and value:
+            if not re.fullmatch(r"[A-Za-z0-9._-]{3,80}", value):
+                await ctx.send("⚠️ That doesn't look like a model code (letters, digits, `.`, `_`, `-`).")
+                return
+            _cfg.update_ai_filter(model=value)
+        elif a == "timeout" and value.isdigit():
+            _cfg.update_ai_filter(timeout_s=int(value))
+        elif a:
+            await ctx.send("Usage: `!ai` · `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>`")
+            return
+        await ctx.send(_ai_status_text())
+    except Exception as e:
+        await ctx.send(f"❌ Error: {e}")
+
+
+@core.bot.command(name="aistats", aliases=["aiverdicts"])
+async def aistats_cmd(ctx, origin: str = "live"):
+    """!aistats [live|backtest|all] — win rate / PnL of closed trades by AI verdict and by news_risk.
+    Only live trades can carry a verdict; compare approve vs reject vs no verdict once n is large enough."""
+    try:
+        st = ai_filter.compute_stats(origin=origin)
+    except ValueError as e:
+        await ctx.send(f"⚠️ {e}")
+        return
+    except Exception as e:
+        await ctx.send(f"❌ Error: {e}")
+        return
+
+    def row(label: str, g: dict) -> str:
+        if not g["n"]:
+            return f"{label:<14} n=0"
+        return f"{label:<14} n={g['n']:<4} win {g['win_rate'] * 100:5.1f}%   avg {g['avg_pnl_pct']:+.2f}%   sum {g['sum_pnl_pct']:+.1f}%"
+
+    lines = [f"🤖 **AI verdict vs real results** (origin: {st['origin']}, closed trades)", "```"]
+    lines += [row(k, st["by_verdict"][k]) for k in ("approve", "neutral", "reject", "none")]
+    lines += ["", "by news risk"]
+    lines += [row(k, st["by_news_risk"][k]) for k in ("low", "medium", "high")]
+    lines.append("```")
+    lines.append("`none` = closed trades without a verdict (opened before this feature, or the AI had no answer) — the baseline.")
+    if st["open_with_verdict"]:
+        lines.append(f"{st['open_with_verdict']} open trade(s) already carry a verdict (counted once they close).")
+    lines.append("_Small n proves nothing — wait for a few dozen trades per group before reading anything into the gaps._")
+    await _send_chunked(ctx, "\n".join(lines))
 
 
 # =====================================================================

@@ -63,6 +63,17 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
 
 ---
 
+## AI verdict (Gemini second opinion)
+
+Optional and **informational only** — it never blocks or changes a signal. After a signal has been opened and its Discord / web / push notifications are out, a background task sends Gemini a compact snapshot (closed-bar digest of the signal timeframe: changes, ATR, EMAs, RSI, relative volume, 50-bar range, last 12 candles) plus the trade's own levels, regime, funding/OI, and gets back `approve` / `neutral` / `reject`, a confidence, a `news_risk` (low/medium/high) and a short reason. The bot's own confidence score is deliberately not sent, so the opinion stays independent.
+
+- Where it shows: an extra field on the Discord signal embed (added a few seconds after the signal), a dot in the web History tab, the web **AI** tab, `!aistats`.
+- If the key is missing, the request times out or Gemini errors, the signal simply has no verdict (a failed attempt is stored as `n/a` so it is not retried or miscounted).
+- The point of the first phase is measurement: `!aistats` / the AI tab compare win rate and PnL of approve vs reject vs no-verdict trades. Only trade on it, if ever, once those groups are large enough to show a real gap.
+- Setup: put `GEMINI_API_KEY` (aistudio.google.com) in `.env` and restart the container. Model, timeout and Google Search grounding (news; Google bills grounded requests per search query after a monthly free allowance) are changed live in the AI tab or with `!ai`.
+
+---
+
 ## Stack
 
 **Backend**
@@ -103,6 +114,7 @@ mufca-bot/
 │   ├── spread.py              # Order book spread collection + live liquidity gate (spot & futures)
 │   ├── walk_forward.py        # Rolling walk-forward check of the filter tuner + audit of pinned filter sets (!walkfwd, /api/walkfwd)
 │   ├── smc.py                 # Smart Money Concepts: the !smcsim event study (sweeps, BOS/CHoCH, FVG vs. any-bar baseline) and the chart overlay of BOS/CHoCH lines and open FVGs; research / visual only
+│   ├── ai_filter.py           # Gemini "second opinion" on each new signal (informational only): market snapshot, request, verdict parsing, !aistats statistics
 │   ├── shadow.py              # Shadow tracking of entries an Entry switch blocked (outcome replay, kept out of signals_history)
 │   ├── market_hours.py        # NYSE session state (pre / open / after-hours / closed, holidays, early closes) for the top-bar NYSE lamp
 │   ├── filter_stats.py        # Live entry-filter funnel counters (which filter rejected how many raw triggers)
@@ -232,6 +244,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 | `zones.json` | Demand/supply zone detector on/off + all 8 detection parameters (ATR period, lookback, base/impulse bars, max zones, base tightness, min displacement, min volume ratio — editable from the web dashboard). Disabling also skips the detector's per-bar work on the live scan path, not just the chart overlay |
 | `smc_overlay.json` | Market-structure chart overlay: on/off (default off), BOS/CHoCH lines on/off, open FVGs on/off, swing length, lookback, max lines, max gaps — editable from the web Settings tab without a restart; visual only |
 | `spread_history.json` | Rolling per-pair order book spread samples (up to `SPREAD_HISTORY_MAX_SAMPLES`), used for the spread filter's own-history anomaly check; written on a throttled interval and flushed immediately on graceful shutdown — collected regardless of whether the filter is switched on |
+| `ai_filter.json` | AI verdict settings: on/off, Gemini model, request timeout, Google Search grounding (editable from the web AI tab or `!ai`; the API key itself is only read from `GEMINI_API_KEY` in `.env`) |
 | `filter_stats.json` | Live entry-filter funnel counters per pair/timeframe/track/side (raw triggers, passed, rejected-by, rejected-only-by); written on a throttled interval and flushed on graceful shutdown; `!filterstats reset` starts over |
 | `indicator_config.json` | FRAMA/MFI/Andean/UT Bot parameters (editable from the web dashboard) |
 | `chart_colors.json` | Chart color scheme (editable from the web dashboard) |
@@ -307,6 +320,8 @@ volumes:
 | `!derivatives [PAIR]` | Show current derivatives bias — funding rate + open interest (futures mode only). Example: `!derivatives ETH/USDT` |
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
 | `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`); the web UI has the same "Reset history" button (Insights → Spread) |
+| `!aistats [live\|backtest\|all]` | Win rate / PnL of closed trades grouped by the Gemini verdict (approve / neutral / reject / none) and by news risk — does the second opinion predict anything? |
+| `!ai [on\|off \| grounding on\|off \| model CODE \| timeout SECONDS]` | Show / change the Gemini second-opinion settings live (informational only, never blocks a signal) |
 | `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch (deliberately does not touch spread history — see `!spread reset`) |
 
 ### 📚 History & Stats
@@ -356,6 +371,7 @@ FastAPI + React, served from the same container as the bot on port **`8585`** �
   - **Spread** — live order book spread + filter status/warm-up progress
   - **Components** — `!components`' report, in-browser
   - **Simulate** — `!tp1sim`/`!compsim`, in-browser: pick a pair/timeframe/bar count, run, see the result as a table instead of Discord text. Runs as a background job with a progress bar and a Cancel button; the result is kept for a few hours, so it survives a reload or a tab switch (`POST /api/tp1sim` / `/api/compsim` return `202` + a job id, poll `GET /api/sim-jobs/{id}`; `DELETE` cancels)
+- **AI** — settings of the Gemini second opinion (on/off, model, timeout, Google Search grounding) and the check that matters: win rate / PnL of closed trades grouped by verdict (approve / neutral / reject / no verdict) and by news risk. The verdict is also shown as a dot in the History tab's trade list (hover for the reason)
 - **Settings** — everything below is editable at runtime, no redeploy or restart required:
   - Market mode (spot/futures), HTF bias, UT Bot Heikin Ashi toggle
   - SL-after-TP1 mode (breakeven / quarter / half / three-quarter of the way to TP1)
@@ -377,7 +393,7 @@ Changing market mode, HTF bias, or any indicator parameter resets active positio
 
 **Top bar:** live connection status, market mode, HTF bias, CHOP/trend/suggested-leverage pulse for the pair selected on the Chart tab, and a row of signal/filter lamps (MFI, Andean, UT Bot, plus every filter's pass/block state — including R:R) computed with the exact same logic the scanner uses to decide whether a trade actually opens.
 
-**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `shadow` (lamp status), `components` (`?split=1&shadow=1`), `tp1sim` (POST), `compsim` (POST), `filtersim` (POST, background job), `smcsim` (POST, background job), `config/smc-overlay` (POST), `filter-stats` (GET; POST `filter-stats/reset`), `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`entry-block`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`volume-profile`/`zones`/`colors`), `onchain`, `history/summary`, `history/records`, `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `limit_filled`, `limit_cancelled`, `scan_tick`, and `config_changed` events.
+**REST API** (all under `/api/`): `status`, `health`, `pairs` (GET/POST/DELETE), `chart`, `pulse`, `derivatives`, `spread`, `shadow` (lamp status), `components` (`?split=1&shadow=1`), `tp1sim` (POST), `compsim` (POST), `filtersim` (POST, background job), `smcsim` (POST, background job), `config/smc-overlay` (POST), `filter-stats` (GET; POST `filter-stats/reset`), `config` (GET full config; POST `mode`/`htf`/`tp1-sl-mode`/`entry-block`/`discord-notifications`/`scan-interval`/`onchain-interval`/`derivatives-enabled`/`derivatives-interval`/`utha`/`filters`/`chop`/`tpconfig`/`indicators`/`volume-profile`/`zones`/`colors`), `onchain`, `history/summary`, `history/records`, `ai/stats` (GET; POST `config/ai-filter`), `devices` (GET/POST/DELETE, plus `devices/test-push`), `ws-ticket`. **WebSocket** `/ws/live` (short-lived ticket auth) pushes `signal`, `tp1_hit`, `limit_filled`, `limit_cancelled`, `scan_tick`, and `config_changed` events.
 
 ---
 

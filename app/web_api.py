@@ -77,6 +77,7 @@ import onchain as _onchain
 import spread
 import shock_guard
 import market_hours
+import ai_filter
 import shadow as shadow_mod
 import filter_stats as filter_stats_mod
 import sim_jobs
@@ -1772,6 +1773,8 @@ async def get_config():
         "ut_heikin_ashi": _cfg.UT_HEIKIN_ASHI,
         "tp1_sl_mode": _cfg.TP1_SL_MODE,
         "intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED,
+        "ai_filter": _cfg.ai_filter_settings(),
+        "ai_timeout_options": list(_cfg.AI_TIMEOUT_OPTIONS),
         "entry_block": dict(_cfg.ENTRY_BLOCK),
         "volume_gate": _cfg.get_volume_gate(),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
@@ -2116,6 +2119,32 @@ async def set_intrabar_check(body: IntrabarCheckIn):
     _cfg.save_intrabar_check(_cfg.INTRABAR_CHECK_ENABLED)
     await broadcast_event({"type": "config_changed", "key": "intrabar_check_enabled", "value": _cfg.INTRABAR_CHECK_ENABLED})
     return {"intrabar_check_enabled": _cfg.INTRABAR_CHECK_ENABLED, "changed": True}
+
+
+class AiFilterIn(BaseModel):
+    """Every field optional — only the ones sent are changed."""
+    enabled: Optional[bool] = None
+    model: Optional[str] = Field(None, min_length=3, max_length=80, pattern=r"^[A-Za-z0-9._-]+$")
+    timeout_s: Optional[int] = Field(None, ge=5, le=120)
+    grounding: Optional[bool] = None
+
+
+@app.post("/api/config/ai-filter")
+async def set_ai_filter(body: AiFilterIn):
+    """Live settings of the AI verdict (Gemini second opinion, informational only —
+    see config.py AI VERDICT and ai_filter.py). No restart needed."""
+    settings = _cfg.update_ai_filter(enabled=body.enabled, model=body.model,
+                                     timeout_s=body.timeout_s, grounding=body.grounding)
+    await broadcast_event({"type": "config_changed", "key": "ai_filter", "value": settings})
+    return settings
+
+
+@app.get("/api/ai/stats")
+async def ai_stats(origin: str = "live"):
+    """Win rate / PnL of closed trades grouped by the AI verdict and by news_risk —
+    the check of whether the verdict predicts anything (Discord twin: !aistats)."""
+    origin = _origin_param(origin)
+    return {**ai_filter.compute_stats(origin=origin), "settings": _cfg.ai_filter_settings()}
 
 
 class EntryBlockIn(BaseModel):
