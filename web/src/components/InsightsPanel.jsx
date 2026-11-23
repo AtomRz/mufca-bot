@@ -745,7 +745,7 @@ export function BarCoverageWarning({ coverage, requested }) {
 // big (e.g. 6000 bars x several pairs), so the page just never showed a result.
 // The last job id per kind lives at module level so a finished result (or a running
 // job) is still there after switching sub-tabs, which unmounts this view.
-const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null, smcsim: null, volfit: null, reconcile: null, rawfill: null, compfill: null }
+const simMemory = { tp1sim: null, compsim: null, autofilter: null, indoptim: null, autopsy: null, smcsim: null, volfit: null, reconcile: null, rawfill: null, compfill: null }
 
 export function useSimJob(kind) {
   const [job, setJob] = useState(null)
