@@ -1142,6 +1142,33 @@ ENTRY_BLOCK_KEYS = ("a_long", "a_short", "u_long", "u_short")
 ENTRY_BLOCK_MODES = ("allow", "block_trend", "block_all")
 ENTRY_BLOCK_FILE = os.path.join(DATA_DIR, "entry_block.json")
 
+# 🆕 Per pair + timeframe overrides on top of the global switches above.
+#   ENTRY_BLOCK_OVERRIDES = {"ETH/USDT": {"4h": {"u_long": "allow"}}}
+# An override holds an explicit mode for one track+side on one (pair, timeframe)
+# and wins over the global mode there ("allow" re-enables an entry that the
+# global switch turned off). No override = the global mode applies, so an
+# existing entry_block.json (flat {key: mode}) keeps behaving exactly as before.
+# Why: the per-pair/timeframe !compsim split showed U-track long in TREND is weak
+# on 1h for both pairs but behaves differently on 4h, so one global switch
+# could not express it.
+ENTRY_BLOCK_OVERRIDES_KEY = "overrides"
+_entry_block_lock = threading.Lock()
+
+def _clean_entry_block_overrides(raw) -> dict:
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for ticker, tfs in raw.items():
+        if not isinstance(ticker, str) or not isinstance(tfs, dict):
+            continue
+        for tf, modes in tfs.items():
+            if not isinstance(tf, str) or not isinstance(modes, dict):
+                continue
+            for k, m in modes.items():
+                if k in ENTRY_BLOCK_KEYS and m in ENTRY_BLOCK_MODES:
+                    out.setdefault(ticker, {}).setdefault(tf, {})[k] = m
+    return out
+
 def load_entry_block() -> dict:
     data = safe_json_load(ENTRY_BLOCK_FILE, {})
     out = {k: "allow" for k in ENTRY_BLOCK_KEYS}
@@ -1151,16 +1178,72 @@ def load_entry_block() -> dict:
                 out[k] = data[k]
     return out
 
-def save_entry_block(modes: dict):
-    safe_json_save(ENTRY_BLOCK_FILE, {k: modes.get(k, "allow") for k in ENTRY_BLOCK_KEYS})
+def load_entry_block_overrides() -> dict:
+    data = safe_json_load(ENTRY_BLOCK_FILE, {})
+    if isinstance(data, dict):
+        return _clean_entry_block_overrides(data.get(ENTRY_BLOCK_OVERRIDES_KEY))
+    return {}
+
+def save_entry_block(modes: Optional[dict] = None):
+    """Writes the global modes and the per pair/timeframe overrides to
+    entry_block.json (one file; the overrides sit under "overrides")."""
+    with _entry_block_lock:
+        src = ENTRY_BLOCK if modes is None else modes
+        payload = {k: src.get(k, "allow") for k in ENTRY_BLOCK_KEYS}
+        payload[ENTRY_BLOCK_OVERRIDES_KEY] = _clean_entry_block_overrides(ENTRY_BLOCK_OVERRIDES)
+        safe_json_save(ENTRY_BLOCK_FILE, payload)
 
 ENTRY_BLOCK = load_entry_block()
+ENTRY_BLOCK_OVERRIDES = load_entry_block_overrides()
 
-def is_entry_blocked(track: str, side: str, regime: str) -> bool:
+def entry_block_mode(key: str, ticker: Optional[str] = None, timeframe: Optional[str] = None) -> str:
+    """Mode in force for one track+side (`key` like "u_long"): the (ticker,
+    timeframe) override if there is one, else the global mode."""
+    if ticker and timeframe:
+        over = ENTRY_BLOCK_OVERRIDES.get(ticker, {}).get(timeframe, {}).get(key)
+        if over in ENTRY_BLOCK_MODES:
+            return over
+    return ENTRY_BLOCK.get(key, "allow")
+
+def set_entry_block_override(ticker: str, timeframe: str, key: str, mode: Optional[str]) -> bool:
+    """Sets (mode in ENTRY_BLOCK_MODES) or clears (mode None -> inherit the global
+    mode) one override and saves. Raises ValueError on a bad key / mode /
+    timeframe. Returns True if anything changed."""
+    if key not in ENTRY_BLOCK_KEYS:
+        raise ValueError(f"key must be one of {list(ENTRY_BLOCK_KEYS)}")
+    if mode is not None and mode not in ENTRY_BLOCK_MODES:
+        raise ValueError(f"mode must be one of {list(ENTRY_BLOCK_MODES)} or inherit")
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"timeframe must be one of {list(TIMEFRAMES)}")
+    if not ticker:
+        raise ValueError("ticker is required")
+    with _entry_block_lock:
+        cur = ENTRY_BLOCK_OVERRIDES.get(ticker, {}).get(timeframe, {}).get(key)
+        if cur == mode:
+            return False
+        if mode is None:
+            tf_map = ENTRY_BLOCK_OVERRIDES.get(ticker, {}).get(timeframe, {})
+            tf_map.pop(key, None)
+            if not tf_map:
+                ENTRY_BLOCK_OVERRIDES.get(ticker, {}).pop(timeframe, None)
+            if ticker in ENTRY_BLOCK_OVERRIDES and not ENTRY_BLOCK_OVERRIDES[ticker]:
+                ENTRY_BLOCK_OVERRIDES.pop(ticker, None)
+        else:
+            ENTRY_BLOCK_OVERRIDES.setdefault(ticker, {}).setdefault(timeframe, {})[key] = mode
+    save_entry_block()
+    return True
+
+def entry_block_overrides_copy() -> dict:
+    with _entry_block_lock:
+        return {t: {tf: dict(m) for tf, m in tfs.items()} for t, tfs in ENTRY_BLOCK_OVERRIDES.items()}
+
+def is_entry_blocked(track: str, side: str, regime: str,
+                     ticker: Optional[str] = None, timeframe: Optional[str] = None) -> bool:
     """True if opening `track`/`side` is switched off for the current regime.
-    Reads ENTRY_BLOCK at call time, so a Settings change applies on the next
+    With ticker + timeframe a per pair/timeframe override wins over the global
+    mode. Reads the dicts at call time, so a Settings change applies on the next
     scan without a restart."""
-    mode = ENTRY_BLOCK.get(f"{track}_{side}", "allow")
+    mode = entry_block_mode(f"{track}_{side}", ticker, timeframe)
     if mode == "block_all":
         return True
     return mode == "block_trend" and regime == "TREND"

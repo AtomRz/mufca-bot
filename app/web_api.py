@@ -550,6 +550,14 @@ async def get_shadow_status():
     Light — reads two small JSON-backed dicts, no exchange calls."""
     status = shadow_mod.summary()
     status["blocks"] = {k: m for k, m in _cfg.ENTRY_BLOCK.items() if m != "allow"}
+    # per pair/timeframe overrides that block something (an "allow" override
+    # only re-enables an entry, so it is not a block)
+    status["block_overrides"] = [
+        {"ticker": t, "timeframe": tf, "key": k, "mode": m}
+        for t, tfs in _cfg.entry_block_overrides_copy().items()
+        for tf, modes in tfs.items()
+        for k, m in modes.items() if m != "allow"
+    ]
     return status
 
 
@@ -1776,6 +1784,7 @@ async def get_config():
         "ai_filter": _cfg.ai_filter_settings(),
         "ai_timeout_options": list(_cfg.AI_TIMEOUT_OPTIONS),
         "entry_block": dict(_cfg.ENTRY_BLOCK),
+        "entry_block_overrides": _cfg.entry_block_overrides_copy(),
         "volume_gate": _cfg.get_volume_gate(),
         "discord_notifications_enabled": _cfg.DISCORD_NOTIFICATIONS_ENABLED,
         "shock_guard_block_entries": _cfg.SHOCK_GUARD_BLOCK_ENTRIES,
@@ -2150,24 +2159,56 @@ async def ai_stats(origin: str = "live"):
 class EntryBlockIn(BaseModel):
     key: str   # one of config.ENTRY_BLOCK_KEYS: a_long / a_short / u_long / u_short
     mode: str  # one of config.ENTRY_BLOCK_MODES: allow / block_trend / block_all
+               # (with ticker + timeframe also "inherit": drop the override)
+    ticker: Optional[str] = None     # set together with timeframe -> per pair/timeframe override
+    timeframe: Optional[str] = None
 
 
 @app.post("/api/config/entry-block")
 async def set_entry_block(body: EntryBlockIn):
     """Switches one track+side off (in TREND only, or in every regime) or back
-    on, live (no restart). Open trades are NOT touched — this only stops new
-    entries from opening. See config.ENTRY_BLOCK."""
+    on, live (no restart). Without ticker/timeframe it sets the global mode; with
+    both it sets an override for that pair and timeframe ("inherit" removes it, so
+    the global mode applies again). Open trades are NOT touched - this only stops
+    new entries from opening. See config.ENTRY_BLOCK / ENTRY_BLOCK_OVERRIDES."""
+    def _state(changed: bool):
+        return {
+            "entry_block": dict(_cfg.ENTRY_BLOCK),
+            "entry_block_overrides": _cfg.entry_block_overrides_copy(),
+            "changed": changed,
+        }
+
     if body.key not in _cfg.ENTRY_BLOCK_KEYS:
         raise HTTPException(400, f"key must be one of {list(_cfg.ENTRY_BLOCK_KEYS)}")
-    if body.mode not in _cfg.ENTRY_BLOCK_MODES:
-        raise HTTPException(400, f"mode must be one of {list(_cfg.ENTRY_BLOCK_MODES)}")
-    if body.mode == _cfg.ENTRY_BLOCK.get(body.key):
-        return {"entry_block": dict(_cfg.ENTRY_BLOCK), "changed": False}
+    if (body.ticker is None) != (body.timeframe is None):
+        raise HTTPException(400, "ticker and timeframe must be given together (or both omitted for the global switch)")
 
-    _cfg.ENTRY_BLOCK[body.key] = body.mode  # in place: is_entry_blocked() reads the same dict
-    _cfg.save_entry_block(_cfg.ENTRY_BLOCK)
-    await broadcast_event({"type": "config_changed", "key": "entry_block", "value": dict(_cfg.ENTRY_BLOCK)})
-    return {"entry_block": dict(_cfg.ENTRY_BLOCK), "changed": True}
+    if body.ticker is None:
+        if body.mode not in _cfg.ENTRY_BLOCK_MODES:
+            raise HTTPException(400, f"mode must be one of {list(_cfg.ENTRY_BLOCK_MODES)}")
+        if body.mode == _cfg.ENTRY_BLOCK.get(body.key):
+            return _state(False)
+        _cfg.ENTRY_BLOCK[body.key] = body.mode  # in place: is_entry_blocked() reads the same dict
+        _cfg.save_entry_block()
+        await broadcast_event({"type": "config_changed", "key": "entry_block", "value": dict(_cfg.ENTRY_BLOCK)})
+        return _state(True)
+
+    ticker = body.ticker.upper()
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(400, f"ticker must be one of {list(_cfg.TICKERS)}")
+    if body.timeframe not in _cfg.TIMEFRAMES:
+        raise HTTPException(400, f"timeframe must be one of {list(_cfg.TIMEFRAMES)}")
+    if body.mode != "inherit" and body.mode not in _cfg.ENTRY_BLOCK_MODES:
+        raise HTTPException(400, f"mode must be one of {list(_cfg.ENTRY_BLOCK_MODES)} or inherit")
+    try:
+        changed = _cfg.set_entry_block_override(
+            ticker, body.timeframe, body.key, None if body.mode == "inherit" else body.mode,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if changed:
+        await broadcast_event({"type": "config_changed", "key": "entry_block", "value": dict(_cfg.ENTRY_BLOCK)})
+    return _state(changed)
 
 
 class HurstBiasCorrectionIn(BaseModel):
