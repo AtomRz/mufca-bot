@@ -71,6 +71,7 @@ import shock_guard
 import shadow
 import volume_gate
 import filter_stats
+import autopsy
 from sim_pool import SimPool
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
@@ -1807,8 +1808,16 @@ def backtest_history(
     indicator_overrides: Optional[Dict[str, float]] = None,
     volume_baseline_days: Optional[float] = None,
     collect_records: bool = False,
+    collect_series: bool = False,
 ):
     """Backtest for accumulating signal history.
+
+    collect_series - trigger_table only: "__stats__" also gets "series", the per-bar
+    numpy arrays of everything the entry decision looked at (OHLC, FRAMA line and
+    direction, MFI and its rolling K-Means levels, Andean oscillator and signal, UT Bot
+    buy/sell events, Hurst, CHOP, ATR, HTF bias). run_autopsy() uses them to describe
+    what the indicators showed at a losing signal or a missed reversal. Off by default:
+    it only adds payload.
 
     collect_records - dry_run + collect_stats only, not with trigger_table: every
     entry of history["__stats__"]["trades"] also carries "ts" (the signal bar's
@@ -2604,6 +2613,21 @@ def backtest_history(
                         "eval_from_ts": int(_ts_all[min(start_idx, len(df) - 1)]),
                         "a_eval_from_ts": int(_ts_all[min(max(start_idx, _a_first), len(df) - 1)]),
                         "eval_to_ts": int(_ts_all[min(_last, len(df) - 1)]),
+                    }
+                if _trig_tbl and collect_series:
+                    def _arr(s, dt=np.float64):
+                        return np.asarray(s, dtype=dt)
+                    _stats["series"] = {
+                        "ts": _arr(df["timestamp"], np.int64),
+                        "open": _arr(df["open"]), "high": _arr(df["high"]),
+                        "low": _arr(df["low"]), "close": _arr(df["close"]),
+                        "frama": _arr(fs), "frama_dir": _arr(fdir),
+                        "mfi": _arr(mfi), "mfi_os": _arr(level_os), "mfi_ob": _arr(level_ob),
+                        "and_osc": _arr(and_osc), "and_sig": _arr(and_sig),
+                        "ut_buy": _arr(ut_buy, bool), "ut_sell": _arr(ut_sell, bool),
+                        "hurst": _arr(hurst), "chop": _arr(chop),
+                        "atr": _arr(atr14), "atr_pct": _arr(atr_pct),
+                        "htf_bias": _arr(htf_bias_arr),
                     }
                 history["__stats__"] = _stats
             return signals_found, history, bars_fetched
@@ -3907,6 +3931,94 @@ async def run_volume_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     return {"fee_pct": fee, "validate": validate, "gate_enabled": gate_enabled, "baseline_days": baseline_days,
             "bar_coverage": bar_coverage, "skipped": skipped, "results": results,
             "assignments": assignments, "meta": meta, "applied": applied}
+
+
+# ---------------------------------------------------------------------
+# Autopsy: what the indicators showed at losing signals and missed reversals
+# ---------------------------------------------------------------------
+async def run_autopsy(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      workers: Optional[int] = None, fee_pct: Optional[float] = None,
+                      pivot_atr_mult: float = 3.0) -> Dict:
+    """Measurement only - nothing is changed or applied. One trigger-table backtest per
+    (ticker, tf) with the per-bar indicator series; the pair's CURRENT filter set decides
+    which triggers count as taken signals. autopsy.analyze_pair() then describes the losing
+    signals and the missed reversals (swings of at least pivot_atr_mult x ATR).
+
+    Returns {"fee_pct", "pivot_atr_mult", "train_fraction", "bar_coverage", "skipped",
+             "results": {ticker: {tf: autopsy.analyze_pair(...)}}}
+    """
+    fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    bar_coverage: List[Dict] = []
+    skipped: List[Dict] = []
+    submitted: List[tuple] = []  # (ticker, tf, bars, future)
+    off = {k: False for k in FILTER_KEYS}  # trigger table: every raw trigger, filters replayed below
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+                except Exception as e:
+                    logger.error(f"run_autopsy: fetch error for {t} {f}: {e}")
+                    skipped.append({"ticker": t, "tf": f, "reason": f"data fetch failed: {e}"})
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    skipped.append({"ticker": t, "tf": f,
+                                    "reason": f"not enough history (got {inputs['bars_fetched']} bars)"})
+                    counters["total"] -= 1
+                    continue
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                    "filter_overrides": off, "collect_stats": True, "trigger_table": True,
+                    "collect_series": True,
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, len(inputs["df"]), fut))
+
+        outcomes = await asyncio.gather(*(item[3] for item in submitted), return_exceptions=True)
+
+    results: Dict[str, Dict] = {}
+    for (t, f, n_bars, _fut), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_autopsy: backtest error for {t} {f}: {outcome!r}")
+            skipped.append({"ticker": t, "tf": f, "reason": f"backtest failed: {outcome!r}"})
+            continue
+        _count, history, _bars = outcome
+        stats = history.pop("__stats__", None) or {}
+        series = stats.get("series")
+        triggers = stats.get("trades", [])
+        if not series:
+            skipped.append({"ticker": t, "tf": f, "reason": "backtest returned no indicator series"})
+            continue
+        flags = current_filter_flags(t, f)
+        taken = replay_filter_set(triggers, flags, f)
+        first_idx = 50
+        last_idx = n_bars - _cfg.MAX_HOLD_BARS
+        cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
+        try:
+            results.setdefault(t, {})[f] = autopsy.analyze_pair(
+                series, triggers, taken, [k for k in FILTER_KEYS if flags.get(k)], fee, cutoff,
+                atr_min=ATR_MIN, atr_max=ATR_MAX, chop_thr=CHOP_THRESHOLD.get(f, 61.8),
+                pivot_atr_mult=pivot_atr_mult)
+        except Exception as e:
+            logger.error(f"run_autopsy: analysis error for {t} {f}: {e}", exc_info=True)
+            skipped.append({"ticker": t, "tf": f, "reason": f"analysis failed: {e}"})
+    return {"fee_pct": fee, "pivot_atr_mult": pivot_atr_mult, "train_fraction": _cfg.AUTOTUNE_TRAIN_FRACTION,
+            "bar_coverage": bar_coverage, "skipped": skipped, "results": results}
 
 
 # ---------------------------------------------------------------------

@@ -53,7 +53,7 @@ from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
-    run_indicator_optimize, run_volume_autotune, FILTER_KEYS,
+    run_indicator_optimize, run_volume_autotune, run_autopsy, FILTER_KEYS,
     run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE, run_raw_outcome_fill, run_components_fill,
 )
 import filter_stats
@@ -155,6 +155,7 @@ async def help_cmd(ctx):
         "`!volume [on|off|metric <bar|smooth|thin|how>|thr <x>|days <n>|live]` — low-volume (thin-liquidity) entry gate: status, switch, default metric/threshold, baseline window, live volume values per pair",
         "`!volfit [preview|run] [pair] [tf] [bars] [metric…]` — find the volume METRIC and threshold per pair × timeframe from history (bar/smooth/thin/how compared; train/test checked; nothing proven = gate off for that pair); `!volfit show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
+        "`!autopsy [pair] [tf] [bars] [swing=N]` — what the indicators showed at LOSING signals and at MISSED reversals (swings ≥ N×ATR, default 3): which states lose more, which turns got no signal and why. Measurement only, nothing is changed",
         "`!walkfwd [pair] [tf] [bars] [folds=N]` — rolling walk-forward check of the filter tuner (several train→test folds, stability of the pick) + audit of pinned sets on the bars since they were pinned; dry-run",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
@@ -2652,6 +2653,139 @@ async def indoptim_cmd(ctx, *args):
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"indoptim command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+def _autopsy_lines(result: dict) -> list:
+    """Discord text of run_autopsy(): per pair/timeframe the trade split, the states that
+    lost more than average (✅ = in both the early and the late part of the history), the
+    missed-reversal count with reasons, and what the indicators showed at the worst cases."""
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            tr, lg = r["trades"], r["legs"]
+            lines.append(f"\n**{ticker} {tf}** — {tr['n']} signals taken ({tr['winners']} won / {tr['losers']} lost, "
+                         f"net {tr['total_net']:+.2f}%), {lg['total']} swings ≥ {lg['pivot_atr_mult']:g}×ATR: "
+                         f"{lg['caught']} caught, {lg['missed']} missed ({lg['missed_leg_pct']:.0f}% of move)")
+            if lg["reasons"]:
+                lines.append("   missed because: " + "; ".join(f"{k} ×{v}" for k, v in list(lg["reasons"].items())[:5]))
+            lf = r["loser_features"]
+            lines.append(f"   📉 states that lost more (average trade loses {lf['base_loss_rate']:.0%}; "
+                         f"{lf['n_tested']} states tested):")
+            shown = 0
+            for c in lf["candidates"]:
+                if c["lift"] <= 1.0 or c["skip_gain"] <= 0:
+                    continue
+                mark = "✅" if c["holds"] else "▫️"
+                lines.append(f"   {mark} {c['feature']}=`{c['value']}` n={c['n']} loses {c['loss_rate']:.0%} "
+                             f"(×{c['lift']:.1f}), skipping it = {c['skip_gain']:+.2f}% "
+                             f"[early {-c['early']['net']:+.1f}% n={c['early']['n']} | late {-c['late']['net']:+.1f}% n={c['late']['n']}]")
+                shown += 1
+                if shown >= 4:
+                    break
+            if not shown:
+                lines.append("   nothing stands out")
+            mf = r["missed_features"]
+            lines.append(f"   🔄 states over-represented at MISSED reversals (base {mf['base_missed_share']:.0%} missed):")
+            shown = 0
+            for c in mf["candidates"]:
+                if c["lift"] <= 1.0:
+                    continue
+                mark = "✅" if c["holds"] else "▫️"
+                lines.append(f"   {mark} {c['feature']}=`{c['value']}` {c['missed']}/{c['n']} missed (×{c['lift']:.1f}, {c['missed_leg_pct']:.0f}% of move)")
+                shown += 1
+                if shown >= 4:
+                    break
+            if not shown:
+                lines.append("   nothing stands out")
+            ex = r["examples"]
+            if ex["worst_trades"]:
+                w = ex["worst_trades"][0]
+                lines.append(f"   worst signal: {w['ts']} {w['track'].upper()}-{w['side']} {w['net']:+.2f}% — "
+                             + ", ".join(f"{k} {v}" for k, v in w["snap"].items() if v != "na"))
+            if ex["biggest_missed"]:
+                m = ex["biggest_missed"][0]
+                why = "no trigger" if m["status"] == "none" else "track busy" if m["status"] == "busy" else "filter " + "+".join(m["blockers"])
+                lines.append(f"   biggest miss: {m['ts']} {m['side']} {m['leg_pct']:.1f}% over {m['bars']} bars ({why}) — "
+                             + ", ".join(f"{k} {v}" for k, v in m["snap"].items() if v != "na"))
+    return lines
+
+
+@core.bot.command(name="autopsy", aliases=["postmortem"])
+async def autopsy_cmd(ctx, *args):
+    """
+    Signal autopsy - MEASUREMENT ONLY, nothing is changed. For each pair/timeframe it
+    replays the history with the pair's current filter set and answers two questions:
+
+      1. LOSING signals - what did FRAMA / MFI / Andean / UT Bot / Hurst / CHOP / regime / HTF
+         show on the signal bar, and which states lose more often than the average trade?
+      2. MISSED reversals - for every swing of at least N x ATR, did a signal catch its
+         start? If not: no trigger fired, a filter rejected it, or the track was busy - and
+         what did the indicators show a couple of bars after the turn?
+
+    A state marked ✅ lost money in BOTH the oldest 60% and the newest 40% of the history.
+    Dozens of states are tested, so some look good by chance - treat ✅ as a candidate to
+    forward-test, not a finding.
+
+    Usage: !autopsy [pair] [tf] [bars] [swing=N]
+      !autopsy ETH/USDT 4h 9900   - one pair/timeframe, long history
+      !autopsy swing=2            - smaller swings count as reversals (default 3 x ATR)
+    Shares the one-at-a-time simulation slot with !tp1sim / !compsim / !filtersim / !indoptim.
+    """
+    ticker = tf = ""
+    num_bars = 3000
+    swing = 3.0
+    for a in args:
+        if a.lower().startswith("swing="):
+            try:
+                swing = float(a.split("=", 1)[1])
+            except ValueError:
+                swing = 0.0
+            if not (1.0 <= swing <= 10.0):
+                await ctx.send(f"❌ `{a}` — use `swing=<1..10>` (swing size in ATRs).")
+                return
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe, bar count or `swing=N`.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        result = await _run_sim_job(
+            ctx, "autopsy", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "swing": swing},
+            lambda progress: run_autopsy(exchange, scope_tickers, scope_tfs, num_bars, progress=progress,
+                                         pivot_atr_mult=swing),
+            intro=(f"⏳ Autopsy: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars, swings ≥ {swing:g}×ATR "
+                   f"(measurement only, nothing is changed)."),
+        )
+        if result is None:
+            return
+        head = [f"**🔬 Signal autopsy** — net of {result['fee_pct']}% fee per trade, early window = oldest "
+                f"{result['train_fraction']:.0%} of the bars, late = the rest"]
+        for c in result["bar_coverage"]:
+            if c["got"] < c["requested"]:
+                head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
+        lines = head + _autopsy_lines(result)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above.")
+        lines.append("\nNothing was applied. ✅ = the state lost money (or was over-represented among missed turns) in both "
+                     "windows; many states are tested, so expect some to look good by chance — forward-test before acting.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"autopsy command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 
