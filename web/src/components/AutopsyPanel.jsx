@@ -52,7 +52,7 @@ function MissedTable({ mf }) {
       {rows.length === 0 ? <div style={faint}>nothing stands out</div> : (
         <table style={{ borderCollapse: 'collapse', marginTop: 2 }}>
           <thead>
-            <tr><th style={th}></th><th style={th}>state</th><th style={th}>missed / all</th><th style={th}>lift</th><th style={th}>move missed</th></tr>
+            <tr><th style={th}></th><th style={th}>state</th><th style={th}>missed / all</th><th style={th}>lift</th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -61,12 +61,47 @@ function MissedTable({ mf }) {
                 <td style={td}>{c.feature} = <b>{c.value}</b></td>
                 <td style={td}>{c.missed} / {c.n}</td>
                 <td style={td}>×{c.lift.toFixed(1)}</td>
-                <td style={td}>{c.missed_leg_pct.toFixed(0)}%</td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+    </div>
+  )
+}
+
+const VERDICT = {
+  off_helps: '✅ off would help in both windows',
+  keeps_value: '🛡️ earns its keep (worse off in both)',
+  mixed: '▫️ windows disagree',
+  no_effect: '— no effect',
+}
+
+// "What if ONE filter were off": the same triggers replayed with that filter alone disabled.
+function FilterTable({ rows }) {
+  if (!rows || rows.length === 0) return null
+  const signed = (v, d = 1) => `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div>🎚️ What if one filter were off <span style={faint}>(same triggers, one position at a time, net of fee)</span></div>
+      <table style={{ borderCollapse: 'collapse', marginTop: 2 }}>
+        <thead>
+          <tr><th style={th}>filter</th><th style={th}>trades</th><th style={th}>net change</th>
+            <th style={th}>early</th><th style={th}>late</th><th style={th}></th></tr>
+        </thead>
+        <tbody>
+          {rows.map((c) => (
+            <tr key={c.filter}>
+              <td style={td}><b>{c.filter}</b></td>
+              <td style={td}>{c.extra_trades >= 0 ? '+' : ''}{c.extra_trades}</td>
+              <td style={td}>{signed(c.delta)}</td>
+              <td style={td}>{signed(c.early.delta)} ({c.early.extra >= 0 ? '+' : ''}{c.early.extra})</td>
+              <td style={td}>{signed(c.late.delta)} ({c.late.extra >= 0 ? '+' : ''}{c.late.extra})</td>
+              <td style={td}>{VERDICT[c.verdict]}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -89,11 +124,17 @@ function ResultRows({ result }) {
             <div style={{ fontWeight: 600 }}>{ticker} {tf}</div>
             <div style={faint}>
               {trades.n} signals taken ({trades.winners} won / {trades.losers} lost, net {pct(trades.total_net)}) ·{' '}
-              {legs.total} swings ≥ {legs.pivot_atr_mult}×ATR: {legs.caught} caught, {legs.missed} missed ({legs.missed_leg_pct.toFixed(0)}% of the move)
+              {legs.total} swings ≥ {legs.pivot_atr_mult}×ATR: {legs.caught} caught, {legs.missed} missed
               {reasons.length > 0 && <><br />missed because: {reasons.map(([k, v]) => `${k} ×${v}`).join('; ')}</>}
             </div>
+            <FilterTable rows={r.filter_cf} />
             <LoserTable lf={r.loser_features} />
             <MissedTable mf={r.missed_features} />
+            {r.skipped_features?.length > 0 && (
+              <div style={{ marginTop: 4, ...faint }}>
+                not tested (an enabled filter already decides them): {r.skipped_features.join(', ')}
+              </div>
+            )}
             {(worst || miss) && (
               <div style={{ marginTop: 6, ...faint }}>
                 {worst && <div>worst signal: {worst.ts} {worst.track.toUpperCase()}-{worst.side} {pct(worst.net)} — {snapText(worst.snap)}</div>}
@@ -131,7 +172,8 @@ export default function AutopsyPanel({ config }) {
         regime / HTF showed (1) on the signals that lost, and (2) at reversals that no signal caught — swings of at least
         the chosen number of ATRs — and why they were missed (no trigger, a filter, or the track was busy). A state marked
         ✅ lost money (or was over-represented among missed turns) in BOTH the older 60% and the newest 40% of the history.
-        Measurement only: nothing is applied.
+        It also replays the same triggers with each enabled filter switched off on its own, to show what that filter costs
+        or saves. Measurement only: nothing is applied.
       </p>
       <SimScopeFields
         pairs={config.pairs} timeframes={config.timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}

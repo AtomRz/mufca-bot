@@ -4013,7 +4013,8 @@ async def run_autopsy(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str
             results.setdefault(t, {})[f] = autopsy.analyze_pair(
                 series, triggers, taken, [k for k in FILTER_KEYS if flags.get(k)], fee, cutoff,
                 atr_min=ATR_MIN, atr_max=ATR_MAX, chop_thr=CHOP_THRESHOLD.get(f, 61.8),
-                pivot_atr_mult=pivot_atr_mult)
+                pivot_atr_mult=pivot_atr_mult, flags=flags,
+                replay=lambda fl, _trig=triggers, _tf=f: replay_filter_set(_trig, fl, _tf))
         except Exception as e:
             logger.error(f"run_autopsy: analysis error for {t} {f}: {e}", exc_info=True)
             skipped.append({"ticker": t, "tf": f, "reason": f"analysis failed: {e}"})

@@ -2666,9 +2666,19 @@ def _autopsy_lines(result: dict) -> list:
             tr, lg = r["trades"], r["legs"]
             lines.append(f"\n**{ticker} {tf}** — {tr['n']} signals taken ({tr['winners']} won / {tr['losers']} lost, "
                          f"net {tr['total_net']:+.2f}%), {lg['total']} swings ≥ {lg['pivot_atr_mult']:g}×ATR: "
-                         f"{lg['caught']} caught, {lg['missed']} missed ({lg['missed_leg_pct']:.0f}% of move)")
+                         f"{lg['caught']} caught, {lg['missed']} missed")
             if lg["reasons"]:
                 lines.append("   missed because: " + "; ".join(f"{k} ×{v}" for k, v in list(lg["reasons"].items())[:5]))
+            if r.get("filter_cf"):
+                lines.append("   🎚️ what if ONE filter were off (same triggers, one position at a time; net of fee):")
+                verdict = {"off_helps": "✅ off would help in both windows", "keeps_value": "🛡️ earns its keep (worse off in both)",
+                           "mixed": "▫️ windows disagree", "no_effect": "— no effect"}
+                for c in r["filter_cf"]:
+                    lines.append(f"   `{c['filter']}` off: {c['extra_trades']:+d} trades, net {c['delta']:+.1f}% "
+                                 f"[early {c['early']['delta']:+.1f}% ({c['early']['extra']:+d}) | "
+                                 f"late {c['late']['delta']:+.1f}% ({c['late']['extra']:+d})] {verdict[c['verdict']]}")
+            if r.get("skipped_features"):
+                lines.append("   (not tested, an enabled filter already decides them: " + ", ".join(r["skipped_features"]) + ")")
             lf = r["loser_features"]
             lines.append(f"   📉 states that lost more (average trade loses {lf['base_loss_rate']:.0%}; "
                          f"{lf['n_tested']} states tested):")
@@ -2692,7 +2702,7 @@ def _autopsy_lines(result: dict) -> list:
                 if c["lift"] <= 1.0:
                     continue
                 mark = "✅" if c["holds"] else "▫️"
-                lines.append(f"   {mark} {c['feature']}=`{c['value']}` {c['missed']}/{c['n']} missed (×{c['lift']:.1f}, {c['missed_leg_pct']:.0f}% of move)")
+                lines.append(f"   {mark} {c['feature']}=`{c['value']}` {c['missed']}/{c['n']} missed (×{c['lift']:.1f})")
                 shown += 1
                 if shown >= 4:
                     break

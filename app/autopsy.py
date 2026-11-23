@@ -246,7 +246,22 @@ def _win(rows: List[Dict], key: str = "net") -> Tuple[int, float]:
     return len(rows), round(sum(r[key] for r in rows), 4)
 
 
-def loser_feature_table(rows: List[Dict], cutoff_idx: int, min_n: int = 8, min_split: int = 4) -> Dict:
+# An enabled filter already decides its own feature: every taken trade passed it (so the
+# losers table would only ever see the passing value) and every trigger it rejected is
+# "missed because of it" by construction (so the missed table would just echo the filter).
+# Those features are left out of both tables while the filter is on.
+FILTER_FEATURE = {
+    "frama": "frama_dir", "slope": "frama_slope", "chop": "chop", "htf": "htf", "hurst": "hurst", "atr": "regime",
+}
+
+
+def features_to_test(enabled_filters: List[str]) -> Tuple[str, ...]:
+    skip = {FILTER_FEATURE[f] for f in enabled_filters if f in FILTER_FEATURE}
+    return tuple(f for f in FEATURES if f not in skip)
+
+
+def loser_feature_table(rows: List[Dict], cutoff_idx: int, min_n: int = 8, min_split: int = 4,
+                        features: Tuple[str, ...] = FEATURES) -> Dict:
     """`rows`: one per taken trade {"idx", "net", "snap": {feature: value}}.
     For every (feature, value) seen at least `min_n` times: how often it lost against the
     overall loss rate, and what skipping that state would have changed - on the early
@@ -258,7 +273,7 @@ def loser_feature_table(rows: List[Dict], cutoff_idx: int, min_n: int = 8, min_s
     base = sum(1 for r in rows if r["net"] < 0) / n
     cands: List[Dict] = []
     tested = 0
-    for f in FEATURES:
+    for f in features:
         values = sorted({r["snap"].get(f, "na") for r in rows})
         for v in values:
             if v == "na":
@@ -327,7 +342,8 @@ def classify_legs(legs: List[Dict], taken: List[Dict], triggers: List[Dict], ena
     return out
 
 
-def missed_feature_table(legs: List[Dict], cutoff_idx: int, min_n: int = 8, min_split: int = 3) -> Dict:
+def missed_feature_table(legs: List[Dict], cutoff_idx: int, min_n: int = 8, min_split: int = 3,
+                         features: Tuple[str, ...] = FEATURES) -> Dict:
     """`legs`: classified legs with "snap" (indicator state SNAP_LAG bars after the turn).
     For every (feature, value): how many turns were caught vs missed, and the missed share
     against the overall missed share. `holds` = over-represented among the missed turns in
@@ -343,7 +359,7 @@ def missed_feature_table(legs: List[Dict], cutoff_idx: int, min_n: int = 8, min_
 
     cands: List[Dict] = []
     tested = 0
-    for f in FEATURES:
+    for f in features:
         for v in sorted({g["snap"].get(f, "na") for g in legs}):
             if v == "na":
                 continue
@@ -370,6 +386,51 @@ def missed_feature_table(legs: List[Dict], cutoff_idx: int, min_n: int = 8, min_
 
 
 # ---------------------------------------------------------------------------
+# What would switching one filter off have done?
+# ---------------------------------------------------------------------------
+def _summary(rows: List[Dict], fee_pct: float, cutoff_idx: int) -> Dict:
+    early = [r for r in rows if int(r["idx"]) < cutoff_idx]
+    late = [r for r in rows if int(r["idx"]) >= cutoff_idx]
+    net = lambda rs: sum(_net(r, fee_pct) for r in rs)  # noqa: E731
+    return {"n": len(rows), "net": net(rows), "early_n": len(early), "early_net": net(early),
+            "late_n": len(late), "late_net": net(late)}
+
+
+def filter_counterfactuals(flags: Dict[str, bool], enabled_filters: List[str], replay, base_rows: List[Dict],
+                           fee_pct: float, cutoff_idx: int) -> List[Dict]:
+    """For every enabled filter: replay the same triggers with ONLY that filter off
+    (`replay(flags) -> taken rows`, the one-position-at-a-time rule included, so a newly
+    allowed trade can displace a later one) and report the change against the current set -
+    in trades and in net PnL, early and late window separately.
+
+    verdict: "off_helps"   - switching it off would have made more in BOTH windows,
+             "keeps_value" - it would have made less in BOTH windows (the filter earns its keep),
+             "mixed"       - the two windows disagree, "no_effect" - no trade changes."""
+    base = _summary(base_rows, fee_pct, cutoff_idx)
+    out: List[Dict] = []
+    for f in enabled_filters:
+        alt = _summary(replay({**flags, f: False}), fee_pct, cutoff_idx)
+        d_early, d_late = alt["early_net"] - base["early_net"], alt["late_net"] - base["late_net"]
+        if alt["n"] == base["n"] and abs(alt["net"] - base["net"]) < 1e-9:
+            verdict = "no_effect"
+        elif d_early > 0 and d_late > 0:
+            verdict = "off_helps"
+        elif d_early < 0 and d_late < 0:
+            verdict = "keeps_value"
+        else:
+            verdict = "mixed"
+        out.append({
+            "filter": f, "extra_trades": alt["n"] - base["n"], "net_off": round(alt["net"], 3),
+            "delta": round(alt["net"] - base["net"], 3),
+            "early": {"extra": alt["early_n"] - base["early_n"], "delta": round(d_early, 3)},
+            "late": {"extra": alt["late_n"] - base["late_n"], "delta": round(d_late, 3)},
+            "verdict": verdict,
+        })
+    out.sort(key=lambda c: -c["delta"])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # One pair / timeframe
 # ---------------------------------------------------------------------------
 def _ts_str(ms) -> str:
@@ -381,9 +442,13 @@ def _ts_str(ms) -> str:
 
 def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filters: List[str],
                  fee_pct: float, cutoff_idx: int, atr_min: float, atr_max: float, chop_thr: float,
-                 pivot_atr_mult: float = 3.0, top: int = 8, examples: int = 5) -> Dict:
+                 pivot_atr_mult: float = 3.0, top: int = 8, examples: int = 5,
+                 flags: Optional[Dict[str, bool]] = None, replay=None) -> Dict:
     """The full autopsy of one pair/timeframe. `S` = per-bar series, `triggers` = every raw
-    trigger of the trigger-table backtest, `taken` = the subset the live filter set takes."""
+    trigger of the trigger-table backtest, `taken` = the subset the live filter set takes.
+    `flags` + `replay` (flags -> taken rows) enable the per-filter "what if it were off"
+    table; without them that table is empty."""
+    feats = features_to_test(enabled_filters)
     # ---- losing / winning signals
     rows = []
     for t in taken:
@@ -395,7 +460,7 @@ def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filte
             "snap": snapshot(S, i, side, atr_min, atr_max, chop_thr),
         })
     n_loss = sum(1 for r in rows if r["net"] < 0)
-    losers_tbl = loser_feature_table(rows, cutoff_idx)
+    losers_tbl = loser_feature_table(rows, cutoff_idx, features=feats)
     worst = sorted(rows, key=lambda r: r["net"])[:examples]
 
     # ---- missed reversals
@@ -409,7 +474,9 @@ def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filte
         key = "no trigger" if g["status"] == "none" else "track busy" if g["status"] == "busy" else (
             "filter: " + "+".join(g["blockers"]))
         reasons[key] = reasons.get(key, 0) + 1
-    missed_tbl = missed_feature_table(legs, cutoff_idx)
+    missed_tbl = missed_feature_table(legs, cutoff_idx, features=feats)
+    filter_cf = (filter_counterfactuals(flags, enabled_filters, replay, taken, fee_pct, cutoff_idx)
+                 if flags is not None and replay is not None else [])
     biggest = sorted(missed, key=lambda g: -g["leg_pct"])[:examples]
 
     return {
@@ -422,9 +489,10 @@ def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filte
         "legs": {
             "pivot_atr_mult": pivot_atr_mult, "total": len(legs),
             "caught": len(legs) - len(missed), "missed": len(missed),
-            "missed_leg_pct": round(sum(g["leg_pct"] for g in missed), 2),
             "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         },
+        "filter_cf": filter_cf,
+        "skipped_features": sorted(set(FEATURES) - set(feats)),
         "loser_features": {**losers_tbl, "candidates": losers_tbl["candidates"][:top]},
         "missed_features": {**missed_tbl, "candidates": missed_tbl["candidates"][:top]},
         "examples": {
