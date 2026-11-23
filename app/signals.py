@@ -1405,7 +1405,8 @@ async def check_signals(
             sig_a_long = sig_a_short = sig_u_long = sig_u_short = False
 
         # 🆕 Per-track/side entry switches (Settings → "Entry switches", see
-        # ENTRY_BLOCK in config.py). Applied BEFORE the in_long/in_short flags
+        # ENTRY_BLOCK in config.py; a per pair/timeframe override wins over the
+        # global mode). Applied BEFORE the in_long/in_short flags
         # are set below, so a blocked signal leaves no state behind.
         # A-track confirmations stay True for the whole closed bar, so the
         # attempt-bar mark (same one open_position's caller sets) keeps the
@@ -1416,23 +1417,23 @@ async def check_signals(
         # run through open_position as a dry run and stored as a shadow
         # record (shadow.py) so its outcome can still be measured.
         _entry_blocked: List[Tuple[str, str]] = []
-        if sig_a_long and _cfg.is_entry_blocked("a", "long", regime):
+        if sig_a_long and _cfg.is_entry_blocked("a", "long", regime, ticker, timeframe):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-LONG skipped — switched off for regime={regime}")
             sig_a_long = False
             _entry_blocked.append(("a", "long"))
             if not dry_run:
                 state["last_a_long_attempt_bar"] = bar_time
-        if sig_a_short and _cfg.is_entry_blocked("a", "short", regime):
+        if sig_a_short and _cfg.is_entry_blocked("a", "short", regime, ticker, timeframe):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} A-SHORT skipped — switched off for regime={regime}")
             sig_a_short = False
             _entry_blocked.append(("a", "short"))
             if not dry_run:
                 state["last_a_short_attempt_bar"] = bar_time
-        if sig_u_long and _cfg.is_entry_blocked("u", "long", regime):
+        if sig_u_long and _cfg.is_entry_blocked("u", "long", regime, ticker, timeframe):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-LONG skipped — switched off for regime={regime}")
             sig_u_long = False
             _entry_blocked.append(("u", "long"))
-        if sig_u_short and _cfg.is_entry_blocked("u", "short", regime):
+        if sig_u_short and _cfg.is_entry_blocked("u", "short", regime, ticker, timeframe):
             logger.info(f"[ENTRY_BLOCK] {ticker} {timeframe} U-SHORT skipped — switched off for regime={regime}")
             sig_u_short = False
             _entry_blocked.append(("u", "short"))

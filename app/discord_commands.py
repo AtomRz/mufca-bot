@@ -151,6 +151,7 @@ async def help_cmd(ctx):
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!smcsim [pair] [tf] [bars]` — Smart Money Concepts event study (sweeps, BOS/CHoCH, FVG, sweep→shift) vs. any-bar baseline on real history; research only, trades nothing",
         "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
+        "`!entry [<key> <mode>] [<pair> <tf> <key> <mode|inherit>]` — Entry switches (a_long / a_short / u_long / u_short; mode allow|trend|all): show, set the global one, or override it for one pair + timeframe",
         "`!volume [on|off|metric <bar|smooth|thin|how>|thr <x>|days <n>|live]` — low-volume (thin-liquidity) entry gate: status, switch, default metric/threshold, baseline window, live volume values per pair",
         "`!volfit [preview|run] [pair] [tf] [bars] [metric…]` — find the volume METRIC and threshold per pair × timeframe from history (bar/smooth/thin/how compared; train/test checked; nothing proven = gate off for that pair); `!volfit show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
@@ -2234,6 +2235,92 @@ def _volume_status_lines() -> list:
     else:
         lines.append("no pinned rules — every pair/timeframe uses the default (`!volfit` finds them from history)")
     return lines
+
+
+_ENTRY_MODE_ALIASES = {
+    "allow": "allow", "on": "allow",
+    "trend": "block_trend", "block_trend": "block_trend",
+    "all": "block_all", "off": "block_all", "block_all": "block_all",
+}
+_ENTRY_MODE_LABEL = {"allow": "On", "block_trend": "Off in TREND", "block_all": "Off (all regimes)"}
+
+
+def _entry_status_lines() -> list:
+    lines = ["**Entry switches**"]
+    for k in _cfg.ENTRY_BLOCK_KEYS:
+        lines.append(f"`{k}` — {_ENTRY_MODE_LABEL[_cfg.ENTRY_BLOCK.get(k, 'allow')]}")
+    over = _cfg.entry_block_overrides_copy()
+    rows = [
+        f"`{t}` `{tf}` `{k}` — {_ENTRY_MODE_LABEL[m]}"
+        for t in sorted(over) for tf in sorted(over[t]) for k, m in sorted(over[t][tf].items())
+    ]
+    lines.append("")
+    lines.append("**Per pair / timeframe overrides** (win over the global mode)" if rows else "No per pair / timeframe overrides.")
+    lines.extend(rows)
+    return lines
+
+
+@core.bot.command(name="entry", aliases=["entryblock"])
+async def entry_cmd(ctx, *args):
+    """
+    Entry switches: stop NEW entries of one track+side (open trades are not touched).
+    Keys: a_long a_short u_long u_short.  Modes: allow (on) | trend (off in TREND) | all (off).
+
+      !entry                                   - show global switches and overrides
+      !entry u_long trend                      - global switch
+      !entry ETH/USDT 4h u_long allow          - override for ETH/USDT on 4h only
+      !entry BTC 1h u_long trend               - override (pair without /USDT = /USDT)
+      !entry ETH/USDT 4h u_long inherit        - remove that override (global applies again)
+    An override wins over the global mode for that pair + timeframe, including `allow`.
+    Blocked signals are still tracked as shadow records.
+    """
+    try:
+        if not args:
+            await _send_long(ctx, "\n".join(_entry_status_lines()))
+            return
+
+        if len(args) == 2:
+            key, mode_in = args[0].lower(), args[1].lower()
+            mode = _ENTRY_MODE_ALIASES.get(mode_in)
+            if key not in _cfg.ENTRY_BLOCK_KEYS or mode is None:
+                await ctx.send("❌ Usage: `!entry <a_long|a_short|u_long|u_short> <allow|trend|all>`")
+                return
+            _cfg.ENTRY_BLOCK[key] = mode
+            _cfg.save_entry_block()
+            await ctx.send(f"✅ Global `{key}` → **{_ENTRY_MODE_LABEL[mode]}**\n" + "\n".join(_entry_status_lines()))
+            return
+
+        if len(args) == 4:
+            ticker = args[0].upper()
+            if "/" not in ticker:
+                ticker += "/USDT"
+            tf, key, mode_in = args[1].lower(), args[2].lower(), args[3].lower()
+            if ticker not in TICKERS:
+                await ctx.send(f"❌ `{ticker}` is not tracked. Tracked: {', '.join(TICKERS)}")
+                return
+            if tf not in TIMEFRAMES:
+                await ctx.send(f"❌ Timeframe must be one of: {', '.join(TIMEFRAMES)}")
+                return
+            if key not in _cfg.ENTRY_BLOCK_KEYS:
+                await ctx.send(f"❌ Key must be one of: {', '.join(_cfg.ENTRY_BLOCK_KEYS)}")
+                return
+            if mode_in in ("inherit", "global", "clear", "reset"):
+                mode = None
+            else:
+                mode = _ENTRY_MODE_ALIASES.get(mode_in)
+                if mode is None:
+                    await ctx.send("❌ Mode must be allow | trend | all | inherit")
+                    return
+            _cfg.set_entry_block_override(ticker, tf, key, mode)
+            what = "override removed (global applies)" if mode is None else f"**{_ENTRY_MODE_LABEL[mode]}**"
+            await ctx.send(f"✅ `{ticker}` `{tf}` `{key}` → {what}\n" + "\n".join(_entry_status_lines()))
+            return
+
+        await ctx.send("❌ Usage: `!entry`, `!entry <key> <mode>` or `!entry <pair> <tf> <key> <mode|inherit>`")
+    except Exception as e:
+        logger.error(f"Entry command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
 
 
 @core.bot.command(name="volume", aliases=["volgate"])

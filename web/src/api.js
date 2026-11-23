@@ -112,8 +112,12 @@ export const api = {
   getAiStats: (origin = 'live') => request(`/api/ai/stats?origin=${origin}`),
   setAiFilter: (changes) =>
     request('/api/config/ai-filter', { method: 'POST', body: JSON.stringify(changes) }),
-  setEntryBlock: (key, mode) =>
-    request('/api/config/entry-block', { method: 'POST', body: JSON.stringify({ key, mode }) }),
+  // ticker + timeframe given -> per pair/timeframe override (mode 'inherit' removes it)
+  setEntryBlock: (key, mode, ticker, timeframe) =>
+    request('/api/config/entry-block', {
+      method: 'POST',
+      body: JSON.stringify(ticker && timeframe ? { key, mode, ticker, timeframe } : { key, mode }),
+    }),
   setHurstBiasCorrection: (enabled) =>
     request('/api/config/hurst-bias-correction', { method: 'POST', body: JSON.stringify({ enabled }) }),
   setDiscordNotifications: (enabled) =>

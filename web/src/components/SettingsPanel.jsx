@@ -96,6 +96,57 @@ function PushPanel({ busy, run }) {
   )
 }
 
+// 🆕 Per pair + timeframe overrides of the Entry switches above. "Same as global"
+// = no override (the global select applies); any other choice is an explicit
+// mode for that pair and timeframe and wins over the global one — including
+// "On", which re-enables an entry the global switch turned off.
+function EntryOverrides({ config, busy, run }) {
+  const pairs = config.pairs || []
+  const tfs = config.timeframes || []
+  const overrides = config.entry_block_overrides || {}
+  if (pairs.length === 0 || tfs.length === 0) return null
+  const count = Object.values(overrides).reduce(
+    (n, byTf) => n + Object.values(byTf).reduce((m, modes) => m + Object.keys(modes).length, 0), 0,
+  )
+  return (
+    <details style={{ margin: '8px 0' }} open={count > 0}>
+      <summary style={{ cursor: 'pointer', fontSize: 13 }}>
+        Entry switches per pair / timeframe{count > 0 ? ` (${count} override${count > 1 ? 's' : ''})` : ''}
+      </summary>
+      <p style={{ fontSize: 11, color: 'var(--text-dim)', margin: '6px 0' }}>
+        "Same as global" uses the switch above. Anything else wins over it for that pair and timeframe
+        (so "On" re-enables an entry the global switch turned off).
+      </p>
+      {pairs.map((ticker) =>
+        tfs.map((tf) => (
+          <div key={`${ticker}-${tf}`} style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{ticker} · {tf}</div>
+            {ENTRY_SWITCHES.map(({ key, label }) => {
+              const cur = overrides[ticker]?.[tf]?.[key] ?? 'inherit'
+              const busyKey = `entry_block_${ticker}_${tf}_${key}`
+              return (
+                <div className="field" key={key}>
+                  <label>{label}</label>
+                  <select
+                    value={cur}
+                    disabled={busy === busyKey}
+                    onChange={(e) => run(busyKey, () => api.setEntryBlock(key, e.target.value, ticker, tf))}
+                  >
+                    <option value="inherit">Same as global</option>
+                    <option value="allow">On</option>
+                    <option value="block_trend">Off in TREND</option>
+                    <option value="block_all">Off (all regimes)</option>
+                  </select>
+                </div>
+              )
+            })}
+          </div>
+        )),
+      )}
+    </details>
+  )
+}
+
 // Numeric field, saved on blur — shared pattern for every indicator parameter
 function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, onSave }) {
   const [warn, setWarn] = useState(null)
@@ -289,6 +340,11 @@ export default function SettingsPanel({ config, onChanged }) {
                 </select>
               </div>
             ))}
+            <EntryOverrides
+              config={config}
+              busy={busy}
+              run={run}
+            />
             <div className="field">
               <label title="How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard's live numbers are.">Scan interval</label>
               <select

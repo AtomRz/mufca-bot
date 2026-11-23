@@ -48,18 +48,22 @@ export default function ShadowLamp({ shadow, onClick }) {
 
   if (!shadow) return null
   const blocks = Object.entries(shadow.blocks || {})
-  if (blocks.length === 0 && total === 0) return null
+  const overrideBlocks = shadow.block_overrides || []
+  if (blocks.length === 0 && overrideBlocks.length === 0 && total === 0) return null
 
-  const active = blocks.length > 0
+  const active = blocks.length > 0 || overrideBlocks.length > 0
   const color = active ? 'var(--accent)' : 'var(--text-dim)'
   const glow = active && shadow.open > 0
 
   const lines = []
   lines.push(
     active
-      ? `Entry switches active: ${blocks.map(([k, m]) => `${KEY_LABEL[k] || k} ${MODE_LABEL[m] || m}`).join(', ')}`
+      ? `Entry switches active: ${blocks.length ? blocks.map(([k, m]) => `${KEY_LABEL[k] || k} ${MODE_LABEL[m] || m}`).join(', ') : 'none global'}`
       : 'No Entry switch active right now (earlier shadow records are kept)',
   )
+  overrideBlocks.forEach((o) => {
+    lines.push(`  ${o.ticker} ${o.timeframe}: ${KEY_LABEL[o.key] || o.key} ${MODE_LABEL[o.mode] || o.mode}`)
+  })
   if (total === 0) {
     lines.push('No blocked signal recorded yet — waiting for the first one')
   } else {
