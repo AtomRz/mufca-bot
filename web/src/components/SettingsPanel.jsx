@@ -1,10 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
-import AutoFilterPanel from './AutoFilterPanel'
-import VolumeGatePanel from './VolumeGatePanel'
-import IndicatorOptimizerPanel from './IndicatorOptimizerPanel'
-import AutopsyPanel from './AutopsyPanel'
-import WalkForwardPanel from './WalkForwardPanel'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
@@ -472,15 +467,10 @@ export default function SettingsPanel({ config, onChanged }) {
             </p>
           </div>
 
-          <AutoFilterPanel config={config} onChanged={onChanged} />
-
-          <VolumeGatePanel config={config} onChanged={onChanged} />
-
-          <IndicatorOptimizerPanel config={config} />
-
-          <AutopsyPanel config={config} />
-
-          <WalkForwardPanel config={config} />
+          <p style={{ fontSize: 11, color: 'var(--text-faint)', margin: '0 0 12px' }}>
+            Auto-tune filters, the low-volume gate, the indicator optimizer, the autopsy and the walk-forward check
+            moved to the Lab tab.
+          </p>
 
           <div className="panel">
             <h3 className="panel-title">CHOP Threshold</h3>
