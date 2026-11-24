@@ -32,7 +32,7 @@ function LoserTable({ lf }) {
                 <td style={td}>{c.holds ? '✅' : '▫️'}</td>
                 <td style={td}>{c.feature} = <b>{c.value}</b></td>
                 <td style={td}>{c.n}</td>
-                <td style={td}>{share(c.loss_rate)} (×{c.lift.toFixed(1)})</td>
+                <td style={td}>{share(c.loss_rate)} (×{c.lift.toFixed(1)}, z={c.z.toFixed(1)})</td>
                 <td style={td}>{pct(c.skip_gain)}</td>
                 <td style={td}>{pct(-c.early.net)} n={c.early.n} / {pct(-c.late.net)} n={c.late.n}</td>
               </tr>
@@ -60,7 +60,7 @@ function MissedTable({ mf }) {
                 <td style={td}>{c.holds ? '✅' : '▫️'}</td>
                 <td style={td}>{c.feature} = <b>{c.value}</b></td>
                 <td style={td}>{c.missed} / {c.n}</td>
-                <td style={td}>×{c.lift.toFixed(1)}</td>
+                <td style={td}>×{c.lift.toFixed(1)} (z={c.z.toFixed(1)})</td>
               </tr>
             ))}
           </tbody>
@@ -106,6 +106,61 @@ function FilterTable({ rows }) {
   )
 }
 
+const signedPct = (v, d = 1) => `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`
+
+// How the taken trades ended: exit mix, the pure losers (stopped before TP1), the winners' dips and
+// the tighter-stop what-if. Everything here is measured from the history, nothing is applied.
+function ExitBlock({ ex }) {
+  if (!ex) return null
+  if (!ex.available) return <div style={{ marginTop: 6, ...faint }}>🚪 exits: not available (re-run with the current version)</div>
+  const nv = ex.never_tp1
+  const h = ex.winners_heat
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div>🚪 How the trades ended <span style={faint}>(net of fee)</span></div>
+      <div style={faint}>
+        {Object.entries(ex.mix).filter(([, v]) => v.n > 0).map(([k, v]) => `${k} ×${v.n} (${signedPct(v.net)})`).join(' · ')}
+      </div>
+      {nv.n > 0 && (
+        <div style={{ marginTop: 4 }}>
+          ❌ Stopped before TP1: <b>{nv.n}</b> ({share(nv.share_of_trades)} of trades, net {signedPct(nv.net)}, avg stop {nv.avg_sl_pct.toFixed(2)}%)
+          <div style={faint}>
+            median {nv.median_bars} bars; stopped within {nv.fast_stop.bars} bars: {share(nv.fast_stop.share)}<br />
+            how far they got toward TP1: {Object.entries(nv.progress_to_tp1).map(([k, v]) => `${k} ×${v}`).join(', ')}
+            {' '}— at least half way: {share(nv.near_miss.share)} (early {share(nv.near_miss.by_window.early)} | late {share(nv.near_miss.by_window.late)})<br />
+            price reached TP1 after the stop: {share(nv.shakeout_tp1.share)} (early {share(nv.shakeout_tp1.by_window.early)} | late {share(nv.shakeout_tp1.by_window.late)}),
+            TP2: {share(nv.shakeout_tp2.share)} — an upper bound for "the stop was too tight", the path after the stop is not replayed
+          </div>
+        </div>
+      )}
+      {h.n > 0 && (
+        <div style={{ marginTop: 4 }}>
+          🔥 Of the {h.n} trades that reached TP1, {share(h.dip_ge_50)} dipped ≥50% of the way to the stop and {share(h.dip_ge_75)} ≥75%
+          <span style={faint}> (median {share(h.median_dip)})</span>
+        </div>
+      )}
+      <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
+        <thead>
+          <tr><th style={th}>stop at</th><th style={th}>never reached TP1 (exact)</th><th style={th}>early / late</th>
+            <th style={th}>deep dips after TP1</th><th style={th}>total between</th><th style={th}>worst case early / late</th></tr>
+        </thead>
+        <tbody>
+          {ex.tighter_sl.map((t) => (
+            <tr key={t.factor}>
+              <td style={td}>{t.factor}× distance</td>
+              <td style={td}>{signedPct(t.exact.all)} ({t.stopped_never_tp1} stopped earlier)</td>
+              <td style={td}>{signedPct(t.exact.early)} / {signedPct(t.exact.late)}</td>
+              <td style={td}>{t.deep_dips_after_tp1} ({signedPct(t.worst_extra.all)} if all before TP1)</td>
+              <td style={td}>{signedPct(t.worst_case.all)} … {signedPct(t.exact.all)}</td>
+              <td style={td}>{signedPct(t.worst_case.early)} / {signedPct(t.worst_case.late)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function ResultRows({ result }) {
   const rows = []
   Object.entries(result.results || {}).forEach(([ticker, perTf]) => {
@@ -128,6 +183,7 @@ function ResultRows({ result }) {
               {reasons.length > 0 && <><br />missed because: {reasons.map(([k, v]) => `${k} ×${v}`).join('; ')}</>}
             </div>
             <FilterTable rows={r.filter_cf} />
+            <ExitBlock ex={r.exits} />
             <LoserTable lf={r.loser_features} />
             <MissedTable mf={r.missed_features} />
             {r.skipped_features?.length > 0 && (
@@ -172,8 +228,10 @@ export default function AutopsyPanel({ config }) {
         regime / HTF showed (1) on the signals that lost, and (2) at reversals that no signal caught — swings of at least
         the chosen number of ATRs — and why they were missed (no trigger, a filter, or the track was busy). A state marked
         ✅ lost money (or was over-represented among missed turns) in BOTH the older 60% and the newest 40% of the history.
+        A ✅ also needs enough trades and a clearly above-average rate (z-score), so a handful of trades never earns one.
         It also replays the same triggers with each enabled filter switched off on its own, to show what that filter costs
-        or saves. Measurement only: nothing is applied.
+        or saves, and looks at the exit side: how the trades ended, how far the stopped-out ones got toward TP1, and what a
+        tighter stop would have done. Measurement only: nothing is applied.
       </p>
       <SimScopeFields
         pairs={config.pairs} timeframes={config.timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
