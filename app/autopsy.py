@@ -466,7 +466,115 @@ def _share(num: int, den: int) -> float:
     return round(num / den, 4) if den else 0.0
 
 
-def exit_autopsy(taken: List[Dict], fee_pct: float, cutoff_idx: int) -> Dict:
+def replay_trade(S: Dict, t: Dict, k: float, tp1_frac: float, max_hold: int,
+                 tp1_first: bool = True) -> Optional[Dict]:
+    """Re-plays one trade bar by bar on the real highs/lows with the stop at k x its original
+    distance, following the backtest's own rules (signals.backtest_history): TP1 moves the stop
+    to entry + tp1_frac x (TP1 - entry) and banks half; the bar that touches TP1 does not check
+    the moved stop / TP2 (except the SAME_BAR_TP1_POLICY=tp1_first case: TP1 and the stop in
+    one bar -> TP1 is credited and the position closes at the moved stop); after max_hold bars
+    the position is closed at the close. All in % of entry, from the trade's point of view.
+    tp1_first=False resolves a bar that touches both TP1 and the stop as a plain stop.
+    Returns {"pnl", "exit_type", "tp1", "ambiguous"} (ambiguous = a bar touched both the
+    stop and TP1 before TP1 was credited) or None when the bars are not there."""
+    i = int(t["idx"])
+    n = len(S["close"])
+    entry = float(S["close"][i])
+    if entry <= 0 or i + 1 >= n:
+        return None
+    long_ = t["side"] == "long"
+    sl, tp1, tp2 = k * float(t["sl_pct"]), float(t["tp1_pct"]), float(t["tp2_pct"])
+    cur = sl                      # adverse-% level of the stop (negative once it is past entry)
+    moved = -tp1_frac * tp1       # adverse-% level of the stop after TP1
+    reached = False
+    ambiguous = False
+    last = min(i + max_hold, n - 1)
+    for j in range(i + 1, last + 1):
+        h, l = float(S["high"][j]), float(S["low"][j])
+        fav = ((h - entry) if long_ else (entry - l)) / entry * 100
+        adv = ((entry - l) if long_ else (h - entry)) / entry * 100
+        if not reached:
+            if fav >= tp1 and fav < tp2 and adv >= cur:
+                ambiguous = True
+                if tp1_first:
+                    return {"pnl": (tp1 + (-moved)) / 2, "exit_type": "sl_after_tp1", "tp1": True,
+                            "ambiguous": True}
+                return {"pnl": -cur, "exit_type": "sl", "tp1": False, "ambiguous": True}
+            if adv >= cur:
+                return {"pnl": -cur, "exit_type": "sl", "tp1": False, "ambiguous": ambiguous}
+            if fav >= tp2:
+                return {"pnl": (tp1 + tp2) / 2, "exit_type": "tp", "tp1": True, "ambiguous": ambiguous}
+            if fav >= tp1:
+                reached, cur = True, moved
+                continue
+        else:
+            if adv >= cur:
+                return {"pnl": (tp1 - cur) / 2, "exit_type": "sl_after_tp1", "tp1": True,
+                        "ambiguous": ambiguous}
+            if fav >= tp2:
+                return {"pnl": (tp1 + tp2) / 2, "exit_type": "tp", "tp1": True, "ambiguous": ambiguous}
+    c = float(S["close"][last])
+    rem = ((c - entry) if long_ else (entry - c)) / entry * 100
+    return {"pnl": (tp1 + rem) / 2 if reached else rem, "exit_type": "cancelled", "tp1": reached,
+            "ambiguous": ambiguous}
+
+
+def tighter_stop_exact(taken: List[Dict], S: Dict, fee_pct: float, cutoff_idx: int,
+                       tp1_frac: float, max_hold: int, factors=SL_TIGHTEN_FACTORS) -> Dict:
+    """The tighter-stop what-if with the real bar order (no worst-case range): every taken trade
+    is re-played with the stop at k x its distance. `check` re-plays at k=1 and compares with
+    what the backtest recorded, so a replay that does not reproduce the backtest shows itself
+    (check.mismatch > 0 => do not trust the numbers). Same trades are assumed: an earlier exit
+    could free the slot for a signal that was skipped, which is not modelled."""
+    rows = [t for t in taken if t.get("sl_pct") and t.get("tp1_pct") and t.get("tp2_pct")
+            and t.get("moved_pct") is not None]
+    base = {}
+    mismatch = 0
+    for t in rows:
+        r = replay_trade(S, t, 1.0, tp1_frac, max_hold)
+        base[id(t)] = r
+        if r is None or r["exit_type"] != t.get("exit_type") or abs(r["pnl"] - float(t["moved_pct"])) > 0.01:
+            mismatch += 1
+    early = lambda t: int(t["idx"]) < cutoff_idx  # noqa: E731
+    out = []
+    for k in factors:
+        res = {"factor": k, "bot_rule": {"all": 0.0, "early": 0.0, "late": 0.0},
+               "strict": {"all": 0.0, "early": 0.0, "late": 0.0},
+               "saved": 0, "cut_winners": 0, "changed": 0, "ambiguous": 0, "n": 0,
+               "net_after": 0.0}
+        for t in rows:
+            if base[id(t)] is None:
+                continue
+            old = float(t["moved_pct"])
+            a = replay_trade(S, t, k, tp1_frac, max_hold, True)
+            b = replay_trade(S, t, k, tp1_frac, max_hold, False)
+            if a is None or b is None:
+                continue
+            res["n"] += 1
+            w = "early" if early(t) else "late"
+            for key, r in (("bot_rule", a), ("strict", b)):
+                d = r["pnl"] - old
+                res[key]["all"] += d
+                res[key][w] += d
+            res["net_after"] += a["pnl"] - fee_pct
+            if abs(a["pnl"] - old) > 1e-9:
+                res["changed"] += 1
+                if a["pnl"] > old:
+                    res["saved"] += 1
+                else:
+                    res["cut_winners"] += 1
+            if a["ambiguous"]:
+                res["ambiguous"] += 1
+        for key in ("bot_rule", "strict"):
+            res[key] = {w: round(v, 2) for w, v in res[key].items()}
+        res["net_after"] = round(res["net_after"], 2)
+        out.append(res)
+    return {"check": {"n": len(rows), "mismatch": mismatch}, "factors": out}
+
+
+def exit_autopsy(taken: List[Dict], fee_pct: float, cutoff_idx: int,
+                 S: Optional[Dict] = None, tp1_frac: Optional[float] = None,
+                 max_hold: Optional[int] = None) -> Dict:
     """How the trades the bot takes ended, from the per-trade exit fields of the trigger
     table (mfe/mae = the way price moved up to the exit, raw_mfe = over the whole holding
     horizon, sl_pct/tp1_pct/tp2_pct = the original stop and targets, all in % of entry).
@@ -557,8 +665,10 @@ def exit_autopsy(taken: List[Dict], fee_pct: float, cutoff_idx: int) -> Dict:
             "worst_case": {w: round(exact[w] + worst[w], 2) for w in exact},
         })
 
+    exact = (tighter_stop_exact(taken, S, fee_pct, cutoff_idx, tp1_frac, max_hold)
+             if S is not None and tp1_frac is not None and max_hold else None)
     return {"available": True, "n": len(rows), "mix": mix, "never_tp1": never, "winners_heat": heat,
-            "tighter_sl": tighter}
+            "tighter_sl": tighter, "tighter_exact": exact}
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +684,8 @@ def _ts_str(ms) -> str:
 def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filters: List[str],
                  fee_pct: float, cutoff_idx: int, atr_min: float, atr_max: float, chop_thr: float,
                  pivot_atr_mult: float = 3.0, top: int = 8, examples: int = 5,
-                 flags: Optional[Dict[str, bool]] = None, replay=None) -> Dict:
+                 flags: Optional[Dict[str, bool]] = None, replay=None,
+                 tp1_frac: Optional[float] = None, max_hold: Optional[int] = None) -> Dict:
     """The full autopsy of one pair/timeframe. `S` = per-bar series, `triggers` = every raw
     trigger of the trigger-table backtest, `taken` = the subset the live filter set takes.
     `flags` + `replay` (flags -> taken rows) enable the per-filter "what if it were off"
@@ -623,7 +734,7 @@ def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filte
             "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         },
         "filter_cf": filter_cf,
-        "exits": exit_autopsy(taken, fee_pct, cutoff_idx),
+        "exits": exit_autopsy(taken, fee_pct, cutoff_idx, S=S, tp1_frac=tp1_frac, max_hold=max_hold),
         "skipped_features": sorted(set(FEATURES) - set(feats)),
         "loser_features": {**losers_tbl, "candidates": losers_tbl["candidates"][:top]},
         "missed_features": {**missed_tbl, "candidates": missed_tbl["candidates"][:top]},

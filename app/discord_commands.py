@@ -2682,6 +2682,19 @@ def _autopsy_exit_lines(ex) -> list:
     if h["n"]:
         out.append(f"   🔥 of the {h['n']} trades that reached TP1, {h['dip_ge_50']:.0%} dipped ≥50% of the way to the stop "
                    f"and {h['dip_ge_75']:.0%} ≥75% (median {h['median_dip']:.0%})")
+    te = ex.get("tighter_exact")
+    if te:
+        chk = te["check"]
+        if chk["mismatch"]:
+            out.append(f"   ⚠️ the bar-by-bar replay does not reproduce {chk['mismatch']} of {chk['n']} recorded trades — do not trust the stop numbers below")
+        for t in te["factors"]:
+            out.append(f"   ✂️ stop at {t['factor']:g}× (replayed bar by bar): {t['bot_rule']['all']:+.1f}% "
+                       f"[early {t['bot_rule']['early']:+.1f}% | late {t['bot_rule']['late']:+.1f}%]; strict same-bar=stop "
+                       f"{t['strict']['all']:+.1f}% [early {t['strict']['early']:+.1f}% | late {t['strict']['late']:+.1f}%]; "
+                       f"{t['saved']} trades better / {t['cut_winners']} worse of {t['n']} ({t['ambiguous']} same-bar); "
+                       f"net after {t['net_after']:+.1f}%")
+        out.append("      same trades assumed — an earlier exit could free a slot for a skipped signal (not modelled)")
+        return out
     for t in ex["tighter_sl"]:
         out.append(f"   ✂️ stop at {t['factor']:g}× its distance: trades that never reached TP1 {t['exact']['all']:+.1f}% exact "
                    f"[early {t['exact']['early']:+.1f}% | late {t['exact']['late']:+.1f}%] ({t['stopped_never_tp1']} stopped earlier); "

@@ -139,7 +139,36 @@ function ExitBlock({ ex }) {
           <span style={faint}> (median {share(h.median_dip)})</span>
         </div>
       )}
-      <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
+      {ex.tighter_exact && (
+        <div style={{ marginTop: 6 }}>
+          ✂️ Tighter stop, re-played bar by bar on the real highs/lows
+          {ex.tighter_exact.check.mismatch > 0 && (
+            <b> ⚠️ the replay does not reproduce {ex.tighter_exact.check.mismatch} of {ex.tighter_exact.check.n} recorded trades — do not trust these numbers</b>
+          )}
+          <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
+            <thead>
+              <tr><th style={th}>stop at</th><th style={th}>PnL change (bot's same-bar rule)</th><th style={th}>early / late</th>
+                <th style={th}>strict (same-bar = stop)</th><th style={th}>early / late</th>
+                <th style={th}>trades saved / winners cut</th><th style={th}>net after</th></tr>
+            </thead>
+            <tbody>
+              {ex.tighter_exact.factors.map((t) => (
+                <tr key={t.factor}>
+                  <td style={td}>{t.factor}× distance</td>
+                  <td style={td}>{signedPct(t.bot_rule.all)}</td>
+                  <td style={td}>{signedPct(t.bot_rule.early)} / {signedPct(t.bot_rule.late)}</td>
+                  <td style={td}>{signedPct(t.strict.all)}</td>
+                  <td style={td}>{signedPct(t.strict.early)} / {signedPct(t.strict.late)}</td>
+                  <td style={td}>{t.saved} / {t.cut_winners} (of {t.n}, {t.ambiguous} same-bar)</td>
+                  <td style={td}>{signedPct(t.net_after)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={faint}>same trades assumed — an earlier exit could free the slot for a signal that was skipped (not modelled)</div>
+        </div>
+      )}
+      {!ex.tighter_exact && <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
         <thead>
           <tr><th style={th}>stop at</th><th style={th}>never reached TP1 (exact)</th><th style={th}>early / late</th>
             <th style={th}>deep dips after TP1</th><th style={th}>total between</th><th style={th}>worst case early / late</th></tr>
@@ -156,7 +185,7 @@ function ExitBlock({ ex }) {
             </tr>
           ))}
         </tbody>
-      </table>
+      </table>}
     </div>
   )
 }
