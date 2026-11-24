@@ -2203,6 +2203,14 @@ async def set_ai_filter(body: AiFilterIn):
     return settings
 
 
+@app.post("/api/ai/test")
+async def ai_test():
+    """One tiny real request to Gemini with the current settings: is the key set,
+    is the model reachable, does the answer parse. Never raises — failures come back
+    as {ok: false, status, message} (Discord twin: !ai test)."""
+    return await ai_filter.test_connection()
+
+
 @app.get("/api/ai/stats")
 async def ai_stats(origin: str = "live"):
     """Win rate / PnL of closed trades grouped by the AI verdict and by news_risk —

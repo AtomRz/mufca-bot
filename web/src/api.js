@@ -110,6 +110,7 @@ export const api = {
   setIntrabarCheck: (enabled) =>
     request('/api/config/intrabar-check', { method: 'POST', body: JSON.stringify({ enabled }) }),
   getAiStats: (origin = 'live') => request(`/api/ai/stats?origin=${origin}`),
+  testAi: () => request('/api/ai/test', { method: 'POST' }),
   setAiFilter: (changes) =>
     request('/api/config/ai-filter', { method: 'POST', body: JSON.stringify(changes) }),
   // ticker + timeframe given -> per pair/timeframe override (mode 'inherit' removes it)

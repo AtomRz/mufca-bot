@@ -70,6 +70,8 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [model, setModel] = useState('')
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState(null)
 
   const ai = config?.ai_filter
   const timeoutOptions = config?.ai_timeout_options ?? [10, 15, 25, 40, 60]
@@ -109,6 +111,19 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
   const commitModel = () => {
     const m = model.trim()
     if (m && ai && m !== ai.model) change({ model: m })
+  }
+
+  // One tiny real request with the current settings — shows whether the next verdict can work.
+  const runTest = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      setTestResult(await api.testAi())
+    } catch (e) {
+      setTestResult({ ok: false, status: 'error', message: e.message, warnings: [] })
+    } finally {
+      setTesting(false)
+    }
   }
 
   if (!ai) return <div className="empty-state">Loading…</div>
@@ -156,6 +171,26 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
             ))}
           </select>
         </div>
+        <div className="field">
+          <label title="Sends one tiny request to Gemini with the settings above (no market data) and checks that the key works, the model answers and the reply parses.">Connection</label>
+          <button className="btn" disabled={busy || testing} onClick={runTest}>
+            {testing ? 'Testing…' : 'Test'}
+          </button>
+        </div>
+        {testResult && (
+          <div style={{ fontSize: 13, marginTop: 4 }}>
+            <div style={{ color: testResult.ok ? 'var(--long)' : 'var(--short)', fontWeight: 600 }}>
+              {testResult.ok ? '✓ OK' : '✗ Failed'}
+              {testResult.model && <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>
+                {` · ${testResult.model} · grounding ${testResult.grounded ? 'on' : 'off'} · ${testResult.latency_s}s`}
+              </span>}
+            </div>
+            <div style={{ color: 'var(--text-dim)', marginTop: 2 }}>{testResult.message}</div>
+            {(testResult.warnings || []).map((w) => (
+              <div key={w} style={{ color: 'var(--accent)', marginTop: 2 }}>⚠ {w}</div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div style={{ margin: '12px 0' }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
