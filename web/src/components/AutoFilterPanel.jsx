@@ -12,6 +12,34 @@ const describeSet = (flags) => {
 const pct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
 const statText = (st) => `n=${st.n} avg ${pct(st.avg)} total ${pct(st.total)}`
 
+const FLIP_MARK = { helps: '✅', hurts: '❌', mixed: '▫️', no_effect: '—' }
+
+// The checks a proposal had to pass: each changed filter flipped alone, then the walk-forward gate.
+function CheckLines({ chk }) {
+  if (!chk) return null
+  const wf = chk.walk_forward
+  return (
+    <div style={{ color: 'var(--text-faint)' }}>
+      {chk.flips.map((f) => (
+        <div key={f.filter}>
+          {FLIP_MARK[f.verdict] || '▫️'} {f.filter} → {f.to ? 'on' : 'off'} alone: net {pct(f.delta)}{' '}
+          [early {pct(f.early)} | late {pct(f.late)}] ({f.extra_trades >= 0 ? '+' : ''}{f.extra_trades} trades) — {f.verdict}
+        </div>
+      ))}
+      {chk.trimmed && (
+        <div>✂️ trimmed to {chk.trimmed.filters.join(', ')}: net {pct(chk.trimmed.delta)} [early {pct(chk.trimmed.early)} | late {pct(chk.trimmed.late)}]</div>
+      )}
+      {wf && (
+        <div>
+          {wf.passed ? '✅' : '⛔'} walk-forward {wf.verdict} ({wf.mode === 'not_worse' ? 'lenient' : 'strict'}): switched in{' '}
+          {wf.folds_switched}/{wf.folds} folds, better in {wf.folds_switched_positive}; in-sample {pct(wf.in_sample_gain)} → out-of-sample {pct(wf.out_of_sample_gain)}
+        </div>
+      )}
+      {chk.decision === 'keep' && <div style={{ color: 'var(--short)' }}>⛔ not applied ({chk.blocked_by}): {chk.reason}</div>}
+    </div>
+  )
+}
+
 function ResultRows({ result }) {
   const rows = []
   Object.entries(result.results || {}).forEach(([ticker, perTf]) => {
@@ -34,8 +62,12 @@ function ResultRows({ result }) {
               {r.validated && <><br />out-of-sample: now {statText(r.best_stats.test)} · was {statText(r.current_stats.test)}</>}
             </div>
           ) : (
-            <div style={{ color: 'var(--text-faint)' }}>{r.reason}</div>
+            <div style={{ color: 'var(--text-faint)' }}>
+              {r.reason}
+              {r.proposed && <><br />🔎 the tuner proposed {describeSet(r.proposed)}</>}
+            </div>
           )}
+          <CheckLines chk={r.checks} />
         </div>
       ))}
     </div>
@@ -128,7 +160,8 @@ function ManualPin({ config, busy, act }) {
 export default function AutoFilterPanel({ config, onChanged }) {
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
-  const [numBars, setNumBars] = useState(3000)
+  const [numBars, setNumBars] = useState(6000)
+  const [lenient, setLenient] = useState(false)
   const [skipOos, setSkipOos] = useState(false)
   const [busy, setBusy] = useState(false)
   const [localError, setLocalError] = useState(null)
@@ -140,7 +173,7 @@ export default function AutoFilterPanel({ config, onChanged }) {
     const bad = barsError(numBars)
     if (bad) { sim.setError(bad); return }
     setLocalError(null)
-    sim.start(() => api.runAutoFilter({ ticker, tf, numBars, apply, validateOos: !skipOos }))
+    sim.start(() => api.runAutoFilter({ ticker, tf, numBars, apply, validateOos: !skipOos, lenient }))
   }
 
   // refresh the pinned list (config.filter_overrides) once an applying run finishes
@@ -159,6 +192,10 @@ export default function AutoFilterPanel({ config, onChanged }) {
         Backtests every pair × timeframe, tries all combinations of the 8 backtestable filters and pins the set with
         the best PnL (after fees) for each one — so e.g. CHOP can stay on for BTC and be off for ETH. The set is chosen
         on the older 60% of history and only replaces the current one if it also holds up on the newest 40%.
+        A change is applied only if it also passes two more checks in the same run: every filter it touches, flipped
+        on its own, must make more money in BOTH the older and the newer part of the history (a change that fails is
+        dropped), and the rolling walk-forward of re-tuning that pair/timeframe (the same check as the Walk-forward
+        panel) must be robust. Otherwise the pair keeps its filters and the result says which check stopped it.
         Spread is live-only and stays global.
       </p>
       <SimScopeFields
@@ -171,9 +208,13 @@ export default function AutoFilterPanel({ config, onChanged }) {
           </>
         }
       />
+      <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, marginBottom: 6 }}>
+        <input type="checkbox" checked={lenient} disabled={skipOos} onChange={(e) => setLenient(e.target.checked)} />
+        Lenient walk-forward: let a change through unless the walk-forward is "not robust" (inconclusive is enough)
+      </label>
       <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, marginBottom: 10 }}>
         <input type="checkbox" checked={skipOos} onChange={(e) => setSkipOos(e.target.checked)} />
-        Skip the out-of-sample check (maximises past PnL, overfits more)
+        Skip ALL checks (no out-of-sample guard, no per-filter or walk-forward check — maximises past PnL, overfits more)
       </label>
       <SimStatus sim={sim} />
       {localError && <p style={{ color: 'var(--short)', fontSize: 13 }}>Failed: {localError}</p>}

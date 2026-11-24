@@ -3540,17 +3540,27 @@ def choose_filter_set(triggers: List[Dict], tf: str, current: Dict[str, bool], c
 async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
                               progress: Optional[Callable[[int, int, str], None]] = None,
                               workers: Optional[int] = None, validate: bool = True,
-                              fee_pct: Optional[float] = None, apply: bool = False) -> Dict:
+                              fee_pct: Optional[float] = None, apply: bool = False,
+                              checks: bool = True, wf_mode: str = "robust") -> Dict:
     """Finds the best filter set for every (ticker, tf): one trigger-table backtest
     each (shared fetched data), then choose_filter_set() over all 256 sets.
     With apply=False nothing is written (preview); with apply=True the changed
     sets are pinned via config.apply_filter_overrides (the previous state is kept
     for config.revert_filter_overrides).
 
-    Returns {"fee_pct", "validate", "bar_coverage", "results": {ticker: {tf: choose_filter_set(...)}},
+    checks - every proposal of choose_filter_set() must also pass autotune_checks.verify_choice():
+    each changed filter flipped alone must help in BOTH the early and the late window (a change
+    that fails is dropped), and the walk-forward of the tuning policy for that pair/timeframe must
+    be "robust" (wf_mode="robust") or at least not "not_robust" (wf_mode="not_worse"). A proposal
+    that fails is NOT applied ("changed" is False, result["checks"] says why, "proposed" keeps it).
+    Skipped when validate=False (the "full" mode: no out-of-sample guard at all).
+
+    Returns {"fee_pct", "validate", "checks", "wf_mode", "bar_coverage",
+             "results": {ticker: {tf: choose_filter_set(...) [+ "proposed", "checks"]}},
              "assignments": {ticker: {tf: flags}}  # only the pairs/tfs whose set changed
              "meta": {ticker: {tf: {...}}}, "applied": bool}
     """
+    use_checks = bool(checks and validate)
     fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
     counters = {"done": 0, "total": len(tickers) * len(tfs)}
     bar_coverage: List[Dict] = []
@@ -3608,10 +3618,28 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
         first_idx = 50
         last_idx = n_bars - _cfg.MAX_HOLD_BARS
         cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
+        current = current_filter_flags(t, f)
         res = choose_filter_set(
-            triggers, f, current_filter_flags(t, f), cutoff, fee,
+            triggers, f, current, cutoff, fee,
             _cfg.AUTOTUNE_MIN_TRAIN_TRADES, _cfg.AUTOTUNE_MIN_TEST_TRADES, _cfg.AUTOTUNE_MIN_GAIN_SE,
             validate=validate)
+        if use_checks and res["changed"]:
+            from autotune_checks import verify_choice  # imports signals/walk_forward: keep it lazy
+            try:
+                chk = await asyncio.to_thread(verify_choice, triggers, f, current, res, cutoff, fee,
+                                              first_idx, last_idx, wf_mode)
+            except Exception as e:
+                logger.error(f"run_filter_autotune: checks failed for {t} {f}: {e}", exc_info=True)
+                chk = {"proposed": dict(res["chosen"]), "decision": "keep", "blocked_by": "error",
+                       "reason": f"the checks could not run ({e})", "flips": [], "accepted": [], "dropped": [],
+                       "trimmed": None, "walk_forward": None, "final": dict(current), "final_stats": None}
+            res["proposed"], res["checks"] = chk["proposed"], chk
+            if chk["decision"] == "apply":
+                res["chosen"], res["best"], res["best_stats"] = chk["final"], chk["final"], chk["final_stats"]
+                res["reason"] = chk["reason"]
+            else:
+                res["chosen"], res["changed"] = dict(current), False
+                res["reason"] = f"proposal blocked - {chk['reason']}"
         results.setdefault(t, {})[f] = res
         if res["changed"]:
             assignments.setdefault(t, {})[f] = res["chosen"]
@@ -3624,7 +3652,8 @@ async def run_filter_autotune(exchange: ccxt.Exchange, tickers: List[str], tfs: 
     if apply and assignments:
         _cfg.apply_filter_overrides(assignments, meta)
         applied = True
-    return {"fee_pct": fee, "validate": validate, "bar_coverage": bar_coverage, "skipped": skipped,
+    return {"fee_pct": fee, "validate": validate, "checks": use_checks, "wf_mode": wf_mode,
+            "bar_coverage": bar_coverage, "skipped": skipped,
             "results": results, "assignments": assignments, "meta": meta, "applied": applied}
 
 
