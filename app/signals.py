@@ -72,6 +72,7 @@ import shadow
 import volume_gate
 import filter_stats
 import autopsy
+import missedsim
 from sim_pool import SimPool
 # 🆕 Market structure (POC/VA/S-R) and relative-strength context — see
 # market_structure.py / relative_strength.py docstrings for why these are
@@ -1815,7 +1816,7 @@ def backtest_history(
     collect_series - trigger_table only: "__stats__" also gets "series", the per-bar
     numpy arrays of everything the entry decision looked at (OHLC, FRAMA line and
     direction, MFI and its rolling K-Means levels, Andean oscillator and signal, UT Bot
-    buy/sell events, Hurst, CHOP, ATR, HTF bias). run_autopsy() uses them to describe
+    buy/sell events, Hurst, CHOP, ATR, HTF bias, volume). run_autopsy() uses them to describe
     what the indicators showed at a losing signal or a missed reversal. Off by default:
     it only adds payload.
 
@@ -2628,6 +2629,7 @@ def backtest_history(
                         "ts": _arr(df["timestamp"], np.int64),
                         "open": _arr(df["open"]), "high": _arr(df["high"]),
                         "low": _arr(df["low"]), "close": _arr(df["close"]),
+                        "volume": _arr(df["volume"]),
                         "frama": _arr(fs), "frama_dir": _arr(fdir),
                         "mfi": _arr(mfi), "mfi_os": _arr(level_os), "mfi_ob": _arr(level_ob),
                         "and_osc": _arr(and_osc), "and_sig": _arr(and_sig),
@@ -4028,6 +4030,96 @@ async def run_autopsy(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str
             skipped.append({"ticker": t, "tf": f, "reason": f"analysis failed: {e}"})
     return {"fee_pct": fee, "pivot_atr_mult": pivot_atr_mult, "train_fraction": _cfg.AUTOTUNE_TRAIN_FRACTION,
             "bar_coverage": bar_coverage, "skipped": skipped, "results": results}
+
+
+# ---------------------------------------------------------------------
+# Missed-reversal structure study: do the turns no signal caught share a structure?
+# ---------------------------------------------------------------------
+async def run_missedsim(exchange: ccxt.Exchange, tickers: List[str], tfs: List[str], num_bars: int = 3000,
+                        progress: Optional[Callable[[int, int, str], None]] = None,
+                        workers: Optional[int] = None, fee_pct: Optional[float] = None,
+                        pivot_atr_mult: float = 3.0) -> Dict:
+    """Measurement only - nothing is changed or applied. Same backtest as run_autopsy (one
+    trigger-table run per ticker/tf with the per-bar series, the pair's CURRENT filter set
+    decides which triggers are taken); missedsim.analyze_pair() then describes the market
+    state at every confirmed swing and on a control sample of ordinary bars and asks which
+    states mark turns AND would have paid as a plain bracket trade, in both the early and
+    the late window.
+
+    Returns {"fee_pct", "pivot_atr_mult", "train_fraction", "bar_coverage", "skipped",
+             "results": {ticker: {tf: missedsim.analyze_pair(...)}}, "consistent": [...]}
+    """
+    fee = _cfg.AUTOTUNE_FEE_PCT if fee_pct is None else fee_pct
+    counters = {"done": 0, "total": len(tickers) * len(tfs)}
+    bar_coverage: List[Dict] = []
+    skipped: List[Dict] = []
+    submitted: List[tuple] = []  # (ticker, tf, bars, future)
+    off = {k: False for k in FILTER_KEYS}
+
+    def _on_done(label: str):
+        def cb(_fut):
+            counters["done"] += 1
+            _report_progress(progress, counters["done"], counters["total"], f"finished {label}")
+        return cb
+
+    _report_progress(progress, 0, counters["total"], "starting")
+    async with SimPool(workers) as pool:
+        for t in tickers:
+            for f in tfs:
+                _report_progress(progress, counters["done"], counters["total"], f"fetching {t} {f}")
+                try:
+                    inputs = await asyncio.to_thread(_prefetch_backtest_inputs, exchange, t, f, num_bars, False)
+                except Exception as e:
+                    logger.error(f"run_missedsim: fetch error for {t} {f}: {e}")
+                    skipped.append({"ticker": t, "tf": f, "reason": f"data fetch failed: {e}"})
+                    counters["total"] -= 1
+                    continue
+                bar_coverage.append({"ticker": t, "tf": f, "requested": num_bars, "got": inputs["bars_fetched"]})
+                if inputs["df"] is None:
+                    skipped.append({"ticker": t, "tf": f,
+                                    "reason": f"not enough history (got {inputs['bars_fetched']} bars)"})
+                    counters["total"] -= 1
+                    continue
+                fut = pool.submit({
+                    "ticker": t, "tf": f, "num_bars": num_bars, "tracks": _cfg.TRACKS,
+                    "tp1_sl_fraction": None, "dry_run": True, "df": inputs["df"],
+                    "compute_confidence": False, "benchmark_df": None, "htf_df": inputs["htf_df"],
+                    "filter_overrides": off, "collect_stats": True, "trigger_table": True,
+                    "collect_series": True,
+                })
+                fut.add_done_callback(_on_done(f"{t} {f}"))
+                submitted.append((t, f, len(inputs["df"]), fut))
+
+        outcomes = await asyncio.gather(*(item[3] for item in submitted), return_exceptions=True)
+
+    results: Dict[str, Dict] = {}
+    for (t, f, n_bars, _fut), outcome in zip(submitted, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(f"run_missedsim: backtest error for {t} {f}: {outcome!r}")
+            skipped.append({"ticker": t, "tf": f, "reason": f"backtest failed: {outcome!r}"})
+            continue
+        _count, history, _bars = outcome
+        stats = history.pop("__stats__", None) or {}
+        series = stats.get("series")
+        triggers = stats.get("trades", [])
+        if not series:
+            skipped.append({"ticker": t, "tf": f, "reason": "backtest returned no indicator series"})
+            continue
+        flags = current_filter_flags(t, f)
+        taken = replay_filter_set(triggers, flags, f)
+        first_idx = 50
+        last_idx = n_bars - _cfg.MAX_HOLD_BARS
+        cutoff = first_idx + int((last_idx - first_idx) * _cfg.AUTOTUNE_TRAIN_FRACTION)
+        try:
+            results.setdefault(t, {})[f] = await asyncio.to_thread(
+                missedsim.analyze_pair, series, triggers, taken, [k for k in FILTER_KEYS if flags.get(k)], fee,
+                cutoff, ATR_MIN, ATR_MAX, CHOP_THRESHOLD.get(f, 61.8), pivot_atr_mult, _cfg.MAX_HOLD_BARS)
+        except Exception as e:
+            logger.error(f"run_missedsim: analysis error for {t} {f}: {e}", exc_info=True)
+            skipped.append({"ticker": t, "tf": f, "reason": f"analysis failed: {e}"})
+    return {"fee_pct": fee, "pivot_atr_mult": pivot_atr_mult, "train_fraction": _cfg.AUTOTUNE_TRAIN_FRACTION,
+            "bar_coverage": bar_coverage, "skipped": skipped, "results": results,
+            "consistent": missedsim.cross_consistency(results)}
 
 
 # ---------------------------------------------------------------------

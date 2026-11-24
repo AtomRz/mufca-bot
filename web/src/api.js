@@ -225,6 +225,8 @@ export const api = {
     request('/api/indoptim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, trials }) }),
   runAutopsy: ({ ticker, tf, numBars = 3000, swing = 3 } = {}) =>
     request('/api/autopsy', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, swing }) }),
+  runMissedSim: ({ ticker, tf, numBars = 3000, swing = 3 } = {}) =>
+    request('/api/missedsim', { method: 'POST', body: JSON.stringify({ ticker: ticker || null, tf: tf || null, num_bars: numBars, swing }) }),
   pinFilters: (ticker, tf, filters) =>
     request('/api/filter-overrides', { method: 'POST', body: JSON.stringify({ ticker, tf, filters }) }),
   revertFilterOverrides: () =>
