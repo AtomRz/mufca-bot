@@ -782,9 +782,11 @@ async def run_smcsim(body: SmcSimIn):
 class AutoFilterIn(BaseModel):
     ticker: Optional[str] = None
     tf: Optional[str] = None
-    num_bars: int = Field(3000, ge=300, le=20000)
+    num_bars: int = Field(6000, ge=300, le=20000)
     apply: bool = True        # False = preview: report only, nothing pinned
     validate_oos: bool = True  # False = skip the out-of-sample check (max in-sample PnL, overfits)
+    checks: bool = True        # per-filter flips + walk-forward must also pass (ignored when validate_oos is False)
+    lenient: bool = False      # walk-forward only has to be "not not_robust" instead of "robust"
 
 
 @app.post("/api/autofilter")
@@ -805,7 +807,8 @@ async def run_autofilter(body: AutoFilterIn):
     async def _run(progress):
         result = await run_filter_autotune(
             exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress,
-            validate=body.validate_oos, apply=body.apply)
+            validate=body.validate_oos, apply=body.apply, checks=body.checks,
+            wf_mode="not_worse" if body.lenient else "robust")
         if result["applied"]:
             await broadcast_event({"type": "config_changed", "key": "filter_overrides", "value": None})
         return result
@@ -813,7 +816,7 @@ async def run_autofilter(body: AutoFilterIn):
     return _start_sim_job(
         "autofilter",
         {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars,
-         "apply": body.apply, "validate": body.validate_oos},
+         "apply": body.apply, "validate": body.validate_oos, "checks": body.checks, "lenient": body.lenient},
         _run,
     )
 

@@ -150,7 +150,7 @@ async def help_cmd(ctx):
         "`!compsim [pair] [tf] [bars] [min_n]` — !components analysis replayed on real historical data instead of waiting for live signals (dry-run)",
         "`!filtersim [pair] [tf] [bars]` — filter ablation on real historical data: each entry filter switched off/on one at a time vs the live setup (dry-run)",
         "`!smcsim [pair] [tf] [bars]` — Smart Money Concepts event study (sweeps, BOS/CHoCH, FVG, sweep→shift) vs. any-bar baseline on real history; research only, trades nothing",
-        "`!autofilter [preview|run] [pair] [tf] [bars]` — backtest every pair × timeframe and pin the filter set with the best PnL for each (`preview` = report only); `!autofilter show|revert|clear`",
+        "`!autofilter [preview|run] [pair] [tf] [bars] [lenient]` — backtest every pair × timeframe, find the filter set with the best PnL for each and pin it ONLY if it also passes the checks (each changed filter helps alone in both windows + the walk-forward of re-tuning is robust); `preview` = report only; `!autofilter show|revert|clear`",
         "`!entry [<key> <mode>] [<pair> <tf> <key> <mode|inherit>]` — Entry switches (a_long / a_short / u_long / u_short; mode allow|trend|all): show, set the global one, or override it for one pair + timeframe",
         "`!volume [on|off|metric <bar|smooth|thin|how>|thr <x>|days <n>|live]` — low-volume (thin-liquidity) entry gate: status, switch, default metric/threshold, baseline window, live volume values per pair",
         "`!volfit [preview|run] [pair] [tf] [bars] [metric…]` — find the volume METRIC and threshold per pair × timeframe from history (bar/smooth/thin/how compared; train/test checked; nothing proven = gate off for that pair); `!volfit show|revert|clear`",
@@ -2053,9 +2053,34 @@ def _autotune_lines(result: dict, applied: bool) -> list:
                 lines.append(f"   {_fmt_autotune_stats('now ', bs['all'])} | {_fmt_autotune_stats('was ', cs['all'])}")
                 if r["validated"]:
                     lines.append(f"   out-of-sample: {_fmt_autotune_stats('now ', bs['test'])} | {_fmt_autotune_stats('was ', cs['test'])}")
+                lines.extend(_autotune_check_lines(r.get("checks")))
             else:
                 lines.append(f"**{ticker} {tf}** unchanged ({_fmt_filter_set(r['current'])}) — {r['reason']}")
+                if r.get("checks"):
+                    lines.append(f"   🔎 the tuner proposed {_fmt_filter_set(r['proposed'])}")
+                    lines.extend(_autotune_check_lines(r["checks"]))
     return lines
+
+
+def _autotune_check_lines(chk) -> list:
+    """Discord text of autotune_checks.verify_choice(): the per-filter flips and the walk-forward gate."""
+    if not chk:
+        return []
+    out = []
+    mark = {"helps": "✅", "hurts": "❌", "mixed": "▫️", "no_effect": "—"}
+    for f in chk["flips"]:
+        out.append(f"   {mark.get(f['verdict'], '▫️')} `{f['filter']}` → {'on' if f['to'] else 'off'} alone: net {f['delta']:+.2f}% "
+                   f"[early {f['early']:+.2f}% | late {f['late']:+.2f}%] ({f['extra_trades']:+d} trades) — {f['verdict']}")
+    if chk.get("trimmed"):
+        t = chk["trimmed"]
+        out.append(f"   ✂️ trimmed to {', '.join(t['filters'])}: net {t['delta']:+.2f}% [early {t['early']:+.2f}% | late {t['late']:+.2f}%]")
+    wf = chk.get("walk_forward")
+    if wf:
+        out.append(f"   {'✅' if wf['passed'] else '⛔'} walk-forward {wf['verdict']} ({wf['mode']}): switched in {wf['folds_switched']}/{wf['folds']} folds, "
+                   f"better in {wf['folds_switched_positive']}; in-sample {wf['in_sample_gain']:+.2f}% → out-of-sample {wf['out_of_sample_gain']:+.2f}%")
+    if chk["decision"] == "keep":
+        out.append(f"   ⛔ not applied ({chk['blocked_by']}): {chk['reason']}")
+    return out
 
 
 @core.bot.command(name="pinfilter", aliases=["setfilters"])
@@ -2107,14 +2132,20 @@ async def autofilter_cmd(ctx, *args):
     (fee deducted per trade, AUTOTUNE_FEE_PCT) for that pair/timeframe. Live
     entries and chart lamps then use the pinned set instead of the global toggles.
 
-    Overfitting guard: the set is chosen on the oldest 60% of the history and
-    only replaces the current one if it is better beyond noise AND not worse on
-    the newest 40%. Otherwise the pair/timeframe keeps its current filters.
+    Overfitting guards, all in this one run: (1) the set is chosen on the oldest 60% of
+    the history and only replaces the current one if it is better beyond noise AND better
+    on the newest 40%; (2) every filter the change touches is flipped ALONE on the current
+    set and must make more money in BOTH windows (a change that fails is dropped, the rest
+    must still help together); (3) the rolling walk-forward of re-tuning this pair/timeframe
+    (the same check as !walkfwd) must be "robust". Otherwise the pair/timeframe keeps its
+    current filters and the report says which check stopped the change.
+    `lenient` lets a change through when the walk-forward is only "inconclusive"/"stable"
+    (anything but "not robust").
 
     Usage:
-      !autofilter [pair] [tf] [bars]          - run + apply (default 3000 bars)
+      !autofilter [pair] [tf] [bars] [lenient] - run + apply (default 6000 bars: the walk-forward needs history)
       !autofilter preview [pair] [tf] [bars]  - same report, nothing applied
-      !autofilter full [pair] [tf] [bars]     - apply WITHOUT the out-of-sample check (max in-sample PnL, overfits)
+      !autofilter full [pair] [tf] [bars]     - apply WITHOUT any out-of-sample check or other check (max in-sample PnL, overfits)
       !autofilter show                        - sets currently pinned per pair/timeframe
       !autofilter revert                      - go back to the state before the last apply
       !autofilter clear                       - drop every pinned set (global toggles again)
@@ -2146,11 +2177,14 @@ async def autofilter_cmd(ctx, *args):
         return
 
     ticker = tf = ""
-    num_bars = 3000
+    num_bars = 6000
+    lenient = False
     for a in args:
         # (volume-gate metric names used to be accepted here and silently ignored -
         # run_filter_autotune() doesn't tune the volume gate; that is !volfit)
-        if a.upper() in TICKERS:
+        if a.lower() == "lenient":
+            lenient = True
+        elif a.upper() in TICKERS:
             ticker = a.upper()
         elif a.lower() in TIMEFRAMES:
             tf = a.lower()
@@ -2173,9 +2207,10 @@ async def autofilter_cmd(ctx, *args):
     try:
         result = await _run_sim_job(
             ctx, "autofilter", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars,
-                                "apply": apply, "validate": validate},
+                                "apply": apply, "validate": validate, "lenient": lenient},
             lambda progress: run_filter_autotune(exchange, scope_tickers, scope_tfs, num_bars, progress=progress,
-                                                 validate=validate, apply=apply),
+                                                 validate=validate, apply=apply,
+                                                 wf_mode="not_worse" if lenient else "robust"),
             intro=(f"⏳ Auto-tuning filters: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars each"
                    f" ({'applying' if apply else 'preview only'}). This takes a while."),
         )
@@ -2184,7 +2219,8 @@ async def autofilter_cmd(ctx, *args):
         applied = result["applied"]
         n_changed = sum(len(v) for v in result["assignments"].values())
         head = [f"**🎛️ Auto filter tuning** — net of {result['fee_pct']}% fee per trade, "
-                f"{'validated on the newest 40%' if result['validate'] else 'NO out-of-sample check'}; "
+                f"{'validated on the newest 40%' if result['validate'] else 'NO out-of-sample check'}"
+                f"{', per-filter + walk-forward checks (' + ('lenient' if result.get('wf_mode') == 'not_worse' else 'strict') + ')' if result.get('checks') else ''}; "
                 f"{n_changed} set(s) {'pinned' if applied else 'would change'}\n"]
         short_pairs = [c for c in result["bar_coverage"] if c["got"] < c["requested"]]
         for c in short_pairs:
