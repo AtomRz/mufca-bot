@@ -169,7 +169,7 @@ async def help_cmd(ctx):
         "`!derivatives [pair]` — funding rate & open interest (futures only)",
         "`!spread [pair]` — order book spread + filter preview (warm-up mode until switched on)",
         "`!aistats [live|backtest|all]` — win rate / PnL of closed trades by Gemini verdict (approve / neutral / reject / none) and by news risk",
-        "`!ai [on|off|grounding on|off|model <code>|timeout <s>]` — Gemini second-opinion settings (informational only, never blocks a signal)",
+        "`!ai [test|on|off|grounding on|off|model <code>|timeout <s>]` — Gemini second-opinion settings; `test` checks the key, the model and the reply format (informational only, never blocks a signal)",
         "",
 
         "**⚙️ Settings**",
@@ -3858,13 +3858,13 @@ def _ai_status_text() -> str:
         f"API key: {key}\n"
         f"Model: `{s['model']}` · timeout: {s['timeout_s']}s · Google Search grounding (news): "
         f"{'on' if s['grounding'] else 'off'}\n"
-        f"Change: `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>` · results: `!aistats`"
+        f"Check: `!ai test` · change: `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>` · results: `!aistats`"
     )
 
 
 @core.bot.command(name="ai")
 async def ai_cmd(ctx, action: str = "", value: str = ""):
-    """!ai — status; !ai on|off; !ai grounding on|off; !ai model <code>; !ai timeout <seconds>.
+    """!ai — status; !ai test; !ai on|off; !ai grounding on|off; !ai model <code>; !ai timeout <seconds>.
     Settings of the Gemini second opinion shown next to each signal (see ai_filter.py)."""
     a, v = action.lower(), value.lower()
     try:
@@ -3879,8 +3879,18 @@ async def ai_cmd(ctx, action: str = "", value: str = ""):
             _cfg.update_ai_filter(model=value)
         elif a == "timeout" and value.isdigit():
             _cfg.update_ai_filter(timeout_s=int(value))
+        elif a == "test":
+            async with ctx.typing():
+                r = await ai_filter.test_connection()
+            lines = [
+                f"{'✅' if r['ok'] else '❌'} **AI test** — `{r['model']}` · grounding {'on' if r['grounded'] else 'off'} · {r['latency_s']}s",
+                r["message"],
+            ]
+            lines += [f"⚠️ {w}" for w in r.get("warnings", [])]
+            await ctx.send("\n".join(lines))
+            return
         elif a:
-            await ctx.send("Usage: `!ai` · `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>`")
+            await ctx.send("Usage: `!ai` · `!ai test` · `!ai on|off` · `!ai grounding on|off` · `!ai model <code>` · `!ai timeout <seconds>`")
             return
         await ctx.send(_ai_status_text())
     except Exception as e:

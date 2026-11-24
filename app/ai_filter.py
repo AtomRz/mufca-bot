@@ -303,6 +303,112 @@ async def evaluate(ctx: Dict[str, Any], df: Optional[pd.DataFrame]) -> Dict[str,
 
 
 # =====================================================================
+# 🩺  CONNECTION TEST
+# =====================================================================
+_TEST_PROMPT = 'Connectivity check. Reply with ONE JSON object and nothing else: {"ok": true}'
+
+# HTTP status -> (our status, hint shown to the operator)
+_TEST_HTTP_HINTS = {
+    400: ("bad_request", "Google rejected the request — most often an invalid GEMINI_API_KEY or a model code this API does not accept."),
+    401: ("auth_error", "The API key was not accepted — check GEMINI_API_KEY in .env."),
+    403: ("auth_error", "Access denied — the key is invalid, restricted, or the API is not enabled for its project."),
+    404: ("model_not_found", "Unknown model code — check the Model field against Google's model list."),
+    429: ("rate_limited", "Rate limit or quota reached — the key works, but Google is throttling it right now."),
+}
+
+
+def _google_error_text(raw: str) -> str:
+    """The human-readable `error.message` of a Google API error body (no secrets in
+    it), or the head of the raw body when it is not the usual JSON."""
+    try:
+        err = (json.loads(raw) or {}).get("error") or {}
+        msg = str(err.get("message") or "").strip()
+        if msg:
+            return re.sub(r"\s+", " ", msg)[:240]
+    except ValueError:
+        pass
+    return re.sub(r"\s+", " ", raw or "").strip()[:240]
+
+
+async def test_connection() -> Dict[str, Any]:
+    """One tiny real request to Gemini with the CURRENT settings (model, timeout,
+    grounding on/off), so a pass means the next signal's verdict request can work.
+    Never raises, costs a few tokens, and sends no market data.
+
+    Returns {ok, status, message, model, grounded, enabled, latency_s, warnings}.
+    status: "ok" / "no_key" / "timeout" / "rate_limited" / "auth_error" / "bad_request" /
+    "model_not_found" / "http_error" / "bad_response" / "error"."""
+    started = time.monotonic()
+    model = _cfg.AI_MODEL
+    grounded = bool(_cfg.AI_GROUNDING)
+    enabled = bool(_cfg.AI_FILTER_ENABLED)
+
+    def result(ok: bool, status: str, message: str, **extra) -> Dict[str, Any]:
+        warnings: List[str] = []
+        if ok and not enabled:
+            warnings.append("AI verdict is switched OFF — signals are not being reviewed until you enable it.")
+        out = {
+            "ok": ok, "status": status, "message": message, "model": model, "grounded": grounded,
+            "enabled": enabled, "latency_s": round(time.monotonic() - started, 1), "warnings": warnings,
+        }
+        out.update(extra)
+        return out
+
+    key = _cfg.GEMINI_API_KEY
+    if not key:
+        return result(False, "no_key", "GEMINI_API_KEY is not set — add it to .env and restart the container.")
+
+    body: Dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": _TEST_PROMPT}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+    }
+    if grounded:
+        body["tools"] = [{"google_search": {}}]   # same request shape as evaluate()
+    else:
+        body["generationConfig"]["responseMimeType"] = "application/json"
+
+    timeout = aiohttp.ClientTimeout(total=max(5, int(_cfg.AI_TIMEOUT_S)))
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                _API_URL.format(model=model), json=body,
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            ) as resp:
+                raw = await resp.text()
+                http = resp.status
+    except TimeoutError:
+        return result(False, "timeout", f"No answer within {_cfg.AI_TIMEOUT_S}s — Google is slow or unreachable from this host. "
+                                        "Try a longer timeout (grounded requests are slower).")
+    except aiohttp.ClientError as e:
+        return result(False, "error", f"Network error: {type(e).__name__} — cannot reach generativelanguage.googleapis.com.")
+    except Exception as e:
+        logger.warning(f"[AI] test request failed: {type(e).__name__}: {e}")
+        return result(False, "error", f"Unexpected error: {type(e).__name__}.")
+
+    if http != 200:
+        status, hint = _TEST_HTTP_HINTS.get(http, ("http_error", f"Google answered HTTP {http}."))
+        detail = _google_error_text(raw)
+        logger.warning(f"[AI] test: Gemini HTTP {http}: {detail}")
+        return result(False, status, f"{hint} (HTTP {http}: {detail})" if detail else f"{hint} (HTTP {http})", http=http)
+
+    try:
+        data = json.loads(raw)
+        cand = (data.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    except Exception as e:
+        return result(False, "bad_response", f"HTTP 200 but the answer could not be read: {type(e).__name__}.")
+
+    obj = _extract_json_object(text)
+    if obj is None:
+        block = (data.get("promptFeedback") or {}).get("blockReason") or cand.get("finishReason")
+        return result(False, "bad_response",
+                      f"The model answered but not with the JSON the verdict parser needs (finish/block: {block or 'unknown'}). "
+                      "Verdicts from this model/setting combination would come back empty.")
+    return result(True, "ok", "Connected — the model answered and its reply parses as the verdict parser expects.")
+
+
+# =====================================================================
 # 💡  DISPLAY HELPERS
 # =====================================================================
 VERDICT_EMOJI = {"approve": "🟢", "neutral": "🟡", "reject": "🔴"}

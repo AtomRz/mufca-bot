@@ -321,7 +321,7 @@ volumes:
 | `!spread [PAIR]` | Show current order book spread + filter status/warm-up progress, works even while the filter is off. Example: `!spread ETH/USDT` |
 | `!spread [PAIR] reset [yes]` | Reset one pair's spread warm-up history (preview first, confirm with `yes`); the web UI has the same "Reset history" button (Insights → Spread) |
 | `!aistats [live\|backtest\|all]` | Win rate / PnL of closed trades grouped by the Gemini verdict (approve / neutral / reject / none) and by news risk — does the second opinion predict anything? |
-| `!ai [on\|off \| grounding on\|off \| model CODE \| timeout SECONDS]` | Show / change the Gemini second-opinion settings live (informational only, never blocks a signal) |
+| `!ai [test \| on\|off \| grounding on\|off \| model CODE \| timeout SECONDS]` | Show / change the Gemini second-opinion settings live; `test` sends one tiny request to check the key, the model and the reply format (informational only, never blocks a signal) |
 | `!reset_cache` | Clear the HTF bias, on-chain, and derivatives data caches and force a fresh fetch (deliberately does not touch spread history — see `!spread reset`) |
 
 ### 📚 History & Stats
