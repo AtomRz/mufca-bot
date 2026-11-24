@@ -17,6 +17,7 @@ Plain REST through aiohttp (already a dependency), API key in a header — the
 key never ends up in a URL or a log line.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -38,6 +39,9 @@ VERDICTS = ("approve", "neutral", "reject")
 NEWS_RISKS = ("low", "medium", "high")
 _MAX_REASON_CHARS = 300
 _SNAPSHOT_CANDLES = 12   # last closed candles listed verbatim in the prompt
+_MAX_ATTEMPTS = 2                      # one retry on a transient failure (timeout / network / 5xx)
+_RETRY_PAUSE_S = 2.0
+_RETRY_HTTP = (500, 502, 503, 504)
 
 
 # =====================================================================
@@ -252,30 +256,57 @@ async def evaluate(ctx: Dict[str, Any], df: Optional[pd.DataFrame]) -> Dict[str,
         body["generationConfig"]["responseMimeType"] = "application/json"
 
     timeout = aiohttp.ClientTimeout(total=max(5, int(_cfg.AI_TIMEOUT_S)))
+    raw = ""
+    attempt = 0
+    # Google overloads (503) and slow answers are usually brief, so a transient failure
+    # (timeout, network error, 5xx) gets ONE more try after a short pause. 429 (quota),
+    # 4xx and unreadable answers are not retried — repeating them cannot help.
+    while True:
+        attempt += 1
+        retry = attempt < _MAX_ATTEMPTS
+        tag = f"{ctx.get('pair')} {ctx.get('timeframe')}"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    _API_URL.format(model=model), json=body,
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                ) as resp:
+                    raw = await resp.text()
+                    http = resp.status
+        except TimeoutError:
+            logger.warning(f"[AI] Gemini timed out after {_cfg.AI_TIMEOUT_S}s ({tag}, attempt {attempt}/{_MAX_ATTEMPTS})")
+            if retry:
+                await asyncio.sleep(_RETRY_PAUSE_S)
+                continue
+            return _failed("timeout", started, attempts=attempt)
+        except aiohttp.ClientError as e:
+            logger.warning(f"[AI] Gemini request failed: {type(e).__name__}: {e} ({tag}, attempt {attempt}/{_MAX_ATTEMPTS})")
+            if retry:
+                await asyncio.sleep(_RETRY_PAUSE_S)
+                continue
+            return _failed("error", started, detail=type(e).__name__, attempts=attempt)
+        except Exception as e:
+            logger.warning(f"[AI] Gemini call failed: {type(e).__name__}: {e}")
+            return _failed("error", started, detail=type(e).__name__, attempts=attempt)
+
+        if http == 429:
+            logger.warning("[AI] Gemini rate limit / quota reached")
+            return _failed("rate_limited", started, detail="HTTP 429", attempts=attempt)
+        if http in _RETRY_HTTP and retry:
+            logger.warning(f"[AI] Gemini HTTP {http} ({tag}, attempt {attempt}/{_MAX_ATTEMPTS}) — retrying")
+            await asyncio.sleep(_RETRY_PAUSE_S)
+            continue
+        if http != 200:
+            # response bodies of Google API errors carry no secrets; keep the head only
+            logger.warning(f"[AI] Gemini HTTP {http}: {raw[:300]}")
+            return _failed("http_error", started, detail=f"HTTP {http}", attempts=attempt)
+        break
+
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                _API_URL.format(model=model), json=body,
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            ) as resp:
-                raw = await resp.text()
-                if resp.status == 429:
-                    logger.warning("[AI] Gemini rate limit / quota reached")
-                    return _failed("rate_limited", started, detail="HTTP 429")
-                if resp.status != 200:
-                    # response bodies of Google API errors carry no secrets; keep the head only
-                    logger.warning(f"[AI] Gemini HTTP {resp.status}: {raw[:300]}")
-                    return _failed("http_error", started, detail=f"HTTP {resp.status}")
         data = json.loads(raw)
-    except TimeoutError:
-        logger.warning(f"[AI] Gemini timed out after {_cfg.AI_TIMEOUT_S}s ({ctx.get('pair')} {ctx.get('timeframe')})")
-        return _failed("timeout", started)
-    except aiohttp.ClientError as e:
-        logger.warning(f"[AI] Gemini request failed: {type(e).__name__}: {e}")
-        return _failed("error", started, detail=type(e).__name__)
     except Exception as e:
-        logger.warning(f"[AI] Gemini call failed: {type(e).__name__}: {e}")
-        return _failed("error", started, detail=type(e).__name__)
+        logger.warning(f"[AI] Gemini answer is not JSON: {type(e).__name__}")
+        return _failed("bad_response", started, detail="not JSON", attempts=attempt)
 
     try:
         cand = (data.get("candidates") or [{}])[0]
@@ -294,7 +325,7 @@ async def evaluate(ctx: Dict[str, Any], df: Optional[pd.DataFrame]) -> Dict[str,
         parsed.update({
             "status": "ok", "model": model, "grounded": grounded,
             "latency_s": round(time.monotonic() - started, 1), "sources": sources,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "attempts": attempt, "ts": datetime.now(timezone.utc).isoformat(),
         })
         return parsed
     except Exception as e:
