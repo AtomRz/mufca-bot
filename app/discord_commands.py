@@ -2656,6 +2656,41 @@ async def indoptim_cmd(ctx, *args):
         await ctx.send(f"❌ Error: {e}")
 
 
+def _autopsy_exit_lines(ex) -> list:
+    """Discord text of autopsy.exit_autopsy(): how the taken trades ended, the pure losers
+    (stopped before TP1), the winners' dips, and the tighter-stop what-if."""
+    if not ex:
+        return []
+    if not ex.get("available"):
+        return ["   🚪 exits: not available (re-run the backtest with the current version)"]
+    mix = ex["mix"]
+    out = ["   🚪 how the trades ended (net of fee): " + ", ".join(
+        f"{k} ×{v['n']} ({v['net']:+.1f}%)" for k, v in mix.items() if v["n"])]
+    nv = ex["never_tp1"]
+    if nv["n"]:
+        b = nv["progress_to_tp1"]
+        out.append(f"   ❌ stopped before TP1: {nv['n']} ({nv['share_of_trades']:.0%} of trades, net {nv['net']:+.1f}%, "
+                   f"avg stop {nv['avg_sl_pct']:.2f}%), median {nv['median_bars']} bars; "
+                   f"stopped within {nv['fast_stop']['bars']} bars: {nv['fast_stop']['share']:.0%}")
+        out.append("      how far they got toward TP1 before the stop: " + ", ".join(f"{k} ×{v}" for k, v in b.items())
+                   + f" — at least half way: {nv['near_miss']['share']:.0%} "
+                     f"(early {nv['near_miss']['by_window']['early']:.0%} | late {nv['near_miss']['by_window']['late']:.0%})")
+        out.append(f"      price reached TP1 AFTER the stop: {nv['shakeout_tp1']['share']:.0%} "
+                   f"(early {nv['shakeout_tp1']['by_window']['early']:.0%} | late {nv['shakeout_tp1']['by_window']['late']:.0%}), "
+                   f"TP2: {nv['shakeout_tp2']['share']:.0%} — an upper bound for 'the stop was too tight': the path after the stop is not replayed")
+    h = ex["winners_heat"]
+    if h["n"]:
+        out.append(f"   🔥 of the {h['n']} trades that reached TP1, {h['dip_ge_50']:.0%} dipped ≥50% of the way to the stop "
+                   f"and {h['dip_ge_75']:.0%} ≥75% (median {h['median_dip']:.0%})")
+    for t in ex["tighter_sl"]:
+        out.append(f"   ✂️ stop at {t['factor']:g}× its distance: trades that never reached TP1 {t['exact']['all']:+.1f}% exact "
+                   f"[early {t['exact']['early']:+.1f}% | late {t['exact']['late']:+.1f}%] ({t['stopped_never_tp1']} stopped earlier); "
+                   f"{t['deep_dips_after_tp1']} trades that reached TP1 dipped that deep (worst case {t['worst_extra']['all']:+.1f}% "
+                   f"if all of them dipped BEFORE TP1) → total between {t['worst_case']['all']:+.1f}% and {t['exact']['all']:+.1f}% "
+                   f"[worst case early {t['worst_case']['early']:+.1f}% | late {t['worst_case']['late']:+.1f}%]")
+    return out
+
+
 def _autopsy_lines(result: dict) -> list:
     """Discord text of run_autopsy(): per pair/timeframe the trade split, the states that
     lost more than average (✅ = in both the early and the late part of the history), the
@@ -2679,6 +2714,7 @@ def _autopsy_lines(result: dict) -> list:
                                  f"late {c['late']['delta']:+.1f}% ({c['late']['extra']:+d})] {verdict[c['verdict']]}")
             if r.get("skipped_features"):
                 lines.append("   (not tested, an enabled filter already decides them: " + ", ".join(r["skipped_features"]) + ")")
+            lines.extend(_autopsy_exit_lines(r.get("exits")))
             lf = r["loser_features"]
             lines.append(f"   📉 states that lost more (average trade loses {lf['base_loss_rate']:.0%}; "
                          f"{lf['n_tested']} states tested):")
@@ -2688,7 +2724,7 @@ def _autopsy_lines(result: dict) -> list:
                     continue
                 mark = "✅" if c["holds"] else "▫️"
                 lines.append(f"   {mark} {c['feature']}=`{c['value']}` n={c['n']} loses {c['loss_rate']:.0%} "
-                             f"(×{c['lift']:.1f}), skipping it = {c['skip_gain']:+.2f}% "
+                             f"(×{c['lift']:.1f}, z={c['z']:.1f}), skipping it = {c['skip_gain']:+.2f}% "
                              f"[early {-c['early']['net']:+.1f}% n={c['early']['n']} | late {-c['late']['net']:+.1f}% n={c['late']['n']}]")
                 shown += 1
                 if shown >= 4:
@@ -2702,7 +2738,7 @@ def _autopsy_lines(result: dict) -> list:
                 if c["lift"] <= 1.0:
                     continue
                 mark = "✅" if c["holds"] else "▫️"
-                lines.append(f"   {mark} {c['feature']}=`{c['value']}` {c['missed']}/{c['n']} missed (×{c['lift']:.1f})")
+                lines.append(f"   {mark} {c['feature']}=`{c['value']}` {c['missed']}/{c['n']} missed (×{c['lift']:.1f}, z={c['z']:.1f})")
                 shown += 1
                 if shown >= 4:
                     break

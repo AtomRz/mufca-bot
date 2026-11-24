@@ -2587,6 +2587,13 @@ def backtest_history(
                         "moved_pct": round(moved_pct, 4), "regime": bt_regime,
                         "tp1_reached": bool(tp1_reached), "bars_held": bars_held,
                         **({"idx": idx, "exit_idx": exit_idx, "fails": _tbl_fails,
+                            # what price did on the way (% of entry) and how far the ORIGINAL
+                            # SL / TP1 / TP2 were - the exit side of the autopsy
+                            "mfe": rec_bt["max_favorable_pct"], "mae": rec_bt["max_adverse_pct"],
+                            "raw_mfe": rec_bt.get("raw_mfe_pct"), "raw_mae": rec_bt.get("raw_mae_pct"),
+                            "sl_pct": round(abs(entry_p - sl) / entry_p * 100, 4),
+                            "tp1_pct": round(abs(tp1 - entry_p) / entry_p * 100, 4),
+                            "tp2_pct": round(abs(tp2 - entry_p) / entry_p * 100, 4),
                             "vol_ratio": volume_gate.ratio_or_none(_vm_arr["bar"][idx]),
                             "vm": {_m: volume_gate.ratio_or_none(_a[idx]) for _m, _a in _vm_arr.items()},
                             "ts": int(df["timestamp"].iloc[idx])} if _trig_tbl else {}),

@@ -255,6 +255,20 @@ FILTER_FEATURE = {
 }
 
 
+# Evidence needed for a ✅ (on top of "holds in both the early and the late window").
+LOSER_MIN_N = 15          # trades in the state
+MIN_Z_ONE_SIDED = 1.64    # loss rate above the average one, ~95% one-sided
+MISSED_MIN_LIFT = 1.15    # missed share vs the average missed share
+MIN_Z_TWO_SIDED = 2.0     # ~95% two-sided
+
+
+def _z(p: float, base: float, n: int) -> float:
+    """z-score of an observed rate p over n trials against the base rate."""
+    if n <= 0 or not (0.0 < base < 1.0):
+        return 0.0
+    return (p - base) / ((base * (1.0 - base) / n) ** 0.5)
+
+
 def features_to_test(enabled_filters: List[str]) -> Tuple[str, ...]:
     skip = {FILTER_FEATURE[f] for f in enabled_filters if f in FILTER_FEATURE}
     return tuple(f for f in FEATURES if f not in skip)
@@ -288,6 +302,7 @@ def loser_feature_table(rows: List[Dict], cutoff_idx: int, min_n: int = 8, min_s
             n_tr, tot_tr = _win(tr)
             n_te, tot_te = _win(te)
             n_all, tot_all = _win(sub)
+            z = _z(losers / n_all, base, n_all)
             cands.append({
                 "feature": f, "value": v, "n": n_all,
                 "loss_rate": round(losers / n_all, 4),
@@ -295,7 +310,11 @@ def loser_feature_table(rows: List[Dict], cutoff_idx: int, min_n: int = 8, min_s
                 "avg_net": round(tot_all / n_all, 4),
                 "skip_gain": round(-tot_all, 4),  # total net PnL removed by skipping it (>0 = it lost money)
                 "early": {"n": n_tr, "net": tot_tr}, "late": {"n": n_te, "net": tot_te},
-                "holds": bool(n_tr >= min_split and n_te >= min_split and tot_tr < 0 and tot_te < 0),
+                "z": round(z, 2),
+                # a ✅ needs (a) the subset to lose money in BOTH windows, (b) enough trades overall
+                # and (c) a loss rate clearly above the average one - 9 trades never qualify
+                "holds": bool(n_tr >= min_split and n_te >= min_split and tot_tr < 0 and tot_te < 0
+                              and n_all >= LOSER_MIN_N and z >= MIN_Z_ONE_SIDED),
             })
     cands.sort(key=lambda c: (not c["holds"], -c["skip_gain"]))
     return {"base_loss_rate": round(base, 4), "n_tested": tested, "candidates": cands}
@@ -372,12 +391,17 @@ def missed_feature_table(legs: List[Dict], cutoff_idx: int, min_n: int = 8, min_
             late = [g for g in sub if g["pivot_idx"] >= cutoff_idx]
             early_all = [g for g in legs if g["pivot_idx"] < cutoff_idx]
             late_all = [g for g in legs if g["pivot_idx"] >= cutoff_idx]
+            lift = (m / len(sub)) / base if base > 0 else 0.0
+            z = _z(m / len(sub), base, len(sub))
+            # a ✅ needs the state to be over-represented in BOTH windows AND to stand clearly above
+            # the average missed share (lift and z), not just to be a hair above it
             holds = bool(len(early) >= min_split and len(late) >= min_split
-                         and share(early) > share(early_all) and share(late) > share(late_all))
+                         and share(early) > share(early_all) and share(late) > share(late_all)
+                         and lift >= MISSED_MIN_LIFT and z >= MIN_Z_TWO_SIDED)
             cands.append({
                 "feature": f, "value": v, "n": len(sub), "caught": len(sub) - m, "missed": m,
-                "missed_share": round(m / len(sub), 4),
-                "lift": round((m / len(sub)) / base, 3) if base > 0 else 0.0,
+                "missed_share": round(m / len(sub), 4), "z": round(z, 2),
+                "lift": round(lift, 3),
                 "missed_leg_pct": round(sum(g["leg_pct"] for g in sub if g["status"] != "caught"), 2),
                 "holds": holds,
             })
@@ -428,6 +452,113 @@ def filter_counterfactuals(flags: Dict[str, bool], enabled_filters: List[str], r
         })
     out.sort(key=lambda c: -c["delta"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Exit side: what happened to the trades after they were opened
+# ---------------------------------------------------------------------------
+EXIT_TYPES = ("tp", "sl_after_tp1", "sl", "cancelled")
+SL_TIGHTEN_FACTORS = (0.75, 0.5)
+FAST_STOP_BARS = 3
+
+
+def _share(num: int, den: int) -> float:
+    return round(num / den, 4) if den else 0.0
+
+
+def exit_autopsy(taken: List[Dict], fee_pct: float, cutoff_idx: int) -> Dict:
+    """How the trades the bot takes ended, from the per-trade exit fields of the trigger
+    table (mfe/mae = the way price moved up to the exit, raw_mfe = over the whole holding
+    horizon, sl_pct/tp1_pct/tp2_pct = the original stop and targets, all in % of entry).
+
+      mix        - trades and net PnL by exit type;
+      never_tp1  - the pure losers (stopped out before TP1): how far toward TP1 they got
+                   (near_miss = at least half way), how fast they were stopped, and whether
+                   price reached TP1/TP2 AFTER the stop ("shake-out", an upper bound: the
+                   path after the stop is not replayed);
+      winners_heat - of the trades that reached TP1, how deep they dipped against the
+                   original SL (how much room a tighter stop would leave them);
+      tighter_sl - what the stop at k x its distance would have done. Trades that never
+                   reached TP1 are exact (their whole path is before the exit); for trades
+                   that reached TP1 the order of the dip and TP1 is unknown, so the table
+                   gives the exact part and a worst case (every deep dip assumed pre-TP1).
+    Returns {"available": False} for rows from a backtest without the exit fields."""
+    rows = [t for t in taken if t.get("sl_pct") and t.get("tp1_pct") and t.get("mfe") is not None]
+    if not rows:
+        return {"available": False}
+    net = lambda t: float(t["moved_pct"]) - fee_pct  # noqa: E731
+    early = lambda t: int(t["idx"]) < cutoff_idx      # noqa: E731
+
+    mix = {}
+    for et in EXIT_TYPES:
+        sub = [t for t in rows if t.get("exit_type") == et]
+        mix[et] = {"n": len(sub), "net": round(sum(net(t) for t in sub), 3),
+                   "avg": round(sum(net(t) for t in sub) / len(sub), 3) if sub else 0.0}
+
+    pure = [t for t in rows if t.get("exit_type") == "sl" and not t.get("tp1_reached")]
+    prog = [float(t["mfe"]) / float(t["tp1_pct"]) for t in pure]
+    buckets = {"<25%": 0, "25-50%": 0, "50-75%": 0, "75-100%": 0}
+    for p in prog:
+        buckets["<25%" if p < 0.25 else "25-50%" if p < 0.5 else "50-75%" if p < 0.75 else "75-100%"] += 1
+    near = [t for t, p in zip(pure, prog) if p >= 0.5]
+    fast = [t for t in pure if int(t.get("bars_held", 0)) <= FAST_STOP_BARS]
+    shake1 = [t for t in pure if t.get("raw_mfe") is not None and float(t["raw_mfe"]) >= float(t["tp1_pct"])]
+    shake2 = [t for t in pure if t.get("raw_mfe") is not None and t.get("tp2_pct")
+              and float(t["raw_mfe"]) >= float(t["tp2_pct"])]
+    bars = sorted(int(t.get("bars_held", 0)) for t in pure)
+
+    def split(sub):
+        e = [t for t in sub if early(t)]
+        return {"early": _share(len(e), len([t for t in pure if early(t)])),
+                "late": _share(len(sub) - len(e), len([t for t in pure if not early(t)]))}
+
+    never = {
+        "n": len(pure), "share_of_trades": _share(len(pure), len(rows)),
+        "net": round(sum(net(t) for t in pure), 3),
+        "avg_sl_pct": round(sum(float(t["sl_pct"]) for t in pure) / len(pure), 3) if pure else 0.0,
+        "progress_to_tp1": buckets,
+        "near_miss": {"n": len(near), "share": _share(len(near), len(pure)), "by_window": split(near)},
+        "fast_stop": {"n": len(fast), "share": _share(len(fast), len(pure)), "bars": FAST_STOP_BARS},
+        "median_bars": bars[len(bars) // 2] if bars else 0,
+        "shakeout_tp1": {"n": len(shake1), "share": _share(len(shake1), len(pure)), "by_window": split(shake1)},
+        "shakeout_tp2": {"n": len(shake2), "share": _share(len(shake2), len(pure))},
+    }
+
+    reached = [t for t in rows if t.get("tp1_reached")]
+    dips = sorted(float(t["mae"]) / float(t["sl_pct"]) for t in reached)
+    heat = {
+        "n": len(reached),
+        "dip_ge_50": _share(sum(1 for d in dips if d >= 0.5), len(dips)),
+        "dip_ge_75": _share(sum(1 for d in dips if d >= 0.75), len(dips)),
+        "median_dip": round(dips[len(dips) // 2], 3) if dips else 0.0,
+    }
+
+    tighter = []
+    for k in SL_TIGHTEN_FACTORS:
+        exact = {"all": 0.0, "early": 0.0, "late": 0.0}
+        worst = {"all": 0.0, "early": 0.0, "late": 0.0}
+        stopped = deep = 0
+        for t in rows:
+            lvl = k * float(t["sl_pct"])
+            if float(t["mae"]) < lvl:
+                continue
+            delta = -lvl - float(t["moved_pct"])  # new PnL (stopped at the tighter level) minus the old one
+            bucket = exact if not t.get("tp1_reached") else worst
+            if not t.get("tp1_reached"):
+                stopped += 1
+            else:
+                deep += 1
+            bucket["all"] += delta
+            bucket["early" if early(t) else "late"] += delta
+        tighter.append({
+            "factor": k, "stopped_never_tp1": stopped, "deep_dips_after_tp1": deep,
+            "exact": {w: round(v, 2) for w, v in exact.items()},
+            "worst_extra": {w: round(v, 2) for w, v in worst.items()},
+            "worst_case": {w: round(exact[w] + worst[w], 2) for w in exact},
+        })
+
+    return {"available": True, "n": len(rows), "mix": mix, "never_tp1": never, "winners_heat": heat,
+            "tighter_sl": tighter}
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +623,7 @@ def analyze_pair(S: Dict, triggers: List[Dict], taken: List[Dict], enabled_filte
             "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         },
         "filter_cf": filter_cf,
+        "exits": exit_autopsy(taken, fee_pct, cutoff_idx),
         "skipped_features": sorted(set(FEATURES) - set(feats)),
         "loser_features": {**losers_tbl, "candidates": losers_tbl["candidates"][:top]},
         "missed_features": {**missed_tbl, "candidates": missed_tbl["candidates"][:top]},
