@@ -3,6 +3,7 @@ import AutoFilterPanel from './AutoFilterPanel'
 import VolumeGatePanel from './VolumeGatePanel'
 import IndicatorOptimizerPanel from './IndicatorOptimizerPanel'
 import AutopsyPanel from './AutopsyPanel'
+import MissedSimPanel from './MissedSimPanel'
 import WalkForwardPanel from './WalkForwardPanel'
 
 // Lab: everything that RUNS a simulation over the history (optimizers, testers, autopsies).
@@ -18,6 +19,7 @@ export default function LabPanel({ config, onChanged }) {
         Only one simulation runs at a time.
       </p>
       <AutopsyPanel config={config} />
+      <MissedSimPanel config={config} />
       <AutoFilterPanel config={config} onChanged={onChanged} />
       <VolumeGatePanel config={config} onChanged={onChanged} />
       <IndicatorOptimizerPanel config={config} />

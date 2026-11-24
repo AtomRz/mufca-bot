@@ -1017,6 +1017,32 @@ async def run_autopsy_endpoint(body: AutopsyIn):
     )
 
 
+class MissedSimIn(BaseModel):
+    ticker: Optional[str] = None
+    tf: Optional[str] = None
+    num_bars: int = Field(3000, ge=300, le=20000)
+    swing: float = Field(3.0, ge=1.0, le=10.0)  # a reversal = a swing of at least this many ATRs
+
+
+@app.post("/api/missedsim")
+async def run_missedsim_endpoint(body: MissedSimIn):
+    """Missed-reversal structure study (same computation as the Discord !missedsim, both call
+    signals.run_missedsim()): do the swings no signal caught share a market structure, checked
+    against ordinary bars and a plain bracket trade in the early and the late window?
+    MEASUREMENT ONLY - nothing is applied or changed.
+
+    Background job, same contract as /api/autopsy: 202 + job now, poll
+    GET /api/sim-jobs/{id} for the result. 409 if another simulation is running."""
+    exchange, scope_tickers, scope_tfs = _sim_scope(body.ticker, body.tf)
+    from signals import run_missedsim
+    return _start_sim_job(
+        "missedsim",
+        {"ticker": body.ticker, "tf": body.tf, "num_bars": body.num_bars, "swing": body.swing},
+        lambda progress: run_missedsim(
+            exchange, scope_tickers, scope_tfs, body.num_bars, progress=progress, pivot_atr_mult=body.swing),
+    )
+
+
 @app.get("/api/filter-overrides")
 async def get_filter_overrides():
     """Filter sets pinned per ticker/timeframe by the auto-tuner (they win over

@@ -53,7 +53,7 @@ from volume_indicators import volume_flow_signal_v3
 from signals import (
     check_signals, backtest_history, make_state, calculate_adaptive_sl, clear_htf_cache,
     run_tp1_mode_comparison, run_component_backtest, run_filter_ablation, run_filter_autotune,
-    run_indicator_optimize, run_volume_autotune, run_autopsy, FILTER_KEYS,
+    run_indicator_optimize, run_volume_autotune, run_autopsy, run_missedsim, FILTER_KEYS,
     run_history_reconcile, apply_history_reconcile, _RECONCILE_CACHE, run_raw_outcome_fill, run_components_fill,
 )
 import filter_stats
@@ -156,6 +156,7 @@ async def help_cmd(ctx):
         "`!volfit [preview|run] [pair] [tf] [bars] [metric…]` — find the volume METRIC and threshold per pair × timeframe from history (bar/smooth/thin/how compared; train/test checked; nothing proven = gate off for that pair); `!volfit show|revert|clear`",
         "`!indoptim [pair] [tf] [bars] [trials=N]` — indicator optimizer: would other FRAMA/MFI/Andean/UT settings have traded better for this pair/timeframe? Preview only, with train/test + stability checks",
         "`!autopsy [pair] [tf] [bars] [swing=N]` — what the indicators showed at LOSING signals and at MISSED reversals (swings ≥ N×ATR, default 3): which states lose more, which turns got no signal and why. Measurement only, nothing is changed",
+        "`!missedsim [pair] [tf] [bars] [swing=N]` — do the reversals no signal caught share a structure (trend length, volatility, volume, range sweep, value area, divergence, CHoCH, FVG, session)? Checked against ordinary bars and a plain bracket trade, early vs late window. Measurement only, nothing is changed",
         "`!walkfwd [pair] [tf] [bars] [folds=N]` — rolling walk-forward check of the filter tuner (several train→test folds, stability of the pick) + audit of pinned sets on the bars since they were pinned; dry-run",
         "`!pinfilter <pair> <tf> chop=off slope=off` — set filters by hand for one pair/timeframe (`default` removes the pin)",
         "`!filterstats [pair] [tf]` / `!filterstats reset` — live funnel: how many raw signals each filter rejected (counters only)",
@@ -2845,6 +2846,131 @@ async def autopsy_cmd(ctx, *args):
         await _send_chunked(ctx, "\n".join(lines))
     except Exception as e:
         logger.error(f"autopsy command error: {e}", exc_info=True)
+        await ctx.send(f"❌ Error: {e}")
+
+
+_MS_GRADE = {"both": "✅", "turn": "🟦", "trade": "🟨", "none": "▫️"}
+
+
+def _missedsim_lines(result: dict) -> list:
+    """Discord text of run_missedsim(): per pair/timeframe the swing split, the base rates, and the
+    strongest states (✅ = marks turns AND the bracket trade paid, early and late)."""
+    lines = []
+    for ticker, per_tf in result["results"].items():
+        for tf, r in per_tf.items():
+            lg, bs, br = r["legs"], r["baseline"], r["bracket"]
+            lines.append(f"\n**{ticker} {tf}** — {lg['total']} swings ≥ {r['pivot_atr_mult']:g}×ATR: {lg['caught']} caught, "
+                         f"{lg['filtered']} filtered, {lg['busy']} busy, **{lg['none']} no trigger**; control = {bs['all']['ctrl']} "
+                         f"bars (every {r['stride']}th, both sides)")
+            lines.append(f"   base: a bar is a turn start {bs['all']['turn_rate']:.2%} of the time; a plain {br['sl_atr']:g}/{br['tp_atr']:g}×ATR "
+                         f"bracket wins {bs['all']['win']:.0%}, avg {bs['all']['avg_net']:+.3f}% net")
+            g = r["grades"]
+            lines.append(f"   {r['n_tested']} states tested ({r['n_singles']} single, {r['n_pairs']} pairs): "
+                         f"✅ {g['both']} · 🟦 turn only {g['turn']} · 🟨 trade only {g['trade']}")
+            shown = 0
+            for c in r["candidates"]:
+                if c["grade"] == "none":
+                    continue
+                a, e, l = c["all"], c["early"], c["late"]
+                lines.append(f"   {_MS_GRADE[c['grade']]} `{c['feature']}` = `{c['value']}` — {c['n_legs']} swings ({c['n_none']} no trigger, "
+                             f"Σ leg size {c['none_leg_pct']:.0f}%), turn ×{a['lift']:.1f} (z={a['z']:.1f}) "
+                             f"[early ×{e['lift']:.1f} | late ×{l['lift']:.1f}]; bracket avg {a['avg_net']:+.3f}% (t={a['t']:.1f}) "
+                             f"[early {e['avg_net']:+.3f}% n={e['ctrl']} | late {l['avg_net']:+.3f}% n={l['ctrl']}]")
+                shown += 1
+                if shown >= 6:
+                    break
+            if not shown:
+                lines.append("   no state stands out")
+            lines.append("   → " + ("candidates to forward-test (not a finding)" if g["both"] else
+                                      "nothing holds - no new signal type is justified by these features on this pair"))
+    cons = result.get("consistent") or []
+    if cons:
+        lines.append("\n**🔗 Holds on every pair of the same timeframe:**")
+        for c in cons:
+            lines.append(f"   ✅ {c['tf']}: `{c['feature']}` = `{c['value']}` ({', '.join(c['pairs'])})")
+    return lines
+
+
+@core.bot.command(name="missedsim", aliases=["missed"])
+async def missedsim_cmd(ctx, *args):
+    """
+    Missed-reversal structure study - MEASUREMENT ONLY, nothing is changed. Most of what the
+    bot loses is not on filters or stops but on reversals where no trigger fired at all. This
+    asks whether those turns share a structure that a NEW signal type could use:
+
+      1. For every swing of at least N x ATR the market state 2 bars after the turn is read
+         (data up to that bar only): length and size of the trend it reverses, ATR percentile
+         and direction, volume spike / dry-up, a sweep of the 100-bar extreme, position against
+         the volume-profile band and POC, MFI / Andean divergence, a CHoCH-like break, a
+         fair-value gap, the session, plus the usual FRAMA / MFI / Andean / UT / Hurst / CHOP
+         states.
+      2. The same states are read on a sample of ordinary bars (control) and a plain bracket
+         trade (stop = target = 1.5 x ATR) is simulated from each.
+      3. A state is ✅ only if it marks turns more often than the control AND the bracket trade
+         paid (net of fee) in BOTH the older 60% and the newest 40% of the history. Pairs of
+         states are tried only for the strongest singles. 🟦 = marks turns but did not pay (a
+         turn leaves traces in the bars after it, so this alone is weak), 🟨 = paid but does not mark turns.
+
+    "Nothing holds" is a valid result: it means no new signal type is justified.
+
+    Usage: !missedsim [pair] [tf] [bars] [swing=N]
+      !missedsim ETH/USDT 4h 9900   - one pair/timeframe, long history
+      !missedsim swing=2            - smaller swings count as reversals (default 3 x ATR)
+    Shares the one-at-a-time simulation slot with !autopsy / !tp1sim / !compsim / !filtersim / !indoptim.
+    """
+    ticker = tf = ""
+    num_bars = 3000
+    swing = 3.0
+    for a in args:
+        if a.lower().startswith("swing="):
+            try:
+                swing = float(a.split("=", 1)[1])
+            except ValueError:
+                swing = 0.0
+            if not (1.0 <= swing <= 10.0):
+                await ctx.send(f"❌ `{a}` — use `swing=<1..10>` (swing size in ATRs).")
+                return
+        elif a.upper() in TICKERS:
+            ticker = a.upper()
+        elif a.lower() in TIMEFRAMES:
+            tf = a.lower()
+        elif a.isdigit():
+            num_bars = _clamp_bars(int(a))
+        else:
+            await ctx.send(f"❌ Don't know `{a}` — expected a tracked pair, timeframe, bar count or `swing=N`.")
+            return
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        await ctx.send("❌ Not connected to the exchange yet.")
+        return
+    scope_tickers = [ticker] if ticker else list(TICKERS)
+    scope_tfs = [tf] if tf else list(TIMEFRAMES)
+
+    try:
+        result = await _run_sim_job(
+            ctx, "missedsim", {"ticker": ticker or None, "tf": tf or None, "num_bars": num_bars, "swing": swing},
+            lambda progress: run_missedsim(exchange, scope_tickers, scope_tfs, num_bars, progress=progress,
+                                           pivot_atr_mult=swing),
+            intro=(f"⏳ Missed-reversal study: {len(scope_tickers)} pair(s) × {len(scope_tfs)} tf(s), {num_bars} bars, swings ≥ {swing:g}×ATR "
+                   f"(measurement only, nothing is changed)."),
+        )
+        if result is None:
+            return
+        head = [f"**🧭 Missed-reversal structure** — net of {result['fee_pct']}% fee per trade, early window = oldest "
+                f"{result['train_fraction']:.0%} of the bars, late = the rest"]
+        for c in result["bar_coverage"]:
+            if c["got"] < c["requested"]:
+                head.append(f"⚠️ {c['ticker']} {c['tf']}: requested {c['requested']} bars, got {c['got']}")
+        for sk in result.get("skipped", []):
+            head.append(f"❌ {sk['ticker']} {sk['tf']}: skipped — {sk['reason']}")
+        lines = head + _missedsim_lines(result)
+        if not result["results"]:
+            lines.append("No pair/timeframe produced a result — see the reasons above.")
+        lines.append("\nNothing was applied. Dozens of states are tested, so a few look good by chance — forward-test before building anything.")
+        await _send_chunked(ctx, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"missedsim command error: {e}", exc_info=True)
         await ctx.send(f"❌ Error: {e}")
 
 
