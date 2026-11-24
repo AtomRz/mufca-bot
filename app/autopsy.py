@@ -459,6 +459,7 @@ def filter_counterfactuals(flags: Dict[str, bool], enabled_filters: List[str], r
 # ---------------------------------------------------------------------------
 EXIT_TYPES = ("tp", "sl_after_tp1", "sl", "cancelled")
 SL_TIGHTEN_FACTORS = (0.75, 0.5)
+SL_EXACT_FACTORS = (1.5, 1.25, 0.75, 0.5)  # the replay handles wider stops too
 FAST_STOP_BARS = 3
 
 
@@ -520,7 +521,7 @@ def replay_trade(S: Dict, t: Dict, k: float, tp1_frac: float, max_hold: int,
 
 
 def tighter_stop_exact(taken: List[Dict], S: Dict, fee_pct: float, cutoff_idx: int,
-                       tp1_frac: float, max_hold: int, factors=SL_TIGHTEN_FACTORS) -> Dict:
+                       tp1_frac: float, max_hold: int, factors=SL_EXACT_FACTORS) -> Dict:
     """The tighter-stop what-if with the real bar order (no worst-case range): every taken trade
     is re-played with the stop at k x its distance. `check` re-plays at k=1 and compares with
     what the backtest recorded, so a replay that does not reproduce the backtest shows itself

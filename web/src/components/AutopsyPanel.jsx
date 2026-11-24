@@ -141,7 +141,7 @@ function ExitBlock({ ex }) {
       )}
       {ex.tighter_exact && (
         <div style={{ marginTop: 6 }}>
-          ✂️ Tighter stop, re-played bar by bar on the real highs/lows
+          ✂️ Stop distance changed (tighter and wider), re-played bar by bar on the real highs/lows
           {ex.tighter_exact.check.mismatch > 0 && (
             <b> ⚠️ the replay does not reproduce {ex.tighter_exact.check.mismatch} of {ex.tighter_exact.check.n} recorded trades — do not trust these numbers</b>
           )}
@@ -149,7 +149,7 @@ function ExitBlock({ ex }) {
             <thead>
               <tr><th style={th}>stop at</th><th style={th}>PnL change (bot's same-bar rule)</th><th style={th}>early / late</th>
                 <th style={th}>strict (same-bar = stop)</th><th style={th}>early / late</th>
-                <th style={th}>trades saved / winners cut</th><th style={th}>net after</th></tr>
+                <th style={th}>trades better / worse</th><th style={th}>net after</th></tr>
             </thead>
             <tbody>
               {ex.tighter_exact.factors.map((t) => (

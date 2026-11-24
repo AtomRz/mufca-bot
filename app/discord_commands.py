@@ -2688,7 +2688,7 @@ def _autopsy_exit_lines(ex) -> list:
         if chk["mismatch"]:
             out.append(f"   ⚠️ the bar-by-bar replay does not reproduce {chk['mismatch']} of {chk['n']} recorded trades — do not trust the stop numbers below")
         for t in te["factors"]:
-            out.append(f"   ✂️ stop at {t['factor']:g}× (replayed bar by bar): {t['bot_rule']['all']:+.1f}% "
+            out.append(f"   ✂️ stop at {t['factor']:g}× (replayed bar by bar){' — WIDER' if t['factor'] > 1 else ''}: {t['bot_rule']['all']:+.1f}% "
                        f"[early {t['bot_rule']['early']:+.1f}% | late {t['bot_rule']['late']:+.1f}%]; strict same-bar=stop "
                        f"{t['strict']['all']:+.1f}% [early {t['strict']['early']:+.1f}% | late {t['strict']['late']:+.1f}%]; "
                        f"{t['saved']} trades better / {t['cut_winners']} worse of {t['n']} ({t['ambiguous']} same-bar); "
