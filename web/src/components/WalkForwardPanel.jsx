@@ -1,15 +1,16 @@
 import React, { useState } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 import { SimScopeFields, SimStatus, BarCoverageWarning, useSimJob, barsError } from './InsightsPanel'
 
 const FILTER_ORDER = ['frama', 'slope', 'chop', 'atr', 'htf', 'fake_break', 'liq_sweep', 'hurst']
 
-const describeSet = (flags) => {
+const describeSet = (flags, t) => {
   const off = FILTER_ORDER.filter((k) => !flags?.[k])
-  return off.length === 0 ? 'all on' : `off: ${off.join(', ')}`
+  return off.length === 0 ? t('all on') : t('off: {list}', { list: off.join(', ') })
 }
 const pct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
-const stat = (st) => `n=${st.n} total ${pct(st.total)}`
+const stat = (st, t) => t('n={n} total {total}', { n: st.n, total: pct(st.total) })
 
 const VERDICTS = {
   robust: { icon: '✅', label: 'robust', color: 'var(--long)' },
@@ -20,18 +21,21 @@ const VERDICTS = {
 }
 
 const AUDIT_STATUS = { holding: '✅', worse: '❌', no_difference: '➖', too_early: '⏳' }
+const AUDIT_LABEL = { holding: 'holding up', worse: 'worse', no_difference: 'no difference', too_early: 'too early' }
 
 function AuditRow({ name, w }) {
+  const { t } = useI18n()
   if (!w) return null
   return (
     <div>
-      {AUDIT_STATUS[w.status] || ''} {name}: pinned {stat(w.pinned)} vs before {stat(w.reference)} →{' '}
-      <b>{pct(w.gain.gain)}</b> (noise {w.gain.noise.toFixed(2)}%) — {w.status.replace('_', ' ')}
+      {AUDIT_STATUS[w.status] || ''} {t('{name}: pinned {pinned} vs before {before} →', { name: t(name), pinned: stat(w.pinned, t), before: stat(w.reference, t) })}{' '}
+      <b>{pct(w.gain.gain)}</b> {t('(noise {noise}%) — {status}', { noise: w.gain.noise.toFixed(2), status: t(AUDIT_LABEL[w.status] || w.status.replace('_', ' ')) })}
     </div>
   )
 }
 
 function PairResult({ ticker, tf, r }) {
+  const { t } = useI18n()
   const wf = r.walk_forward
   const v = VERDICTS[wf.verdict] || { icon: '', label: wf.verdict, color: 'var(--text-faint)' }
   const agg = wf.aggregate
@@ -40,35 +44,40 @@ function PairResult({ ticker, tf, r }) {
   return (
     <div style={{ fontSize: 12, marginBottom: 12 }}>
       <div style={{ fontWeight: 600 }}>
-        {ticker} {tf} <span style={{ color: v.color }}>{v.icon} {v.label}</span>
+        {ticker} {tf} <span style={{ color: v.color }}>{v.icon} {t(v.label)}</span>
       </div>
       <div style={{ color: 'var(--text-faint)' }}>
         {wf.reason}<br />
-        current{r.current_pinned ? ' (pinned)' : ''}: {describeSet(r.current)}<br />
-        out-of-sample, all folds — re-tuned {stat(agg.policy)} · current {stat(agg.current)} · all on {stat(agg.all_on)} · all off {stat(agg.all_off)}
+        {r.current_pinned ? t('current (pinned): {set}', { set: describeSet(r.current, t) }) : t('current: {set}', { set: describeSet(r.current, t) })}<br />
+        {t('out-of-sample, all folds — re-tuned {policy} · current {current} · all on {allOn} · all off {allOff}', {
+          policy: stat(agg.policy, t), current: stat(agg.current, t), allOn: stat(agg.all_on, t), allOff: stat(agg.all_off, t),
+        })}
         {agg.folds_switched > 0 && (
-          <><br />switched in {agg.folds_switched}/{agg.folds} folds: saw {pct(agg.in_sample_gain)} in training,
-            got {pct(agg.out_of_sample_gain)} on the next block</>
+          <><br />{t('switched in {switched}/{folds} folds: saw {inSample} in training, got {outSample} on the next block', {
+            switched: agg.folds_switched, folds: agg.folds, inSample: pct(agg.in_sample_gain), outSample: pct(agg.out_of_sample_gain),
+          })}</>
         )}
         {stab.folds_scored > 0 && stab.modal_pick && (
-          <><br />stability: {stab.distinct_picks} distinct pick(s) in {stab.folds_scored} folds; most common
-            ({Math.round(stab.modal_share * 100)}%): {describeSet(stab.modal_pick)}</>
+          <><br />{t('stability: {picks} distinct pick(s) in {folds} folds; most common ({share}%): {set}', {
+            picks: stab.distinct_picks, folds: stab.folds_scored, share: Math.round(stab.modal_share * 100), set: describeSet(stab.modal_pick, t),
+          })}</>
         )}
-        {thin.length > 0 && <><br />⚠ thin test block(s): {thin.join(', ')}</>}
+        {thin.length > 0 && <><br />{t('⚠ thin test block(s): {list}', { list: thin.join(', ') })}</>}
         {r.audit && (
           <div style={{ marginTop: 4 }}>
-            📌 pinned-set audit vs {r.audit.reference_kind === 'previous pin' ? 'the set before the pin' : 'the global toggles'}:
+            {t('📌 pinned-set audit vs {ref}:', { ref: r.audit.reference_kind === 'previous pin' ? t('the set before the pin') : t('the global toggles') })}
             <AuditRow name="since it was pinned" w={r.audit.since_pin} />
             <AuditRow name="newest bars" w={r.audit.recent} />
           </div>
         )}
-        {r.current_pinned && <div>(the current set was itself tuned on this history, so its numbers here are optimistic)</div>}
+        {r.current_pinned && <div>{t('(the current set was itself tuned on this history, so its numbers here are optimistic)')}</div>}
       </div>
     </div>
   )
 }
 
 export default function WalkForwardPanel({ config }) {
+  const { t } = useI18n()
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(6000)
@@ -80,24 +89,20 @@ export default function WalkForwardPanel({ config }) {
   const start = () => {
     const bad = barsError(numBars)
     if (bad) { sim.setError(bad); return }
-    if (!Number.isInteger(folds) || folds < 2 || folds > 12) { sim.setError('Folds must be a whole number between 2 and 12'); return }
+    if (!Number.isInteger(folds) || folds < 2 || folds > 12) { sim.setError(t('Folds must be a whole number between 2 and 12')); return }
     sim.start(() => api.runWalkForward({ ticker, tf, numBars, folds }))
   }
 
   const rows = []
-  Object.entries(result?.results || {}).forEach(([t, perTf]) => {
-    Object.entries(perTf).forEach(([f, r]) => rows.push({ t, f, r }))
+  Object.entries(result?.results || {}).forEach(([tk, perTf]) => {
+    Object.entries(perTf).forEach(([f, r]) => rows.push({ tk, f, r }))
   })
 
   return (
     <div className="panel">
-      <h3 className="panel-title">Walk-forward check</h3>
+      <h3 className="panel-title">{t('Walk-forward check')}</h3>
       <p style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 12 }}>
-        Auto-tune confirms its pick on one out-of-sample window. This cuts the history into several train → test folds,
-        lets the tuner choose on each training part only and trades that choice on the next block it has never seen — so
-        you see whether re-tuning keeps its edge or just fits noise, and how stable the chosen set is. Sets that are
-        already pinned are also compared with the set they replaced on the bars after they were pinned.
-        Dry run: nothing is applied.
+        {t('Auto-tune confirms its pick on one out-of-sample window. This cuts the history into several train → test folds, lets the tuner choose on each training part only and trades that choice on the next block it has never seen — so you see whether re-tuning keeps its edge or just fits noise, and how stable the chosen set is. Sets that are already pinned are also compared with the set they replaced on the bars after they were pinned. Dry run: nothing is applied.')}
       </p>
       <SimScopeFields
         pairs={config.pairs} timeframes={config.timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
@@ -105,11 +110,11 @@ export default function WalkForwardPanel({ config }) {
         extra={
           <>
             <div>
-              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Folds</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>{t('Folds')}</label>
               <input type="number" value={folds} min={2} max={12} step={1}
                      onChange={(e) => setFolds(Number(e.target.value))} style={{ width: 70 }} />
             </div>
-            <button onClick={start} disabled={sim.running}>{sim.running ? 'Running…' : 'Run check'}</button>
+            <button onClick={start} disabled={sim.running}>{sim.running ? t('Running…') : t('Run check')}</button>
           </>
         }
       />
@@ -118,20 +123,20 @@ export default function WalkForwardPanel({ config }) {
         <>
           <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
           <p style={{ fontSize: 12, marginBottom: 8 }}>
-            {result.folds} test folds after the first {Math.round(result.initial_fraction * 100)}% of the history ·
-            net of {result.fee_pct}% fee per trade · nothing applied
+            {t('{folds} test folds after the first {pct}% of the history · net of {fee}% fee per trade · nothing applied', {
+              folds: result.folds, pct: Math.round(result.initial_fraction * 100), fee: result.fee_pct,
+            })}
           </p>
           {(result.skipped || []).map((sk) => (
             <p key={`${sk.ticker}-${sk.tf}`} style={{ fontSize: 12, color: 'var(--short)', marginBottom: 6 }}>
-              ❌ {sk.ticker} {sk.tf}: skipped — {sk.reason}
+              {t('❌ {ticker} {tf}: skipped — {reason}', { ticker: sk.ticker, tf: sk.tf, reason: sk.reason })}
             </p>
           ))}
           {rows.length === 0
-            ? <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>No pair/timeframe produced a result.</p>
-            : rows.map(({ t, f, r }) => <PairResult key={`${t}-${f}`} ticker={t} tf={f} r={r} />)}
+            ? <p style={{ fontSize: 12, color: 'var(--text-faint)' }}>{t('No pair/timeframe produced a result.')}</p>
+            : rows.map(({ tk, f, r }) => <PairResult key={`${tk}-${f}`} ticker={tk} tf={f} r={r} />)}
           <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-            ✅ robust = re-tuning gained out-of-sample beyond the noise; ❌ = in-sample gains did not carry over, keep the
-            current sets. Small samples stay noisy — re-run as bars accumulate. Also in Discord: !walkfwd.
+            {t('✅ robust = re-tuning gained out-of-sample beyond the noise; ❌ = in-sample gains did not carry over, keep the current sets. Small samples stay noisy — re-run as bars accumulate. Also in Discord: !walkfwd.')}
           </p>
         </>
       )}

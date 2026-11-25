@@ -21,9 +21,9 @@
   --nyse-pre: #4da3ff;     /* NYSE lamp: pre-market (blue); open uses --long (green) */
   --nyse-after: #f5d547;   /* NYSE lamp: after-hours (yellow) */
 
-  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
-  --font-display: 'Space Grotesk', 'Inter', sans-serif;
-  --font-mono: 'IBM Plex Mono', 'SFMono-Regular', Menlo, monospace;
+  --font-ui: 'Inter', 'Noto Sans Georgian', system-ui, -apple-system, sans-serif;
+  --font-display: 'Space Grotesk', 'Inter', 'Noto Sans Georgian', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Noto Sans Georgian', 'SFMono-Regular', Menlo, monospace;
 }
 
 * {
@@ -655,4 +655,12 @@ table.data-table tbody tr:hover .row-delete-btn {
   border-radius: 2px;
   margin-right: 5px;
   vertical-align: middle;
+}
+
+/* Language switcher (top bar and login screen) */
+.lang-switch {
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
 }

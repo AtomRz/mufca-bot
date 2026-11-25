@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 
 /**
  * "NYSE" lamp in the top bar — which part of the New York trading day it is.
@@ -31,43 +32,45 @@ const NEXT_EVENT = {
   closed: 'After-hours end',
 }
 
-const hhmm = (d, timeZone) =>
-  d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone })
+const hhmm = (d, locale, timeZone) =>
+  d.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', hour12: false, timeZone })
 
-function untilText(ms) {
+function untilText(ms, t) {
   const min = Math.max(1, Math.round(ms / 60000))
   const h = Math.floor(min / 60)
-  if (h >= 48) return `${Math.floor(h / 24)} d ${h % 24} h`
-  if (h >= 1) return `${h} h ${min % 60} min`
-  return `${min} min`
+  if (h >= 48) return t('{d} d {h} h', { d: Math.floor(h / 24), h: h % 24 })
+  if (h >= 1) return t('{h} h {m} min', { h, m: min % 60 })
+  return t('{n} min', { n: min })
 }
 
-function tooltipLines(nyse) {
-  if (nyse.state === 'unknown') return ['NYSE status unavailable']
+function tooltipLines(nyse, t, locale) {
+  if (nyse.state === 'unknown') return [t('NYSE status unavailable')]
 
   const info = STATE[nyse.state] || STATE.closed
-  let head = `NYSE: ${info.label}`
+  let head = t('NYSE: {state}', { state: t(info.label) })
   if (nyse.state === 'closed') {
-    if (nyse.closed_reason === 'holiday') head += ` — ${nyse.holiday_name || 'holiday'}`
-    else if (nyse.closed_reason === 'weekend') head += ' — weekend'
+    if (nyse.closed_reason === 'holiday') head += ` — ${nyse.holiday_name || t('holiday')}`
+    else if (nyse.closed_reason === 'weekend') head += ` — ${t('weekend')}`
   }
-  if (nyse.early_close && nyse.state !== 'closed') head += ' (early close today)'
+  if (nyse.early_close && nyse.state !== 'closed') head += ` ${t('(early close today)')}`
   const lines = [head]
 
   if (nyse.next_change_at) {
     const at = new Date(nyse.next_change_at)
     if (!Number.isNaN(at.getTime())) {
       const sameDay = at.toDateString() === new Date().toDateString()
-      const day = sameDay ? '' : `${at.toLocaleDateString([], { weekday: 'short' })} `
-      const note = nyse.next_state === 'pre' && nyse.early_close ? ' (early-close day)' : ''
-      lines.push(`${NEXT_EVENT[nyse.next_state] || 'Next change'}${note}: ${day}${hhmm(at)} your time (${hhmm(at, 'America/New_York')} ET)`)
-      lines.push(`in ${untilText(at.getTime() - Date.now())}`)
+      const day = sameDay ? '' : `${at.toLocaleDateString(locale, { weekday: 'short' })} `
+      const note = nyse.next_state === 'pre' && nyse.early_close ? ` ${t('(early-close day)')}` : ''
+      const evLabel = NEXT_EVENT[nyse.next_state] ? t(NEXT_EVENT[nyse.next_state]) : t('Next change')
+      lines.push(t('{event}{note}: {when} your time ({et} ET)', { event: evLabel, note, when: `${day}${hhmm(at, locale)}`, et: hhmm(at, locale, 'America/New_York') }))
+      lines.push(t('in {time}', { time: untilText(at.getTime() - Date.now(), t) }))
     }
   }
   return lines
 }
 
 export default function NyseLamp() {
+  const { t, locale } = useI18n()
   const [nyse, setNyse] = useState(null)
 
   const load = useCallback(() => {
@@ -102,7 +105,7 @@ export default function NyseLamp() {
   const lit = nyse.state === 'pre' || nyse.state === 'open' || nyse.state === 'after'
 
   return (
-    <div className="lamp nyse-lamp" title={tooltipLines(nyse).join('\n')}>
+    <div className="lamp nyse-lamp" title={tooltipLines(nyse, t, locale).join('\n')}>
       <span className="lamp-dot" style={{ background: info.color, boxShadow: lit ? `0 0 6px ${info.color}` : 'none' }} />
       <span className="lamp-label" style={{ color: lit ? info.color : undefined }}>NYSE</span>
     </div>

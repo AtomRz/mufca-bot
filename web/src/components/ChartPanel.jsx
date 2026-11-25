@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { createChart, ColorType, LineStyle } from 'lightweight-charts'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 
 const TIMEFRAMES = ['1h', '4h']
 
@@ -46,6 +47,10 @@ function toLineData(times, values) {
 }
 
 export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticker, tf, onTickerChange, onTfChange, onLoadingChange }) {
+  const { t } = useI18n()
+  // always-current translator for long-lived chart callbacks (canvas draw, price-line titles)
+  const tRef = useRef(t)
+  tRef.current = t
   const containerRef = useRef(null)
   const chartRef = useRef(null)
   const seriesRef = useRef({})
@@ -190,7 +195,8 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         const clampedStart = startX == null ? 0 : Math.max(0, Math.min(startX, width))
         const x = (clampedStart + width) / 2
         const color = side === 'demand' ? C.demand_zone : C.supply_zone
-        const label = `${side.toUpperCase()} ${Math.round(zone.score)} ${String(zone.state).toUpperCase()} T${zone.touches}`
+        const tt = tRef.current
+        const label = `${tt(side.toUpperCase())} ${Math.round(zone.score)} ${tt(String(zone.state).toUpperCase())} T${zone.touches}`
         const textWidth = ctx.measureText(label).width
         const padX = 4, padY = 2
         ctx.fillStyle = 'rgba(19,25,34,0.82)'
@@ -419,6 +425,12 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     drawVolumeProfile()
   }, [C, drawVolumeProfile])
 
+  // language changed — retitle price lines / marker and redraw canvas labels (chart is not recreated)
+  useEffect(() => {
+    seriesRef.current.relabel?.()
+    drawVolumeProfileRef.current()
+  }, [t])
+
   // populate data when it updates
   useEffect(() => {
     if (!data || !chartRef.current) return
@@ -466,20 +478,27 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
       try { s.mfi.removePriceLine(line) } catch (_) {}
     })
     s.mfiLines = []
+    // price-line titles that contain translatable words; re-applied when the language changes
+    const titled = []
+    const addTitled = (series, opts, title) => {
+      const line = series.createPriceLine({ ...opts, title: title(tRef.current) })
+      titled.push({ line, title })
+      return line
+    }
     if (data.mfi_overbought != null) {
       s.mfiLines.push(
-        s.mfi.createPriceLine({
+        addTitled(s.mfi, {
           price: data.mfi_overbought, color: hexToRgba(C.mfi_overbought, 0.6), lineWidth: 1,
-          lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OB',
-        }),
+          lineStyle: LineStyle.Dashed, axisLabelVisible: true,
+        }, () => 'OB'),
       )
     }
     if (data.mfi_oversold != null) {
       s.mfiLines.push(
-        s.mfi.createPriceLine({
+        addTitled(s.mfi, {
           price: data.mfi_oversold, color: hexToRgba(C.mfi_oversold, 0.6), lineWidth: 1,
-          lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'OS',
-        }),
+          lineStyle: LineStyle.Dashed, axisLabelVisible: true,
+        }, () => 'OS'),
       )
     }
 
@@ -616,39 +635,46 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
       })
     }
 
+    let markerSpec = null
     if (data.active_trade) {
       const t = data.active_trade
-      if (t.entry) s.tradeLines.push(s.candle.createPriceLine({ price: t.entry, color: '#dde3ec', lineWidth: 1, lineStyle: LineStyle.Solid, title: 'Entry' }))
+      if (t.entry) s.tradeLines.push(addTitled(s.candle, { price: t.entry, color: '#dde3ec', lineWidth: 1, lineStyle: LineStyle.Solid }, (tt) => tt('Entry')))
       if (t.tp1 && t.tp1 !== t.tp) {
-        s.tradeLines.push(s.candle.createPriceLine({
+        s.tradeLines.push(addTitled(s.candle, {
           price: t.tp1, color: hexToRgba(C.tp_line, 0.7), lineWidth: 1,
-          lineStyle: LineStyle.Dashed, title: t.tp1_hit ? 'TP1 ✓' : 'TP1',
-        }))
+          lineStyle: LineStyle.Dashed,
+        }, () => (t.tp1_hit ? 'TP1 ✓' : 'TP1')))
       }
-      if (t.tp) s.tradeLines.push(s.candle.createPriceLine({ price: t.tp, color: C.tp_line, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'TP2' }))
+      if (t.tp) s.tradeLines.push(addTitled(s.candle, { price: t.tp, color: C.tp_line, lineWidth: 2, lineStyle: LineStyle.Solid }, () => 'TP2'))
       if (t.sl) {
-        s.tradeLines.push(s.candle.createPriceLine({
+        s.tradeLines.push(addTitled(s.candle, {
           price: t.sl, color: C.sl_line, lineWidth: 2, lineStyle: LineStyle.Solid,
-          title: t.tp1_hit ? 'SL (BE)' : 'SL',
-        }))
+        }, () => (t.tp1_hit ? 'SL (BE)' : 'SL')))
       }
 
       // 🆕 signal marker on the entry bar — signal_bar_time used to always be
       // null because of a field-name bug in chart_data.py (entry_time_ms vs bar_opened_time)
       if (t.signal_bar_time) {
         const isLong = t.side === 'long'
-        s.candle.setMarkers([{
+        markerSpec = {
           time: t.signal_bar_time,
           position: isLong ? 'belowBar' : 'aboveBar',
           color: isLong ? C.signal_long : C.signal_short,
           shape: isLong ? 'arrowUp' : 'arrowDown',
           text: isLong ? 'Long' : 'Short',
-        }])
-      } else {
-        s.candle.setMarkers([])
+        }
       }
-    } else {
-      s.candle.setMarkers([])
+    }
+    const applyMarkers = () => {
+      s.candle.setMarkers(markerSpec ? [{ ...markerSpec, text: tRef.current(markerSpec.text) }] : [])
+    }
+    applyMarkers()
+    // language switch: retitle price lines and marker without rebuilding anything
+    s.relabel = () => {
+      titled.forEach(({ line, title }) => {
+        try { line.applyOptions({ title: title(tRef.current) }) } catch (_) {}
+      })
+      applyMarkers()
     }
 
     // 🆕 restore the position instead of resetting to fitContent on every update
@@ -673,23 +699,23 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
           ))}
         </div>
         <div className="seg">
-          {(timeframes && timeframes.length ? timeframes : TIMEFRAMES).map((t) => (
-            <button key={t} className={tf === t ? 'active' : ''} onClick={() => onTfChange?.(t)}>
-              {t}
+          {(timeframes && timeframes.length ? timeframes : TIMEFRAMES).map((x) => (
+            <button key={x} className={tf === x ? 'active' : ''} onClick={() => onTfChange?.(x)}>
+              {x}
             </button>
           ))}
         </div>
         <div className="seg">
-          {['a', 'u'].map((t) => (
-            <button key={t} className={track === t ? 'active' : ''} onClick={() => setTrack(t)}>
-              {t === 'a' ? 'Andean' : 'UT Bot'}
+          {['a', 'u'].map((x) => (
+            <button key={x} className={track === x ? 'active' : ''} onClick={() => setTrack(x)}>
+              {x === 'a' ? 'Andean' : 'UT Bot'}
             </button>
           ))}
         </div>
         <div className="seg">
           {[100, 200, 300, 500].map((n) => (
             <button key={n} className={barsLimit === n ? 'active' : ''} onClick={() => setBarsLimit(n)}>
-              {n} bars
+              {t('{n} bars', { n })}
             </button>
           ))}
         </div>
@@ -699,26 +725,26 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
 
       <div className="chart-legend">
         <span><span className="legend-dot" style={{ background: C.frama }} />FRAMA</span>
-        <span><span className="legend-dot" style={{ background: C.bb }} />Bollinger</span>
-        <span><span className="legend-dot" style={{ background: C.support }} />Support</span>
-        <span><span className="legend-dot" style={{ background: C.resistance }} />Resistance</span>
-        <span><span className="legend-dot" style={{ background: C.demand_zone }} />Demand Zone</span>
-        <span><span className="legend-dot" style={{ background: C.supply_zone }} />Supply Zone</span>
+        <span><span className="legend-dot" style={{ background: C.bb }} />{t('Bollinger')}</span>
+        <span><span className="legend-dot" style={{ background: C.support }} />{t('Support')}</span>
+        <span><span className="legend-dot" style={{ background: C.resistance }} />{t('Resistance')}</span>
+        <span><span className="legend-dot" style={{ background: C.demand_zone }} />{t('Demand Zone')}</span>
+        <span><span className="legend-dot" style={{ background: C.supply_zone }} />{t('Supply Zone')}</span>
         {data?.smc_overlay && (
           <>
             <span><span className="legend-dot" style={{ background: C.smc_bos }} />BOS</span>
             <span><span className="legend-dot" style={{ background: C.smc_choch }} />CHoCH</span>
-            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bull, 0.6) }} />FVG (bull)</span>
-            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bear, 0.6) }} />FVG (bear)</span>
+            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bull, 0.6) }} />{t('FVG (bull)')}</span>
+            <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bear, 0.6) }} />{t('FVG (bear)')}</span>
           </>
         )}
-        <span><span className="legend-dot" style={{ background: C.poc }} />POC / Value Area</span>
+        <span><span className="legend-dot" style={{ background: C.poc }} />{t('POC / Value Area')}</span>
         <span><span className="legend-dot" style={{ background: C.tp_line }} />TP</span>
         <span><span className="legend-dot" style={{ background: C.sl_line }} />SL</span>
-        <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />Delta Volume</span>
+        <span><span className="legend-dot" style={{ background: hexToRgba(C.candle_up, 0.5) }} />{t('Delta Volume')}</span>
         <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
-        <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />MFI overbought</span>
-        <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />MFI oversold</span>
+        <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />{t('MFI overbought')}</span>
+        <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />{t('MFI oversold')}</span>
       </div>
 
       <div className="chart-wrap panel" style={{ padding: 8, position: 'relative' }}>

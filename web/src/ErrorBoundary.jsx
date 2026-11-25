@@ -1,4 +1,24 @@
 import React from 'react'
+import { useI18n } from './i18n'
+
+// Class components cannot use hooks, so the text lives in small function components.
+function CrashMessage() {
+  const { t } = useI18n()
+  return (
+    <p style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 16 }}>
+      {t('Something went wrong rendering the dashboard. This is usually a transient rendering glitch — reloading fixes it.')}
+    </p>
+  )
+}
+
+function ReloadButton() {
+  const { t } = useI18n()
+  return (
+    <button className="btn primary" style={{ width: '100%' }} onClick={() => window.location.reload()}>
+      {t('Reload')}
+    </button>
+  )
+}
 
 export default class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -23,18 +43,13 @@ export default class ErrorBoundary extends React.Component {
               <span className="pulse" style={{ background: 'var(--short)' }} />
               MUFCA
             </div>
-            <p style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 16 }}>
-              Something went wrong rendering the dashboard. This is usually a transient
-              rendering glitch — reloading fixes it.
-            </p>
+            <CrashMessage />
             {this.state.error && (
               <p style={{ color: 'var(--text-faint)', fontSize: 11, marginBottom: 16, wordBreak: 'break-word', fontFamily: 'var(--font-mono, monospace)' }}>
                 {String(this.state.error.message || this.state.error).slice(0, 200)}
               </p>
             )}
-            <button className="btn primary" style={{ width: '100%' }} onClick={() => window.location.reload()}>
-              Reload
-            </button>
+            <ReloadButton />
           </div>
         </div>
       )

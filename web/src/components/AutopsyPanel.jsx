@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 import { SimScopeFields, SimStatus, BarCoverageWarning, useSimJob, barsError } from './InsightsPanel'
 
 const pct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
@@ -12,19 +13,20 @@ const td = { padding: '2px 8px 2px 0' }
 const snapText = (snap) =>
   Object.entries(snap || {}).filter(([, v]) => v !== 'na').map(([k, v]) => `${k} ${v}`).join(' · ')
 
-const reasonText = (m) =>
-  m.status === 'none' ? 'no trigger' : m.status === 'busy' ? 'track busy' : `filter ${m.blockers.join('+')}`
+const reasonText = (m, t) =>
+  m.status === 'none' ? t('no trigger') : m.status === 'busy' ? t('track busy') : t('filter {list}', { list: m.blockers.join('+') })
 
 function LoserTable({ lf }) {
+  const { t } = useI18n()
   const rows = lf.candidates.filter((c) => c.lift > 1 && c.skip_gain > 0).slice(0, 6)
   return (
     <div style={{ marginTop: 6 }}>
-      <div>📉 States that lost more <span style={faint}>(average signal loses {share(lf.base_loss_rate)}; {lf.n_tested} states tested)</span></div>
-      {rows.length === 0 ? <div style={faint}>nothing stands out</div> : (
+      <div>{t('📉 States that lost more')} <span style={faint}>{t('(average signal loses {rate}; {n} states tested)', { rate: share(lf.base_loss_rate), n: lf.n_tested })}</span></div>
+      {rows.length === 0 ? <div style={faint}>{t('nothing stands out')}</div> : (
         <table style={{ borderCollapse: 'collapse', marginTop: 2 }}>
           <thead>
-            <tr><th style={th}></th><th style={th}>state</th><th style={th}>n</th><th style={th}>loses</th>
-              <th style={th}>skipping it</th><th style={th}>early / late</th></tr>
+            <tr><th style={th}></th><th style={th}>{t('state')}</th><th style={th}>n</th><th style={th}>{t('loses')}</th>
+              <th style={th}>{t('skipping it')}</th><th style={th}>{t('early / late')}</th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -45,14 +47,15 @@ function LoserTable({ lf }) {
 }
 
 function MissedTable({ mf }) {
+  const { t } = useI18n()
   const rows = mf.candidates.filter((c) => c.lift > 1).slice(0, 6)
   return (
     <div style={{ marginTop: 6 }}>
-      <div>🔄 States over-represented at missed reversals <span style={faint}>(on average {share(mf.base_missed_share)} are missed)</span></div>
-      {rows.length === 0 ? <div style={faint}>nothing stands out</div> : (
+      <div>{t('🔄 States over-represented at missed reversals')} <span style={faint}>{t('(on average {share} are missed)', { share: share(mf.base_missed_share) })}</span></div>
+      {rows.length === 0 ? <div style={faint}>{t('nothing stands out')}</div> : (
         <table style={{ borderCollapse: 'collapse', marginTop: 2 }}>
           <thead>
-            <tr><th style={th}></th><th style={th}>state</th><th style={th}>missed / all</th><th style={th}>lift</th></tr>
+            <tr><th style={th}></th><th style={th}>{t('state')}</th><th style={th}>{t('missed / all')}</th><th style={th}>{t('lift')}</th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -79,15 +82,16 @@ const VERDICT = {
 
 // "What if ONE filter were off": the same triggers replayed with that filter alone disabled.
 function FilterTable({ rows }) {
+  const { t } = useI18n()
   if (!rows || rows.length === 0) return null
   const signed = (v, d = 1) => `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`
   return (
     <div style={{ marginTop: 6 }}>
-      <div>🎚️ What if one filter were off <span style={faint}>(same triggers, one position at a time, net of fee)</span></div>
+      <div>{t('🎚️ What if one filter were off')} <span style={faint}>{t('(same triggers, one position at a time, net of fee)')}</span></div>
       <table style={{ borderCollapse: 'collapse', marginTop: 2 }}>
         <thead>
-          <tr><th style={th}>filter</th><th style={th}>trades</th><th style={th}>net change</th>
-            <th style={th}>early</th><th style={th}>late</th><th style={th}></th></tr>
+          <tr><th style={th}>{t('filter')}</th><th style={th}>{t('trades')}</th><th style={th}>{t('net change')}</th>
+            <th style={th}>{t('early')}</th><th style={th}>{t('late')}</th><th style={th}></th></tr>
         </thead>
         <tbody>
           {rows.map((c) => (
@@ -97,7 +101,7 @@ function FilterTable({ rows }) {
               <td style={td}>{signed(c.delta)}</td>
               <td style={td}>{signed(c.early.delta)} ({c.early.extra >= 0 ? '+' : ''}{c.early.extra})</td>
               <td style={td}>{signed(c.late.delta)} ({c.late.extra >= 0 ? '+' : ''}{c.late.extra})</td>
-              <td style={td}>{VERDICT[c.verdict]}</td>
+              <td style={td}>{VERDICT[c.verdict] ? t(VERDICT[c.verdict]) : undefined}</td>
             </tr>
           ))}
         </tbody>
@@ -111,77 +115,82 @@ const signedPct = (v, d = 1) => `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`
 // How the taken trades ended: exit mix, the pure losers (stopped before TP1), the winners' dips and
 // the tighter-stop what-if. Everything here is measured from the history, nothing is applied.
 function ExitBlock({ ex }) {
+  const { t } = useI18n()
   if (!ex) return null
-  if (!ex.available) return <div style={{ marginTop: 6, ...faint }}>🚪 exits: not available (re-run with the current version)</div>
+  if (!ex.available) return <div style={{ marginTop: 6, ...faint }}>{t('🚪 exits: not available (re-run with the current version)')}</div>
   const nv = ex.never_tp1
   const h = ex.winners_heat
   return (
     <div style={{ marginTop: 6 }}>
-      <div>🚪 How the trades ended <span style={faint}>(net of fee)</span></div>
+      <div>{t('🚪 How the trades ended')} <span style={faint}>{t('(net of fee)')}</span></div>
       <div style={faint}>
         {Object.entries(ex.mix).filter(([, v]) => v.n > 0).map(([k, v]) => `${k} ×${v.n} (${signedPct(v.net)})`).join(' · ')}
       </div>
       {nv.n > 0 && (
         <div style={{ marginTop: 4 }}>
-          ❌ Stopped before TP1: <b>{nv.n}</b> ({share(nv.share_of_trades)} of trades, net {signedPct(nv.net)}, avg stop {nv.avg_sl_pct.toFixed(2)}%)
+          {t('❌ Stopped before TP1:')} <b>{nv.n}</b> {t('({share} of trades, net {net}, avg stop {stop}%)', { share: share(nv.share_of_trades), net: signedPct(nv.net), stop: nv.avg_sl_pct.toFixed(2) })}
           <div style={faint}>
-            median {nv.median_bars} bars; stopped within {nv.fast_stop.bars} bars: {share(nv.fast_stop.share)}<br />
-            how far they got toward TP1: {Object.entries(nv.progress_to_tp1).map(([k, v]) => `${k} ×${v}`).join(', ')}
-            {' '}— at least half way: {share(nv.near_miss.share)} (early {share(nv.near_miss.by_window.early)} | late {share(nv.near_miss.by_window.late)})<br />
-            price reached TP1 after the stop: {share(nv.shakeout_tp1.share)} (early {share(nv.shakeout_tp1.by_window.early)} | late {share(nv.shakeout_tp1.by_window.late)}),
-            TP2: {share(nv.shakeout_tp2.share)} — an upper bound for "the stop was too tight", the path after the stop is not replayed
+            {t('median {median} bars; stopped within {bars} bars: {share}', { median: nv.median_bars, bars: nv.fast_stop.bars, share: share(nv.fast_stop.share) })}<br />
+            {t('how far they got toward TP1: {list} — at least half way: {share} (early {early} | late {late})', {
+              list: Object.entries(nv.progress_to_tp1).map(([k, v]) => `${k} ×${v}`).join(', '),
+              share: share(nv.near_miss.share), early: share(nv.near_miss.by_window.early), late: share(nv.near_miss.by_window.late),
+            })}<br />
+            {t('price reached TP1 after the stop: {share} (early {early} | late {late}), TP2: {share2} — an upper bound for "the stop was too tight", the path after the stop is not replayed', {
+              share: share(nv.shakeout_tp1.share), early: share(nv.shakeout_tp1.by_window.early), late: share(nv.shakeout_tp1.by_window.late),
+              share2: share(nv.shakeout_tp2.share),
+            })}
           </div>
         </div>
       )}
       {h.n > 0 && (
         <div style={{ marginTop: 4 }}>
-          🔥 Of the {h.n} trades that reached TP1, {share(h.dip_ge_50)} dipped ≥50% of the way to the stop and {share(h.dip_ge_75)} ≥75%
-          <span style={faint}> (median {share(h.median_dip)})</span>
+          {t('🔥 Of the {n} trades that reached TP1, {a} dipped ≥50% of the way to the stop and {b} ≥75%', { n: h.n, a: share(h.dip_ge_50), b: share(h.dip_ge_75) })}
+          <span style={faint}> {t('(median {m})', { m: share(h.median_dip) })}</span>
         </div>
       )}
       {ex.tighter_exact && (
         <div style={{ marginTop: 6 }}>
-          ✂️ Stop distance changed (tighter and wider), re-played bar by bar on the real highs/lows
+          {t('✂️ Stop distance changed (tighter and wider), re-played bar by bar on the real highs/lows')}
           {ex.tighter_exact.check.mismatch > 0 && (
-            <b> ⚠️ the replay does not reproduce {ex.tighter_exact.check.mismatch} of {ex.tighter_exact.check.n} recorded trades — do not trust these numbers</b>
+            <b> {t('⚠️ the replay does not reproduce {m} of {n} recorded trades — do not trust these numbers', { m: ex.tighter_exact.check.mismatch, n: ex.tighter_exact.check.n })}</b>
           )}
           <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
             <thead>
-              <tr><th style={th}>stop at</th><th style={th}>PnL change (bot's same-bar rule)</th><th style={th}>early / late</th>
-                <th style={th}>strict (same-bar = stop)</th><th style={th}>early / late</th>
-                <th style={th}>trades better / worse</th><th style={th}>net after</th></tr>
+              <tr><th style={th}>{t('stop at')}</th><th style={th}>{t("PnL change (bot's same-bar rule)")}</th><th style={th}>{t('early / late')}</th>
+                <th style={th}>{t('strict (same-bar = stop)')}</th><th style={th}>{t('early / late')}</th>
+                <th style={th}>{t('trades better / worse')}</th><th style={th}>{t('net after')}</th></tr>
             </thead>
             <tbody>
-              {ex.tighter_exact.factors.map((t) => (
-                <tr key={t.factor}>
-                  <td style={td}>{t.factor}× distance</td>
-                  <td style={td}>{signedPct(t.bot_rule.all)}</td>
-                  <td style={td}>{signedPct(t.bot_rule.early)} / {signedPct(t.bot_rule.late)}</td>
-                  <td style={td}>{signedPct(t.strict.all)}</td>
-                  <td style={td}>{signedPct(t.strict.early)} / {signedPct(t.strict.late)}</td>
-                  <td style={td}>{t.saved} / {t.cut_winners} (of {t.n}, {t.ambiguous} same-bar)</td>
-                  <td style={td}>{signedPct(t.net_after)}</td>
+              {ex.tighter_exact.factors.map((fx) => (
+                <tr key={fx.factor}>
+                  <td style={td}>{t('{factor}× distance', { factor: fx.factor })}</td>
+                  <td style={td}>{signedPct(fx.bot_rule.all)}</td>
+                  <td style={td}>{signedPct(fx.bot_rule.early)} / {signedPct(fx.bot_rule.late)}</td>
+                  <td style={td}>{signedPct(fx.strict.all)}</td>
+                  <td style={td}>{signedPct(fx.strict.early)} / {signedPct(fx.strict.late)}</td>
+                  <td style={td}>{fx.saved} / {fx.cut_winners} {t('(of {n}, {amb} same-bar)', { n: fx.n, amb: fx.ambiguous })}</td>
+                  <td style={td}>{signedPct(fx.net_after)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div style={faint}>same trades assumed — an earlier exit could free the slot for a signal that was skipped (not modelled)</div>
+          <div style={faint}>{t('same trades assumed — an earlier exit could free the slot for a signal that was skipped (not modelled)')}</div>
         </div>
       )}
       {!ex.tighter_exact && <table style={{ borderCollapse: 'collapse', marginTop: 4 }}>
         <thead>
-          <tr><th style={th}>stop at</th><th style={th}>never reached TP1 (exact)</th><th style={th}>early / late</th>
-            <th style={th}>deep dips after TP1</th><th style={th}>total between</th><th style={th}>worst case early / late</th></tr>
+          <tr><th style={th}>{t('stop at')}</th><th style={th}>{t('never reached TP1 (exact)')}</th><th style={th}>{t('early / late')}</th>
+            <th style={th}>{t('deep dips after TP1')}</th><th style={th}>{t('total between')}</th><th style={th}>{t('worst case early / late')}</th></tr>
         </thead>
         <tbody>
-          {ex.tighter_sl.map((t) => (
-            <tr key={t.factor}>
-              <td style={td}>{t.factor}× distance</td>
-              <td style={td}>{signedPct(t.exact.all)} ({t.stopped_never_tp1} stopped earlier)</td>
-              <td style={td}>{signedPct(t.exact.early)} / {signedPct(t.exact.late)}</td>
-              <td style={td}>{t.deep_dips_after_tp1} ({signedPct(t.worst_extra.all)} if all before TP1)</td>
-              <td style={td}>{signedPct(t.worst_case.all)} … {signedPct(t.exact.all)}</td>
-              <td style={td}>{signedPct(t.worst_case.early)} / {signedPct(t.worst_case.late)}</td>
+          {ex.tighter_sl.map((fx) => (
+            <tr key={fx.factor}>
+              <td style={td}>{t('{factor}× distance', { factor: fx.factor })}</td>
+              <td style={td}>{signedPct(fx.exact.all)} {t('({n} stopped earlier)', { n: fx.stopped_never_tp1 })}</td>
+              <td style={td}>{signedPct(fx.exact.early)} / {signedPct(fx.exact.late)}</td>
+              <td style={td}>{fx.deep_dips_after_tp1} {t('({pct} if all before TP1)', { pct: signedPct(fx.worst_extra.all) })}</td>
+              <td style={td}>{signedPct(fx.worst_case.all)} … {signedPct(fx.exact.all)}</td>
+              <td style={td}>{signedPct(fx.worst_case.early)} / {signedPct(fx.worst_case.late)}</td>
             </tr>
           ))}
         </tbody>
@@ -191,11 +200,12 @@ function ExitBlock({ ex }) {
 }
 
 function ResultRows({ result }) {
+  const { t } = useI18n()
   const rows = []
   Object.entries(result.results || {}).forEach(([ticker, perTf]) => {
     Object.entries(perTf).forEach(([tf, r]) => rows.push({ ticker, tf, r }))
   })
-  if (rows.length === 0) return <p style={{ fontSize: 12, ...faint }}>No pair/timeframe produced a result.</p>
+  if (rows.length === 0) return <p style={{ fontSize: 12, ...faint }}>{t('No pair/timeframe produced a result.')}</p>
   return (
     <div style={{ marginBottom: 10 }}>
       {rows.map(({ ticker, tf, r }) => {
@@ -207,9 +217,9 @@ function ResultRows({ result }) {
           <div key={`${ticker}-${tf}`} style={{ fontSize: 12, marginBottom: 16 }}>
             <div style={{ fontWeight: 600 }}>{ticker} {tf}</div>
             <div style={faint}>
-              {trades.n} signals taken ({trades.winners} won / {trades.losers} lost, net {pct(trades.total_net)}) ·{' '}
-              {legs.total} swings ≥ {legs.pivot_atr_mult}×ATR: {legs.caught} caught, {legs.missed} missed
-              {reasons.length > 0 && <><br />missed because: {reasons.map(([k, v]) => `${k} ×${v}`).join('; ')}</>}
+              {t('{n} signals taken ({won} won / {lost} lost, net {net})', { n: trades.n, won: trades.winners, lost: trades.losers, net: pct(trades.total_net) })} ·{' '}
+              {t('{total} swings ≥ {mult}×ATR: {caught} caught, {missed} missed', { total: legs.total, mult: legs.pivot_atr_mult, caught: legs.caught, missed: legs.missed })}
+              {reasons.length > 0 && <><br />{t('missed because: {list}', { list: reasons.map(([k, v]) => `${k} ×${v}`).join('; ') })}</>}
             </div>
             <FilterTable rows={r.filter_cf} />
             <ExitBlock ex={r.exits} />
@@ -217,13 +227,13 @@ function ResultRows({ result }) {
             <MissedTable mf={r.missed_features} />
             {r.skipped_features?.length > 0 && (
               <div style={{ marginTop: 4, ...faint }}>
-                not tested (an enabled filter already decides them): {r.skipped_features.join(', ')}
+                {t('not tested (an enabled filter already decides them): {list}', { list: r.skipped_features.join(', ') })}
               </div>
             )}
             {(worst || miss) && (
               <div style={{ marginTop: 6, ...faint }}>
-                {worst && <div>worst signal: {worst.ts} {worst.track.toUpperCase()}-{worst.side} {pct(worst.net)} — {snapText(worst.snap)}</div>}
-                {miss && <div>biggest miss: {miss.ts} {miss.side} {miss.leg_pct.toFixed(1)}% over {miss.bars} bars ({reasonText(miss)}) — {snapText(miss.snap)}</div>}
+                {worst && <div>{t('worst signal: {ts} {kind} {net} — {snap}', { ts: worst.ts, kind: `${worst.track.toUpperCase()}-${worst.side}`, net: pct(worst.net), snap: snapText(worst.snap) })}</div>}
+                {miss && <div>{t('biggest miss: {ts} {side} {pct}% over {bars} bars ({reason}) — {snap}', { ts: miss.ts, side: miss.side, pct: miss.leg_pct.toFixed(1), bars: miss.bars, reason: reasonText(miss, t), snap: snapText(miss.snap) })}</div>}
               </div>
             )}
           </div>
@@ -234,6 +244,7 @@ function ResultRows({ result }) {
 }
 
 export default function AutopsyPanel({ config }) {
+  const { t } = useI18n()
   const [ticker, setTicker] = useState('')
   const [tf, setTf] = useState('')
   const [numBars, setNumBars] = useState(3000)
@@ -245,22 +256,15 @@ export default function AutopsyPanel({ config }) {
   const start = () => {
     const bad = barsError(numBars)
     if (bad) { sim.setError(bad); return }
-    if (!(swing >= 1 && swing <= 10)) { sim.setError('Swing size must be between 1 and 10 ATRs'); return }
+    if (!(swing >= 1 && swing <= 10)) { sim.setError(t('Swing size must be between 1 and 10 ATRs')); return }
     sim.start(() => api.runAutopsy({ ticker, tf, numBars, swing }))
   }
 
   return (
     <div className="panel">
-      <h3 className="panel-title">Signal autopsy</h3>
+      <h3 className="panel-title">{t('Signal autopsy')}</h3>
       <p style={{ fontSize: 12, ...faint, marginBottom: 12 }}>
-        Replays the history with each pair's current filters and shows what FRAMA / MFI / Andean / UT Bot / Hurst / CHOP /
-        regime / HTF showed (1) on the signals that lost, and (2) at reversals that no signal caught — swings of at least
-        the chosen number of ATRs — and why they were missed (no trigger, a filter, or the track was busy). A state marked
-        ✅ lost money (or was over-represented among missed turns) in BOTH the older 60% and the newest 40% of the history.
-        A ✅ also needs enough trades and a clearly above-average rate (z-score), so a handful of trades never earns one.
-        It also replays the same triggers with each enabled filter switched off on its own, to show what that filter costs
-        or saves, and looks at the exit side: how the trades ended, how far the stopped-out ones got toward TP1, and what a
-        tighter stop would have done. Measurement only: nothing is applied.
+        {t("Replays the history with each pair's current filters and shows what FRAMA / MFI / Andean / UT Bot / Hurst / CHOP / regime / HTF showed (1) on the signals that lost, and (2) at reversals that no signal caught — swings of at least the chosen number of ATRs — and why they were missed (no trigger, a filter, or the track was busy). A state marked ✅ lost money (or was over-represented among missed turns) in BOTH the older 60% and the newest 40% of the history. A ✅ also needs enough trades and a clearly above-average rate (z-score), so a handful of trades never earns one. It also replays the same triggers with each enabled filter switched off on its own, to show what that filter costs or saves, and looks at the exit side: how the trades ended, how far the stopped-out ones got toward TP1, and what a tighter stop would have done. Measurement only: nothing is applied.")}
       </p>
       <SimScopeFields
         pairs={config.pairs} timeframes={config.timeframes} ticker={ticker} setTicker={setTicker} tf={tf} setTf={setTf}
@@ -268,11 +272,11 @@ export default function AutopsyPanel({ config }) {
         extra={
           <>
             <div>
-              <label style={{ display: 'block', fontSize: 11, ...faint, marginBottom: 4 }}>Swing (× ATR)</label>
+              <label style={{ display: 'block', fontSize: 11, ...faint, marginBottom: 4 }}>{t('Swing (× ATR)')}</label>
               <input type="number" value={swing} min={1} max={10} step={0.5}
                      onChange={(e) => setSwing(Number(e.target.value))} style={{ width: 70 }} />
             </div>
-            <button onClick={start} disabled={sim.running}>{sim.running ? 'Running…' : 'Run autopsy'}</button>
+            <button onClick={start} disabled={sim.running}>{sim.running ? t('Running…') : t('Run autopsy')}</button>
           </>
         }
       />
@@ -281,17 +285,16 @@ export default function AutopsyPanel({ config }) {
         <>
           <BarCoverageWarning coverage={result.bar_coverage} requested={ranBars} />
           <p style={{ fontSize: 12, marginBottom: 8 }}>
-            Net of {result.fee_pct}% fee per trade · early window = oldest {Math.round(result.train_fraction * 100)}% of the bars · nothing applied
+            {t('Net of {fee}% fee per trade · early window = oldest {pct}% of the bars · nothing applied', { fee: result.fee_pct, pct: Math.round(result.train_fraction * 100) })}
           </p>
           {(result.skipped || []).map((sk) => (
             <p key={`${sk.ticker}-${sk.tf}`} style={{ fontSize: 12, color: 'var(--short)', marginBottom: 6 }}>
-              ❌ {sk.ticker} {sk.tf}: skipped — {sk.reason}
+              {t('❌ {ticker} {tf}: skipped — {reason}', { ticker: sk.ticker, tf: sk.tf, reason: sk.reason })}
             </p>
           ))}
           <ResultRows result={result} />
           <p style={{ fontSize: 11, ...faint }}>
-            Dozens of states are tested per pair, so some will look good by chance — treat ✅ as a candidate to
-            forward-test, not a finding. Also in Discord: !autopsy.
+            {t('Dozens of states are tested per pair, so some will look good by chance — treat ✅ as a candidate to forward-test, not a finding. Also in Discord: !autopsy.')}
           </p>
         </>
       )}

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { useI18n } from '../i18n'
 
 /**
  * 🆕 "SHOCK" lamp in the top bar — warns about abnormal market conditions:
@@ -14,6 +15,7 @@ import React, { useEffect, useRef, useState } from 'react'
  * listed in the "Abnormal market conditions" banner.
  */
 export default function ShockLamp({ shock, onClick }) {
+  const { t, locale } = useI18n()
   const shocks = shock?.market_shocks || []
   const anomaly = shock?.onchain_anomaly
   const anomalyEvents = anomaly?.events || []
@@ -41,23 +43,23 @@ export default function ShockLamp({ shock, onClick }) {
 
   const lines = []
   if (!active) {
-    lines.push('No market shock or abnormal on-chain activity')
+    lines.push(t('No market shock or abnormal on-chain activity'))
   } else {
     shocks.forEach((s) => {
       lines.push(
-        `${s.ticker} ${s.timeframe} shock: ${s.move_pct > 0 ? '+' : ''}${s.move_pct}% in ${s.bars} bars (${s.move_atr}x ATR)`,
+        t('{ticker} {tf} shock: {pct}% in {bars} bars ({atr}x ATR)', { ticker: s.ticker, tf: s.timeframe, pct: `${s.move_pct > 0 ? '+' : ''}${s.move_pct}`, bars: s.bars, atr: s.move_atr }),
       )
     })
     anomalyEvents.forEach((ev) => {
       lines.push(
-        `${ev.exchange} ${ev.wallet} ${ev.kind}:${Math.round(ev.prev_eth).toLocaleString()} → ${Math.round(ev.curr_eth).toLocaleString()} ETH (${ev.change_pct}%)`,
+        `${ev.exchange} ${ev.wallet} ${ev.kind}:${Math.round(ev.prev_eth).toLocaleString(locale)} → ${Math.round(ev.curr_eth).toLocaleString(locale)} ETH (${ev.change_pct}%)`,
       )
     })
-    if (anomaly && anomalyEvents.length === 0) lines.push('On-chain anomaly active')
-    lines.push(shock.blocks_entries && shocks.length > 0 ? 'New entries are blocked while the shock lasts' : 'Entries are not blocked')
+    if (anomaly && anomalyEvents.length === 0) lines.push(t('On-chain anomaly active'))
+    lines.push(shock.blocks_entries && shocks.length > 0 ? t('New entries are blocked while the shock lasts') : t('Entries are not blocked'))
   }
-  if (shock.alerts_muted) lines.push('Discord / push alerts for this are muted (Settings → Notifications)')
-  lines.push('Click → Status')
+  if (shock.alerts_muted) lines.push(t('Discord / push alerts for this are muted (Settings → Notifications)'))
+  lines.push(t('Click → Status'))
 
   return (
     <div
