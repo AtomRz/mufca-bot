@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 
 // 🆕 FIX: App keeps `lastEvent` alive across tab switches, but this panel is
 // unmounted on every switch — so on coming back its effect ran again on the
@@ -9,19 +10,20 @@ import { api } from '../api'
 // should keep showing, lives at module level so it survives the remount.
 const persisted = { seenEvent: null, tp1Banner: null, latestSignal: null }
 
-function fmtPrice(v) {
+function fmtPrice(v, locale) {
   if (v === undefined || v === null) return '—'
-  return typeof v === 'number' ? v.toLocaleString(undefined, { maximumFractionDigits: 6 }) : v
+  return typeof v === 'number' ? v.toLocaleString(locale, { maximumFractionDigits: 6 }) : v
 }
 
 // Full trade card: side, entry, TP1/TP2, SL, and a TP1-hit indicator —
 // not just a flat/long/short tag, so you can see targets without opening the chart.
 function TradeCard({ trade, label }) {
+  const { t, locale } = useI18n()
   if (!trade) {
     return (
       <div className="row">
         <span className="row-label">{label}</span>
-        <span className="tag flat">flat</span>
+        <span className="tag flat">{t('flat')}</span>
       </div>
     )
   }
@@ -29,22 +31,22 @@ function TradeCard({ trade, label }) {
     <div style={{ padding: '6px 0', borderBottom: '1px solid var(--border-soft)' }}>
       <div className="row" style={{ borderBottom: 'none', padding: '2px 0' }}>
         <span className="row-label">{label}</span>
-        <span className={`tag ${trade.side}`}>{trade.side}</span>
+        <span className={`tag ${trade.side}`}>{t(trade.side)}</span>
       </div>
       <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, marginTop: 2 }}>
-        <span><span style={{ color: 'var(--text-faint)' }}>Entry </span><span className="mono">{fmtPrice(trade.entry)}</span></span>
+        <span><span style={{ color: 'var(--text-faint)' }}>{t('Entry')} </span><span className="mono">{fmtPrice(trade.entry, locale)}</span></span>
         {trade.tp1 && trade.tp1 !== trade.tp && (
           <span>
             <span style={{ color: 'var(--text-faint)' }}>TP1 </span>
             <span className="mono" style={{ color: trade.tp1_hit ? 'var(--long)' : 'var(--text)' }}>
-              {fmtPrice(trade.tp1)}{trade.tp1_hit ? ' ✓' : ''}
+              {fmtPrice(trade.tp1, locale)}{trade.tp1_hit ? ' ✓' : ''}
             </span>
           </span>
         )}
-        <span><span style={{ color: 'var(--text-faint)' }}>TP2 </span><span className="mono" style={{ color: 'var(--long)' }}>{fmtPrice(trade.tp)}</span></span>
+        <span><span style={{ color: 'var(--text-faint)' }}>TP2 </span><span className="mono" style={{ color: 'var(--long)' }}>{fmtPrice(trade.tp, locale)}</span></span>
         <span>
           <span style={{ color: 'var(--text-faint)' }}>SL </span>
-          <span className="mono" style={{ color: 'var(--short)' }}>{fmtPrice(trade.sl)}</span>
+          <span className="mono" style={{ color: 'var(--short)' }}>{fmtPrice(trade.sl, locale)}</span>
           {trade.tp1_hit && <span style={{ color: 'var(--text-faint)' }}> (BE)</span>}
         </span>
       </div>
@@ -53,6 +55,7 @@ function TradeCard({ trade, label }) {
 }
 
 export default function StatusPanel({ lastEvent }) {
+  const { t, locale } = useI18n()
   const [status, setStatus] = useState(null)
   const [error, setError] = useState(null)
   const [tp1Banner, setTp1BannerState] = useState(persisted.tp1Banner)
@@ -92,7 +95,7 @@ export default function StatusPanel({ lastEvent }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent])
 
-  if (!status) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">Loading…</div>
+  if (!status) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">{t('Loading…')}</div>
 
   const pairs = Object.entries(status.pairs || {})
   const shocks = status.market_shocks || []
@@ -103,67 +106,67 @@ export default function StatusPanel({ lastEvent }) {
       {error && <div className="error-banner">{error}</div>}
       {(shocks.length > 0 || (anomaly && anomaly.active)) && (
         <div className="panel" style={{ borderColor: 'var(--short)' }}>
-          <h3 className="panel-title" style={{ color: 'var(--short)' }}>⚠️ Abnormal market conditions</h3>
+          <h3 className="panel-title" style={{ color: 'var(--short)' }}>{t('⚠️ Abnormal market conditions')}</h3>
           {shocks.map((s) => (
             <div className="row" key={`${s.ticker}-${s.timeframe}`}>
-              <span className="row-label">{s.ticker} · {s.timeframe} market shock</span>
+              <span className="row-label">{t('{ticker} · {tf} market shock', { ticker: s.ticker, tf: s.timeframe })}</span>
               <span className="row-value">
-                {s.move_pct > 0 ? '+' : ''}{s.move_pct}% in {s.bars} bars ({s.move_atr}× ATR)
+                {t('{pct}% in {bars} bars ({atr}× ATR)', { pct: `${s.move_pct > 0 ? '+' : ''}${s.move_pct}`, bars: s.bars, atr: s.move_atr })}
               </span>
             </div>
           ))}
           {anomaly && anomaly.active && (anomaly.events || []).map((ev) => (
             <div className="row" key={`${ev.exchange}-${ev.wallet}-${ev.detected_ts}`}>
-              <span className="row-label">{ev.exchange} wallet {ev.kind} · {ev.wallet}</span>
+              <span className="row-label">{t('{exchange} wallet {kind} · {wallet}', { exchange: ev.exchange, kind: ev.kind, wallet: ev.wallet })}</span>
               <span className="row-value">
-                {Math.round(ev.prev_eth).toLocaleString()} → {Math.round(ev.curr_eth).toLocaleString()} ETH ({ev.change_pct}%)
+                {Math.round(ev.prev_eth).toLocaleString(locale)} → {Math.round(ev.curr_eth).toLocaleString(locale)} ETH ({ev.change_pct}%)
               </span>
             </div>
           ))}
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
             {status.shock_blocks_entries && shocks.length > 0
-              ? 'New entries are blocked while the shock lasts. '
-              : 'The A/U tracks are not built for news-driven cascades, so FLAT here can simply mean "no valid trigger". '}
-            {anomaly && anomaly.active ? 'On-chain flow is held neutral and leverage is reduced.' : ''}
+              ? t('New entries are blocked while the shock lasts.')
+              : t('The A/U tracks are not built for news-driven cascades, so FLAT here can simply mean "no valid trigger".')}
+            {anomaly && anomaly.active ? ` ${t('On-chain flow is held neutral and leverage is reduced.')}` : ''}
           </p>
         </div>
       )}
       {tp1Banner && (
         <div className="panel" style={{ borderColor: 'var(--accent)' }}>
-          <h3 className="panel-title" style={{ color: 'var(--accent)' }}>🎯 TP1 Hit</h3>
+          <h3 className="panel-title" style={{ color: 'var(--accent)' }}>{t('🎯 TP1 Hit')}</h3>
           <div className="row">
             <span className="row-label">
               {tp1Banner.ticker} · {tp1Banner.tf} · {tp1Banner.track === 'a' ? 'Andean' : 'UT Bot'}
             </span>
-            <span className={`tag ${tp1Banner.side}`}>{tp1Banner.side}</span>
+            <span className={`tag ${tp1Banner.side}`}>{t(tp1Banner.side)}</span>
           </div>
           <div className="row">
-            <span className="row-label">Entry → TP1</span>
-            <span className="row-value">{fmtPrice(tp1Banner.entry)} → {fmtPrice(tp1Banner.tp1)}</span>
+            <span className="row-label">{t('Entry → TP1')}</span>
+            <span className="row-value">{fmtPrice(tp1Banner.entry, locale)} → {fmtPrice(tp1Banner.tp1, locale)}</span>
           </div>
           <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
-            Close 50% of the position and move SL to {(tp1Banner.sl_mode || 'breakeven').replace(/_/g, ' ')} ({fmtPrice(tp1Banner.new_sl ?? tp1Banner.entry)}) — same as the Discord alert.
+            {t('Close 50% of the position and move SL to {mode} ({price}) — same as the Discord alert.', { mode: (tp1Banner.sl_mode || 'breakeven').replace(/_/g, ' '), price: fmtPrice(tp1Banner.new_sl ?? tp1Banner.entry, locale) })}
           </p>
-          <button className="btn" style={{ marginTop: 8 }} onClick={() => setTp1Banner(null)}>Dismiss</button>
+          <button className="btn" style={{ marginTop: 8 }} onClick={() => setTp1Banner(null)}>{t('Dismiss')}</button>
         </div>
       )}
 
       <div className="panel">
-        <h3 className="panel-title">Scanner</h3>
+        <h3 className="panel-title">{t('Scanner')}</h3>
         <div className="row">
-          <span className="row-label">Total scans</span>
+          <span className="row-label">{t('Total scans')}</span>
           <span className="row-value">{status.scan_stats?.total_scans ?? '—'}</span>
         </div>
         <div className="row">
-          <span className="row-label">Signals generated</span>
+          <span className="row-label">{t('Signals generated')}</span>
           <span className="row-value">{status.scan_stats?.signals_generated ?? '—'}</span>
         </div>
         <div className="row">
-          <span className="row-label">Mode</span>
+          <span className="row-label">{t('Mode')}</span>
           <span className="row-value">{status.market_mode}</span>
         </div>
         <div className="row">
-          <span className="row-label">HTF Bias</span>
+          <span className="row-label">{t('HTF Bias')}</span>
           <span className="row-value">{status.htf_bias}</span>
         </div>
       </div>
@@ -183,7 +186,7 @@ export default function StatusPanel({ lastEvent }) {
 
       {latestSignal && (
         <div className="panel">
-          <h3 className="panel-title">Latest signal</h3>
+          <h3 className="panel-title">{t('Latest signal')}</h3>
           <div className="row">
             <span className="row-label">{latestSignal.ticker} · {latestSignal.tf}</span>
             <span className={`tag ${latestSignal.sig_type?.includes('SHORT') ? 'short' : 'long'}`}>
@@ -191,7 +194,7 @@ export default function StatusPanel({ lastEvent }) {
             </span>
           </div>
           <div className="row">
-            <span className="row-label">Entry / TP / SL</span>
+            <span className="row-label">{t('Entry / TP / SL')}</span>
             <span className="row-value">
               {latestSignal.price} / {latestSignal.tp} / {latestSignal.sl}
             </span>

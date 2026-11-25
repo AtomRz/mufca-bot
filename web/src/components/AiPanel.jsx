@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { api } from '../api'
 import { OriginSwitch, useOrigin } from './HistoryPanel'
+import { useI18n } from '../i18n'
 
 // Gemini "second opinion" on each signal — informational only, it never blocks a trade.
 // Settings on top, below them the check that matters: does the verdict predict results?
@@ -32,16 +33,17 @@ function fmtPct(v) {
 }
 
 function StatsTable({ title, rows, labels }) {
+  const { t } = useI18n()
   return (
     <div className="table-wrap">
       <table className="data-table">
         <thead>
           <tr>
             <th>{title}</th>
-            <th>Trades</th>
-            <th>Win rate</th>
-            <th>Avg PnL</th>
-            <th>Total PnL</th>
+            <th>{t('Trades')}</th>
+            <th>{t('Win rate')}</th>
+            <th>{t('Avg PnL')}</th>
+            <th>{t('Total PnL')}</th>
           </tr>
         </thead>
         <tbody>
@@ -50,7 +52,7 @@ function StatsTable({ title, rows, labels }) {
             const empty = !g || !g.n
             return (
               <tr key={k}>
-                <td style={{ color: labels[k].color, fontWeight: 600 }}>{labels[k].text}</td>
+                <td style={{ color: labels[k].color, fontWeight: 600 }}>{t(labels[k].text)}</td>
                 <td>{g?.n ?? 0}</td>
                 <td>{empty ? '—' : `${(g.win_rate * 100).toFixed(1)}%`}</td>
                 <td style={empty ? undefined : { color: g.avg_pnl_pct >= 0 ? 'var(--long)' : 'var(--short)' }}>{empty ? '—' : fmtPct(g.avg_pnl_pct)}</td>
@@ -65,6 +67,7 @@ function StatsTable({ title, rows, labels }) {
 }
 
 export default function AiPanel({ lastEvent, config, onConfigChanged }) {
+  const { t } = useI18n()
   const [origin, setOrigin] = useOrigin()
   const [stats, setStats] = useState(null)
   const [error, setError] = useState(null)
@@ -126,33 +129,32 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
     }
   }
 
-  if (!ai) return <div className="empty-state">Loading…</div>
+  if (!ai) return <div className="empty-state">{t('Loading…')}</div>
 
   return (
     <div>
       {error && <div className="error-banner">{error}</div>}
 
       <div className="panel">
-        <h3 className="panel-title">AI verdict (Gemini second opinion)</h3>
+        <h3 className="panel-title">{t('AI verdict (Gemini second opinion)')}</h3>
         <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>
-          Informational only: after a signal is sent, Gemini reviews it and the verdict is shown next to it. Nothing is blocked.
-          Judge it by the table below, not by how convincing the reasons sound.
+          {t('Informational only: after a signal is sent, Gemini reviews it and the verdict is shown next to it. Nothing is blocked. Judge it by the table below, not by how convincing the reasons sound.')}
         </div>
         {!ai.has_key && (
-          <div className="error-banner">GEMINI_API_KEY is not set — add it to .env and restart the container. Until then no verdicts are requested.</div>
+          <div className="error-banner">{t('GEMINI_API_KEY is not set — add it to .env and restart the container. Until then no verdicts are requested.')}</div>
         )}
         <div className="toggle-row">
-          <span className="row-label" title="Master switch. Needs GEMINI_API_KEY in the environment.">Enabled</span>
+          <span className="row-label" title={t('Master switch. Needs GEMINI_API_KEY in the environment.')}>{t('Enabled')}</span>
           <Toggle checked={ai.enabled} disabled={busy} onChange={(v) => change({ enabled: v })} />
         </div>
         <div className="toggle-row">
-          <span className="row-label" title="Lets Gemini search Google for recent news and events (the news risk field). Google bills it per search query after a monthly free allowance; off = the verdict is based only on the numbers sent.">
-            Google Search grounding (news)
+          <span className="row-label" title={t('Lets Gemini search Google for recent news and events (the news risk field). Google bills it per search query after a monthly free allowance; off = the verdict is based only on the numbers sent.')}>
+            {t('Google Search grounding (news)')}
           </span>
           <Toggle checked={ai.grounding} disabled={busy} onChange={(v) => change({ grounding: v })} />
         </div>
         <div className="field">
-          <label title="Gemini model code as listed in Google's API docs. A wrong code just yields 'no data' verdicts (see the log).">Model</label>
+          <label title={t("Gemini model code as listed in Google's API docs. A wrong code just yields 'no data' verdicts (see the log).")}>{t('Model')}</label>
           <input
             type="text"
             value={model}
@@ -164,7 +166,7 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
           />
         </div>
         <div className="field">
-          <label title="Hard limit for one request. A grounded request is slower. On timeout the signal simply has no verdict.">Timeout</label>
+          <label title={t('Hard limit for one request. A grounded request is slower. On timeout the signal simply has no verdict.')}>{t('Timeout')}</label>
           <select value={ai.timeout_s} disabled={busy} onChange={(e) => change({ timeout_s: Number(e.target.value) })}>
             {[...new Set([...timeoutOptions, ai.timeout_s])].sort((a, b) => a - b).map((s) => (
               <option key={s} value={s}>{s} s</option>
@@ -172,17 +174,17 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
           </select>
         </div>
         <div className="field">
-          <label title="Sends one tiny request to Gemini with the settings above (no market data) and checks that the key works, the model answers and the reply parses.">Connection</label>
+          <label title={t('Sends one tiny request to Gemini with the settings above (no market data) and checks that the key works, the model answers and the reply parses.')}>{t('Connection')}</label>
           <button className="btn" disabled={busy || testing} onClick={runTest}>
-            {testing ? 'Testing…' : 'Test'}
+            {testing ? t('Testing…') : t('Test')}
           </button>
         </div>
         {testResult && (
           <div style={{ fontSize: 13, marginTop: 4 }}>
             <div style={{ color: testResult.ok ? 'var(--long)' : 'var(--short)', fontWeight: 600 }}>
-              {testResult.ok ? '✓ OK' : '✗ Failed'}
+              {testResult.ok ? '✓ OK' : t('✗ Failed')}
               {testResult.model && <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>
-                {` · ${testResult.model} · grounding ${testResult.grounded ? 'on' : 'off'} · ${testResult.latency_s}s`}
+                {` · ${t('{model} · grounding {state} · {lat}s', { model: testResult.model, state: testResult.grounded ? t('on') : t('off'), lat: testResult.latency_s })}`}
               </span>}
             </div>
             <div style={{ color: 'var(--text-dim)', marginTop: 2 }}>{testResult.message}</div>
@@ -196,17 +198,16 @@ export default function AiPanel({ lastEvent, config, onConfigChanged }) {
       <div style={{ margin: '12px 0' }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
 
       <div className="panel">
-        <h3 className="panel-title">Results by verdict (closed trades)</h3>
-        {!stats && !error && <div className="empty-state">Loading…</div>}
+        <h3 className="panel-title">{t('Results by verdict (closed trades)')}</h3>
+        {!stats && !error && <div className="empty-state">{t('Loading…')}</div>}
         {stats && (
           <>
-            <StatsTable title="Verdict" rows={stats.by_verdict} labels={VERDICT_LABEL} />
+            <StatsTable title={t('Verdict')} rows={stats.by_verdict} labels={VERDICT_LABEL} />
             <div style={{ height: 12 }} />
-            <StatsTable title="News risk" rows={stats.by_news_risk} labels={NEWS_LABEL} />
+            <StatsTable title={t('News risk')} rows={stats.by_news_risk} labels={NEWS_LABEL} />
             <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 10 }}>
-              The baseline row is closed trades without a verdict (opened before this feature, or the AI had no answer).
-              Wait for a few dozen trades per group before reading anything into a gap.
-              {stats.open_with_verdict > 0 && ` ${stats.open_with_verdict} open trade(s) already have a verdict and will be counted once they close.`}
+              {t('The baseline row is closed trades without a verdict (opened before this feature, or the AI had no answer). Wait for a few dozen trades per group before reading anything into a gap.')}
+              {stats.open_with_verdict > 0 && ` ${t('{n} open trade(s) already have a verdict and will be counted once they close.', { n: stats.open_with_verdict })}`}
             </div>
           </>
         )}

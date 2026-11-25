@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 
 const HTF_OPTIONS = ['1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 
@@ -42,6 +43,7 @@ function Toggle({ checked, onChange, disabled }) {
 // Checks the whole Android push pipeline at once: server → Firebase → device,
 // instead of waiting for a real signal to test it.
 function PushPanel({ busy, run }) {
+  const { t } = useI18n()
   const [devices, setDevices] = useState(null)
   const [result, setResult] = useState(null)
 
@@ -59,9 +61,9 @@ function PushPanel({ busy, run }) {
 
   return (
     <div className="panel">
-      <h3 className="panel-title">Android Push Notifications</h3>
+      <h3 className="panel-title">{t('Android Push Notifications')}</h3>
       <div className="row">
-        <span className="row-label">Registered devices</span>
+        <span className="row-label">{t('Registered devices')}</span>
         <span className="row-value">{devices === null ? '…' : devices.length}</span>
       </div>
       {devices && devices.length > 0 && (
@@ -77,15 +79,17 @@ function PushPanel({ busy, run }) {
         disabled={busy === 'test_push'}
         onClick={sendTest}
       >
-        {busy === 'test_push' ? 'Sending…' : 'Send test push'}
+        {busy === 'test_push' ? t('Sending…') : t('Send test push')}
       </button>
       {result && (
         <p style={{ fontSize: 12, marginTop: 10, color: result.skipped ? 'var(--short)' : 'var(--long)' }}>
           {result.skipped === 'firebase_not_configured' &&
-            'Firebase not configured on the server — place firebase-credentials.json and set FIREBASE_CREDENTIALS_PATH in .env.'}
+            t('Firebase not configured on the server — place firebase-credentials.json and set FIREBASE_CREDENTIALS_PATH in .env.')}
           {result.skipped === 'no_devices_registered' &&
-            'No devices registered yet — open the Android app once to register this phone.'}
-          {!result.skipped && `Sent to ${result.sent} device(s)${result.failed ? `, ${result.failed} failed` : ''}.`}
+            t('No devices registered yet — open the Android app once to register this phone.')}
+          {!result.skipped && (result.failed
+            ? t('Sent to {sent} device(s), {failed} failed.', { sent: result.sent, failed: result.failed })
+            : t('Sent to {sent} device(s).', { sent: result.sent }))}
         </p>
       )}
     </div>
@@ -97,6 +101,7 @@ function PushPanel({ busy, run }) {
 // mode for that pair and timeframe and wins over the global one — including
 // "On", which re-enables an entry the global switch turned off.
 function EntryOverrides({ config, busy, run }) {
+  const { t } = useI18n()
   const pairs = config.pairs || []
   const tfs = config.timeframes || []
   const overrides = config.entry_block_overrides || {}
@@ -107,11 +112,12 @@ function EntryOverrides({ config, busy, run }) {
   return (
     <details style={{ margin: '8px 0' }} open={count > 0}>
       <summary style={{ cursor: 'pointer', fontSize: 13 }}>
-        Entry switches per pair / timeframe{count > 0 ? ` (${count} override${count > 1 ? 's' : ''})` : ''}
+        {count > 0
+          ? t(count > 1 ? 'Entry switches per pair / timeframe ({count} overrides)' : 'Entry switches per pair / timeframe ({count} override)', { count })
+          : t('Entry switches per pair / timeframe')}
       </summary>
       <p style={{ fontSize: 11, color: 'var(--text-dim)', margin: '6px 0' }}>
-        "Same as global" uses the switch above. Anything else wins over it for that pair and timeframe
-        (so "On" re-enables an entry the global switch turned off).
+        {t('"Same as global" uses the switch above. Anything else wins over it for that pair and timeframe (so "On" re-enables an entry the global switch turned off).')}
       </p>
       {pairs.map((ticker) =>
         tfs.map((tf) => (
@@ -122,16 +128,16 @@ function EntryOverrides({ config, busy, run }) {
               const busyKey = `entry_block_${ticker}_${tf}_${key}`
               return (
                 <div className="field" key={key}>
-                  <label>{label}</label>
+                  <label>{t(label)}</label>
                   <select
                     value={cur}
                     disabled={busy === busyKey}
                     onChange={(e) => run(busyKey, () => api.setEntryBlock(key, e.target.value, ticker, tf))}
                   >
-                    <option value="inherit">Same as global</option>
-                    <option value="allow">On</option>
-                    <option value="block_trend">Off in TREND</option>
-                    <option value="block_all">Off (all regimes)</option>
+                    <option value="inherit">{t('Same as global')}</option>
+                    <option value="allow">{t('On')}</option>
+                    <option value="block_trend">{t('Off in TREND')}</option>
+                    <option value="block_all">{t('Off (all regimes)')}</option>
                   </select>
                 </div>
               )
@@ -145,10 +151,11 @@ function EntryOverrides({ config, busy, run }) {
 
 // Numeric field, saved on blur — shared pattern for every indicator parameter
 function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, onSave }) {
-  const [warn, setWarn] = useState(null)
+  const { t } = useI18n()
+  const [warn, setWarn] = useState(false)
   return (
     <div className="field">
-      <label>{label}{hint ? ` (${hint})` : ''}</label>
+      <label>{t(label)}{hint ? ` (${t(hint)})` : ''}</label>
       <input
         type="number"
         min={min}
@@ -169,20 +176,21 @@ function NumberField({ label, hint, value, min, max, step = 1, busyKey, busy, on
           // the user right away instead of making them wait for a round
           // trip to the server for an obvious mistake
           if (v < min || v > max) {
-            setWarn(`Must be between ${min} and ${max}`)
+            setWarn(true)
             e.target.value = value
             return
           }
-          setWarn(null)
+          setWarn(false)
           if (v !== value) onSave(v)
         }}
       />
-      {warn && <p style={{ fontSize: 11, color: 'var(--short)', margin: '4px 0 0' }}>{warn}</p>}
+      {warn && <p style={{ fontSize: 11, color: 'var(--short)', margin: '4px 0 0' }}>{t('Must be between {min} and {max}', { min, max })}</p>}
     </div>
   )
 }
 
 function ColorField({ label, value, onSave }) {
+  const { t } = useI18n()
   const [draft, setDraft] = useState(value)
   const timer = useRef(null)
   // 🆕 FIX: the draft was initialised once and never followed the saved value
@@ -195,7 +203,7 @@ function ColorField({ label, value, onSave }) {
   }
   return (
     <div className="toggle-row">
-      <span className="row-label">{label}</span>
+      <span className="row-label">{t(label)}</span>
       <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className="row-value mono">{draft}</span>
         <input
@@ -220,6 +228,7 @@ function ColorField({ label, value, onSave }) {
 }
 
 export default function SettingsPanel({ config, onChanged }) {
+  const { t } = useI18n()
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
   const [newPair, setNewPair] = useState('')
@@ -238,7 +247,7 @@ export default function SettingsPanel({ config, onChanged }) {
     setHurstWindowDraft({}) // 🆕 was never cleared, so it kept showing a stale number
   }, [config])
 
-  if (!config) return <div className="empty-state">Loading…</div>
+  if (!config) return <div className="empty-state">{t('Loading…')}</div>
 
   const run = async (key, fn) => {
     setBusy(key)
@@ -255,8 +264,8 @@ export default function SettingsPanel({ config, onChanged }) {
     }
   }
 
-  const chopValue = (t) => chopDraft[t] ?? config.chop_threshold[t]
-  const hurstWindowValue = (t) => hurstWindowDraft[t] ?? config.hurst_window[t]
+  const chopValue = (tf) => chopDraft[tf] ?? config.chop_threshold[tf]
+  const hurstWindowValue = (tf) => hurstWindowDraft[tf] ?? config.hurst_window[tf]
   const ind = config.indicators
   const colors = config.colors
   const tp = config.trade_params
@@ -273,20 +282,20 @@ export default function SettingsPanel({ config, onChanged }) {
       <div className="grid-2">
         <div>
           <div className="panel">
-            <h3 className="panel-title">Trading Mode</h3>
+            <h3 className="panel-title">{t('Trading Mode')}</h3>
             <div className="field">
-              <label>Market mode</label>
+              <label>{t('Market mode')}</label>
               <select
                 value={config.mode}
                 disabled={busy === 'mode'}
                 onChange={(e) => run('mode', () => api.setMode(e.target.value))}
               >
-                <option value="spot">Spot</option>
-                <option value="futures">Futures</option>
+                <option value="spot">{t('Spot')}</option>
+                <option value="futures">{t('Futures')}</option>
               </select>
             </div>
             <div className="field">
-              <label>HTF Bias</label>
+              <label>{t('HTF Bias')}</label>
               <select
                 value={config.htf_bias}
                 disabled={busy === 'htf'}
@@ -298,21 +307,21 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="field">
-              <label title="Where to move SL after closing 50% at TP1">SL after TP1</label>
+              <label title={t('Where to move SL after closing 50% at TP1')}>{t('SL after TP1')}</label>
               <select
                 value={config.tp1_sl_mode}
                 disabled={busy === 'tp1_sl_mode'}
                 onChange={(e) => run('tp1_sl_mode', () => api.setTp1SlMode(e.target.value))}
               >
-                <option value="breakeven">Breakeven (SL = entry)</option>
-                <option value="quarter_tp1">1/4 of the way to TP1</option>
-                <option value="half_tp1">Half-way to TP1 (SL &gt; entry)</option>
-                <option value="three_quarter_tp1">3/4 of the way to TP1</option>
+                <option value="breakeven">{t('Breakeven (SL = entry)')}</option>
+                <option value="quarter_tp1">{t('1/4 of the way to TP1')}</option>
+                <option value="half_tp1">{t('Half-way to TP1 (SL > entry)')}</option>
+                <option value="three_quarter_tp1">{t('3/4 of the way to TP1')}</option>
               </select>
             </div>
             <div className="toggle-row">
-              <span className="row-label" title="Replays the 1m candles since the last check against SL / TP1 / TP2 on every scan, so a wick that touches a level between two live-price polls is no longer missed (e.g. TP1 touched but SL never moved). Costs one extra 1m candle fetch per open trade per scan. Off = old behavior: live price poll + closed-bar check only.">
-                Intrabar 1m TP/SL check
+              <span className="row-label" title={t('Replays the 1m candles since the last check against SL / TP1 / TP2 on every scan, so a wick that touches a level between two live-price polls is no longer missed (e.g. TP1 touched but SL never moved). Costs one extra 1m candle fetch per open trade per scan. Off = old behavior: live price poll + closed-bar check only.')}>
+                {t('Intrabar 1m TP/SL check')}
               </span>
               <Toggle
                 checked={config.intrabar_check_enabled ?? true}
@@ -322,17 +331,17 @@ export default function SettingsPanel({ config, onChanged }) {
             </div>
             {ENTRY_SWITCHES.map(({ key, label }) => (
               <div className="field" key={key}>
-                <label title="Stops NEW entries for this track and side. Open trades are not affected. Off in TREND = still opens in NORMAL/CHAOS. Based on !compsim win-rates; the backtest itself ignores this switch.">
-                  Entry: {label}
+                <label title={t('Stops NEW entries for this track and side. Open trades are not affected. Off in TREND = still opens in NORMAL/CHAOS. Based on !compsim win-rates; the backtest itself ignores this switch.')}>
+                  {t('Entry: {label}', { label: t(label) })}
                 </label>
                 <select
                   value={config.entry_block?.[key] ?? 'allow'}
                   disabled={busy === `entry_block_${key}`}
                   onChange={(e) => run(`entry_block_${key}`, () => api.setEntryBlock(key, e.target.value))}
                 >
-                  <option value="allow">On</option>
-                  <option value="block_trend">Off in TREND</option>
-                  <option value="block_all">Off (all regimes)</option>
+                  <option value="allow">{t('On')}</option>
+                  <option value="block_trend">{t('Off in TREND')}</option>
+                  <option value="block_all">{t('Off (all regimes)')}</option>
                 </select>
               </div>
             ))}
@@ -342,7 +351,7 @@ export default function SettingsPanel({ config, onChanged }) {
               run={run}
             />
             <div className="field">
-              <label title="How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard's live numbers are.">Scan interval</label>
+              <label title={t('How often the bot re-fetches candles and re-checks for signals. Signals only ever form on a closed bar, so this mainly affects how fast TP1/SL hits are caught and how fresh the dashboard\'s live numbers are.')}>{t('Scan interval')}</label>
               <select
                 value={config.scan_interval_seconds}
                 disabled={busy === 'scan_interval'}
@@ -354,7 +363,7 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="field">
-              <label title="How often the bot re-fetches on-chain data (Etherscan exchange balances + CoinGecko Fear&Greed/dominance). Lower is fresher but flow deltas over a shorter window tend to be noisier.">On-chain interval</label>
+              <label title={t('How often the bot re-fetches on-chain data (Etherscan exchange balances + CoinGecko Fear&Greed/dominance). Lower is fresher but flow deltas over a shorter window tend to be noisier.')}>{t('On-chain interval')}</label>
               <select
                 value={config.onchain_interval_seconds}
                 disabled={busy === 'onchain_interval'}
@@ -366,8 +375,8 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="toggle-row">
-              <span className="row-label" title="Funding rate + open interest bias, per pair — only has any effect in Futures mode. See Signal Filters below for the direction-agnostic Hurst regime filter, a separate feature.">
-                Derivatives bias (funding + OI)
+              <span className="row-label" title={t('Funding rate + open interest bias, per pair — only has any effect in Futures mode. See Signal Filters below for the direction-agnostic Hurst regime filter, a separate feature.')}>
+                {t('Derivatives bias (funding + OI)')}
               </span>
               <Toggle
                 checked={config.derivatives_enabled ?? true}
@@ -376,7 +385,7 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <div className="field">
-              <label title="How often the bot re-fetches funding rate and open interest. Shorter default than on-chain — both move meaningfully within a single 1h/4h trading timeframe.">Derivatives interval</label>
+              <label title={t('How often the bot re-fetches funding rate and open interest. Shorter default than on-chain — both move meaningfully within a single 1h/4h trading timeframe.')}>{t('Derivatives interval')}</label>
               <select
                 value={config.derivatives_interval_seconds}
                 disabled={busy === 'derivatives_interval'}
@@ -388,7 +397,7 @@ export default function SettingsPanel({ config, onChanged }) {
               </select>
             </div>
             <div className="toggle-row">
-              <span className="row-label">Heikin Ashi for UT Bot</span>
+              <span className="row-label">{t('Heikin Ashi for UT Bot')}</span>
               <Toggle
                 checked={config.ut_heikin_ashi}
                 disabled={busy === 'utha'}
@@ -396,15 +405,15 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Changing mode/HTF resets active position-tracking state — same as the equivalent Discord commands.
+              {t('Changing mode/HTF resets active position-tracking state — same as the equivalent Discord commands.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Notifications</h3>
+            <h3 className="panel-title">{t('Notifications')}</h3>
             <div className="toggle-row">
-              <span className="row-label" title="Discord gateway stays connected — commands like !status keep working. Only the channel messages (signals, TP1) are suppressed. WebSocket and Android push are unaffected.">
-                Discord signal notifications
+              <span className="row-label" title={t('Discord gateway stays connected — commands like !status keep working. Only the channel messages (signals, TP1) are suppressed. WebSocket and Android push are unaffected.')}>
+                {t('Discord signal notifications')}
               </span>
               <Toggle
                 checked={config.discord_notifications_enabled}
@@ -413,12 +422,11 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Off = the bot stops posting signal/TP1 messages to the Discord channel. Scanning, the web
-              dashboard, and Android push all keep working exactly the same either way.
+              {t('Off = the bot stops posting signal/TP1 messages to the Discord channel. Scanning, the web dashboard, and Android push all keep working exactly the same either way.')}
             </p>
             <div className="toggle-row">
-              <span className="row-label" title="Market shocks (5x ATR moves) and abnormal on-chain exchange-wallet moves. Off = no Discord message and no push for these two alert types; the 'Abnormal market conditions' banner on the Status tab still shows them. Signal / TP1 notifications are not affected.">
-                Market shock / on-chain anomaly alerts
+              <span className="row-label" title={t('Market shocks (5x ATR moves) and abnormal on-chain exchange-wallet moves. Off = no Discord message and no push for these two alert types; the \'Abnormal market conditions\' banner on the Status tab still shows them. Signal / TP1 notifications are not affected.')}>
+                {t('Market shock / on-chain anomaly alerts')}
               </span>
               <Toggle
                 checked={config.system_alerts_enabled ?? true}
@@ -427,16 +435,15 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Off = no Discord message and no push about market shocks or abnormal on-chain activity.
-              The warning banner on the Status tab stays, so you still see it in the web.
+              {t('Off = no Discord message and no push about market shocks or abnormal on-chain activity. The warning banner on the Status tab stays, so you still see it in the web.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Market Shock Guard</h3>
+            <h3 className="panel-title">{t('Market Shock Guard')}</h3>
             <div className="toggle-row">
-              <span className="row-label" title="A market shock is a move of 5x ATR or more over the last 4 closed bars (news cascades, exchange hacks). Off = warn only (alert + dashboard banner). On = also stop opening new positions while the shock lasts.">
-                Block new entries during a shock
+              <span className="row-label" title={t('A market shock is a move of 5x ATR or more over the last 4 closed bars (news cascades, exchange hacks). Off = warn only (alert + dashboard banner). On = also stop opening new positions while the shock lasts.')}>
+                {t('Block new entries during a shock')}
               </span>
               <Toggle
                 checked={config.shock_guard_block_entries ?? false}
@@ -445,16 +452,15 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Off (default) = a shock only raises an alert and a banner on the Status tab. On = the bot also
-              skips new entries while the move lasts. Open positions are never touched.
+              {t('Off (default) = a shock only raises an alert and a banner on the Status tab. On = the bot also skips new entries while the move lasts. Open positions are never touched.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Signal Filters</h3>
+            <h3 className="panel-title">{t('Signal Filters')}</h3>
             {FILTER_TOGGLES.map(({ key, label, hint }) => (
               <div className="toggle-row" key={key}>
-                <span className="row-label" title={hint}>{label}</span>
+                <span className="row-label" title={hint ? t(hint) : undefined}>{t(label)}</span>
                 <Toggle
                   checked={config.filter_toggles?.[key] ?? true}
                   disabled={busy === `filter_${key}`}
@@ -463,20 +469,19 @@ export default function SettingsPanel({ config, onChanged }) {
               </div>
             ))}
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Off = filter is skipped entirely (always passes) when deciding whether a signal fires. Matches the lamp row in the topbar.
+              {t('Off = filter is skipped entirely (always passes) when deciding whether a signal fires. Matches the lamp row in the topbar.')}
             </p>
           </div>
 
           <p style={{ fontSize: 11, color: 'var(--text-faint)', margin: '0 0 12px' }}>
-            Auto-tune filters, the low-volume gate, the indicator optimizer, the autopsy and the walk-forward check
-            moved to the Lab tab.
+            {t('Auto-tune filters, the low-volume gate, the indicator optimizer, the autopsy and the walk-forward check moved to the Lab tab.')}
           </p>
 
           <div className="panel">
-            <h3 className="panel-title">CHOP Threshold</h3>
+            <h3 className="panel-title">{t('CHOP Threshold')}</h3>
             {Object.keys(config.chop_threshold).map((tf) => (
               <div className="field" key={tf}>
-                <label>{tf} (20–90, lower = trending)</label>
+                <label>{t('{tf} (20–90, lower = trending)', { tf })}</label>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input
                     type="number"
@@ -492,11 +497,11 @@ export default function SettingsPanel({ config, onChanged }) {
                     onClick={() => {
                       const v = parseFloat(chopValue(tf))
                       // 🆕 an empty/invalid field used to send NaN (JSON null) and surface a raw 422
-                      if (!Number.isFinite(v)) { setError(`CHOP ${tf}: enter a number between 20 and 90`); return }
+                      if (!Number.isFinite(v)) { setError(t('CHOP {tf}: enter a number between 20 and 90', { tf })); return }
                       run(`chop_${tf}`, () => api.setChop(tf, v))
                     }}
                   >
-                    Save
+                    {t('Save')}
                   </button>
                 </div>
               </div>
@@ -504,23 +509,23 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Hurst Filter</h3>
+            <h3 className="panel-title">{t('Hurst Filter')}</h3>
             <div className="field">
-              <label title="Only Hurst > 0.5 + Min Deviation passes. Matches this bot's trend-following A/U entries — mean-reverting regimes (Hurst < 0.5) tend to hurt them, not just add noise. Use Symmetric only if you've added a mean-reversion-style entry elsewhere.">
-                Mode
+              <label title={t('Only Hurst > 0.5 + Min Deviation passes. Matches this bot\'s trend-following A/U entries — mean-reverting regimes (Hurst < 0.5) tend to hurt them, not just add noise. Use Symmetric only if you\'ve added a mean-reversion-style entry elsewhere.')}>
+                {t('Mode')}
               </label>
               <select
                 value={config.hurst_mode}
                 disabled={busy === 'hurst_mode'}
                 onChange={(e) => run('hurst_mode', () => api.setHurstConfig({ hurst_mode: e.target.value }))}
               >
-                <option value="trending_only">Trending Only (recommended)</option>
-                <option value="symmetric">Symmetric (trend + mean-rev)</option>
+                <option value="trending_only">{t('Trending Only (recommended)')}</option>
+                <option value="symmetric">{t('Symmetric (trend + mean-rev)')}</option>
               </select>
             </div>
             <div className="toggle-row">
-              <span className="row-label" title="Anis-Lloyd small-sample correction of the R/S Hurst estimate. On: pure noise reads ~0.5 at any window. Off: legacy uncorrected estimate (noise reads ~0.58-0.61) that older windows / Min Deviation were tuned on. Applies from the next scan.">
-                Anis-Lloyd correction
+              <span className="row-label" title={t('Anis-Lloyd small-sample correction of the R/S Hurst estimate. On: pure noise reads ~0.5 at any window. Off: legacy uncorrected estimate (noise reads ~0.58-0.61) that older windows / Min Deviation were tuned on. Applies from the next scan.')}>
+                {t('Anis-Lloyd correction')}
               </span>
               <Toggle
                 checked={config.hurst_bias_correction ?? true}
@@ -536,8 +541,8 @@ export default function SettingsPanel({ config, onChanged }) {
             />
             {Object.keys(config.hurst_window).map((tf) => (
               <div className="field" key={tf}>
-                <label title="Bars used for the rolling R/S estimate. The optimal value is pair/TF-specific, not universal — adjust it here and watch A/U Win Rate after a batch of trades closes.">
-                  {tf} window (18–300)
+                <label title={t('Bars used for the rolling R/S estimate. The optimal value is pair/TF-specific, not universal — adjust it here and watch A/U Win Rate after a batch of trades closes.')}>
+                  {t('{tf} window (18–300)', { tf })}
                 </label>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input
@@ -553,31 +558,31 @@ export default function SettingsPanel({ config, onChanged }) {
                     disabled={busy === `hurst_window_${tf}`}
                     onClick={() => {
                       const v = parseInt(hurstWindowValue(tf), 10)
-                      if (!Number.isFinite(v)) { setError(`Hurst window ${tf}: enter a whole number between 18 and 300`); return }
+                      if (!Number.isFinite(v)) { setError(t('Hurst window {tf}: enter a whole number between 18 and 300', { tf })); return }
                       run(`hurst_window_${tf}`, () => api.setHurstWindow(tf, v))
                     }}
                   >
-                    Save
+                    {t('Save')}
                   </button>
                 </div>
               </div>
             ))}
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Only applies when the "Hurst regime clarity" toggle above (Signal Filters) is on.
+              {t('Only applies when the "Hurst regime clarity" toggle above (Signal Filters) is on.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Adaptive TP</h3>
+            <h3 className="panel-title">{t('Adaptive TP')}</h3>
             <div className="field">
-              <label>Mode</label>
+              <label>{t('Mode')}</label>
               <select
                 value={config.tp_config.use_safe_tp ? 'safe' : 'aggressive'}
                 disabled={busy === 'tp_mode'}
                 onChange={(e) => run('tp_mode', () => api.setTpConfig('mode', e.target.value))}
               >
-                <option value="aggressive">Aggressive ⚡</option>
-                <option value="safe">Safe 🛡️</option>
+                <option value="aggressive">{t('Aggressive ⚡')}</option>
+                <option value="safe">{t('Safe 🛡️')}</option>
               </select>
             </div>
             <NumberField
@@ -599,13 +604,13 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => run('tp_limit', () => api.setTpConfig('limit', v))}
             />
             <div className="row">
-              <span className="row-label">Min / Max TP</span>
+              <span className="row-label">{t('Min / Max TP')}</span>
               <span className="row-value">{config.tp_config.min_tp_pct}% / {config.tp_config.max_tp_pct}%</span>
             </div>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Risk &amp; Hold Time</h3>
+            <h3 className="panel-title">{t('Risk & Hold Time')}</h3>
             <NumberField
               label="Risk per trade, % of deposit"
               hint={`${tp.target_risk_dep_bounds[0]}–${tp.target_risk_dep_bounds[1]}`}
@@ -623,21 +628,18 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => run('trade_hold', () => api.setTradeParams({ max_hold_bars: v }))}
             />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Risk sets the leverage of NEW positions: leverage = risk % ÷ stop-loss distance in ATR (1–3.5),
-              capped at {tp.max_allowed_lev}x, then adjusted for regime and volume. Open positions keep their
-              leverage. Max bars is a time stop: a trade still unresolved after that many bars is closed as
-              cancelled — it also applies to trades that are already open.
+              {t('Risk sets the leverage of NEW positions: leverage = risk % ÷ stop-loss distance in ATR (1–3.5), capped at {lev}x, then adjusted for regime and volume. Open positions keep their leverage. Max bars is a time stop: a trade still unresolved after that many bars is closed as cancelled — it also applies to trades that are already open.', { lev: tp.max_allowed_lev })}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Tracked Pairs</h3>
+            <h3 className="panel-title">{t('Tracked Pairs')}</h3>
             <div className="chip-row">
               {config.pairs.map((p) => (
                 <span className="chip" key={p}>
                   {p}
                   <button
-                    title="Remove pair"
+                    title={t('Remove pair')}
                     onClick={() => setRemoving(removing === p ? null : p)}
                     disabled={busy === `rm_${p}`}
                   >
@@ -649,8 +651,7 @@ export default function SettingsPanel({ config, onChanged }) {
             {removing && config.pairs.includes(removing) && (
               <div className="panel" style={{ marginTop: 10, borderColor: 'var(--short)' }}>
                 <p style={{ margin: '0 0 8px', fontSize: 13 }}>
-                  Stop tracking <b>{removing}</b>? Keep its accumulated signal history in case you re-add it later,
-                  or delete the history too (cannot be undone).
+                  {t('Stop tracking {pair}? Keep its accumulated signal history in case you re-add it later, or delete the history too (cannot be undone).').split('{pair}').reduce((acc, part, i) => (i === 0 ? [part] : [...acc, <b key="pair">{removing}</b>, part]), [])}
                 </p>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button
@@ -658,7 +659,7 @@ export default function SettingsPanel({ config, onChanged }) {
                     disabled={busy === `rm_${removing}`}
                     onClick={() => { const p = removing; setRemoving(null); run(`rm_${p}`, () => api.removePair(p, false)) }}
                   >
-                    Remove, keep history
+                    {t('Remove, keep history')}
                   </button>
                   <button
                     className="btn"
@@ -666,9 +667,9 @@ export default function SettingsPanel({ config, onChanged }) {
                     disabled={busy === `rm_${removing}`}
                     onClick={() => { const p = removing; setRemoving(null); run(`rm_${p}`, () => api.removePair(p, true)) }}
                   >
-                    Remove + delete history
+                    {t('Remove + delete history')}
                   </button>
-                  <button className="btn" onClick={() => setRemoving(null)}>Cancel</button>
+                  <button className="btn" onClick={() => setRemoving(null)}>{t('Cancel')}</button>
                 </div>
               </div>
             )}
@@ -688,7 +689,7 @@ export default function SettingsPanel({ config, onChanged }) {
                 disabled={!newPair.trim() || busy === 'add_pair'}
                 onClick={() => run('add_pair', () => api.addPair(newPair.trim())).then((ok) => { if (ok) setNewPair('') })}
               >
-                Add
+                {t('Add')}
               </button>
             </div>
           </div>
@@ -698,7 +699,7 @@ export default function SettingsPanel({ config, onChanged }) {
 
         <div>
           <div className="panel">
-            <h3 className="panel-title">Andean + MFI</h3>
+            <h3 className="panel-title">{t('Andean + MFI')}</h3>
             <NumberField label="MFI Length" hint="2–50" value={ind.mfi_len} min={2} max={50}
               busyKey="ind_mfi_len" busy={busy} onSave={(v) => saveIndicator('mfi_len', v)} />
             <NumberField label="AI Training Size" hint="100–3000" value={ind.mfi_training} min={100} max={3000}
@@ -712,7 +713,7 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">FRAMA Channel</h3>
+            <h3 className="panel-title">{t('FRAMA Channel')}</h3>
             <NumberField label="FRAMA Length" hint="5–100" value={ind.frama_len} min={5} max={100}
               busyKey="ind_frama_len" busy={busy} onSave={(v) => saveIndicator('frama_len', v)} />
             <NumberField label="FRAMA Multiplier" hint="0.5–5.0" value={ind.frama_mult} min={0.5} max={5} step={0.1}
@@ -720,48 +721,47 @@ export default function SettingsPanel({ config, onChanged }) {
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">UT Bot</h3>
+            <h3 className="panel-title">{t('UT Bot')}</h3>
             <NumberField label="Key Value (Sensitivity)" hint="0.1–10" value={ind.ut_sensitivity} min={0.1} max={10} step={0.1}
               busyKey="ind_ut_sensitivity" busy={busy} onSave={(v) => saveIndicator('ut_sensitivity', v)} />
             <NumberField label="ATR Period" hint="2–50" value={ind.ut_period} min={2} max={50}
               busyKey="ind_ut_period" busy={busy} onSave={(v) => saveIndicator('ut_period', v)} />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Heikin Ashi Candles toggle is above, in the "Trading Mode" panel.
+              {t('Heikin Ashi Candles toggle is above, in the "Trading Mode" panel.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Bollinger Bands</h3>
+            <h3 className="panel-title">{t('Bollinger Bands')}</h3>
             <NumberField label="Length" hint="5–100" value={ind.bb_period} min={5} max={100}
               busyKey="ind_bb_period" busy={busy} onSave={(v) => saveIndicator('bb_period', v)} />
             <NumberField label="StdDev" hint="0.5–5.0" value={ind.bb_stddev} min={0.5} max={5} step={0.1}
               busyKey="ind_bb_stddev" busy={busy} onSave={(v) => saveIndicator('bb_stddev', v)} />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Basis MA type and source are fixed (SMA of Close) — not configurable yet.
+              {t('Basis MA type and source are fixed (SMA of Close) — not configurable yet.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">S&amp;R Power Channel</h3>
+            <h3 className="panel-title">{t('S&R Power Channel')}</h3>
             <NumberField label="Lookback Length" hint="3–50, pivot confirmation window" value={ind.sr_pivot_window} min={3} max={50}
               busyKey="ind_sr_pivot_window" busy={busy} onSave={(v) => saveIndicator('sr_pivot_window', v)} />
             <NumberField label="Max Levels Shown" hint="1–10, per support/resistance" value={ind.sr_max_levels} min={1} max={10}
               busyKey="ind_sr_max_levels" busy={busy} onSave={(v) => saveIndicator('sr_max_levels', v)} />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              A pivot needs Lookback Length bars <em>after</em> it to be confirmed — a fresh breakout won't show
-              as resistance until price pulls back. This is standard pivot-based S/R behavior, not a bug.
-              "Extend Bars" from the reference indicator doesn't apply here — our lines already span the full chart.
+              {t('A pivot needs Lookback Length bars {after} it to be confirmed — a fresh breakout won\'t show as resistance until price pulls back. This is standard pivot-based S/R behavior, not a bug.').split('{after}').reduce((acc, part, i) => (i === 0 ? [part] : [...acc, <em key="after">{t('after')}</em>, part]), [])}
+              {t('"Extend Bars" from the reference indicator doesn\'t apply here — our lines already span the full chart.')}
             </p>
             <p style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-              Changing any indicator parameter above resets active position-tracking state — same as mode/HTF.
+              {t('Changing any indicator parameter above resets active position-tracking state — same as mode/HTF.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Volume Profile</h3>
+            <h3 className="panel-title">{t('Volume Profile')}</h3>
             <div className="toggle-row">
-              <span className="row-label" title="Approximated from OHLCV (no tick data) — see the POC/Value Area overlay on the Chart tab.">
-                Enabled
+              <span className="row-label" title={t('Approximated from OHLCV (no tick data) — see the POC/Value Area overlay on the Chart tab.')}>
+                {t('Enabled')}
               </span>
               <Toggle
                 checked={config.volume_profile?.enabled ?? true}
@@ -788,8 +788,8 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => saveVp('value_area_pct', v / 100)}
             />
             <div className="toggle-row">
-              <span className="row-label" title="Off keeps the POC line and Value Area band, just drops the horizontal histogram bars.">
-                Show histogram
+              <span className="row-label" title={t('Off keeps the POC line and Value Area band, just drops the horizontal histogram bars.')}>
+                {t('Show histogram')}
               </span>
               <Toggle
                 checked={config.volume_profile?.show_histogram ?? true}
@@ -798,29 +798,28 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <div className="field">
-              <label title="Which edge of the chart the histogram bars grow from — web chart and Discord !chart image.">
-                Histogram side
+              <label title={t('Which edge of the chart the histogram bars grow from — web chart and Discord !chart image.')}>
+                {t('Histogram side')}
               </label>
               <select
                 value={config.volume_profile?.histogram_side ?? 'right'}
                 disabled={busy === 'vp_histogram_side'}
                 onChange={(e) => saveVp('histogram_side', e.target.value)}
               >
-                <option value="left">Left</option>
-                <option value="right">Right</option>
+                <option value="left">{t('Left')}</option>
+                <option value="right">{t('Right')}</option>
               </select>
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              POC (Point of Control) and Value Area are a different kind of level from pivot support/resistance
-              above — they mark where volume actually concentrated, not local price extremes. Complementary, not a replacement.
+              {t('POC (Point of Control) and Value Area are a different kind of level from pivot support/resistance above — they mark where volume actually concentrated, not local price extremes. Complementary, not a replacement.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Demand / Supply Zones</h3>
+            <h3 className="panel-title">{t('Demand / Supply Zones')}</h3>
             <div className="toggle-row">
-              <span className="row-label" title="A tight consolidation ('base') followed by a strong, high-volume move out of it. Disabling also skips the detector's per-bar work on the live scan, not just the chart overlay.">
-                Enabled
+              <span className="row-label" title={t('A tight consolidation (\'base\') followed by a strong, high-volume move out of it. Disabling also skips the detector\'s per-bar work on the live scan, not just the chart overlay.')}>
+                {t('Enabled')}
               </span>
               <Toggle
                 checked={config.zones?.enabled ?? true}
@@ -877,16 +876,15 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => saveZones('min_volume_ratio', v)}
             />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Shown on the Chart tab (Discord and web) as colored bands with a state label (fresh/tested/weakened/broken).
-              Not yet read by confidence scoring or TP capping — informational only, same as Volume Profile above.
+              {t('Shown on the Chart tab (Discord and web) as colored bands with a state label (fresh/tested/weakened/broken). Not yet read by confidence scoring or TP capping — informational only, same as Volume Profile above.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Market structure (BOS / CHoCH / FVG)</h3>
+            <h3 className="panel-title">{t('Market structure (BOS / CHoCH / FVG)')}</h3>
             <div className="toggle-row">
-              <span className="row-label" title="Draws break-of-structure / change-of-character lines and still-open fair value gaps on the chart. Off by default.">
-                Enabled
+              <span className="row-label" title={t('Draws break-of-structure / change-of-character lines and still-open fair value gaps on the chart. Off by default.')}>
+                {t('Enabled')}
               </span>
               <Toggle
                 checked={config.smc_overlay?.enabled ?? false}
@@ -895,8 +893,8 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <div className="toggle-row">
-              <span className="row-label" title="BOS = close beyond the last swing high/low in the direction of the prevailing structure; CHoCH = the same break against it.">
-                BOS / CHoCH lines
+              <span className="row-label" title={t('BOS = close beyond the last swing high/low in the direction of the prevailing structure; CHoCH = the same break against it.')}>
+                {t('BOS / CHoCH lines')}
               </span>
               <Toggle
                 checked={config.smc_overlay?.show_breaks ?? true}
@@ -905,8 +903,8 @@ export default function SettingsPanel({ config, onChanged }) {
               />
             </div>
             <div className="toggle-row">
-              <span className="row-label" title="A three-candle gap that price has not fully traded back through since; a partly filled gap shows only the part still open.">
-                Open fair value gaps
+              <span className="row-label" title={t('A three-candle gap that price has not fully traded back through since; a partly filled gap shows only the part still open.')}>
+                {t('Open fair value gaps')}
               </span>
               <Toggle
                 checked={config.smc_overlay?.show_fvg ?? true}
@@ -939,14 +937,12 @@ export default function SettingsPanel({ config, onChanged }) {
               onSave={(v) => saveSmc('max_fvgs', v)}
             />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
-              Shown on the Chart tab (Discord and web), calculated on closed candles only. Purely visual: the Insights →
-              Simulate "SMC event study" found no tradable edge in these events, so nothing here is read by signals,
-              filters, TP/SL or confidence.
+              {t('Shown on the Chart tab (Discord and web), calculated on closed candles only. Purely visual: the Insights → Simulate "SMC event study" found no tradable edge in these events, so nothing here is read by signals, filters, TP/SL or confidence.')}
             </p>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title">Chart Colors</h3>
+            <h3 className="panel-title">{t('Chart Colors')}</h3>
             <ColorField label="FRAMA" value={colors.frama} onSave={(v) => saveColor('frama', v)} />
             <ColorField label="Bollinger Bands" value={colors.bb} onSave={(v) => saveColor('bb', v)} />
             <ColorField label="Support" value={colors.support} onSave={(v) => saveColor('support', v)} />

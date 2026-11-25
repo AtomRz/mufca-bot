@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api'
+import { useI18n } from '../i18n'
 
 function winrateColor(wr) {
   if (wr >= 0.55) return 'var(--long)'
@@ -27,7 +28,7 @@ function num2(v) {
   return Number.isFinite(v) ? v.toFixed(2) : '—'
 }
 
-function fmtDate(ts) {
+function fmtDate(ts, locale) {
   if (!ts) return '—'
   try {
     // 🆕 FIX: backtest records from before this fix stored the timestamp as
@@ -39,7 +40,7 @@ function fmtDate(ts) {
     const value = typeof ts === 'string' && /^\d+$/.test(ts) ? Number(ts) : ts
     const d = new Date(value)
     if (isNaN(d.getTime())) return ts
-    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    return d.toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   } catch (_) {
     return ts
   }
@@ -49,11 +50,12 @@ function fmtDate(ts) {
 const AI_DOT = { approve: 'var(--long)', neutral: 'var(--accent)', reject: 'var(--short)' }
 
 function AiCell({ ai }) {
+  const { t } = useI18n()
   if (!ai) return <span style={{ color: 'var(--text-faint)' }}>—</span>
   if (ai.status !== 'ok') {
-    return <span style={{ color: 'var(--text-faint)' }} title={`AI had no answer (${ai.status}${ai.detail ? `, ${ai.detail}` : ''})`}>n/a</span>
+    return <span style={{ color: 'var(--text-faint)' }} title={t('AI had no answer ({reason})', { reason: `${ai.status}${ai.detail ? `, ${ai.detail}` : ''}` })}>{t('n/a')}</span>
   }
-  const news = ai.news_risk && ai.news_risk !== 'unknown' ? ` · news risk: ${ai.news_risk}` : ''
+  const news = ai.news_risk && ai.news_risk !== 'unknown' ? ` · ${t('news risk: {risk}', { risk: ai.news_risk })}` : ''
   const tip = `${ai.verdict} (${ai.confidence}%)${news}${ai.reason ? `\n${ai.reason}` : ''}`
   return (
     <span title={tip} style={{ whiteSpace: 'nowrap' }}>
@@ -88,13 +90,14 @@ export function useOrigin() {
 }
 
 export function OriginSwitch({ origin, onChange }) {
+  const { t } = useI18n()
   return (
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 }}
-         title="Backtest-origin records (the first bootstrap and anything added from the Backup tab) are simulated: they skip live-only gates (spread/derivatives, intrabar check). Live only = what the bot actually did.">
-      <span style={{ color: 'var(--text-faint)' }}>Records:</span>
+         title={t('Backtest-origin records (the first bootstrap and anything added from the Backup tab) are simulated: they skip live-only gates (spread/derivatives, intrabar check). Live only = what the bot actually did.')}>
+      <span style={{ color: 'var(--text-faint)' }}>{t('Records:')}</span>
       {ORIGIN_OPTIONS.map((o) => (
         <button key={o.id} className={`btn ${origin === o.id ? 'primary' : ''}`} onClick={() => onChange(o.id)}>
-          {o.label}
+          {t(o.label)}
         </button>
       ))}
     </div>
@@ -102,6 +105,7 @@ export function OriginSwitch({ origin, onChange }) {
 }
 
 export default function HistoryPanel({ lastEvent }) {
+  const { t, locale } = useI18n()
   const [origin, setOrigin] = useOrigin()
   const [summary, setSummary] = useState(null)
   const [error, setError] = useState(null)
@@ -182,14 +186,14 @@ export default function HistoryPanel({ lastEvent }) {
       loadRecords() // row counts/PnL aggregates changed — refresh both tables
       load()
     } catch (e) {
-      setDeleteError(`Failed to delete record: ${e.message}`)
+      setDeleteError(t('Failed to delete record: {error}', { error: e.message }))
       loadRecords() // the usual reason is a stale list — show the current one
     } finally {
       setDeletingIdx(null)
     }
   }
 
-  if (!summary) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">Loading…</div>
+  if (!summary) return error ? <div className="error-banner">{error}</div> : <div className="empty-state">{t('Loading…')}</div>
 
   const { rows, total } = summary
 
@@ -199,8 +203,8 @@ export default function HistoryPanel({ lastEvent }) {
         <div style={{ marginBottom: 12 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
         <div className="empty-state">
           {origin === 'all'
-            ? 'No closed signals yet — stats will appear after the first TP/SL hit.'
-            : `No closed ${origin} signals yet.`}
+            ? t('No closed signals yet — stats will appear after the first TP/SL hit.')
+            : origin === 'live' ? t('No closed live signals yet.') : t('No closed backtest signals yet.')}
         </div>
       </div>
     )
@@ -215,34 +219,34 @@ export default function HistoryPanel({ lastEvent }) {
       <div style={{ marginBottom: 12 }}><OriginSwitch origin={origin} onChange={setOrigin} /></div>
       {total && (
         <div className="panel">
-          <h3 className="panel-title">Overall (all pairs)</h3>
+          <h3 className="panel-title">{t('Overall (all pairs)')}</h3>
           <div className="stat-cards">
-            <StatCard label="Win Rate" value={`${Math.round(total.win_rate * 100)}%`} color={winrateColor(total.win_rate)} />
-            <StatCard label="Signals" value={total.count} />
-            <StatCard label="Avg PnL" value={fmtPct(total.avg_pnl)} color={total.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)'} />
-            <StatCard label="Avg MFE" value={`${num2(total.avg_mfe)}%`} />
-            <StatCard label="Avg MAE" value={`${num2(total.avg_mae)}%`} />
-            <StatCard label="TP / SL after TP1 / SL / Cancel" value={`${total.tp_hits} / ${total.sl_after_tp1_hits ?? 0} / ${total.sl_hits} / ${total.cancelled}`} />
+            <StatCard label={t('Win Rate')} value={`${Math.round(total.win_rate * 100)}%`} color={winrateColor(total.win_rate)} />
+            <StatCard label={t('Signals')} value={total.count} />
+            <StatCard label={t('Avg PnL')} value={fmtPct(total.avg_pnl)} color={total.avg_pnl >= 0 ? 'var(--long)' : 'var(--short)'} />
+            <StatCard label={t('Avg MFE')} value={`${num2(total.avg_mfe)}%`} />
+            <StatCard label={t('Avg MAE')} value={`${num2(total.avg_mae)}%`} />
+            <StatCard label={t('TP / SL after TP1 / SL / Cancel')} value={`${total.tp_hits} / ${total.sl_after_tp1_hits ?? 0} / ${total.sl_hits} / ${total.cancelled}`} />
           </div>
         </div>
       )}
 
       <div className="panel">
-        <h3 className="panel-title">By pair / timeframe / track</h3>
+        <h3 className="panel-title">{t('By pair / timeframe / track')}</h3>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
               <tr>
-                <th>Pair</th>
-                <th>TF</th>
-                <th>Side</th>
-                <th>Track</th>
-                <th>Signals</th>
-                <th>Win Rate</th>
-                <th>Avg PnL</th>
-                <th>Avg MFE</th>
-                <th>Avg MAE</th>
-                <th title="TP2 hit / stopped after TP1 (moved SL, usually still a profit) / SL before TP1 / cancelled">TP/SL·TP1/SL/Canc</th>
+                <th>{t('Pair')}</th>
+                <th>{t('TF')}</th>
+                <th>{t('Side')}</th>
+                <th>{t('Track')}</th>
+                <th>{t('Signals')}</th>
+                <th>{t('Win Rate')}</th>
+                <th>{t('Avg PnL')}</th>
+                <th>{t('Avg MFE')}</th>
+                <th>{t('Avg MAE')}</th>
+                <th title={t('TP2 hit / stopped after TP1 (moved SL, usually still a profit) / SL before TP1 / cancelled')}>{t('TP/SL·TP1/SL/Canc')}</th>
               </tr>
             </thead>
             <tbody>
@@ -255,7 +259,7 @@ export default function HistoryPanel({ lastEvent }) {
                   <td>{r.ticker}</td>
                   <td>{r.tf}</td>
                   <td className={r.side === 'long' ? 'tag long' : 'tag short'} style={{ display: 'inline-block', margin: '2px 0' }}>
-                    {r.side}
+                    {t(r.side)}
                   </td>
                   <td>{r.track === 'a' ? 'Andean' : r.track === 'u' ? 'UT Bot' : r.track}</td>
                   <td>{r.count}</td>
@@ -284,33 +288,38 @@ export default function HistoryPanel({ lastEvent }) {
       {selected && (
         <div className="panel">
           <h3 className="panel-title">
-            {selected.ticker} · {selected.tf} · {selected.side} · {selected.track === 'a' ? 'Andean' : selected.track === 'u' ? 'UT Bot' : selected.track} — recent trades
+            {t('{ticker} · {tf} · {side} · {track} — recent trades', {
+              ticker: selected.ticker,
+              tf: selected.tf,
+              side: t(selected.side),
+              track: selected.track === 'a' ? 'Andean' : selected.track === 'u' ? 'UT Bot' : selected.track,
+            })}
           </h3>
           {recordsError && <div className="error-banner">{recordsError}</div>}
           {deleteError && <div className="error-banner">{deleteError}</div>}
-          {!records && !recordsError && <div className="empty-state">Loading…</div>}
-          {records && records.length === 0 && <div className="empty-state">No closed trades for this combination.</div>}
+          {!records && !recordsError && <div className="empty-state">{t('Loading…')}</div>}
+          {records && records.length === 0 && <div className="empty-state">{t('No closed trades for this combination.')}</div>}
           {records && records.length > 0 && (
             <div className="table-wrap">
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Date</th>
-                    <th>Entry</th>
-                    <th>Exit</th>
+                    <th>{t('Date')}</th>
+                    <th>{t('Entry')}</th>
+                    <th>{t('Exit')}</th>
                     <th>PnL</th>
                     <th>MFE</th>
                     <th>MAE</th>
-                    <th>Result</th>
-                    <th>Regime</th>
-                    <th title="Gemini second opinion (informational) — hover for the reason">AI</th>
+                    <th>{t('Result')}</th>
+                    <th>{t('Regime')}</th>
+                    <th title={t('Gemini second opinion (informational) — hover for the reason')}>AI</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {records.map((rec) => (
                     <tr key={rec.idx}>
-                      <td>{fmtDate(rec.timestamp)}</td>
+                      <td>{fmtDate(rec.timestamp, locale)}</td>
                       <td>{rec.entry}</td>
                       <td>{rec.exit ?? '—'}</td>
                       <td style={{ color: rec.moved_pct >= 0 ? 'var(--long)' : 'var(--short)' }}>{fmtPct(rec.moved_pct)}</td>
@@ -318,22 +327,22 @@ export default function HistoryPanel({ lastEvent }) {
                       <td>{num2(rec.max_adverse_pct ?? 0)}%</td>
                       <td>
                         <span className={`tag ${rec.exit_type === 'tp' ? 'long' : rec.exit_type === 'sl' ? 'short' : rec.exit_type === 'sl_after_tp1' ? 'long' : 'flat'}`}>
-                          {rec.exit_type === 'sl_after_tp1' ? 'SL (post-TP1)' : rec.exit_type}
+                          {rec.exit_type === 'sl_after_tp1' ? t('SL (post-TP1)') : rec.exit_type}
                         </span>
-                        {rec.tp1_hit && <span className="tag long" style={{ marginLeft: 6 }} title="TP1 was reached before final exit — PnL reflects the blended 50/50 result">TP1 ✓</span>}
-                        {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>sim</span>}
+                        {rec.tp1_hit && <span className="tag long" style={{ marginLeft: 6 }} title={t('TP1 was reached before final exit — PnL reflects the blended 50/50 result')}>TP1 ✓</span>}
+                        {rec.synthetic && <span className="tag flat" style={{ marginLeft: 6 }}>{t('sim')}</span>}
                       </td>
                       <td style={{ color: 'var(--text-dim)' }}>{rec.regime || '—'}</td>
                       <td><AiCell ai={rec.ai} /></td>
                       <td>
                         <button
                           className="row-delete-btn"
-                          title={confirmIdx === rec.idx ? 'Click again to delete — this cannot be undone' : 'Delete this record'}
+                          title={confirmIdx === rec.idx ? t('Click again to delete — this cannot be undone') : t('Delete this record')}
                           onClick={() => handleDelete(rec)}
                           disabled={deletingIdx === rec.idx}
                           style={confirmIdx === rec.idx ? { color: 'var(--short)', fontWeight: 700 } : undefined}
                         >
-                          {deletingIdx === rec.idx ? '…' : confirmIdx === rec.idx ? 'sure?' : '×'}
+                          {deletingIdx === rec.idx ? '…' : confirmIdx === rec.idx ? t('sure?') : '×'}
                         </button>
                       </td>
                     </tr>

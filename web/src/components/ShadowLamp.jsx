@@ -1,18 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { useI18n } from '../i18n'
 
 const KEY_LABEL = { a_long: 'A long', a_short: 'A short', u_long: 'U long', u_short: 'U short' }
 const MODE_LABEL = { block_trend: 'off in TREND', block_all: 'off' }
 
-function ago(iso) {
+function ago(iso, t) {
   if (!iso) return null
-  const t = Date.parse(iso)
-  if (Number.isNaN(t)) return null
-  const m = Math.max(0, Math.round((Date.now() - t) / 60000))
-  if (m < 1) return 'just now'
-  if (m < 60) return `${m} min ago`
+  const ts = Date.parse(iso)
+  if (Number.isNaN(ts)) return null
+  const m = Math.max(0, Math.round((Date.now() - ts) / 60000))
+  if (m < 1) return t('just now')
+  if (m < 60) return t('{n} min ago', { n: m })
   const h = Math.round(m / 60)
-  if (h < 48) return `${h} h ago`
-  return `${Math.round(h / 24)} d ago`
+  if (h < 48) return t('{n} h ago', { n: h })
+  return t('{n} d ago', { n: Math.round(h / 24) })
 }
 
 /**
@@ -30,6 +31,7 @@ function ago(iso) {
  * Clicking it opens the Insights tab (Components → "Include shadow").
  */
 export default function ShadowLamp({ shadow, onClick }) {
+  const { t } = useI18n()
   const total = shadow ? shadow.open + shadow.closed : 0
   const prevTotal = useRef(null)
   const [flash, setFlash] = useState(false)
@@ -56,26 +58,28 @@ export default function ShadowLamp({ shadow, onClick }) {
   const glow = active && shadow.open > 0
 
   const lines = []
+  const keyLabel = (k) => (KEY_LABEL[k] ? t(KEY_LABEL[k]) : k)
+  const modeLabel = (m) => (MODE_LABEL[m] ? t(MODE_LABEL[m]) : m)
   lines.push(
     active
-      ? `Entry switches active: ${blocks.length ? blocks.map(([k, m]) => `${KEY_LABEL[k] || k} ${MODE_LABEL[m] || m}`).join(', ') : 'none global'}`
-      : 'No Entry switch active right now (earlier shadow records are kept)',
+      ? t('Entry switches active: {list}', { list: blocks.length ? blocks.map(([k, m]) => `${keyLabel(k)} ${modeLabel(m)}`).join(', ') : t('none global') })
+      : t('No Entry switch active right now (earlier shadow records are kept)'),
   )
   overrideBlocks.forEach((o) => {
-    lines.push(`  ${o.ticker} ${o.timeframe}: ${KEY_LABEL[o.key] || o.key} ${MODE_LABEL[o.mode] || o.mode}`)
+    lines.push(`  ${o.ticker} ${o.timeframe}: ${keyLabel(o.key)} ${modeLabel(o.mode)}`)
   })
   if (total === 0) {
-    lines.push('No blocked signal recorded yet — waiting for the first one')
+    lines.push(t('No blocked signal recorded yet — waiting for the first one'))
   } else {
-    lines.push(`Shadow positions: ${shadow.open} open · ${shadow.closed} closed`)
+    lines.push(t('Shadow positions: {open} open · {closed} closed', { open: shadow.open, closed: shadow.closed }))
     Object.entries(shadow.by_key || {}).forEach(([k, b]) => {
-      const wr = b.closed ? ` · ${Math.round((b.wins / b.closed) * 100)}% wins` : ''
-      lines.push(`  ${KEY_LABEL[k] || k}: ${b.open} open, ${b.closed} closed${wr}`)
+      const wr = b.closed ? ` · ${t('{pct}% wins', { pct: Math.round((b.wins / b.closed) * 100) })}` : ''
+      lines.push(`  ${keyLabel(k)}: ${t('{open} open, {closed} closed', { open: b.open, closed: b.closed })}${wr}`)
     })
-    const last = ago(shadow.last_recorded)
-    if (last) lines.push(`Last recorded ${last}`)
+    const last = ago(shadow.last_recorded, t)
+    if (last) lines.push(t('Last recorded {when}', { when: last }))
   }
-  lines.push('Click → Insights (tick “Include shadow”)')
+  lines.push(t('Click → Insights (tick “Include shadow”)'))
 
   return (
     <div

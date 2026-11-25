@@ -1,7 +1,9 @@
 import React, { useState } from 'react'
 import { login } from '../api'
+import { useI18n, LanguageSwitcher } from '../i18n'
 
 export default function LoginScreen({ onSuccess }) {
+  const { t } = useI18n()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState(null)
@@ -28,9 +30,10 @@ export default function LoginScreen({ onSuccess }) {
           <span className="pulse live" />
           MUFCA
         </div>
+        <div style={{ position: 'absolute', top: 12, right: 12 }}><LanguageSwitcher /></div>
         {error && <div className="error-banner">{error}</div>}
         <div className="field">
-          <label>Username</label>
+          <label>{t('Username')}</label>
           <input
             autoFocus
             value={username}
@@ -39,7 +42,7 @@ export default function LoginScreen({ onSuccess }) {
           />
         </div>
         <div className="field">
-          <label>Password</label>
+          <label>{t('Password')}</label>
           <input
             type="password"
             value={password}
@@ -48,7 +51,7 @@ export default function LoginScreen({ onSuccess }) {
           />
         </div>
         <button className="btn primary" type="submit" disabled={busy} style={{ width: '100%' }}>
-          {busy ? 'Signing in…' : 'Sign in'}
+          {busy ? t('Signing in…') : t('Sign in')}
         </button>
       </form>
     </div>

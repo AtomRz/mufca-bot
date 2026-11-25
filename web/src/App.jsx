@@ -13,6 +13,7 @@ import SignalLamps from './components/SignalLamps'
 import ShadowLamp from './components/ShadowLamp'
 import ShockLamp from './components/ShockLamp'
 import NyseLamp from './components/NyseLamp'
+import { useI18n, LanguageSwitcher } from './i18n'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -28,6 +29,7 @@ const TREND_COLOR = { bullish: 'var(--long)', bearish: 'var(--short)', neutral: 
 const TREND_LABEL = { bullish: 'Bullish', bearish: 'Bearish', neutral: 'Neutral' }
 
 export default function App() {
+  const { t } = useI18n()
   const [authenticated, setAuthenticated] = useState(!!getAuthToken())
   const [tab, setTab] = useState('status')
   const [connStatus, setConnStatus] = useState('connecting')
@@ -202,20 +204,20 @@ export default function App() {
           <span
             key={pulseKey}
             className={`pulse ${connStatus === 'connected' ? 'live' : ''}`}
-            title={connStatus === 'connected' ? 'Connected' : 'Disconnected'}
+            title={connStatus === 'connected' ? t('Connected') : t('Disconnected')}
           />
           MUFCA
         </div>
         {config && <span className="mode-badge">{config.mode}</span>}
         {config && <span className="mode-badge">HTF {config.htf_bias}</span>}
         {pulse && (
-          <span className="mode-badge" style={{ color: TREND_COLOR[pulse.trend] }} title={`${pulse.ticker} ${pulse.tf} trend`}>
-            {TREND_LABEL[pulse.trend]}
+          <span className="mode-badge" style={{ color: TREND_COLOR[pulse.trend] }} title={t('{ticker} {tf} trend', { ticker: pulse.ticker, tf: pulse.tf })}>
+            {t(TREND_LABEL[pulse.trend])}
           </span>
         )}
         {pulse && (
-          <span className="mode-badge" title="Estimate from the current adaptive SL, regime and on-chain delta (same formula as a real entry, without the volume step). The Discord signal shows the final leverage.">
-            ≈{pulse.suggested_leverage}x lev
+          <span className="mode-badge" title={t('Estimate from the current adaptive SL, regime and on-chain delta (same formula as a real entry, without the volume step). The Discord signal shows the final leverage.')}>
+            {t('≈{lev}x lev', { lev: pulse.suggested_leverage })}
           </span>
         )}
         {pulse && <SignalLamps lamps={pulse.lamps} />}
@@ -223,27 +225,28 @@ export default function App() {
         <ShockLamp shock={shock} onClick={() => setTab('status')} />
         <ShadowLamp shadow={shadow} onClick={() => setTab('insights')} />
         <div className="spacer" />
-        {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>loading…</span>}
+        {chartLoading && <span className="conn-label" style={{ color: 'var(--accent)' }}>{t('loading…')}</span>}
         <span className="conn-label">
-          {connStatus === 'connected' ? 'live' : connStatus}
+          {connStatus === 'connected' ? t('live') : t(connStatus)}
         </span>
+        <LanguageSwitcher />
         <button
           className="btn"
           style={{ padding: '4px 10px', fontSize: 11 }}
           onClick={() => { clearAuthToken(); window.location.reload() }}
         >
-          Log out
+          {t('Log out')}
         </button>
       </header>
 
       <nav className="tabs">
-        {TABS.map((t) => (
+        {TABS.map((item) => (
           <button
-            key={t.id}
-            className={`tab ${tab === t.id ? 'active' : ''}`}
-            onClick={() => setTab(t.id)}
+            key={item.id}
+            className={`tab ${tab === item.id ? 'active' : ''}`}
+            onClick={() => setTab(item.id)}
           >
-            {t.label}
+            {t(item.label)}
           </button>
         ))}
         <div className="spacer" />
@@ -251,8 +254,8 @@ export default function App() {
           className={`tab ${tab === 'settings' ? 'active' : ''}`}
           style={{ display: 'flex', alignItems: 'center', padding: '0 16px' }}
           onClick={() => setTab('settings')}
-          title="Settings"
-          aria-label="Settings"
+          title={t('Settings')}
+          aria-label={t('Settings')}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="3" />
