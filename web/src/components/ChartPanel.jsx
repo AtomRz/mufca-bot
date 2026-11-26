@@ -6,7 +6,7 @@ import { useI18n } from '../i18n'
 
 const TIMEFRAMES = ['1h', '4h']
 
-const DEFAULT_COLORS = {
+export const DEFAULT_COLORS = {
   frama: '#e8a33d',
   bb: '#7c8797',
   support: '#45d0a5',
@@ -33,7 +33,7 @@ const DEFAULT_COLORS = {
 // Colours that can't come from CSS variables (lightweight-charts options and the overlay
 // canvas) and must differ between the dark and light themes. Series colours the user
 // configures in Settings (candles, FRAMA, zones, ...) are theme-independent.
-const CHART_THEME = {
+export const CHART_THEME = {
   dark: {
     text: '#7c8797',
     grid: '#1b222b',
@@ -57,7 +57,7 @@ const CHART_THEME = {
 }
 const DEFAULT_CHOCH = '#f0f6fc'
 
-function hexToRgba(hex, alpha) {
+export function hexToRgba(hex, alpha) {
   const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '')
   if (!m) return hex
   const [r, g, b] = [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)]

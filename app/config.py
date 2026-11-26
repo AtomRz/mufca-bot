@@ -771,6 +771,14 @@ TP_CAP_MIN_TOUCHES = 2
 # barsLimit.
 SR_MIN_LOOKBACK = 900
 
+# 🆕 Web "TA" tab (trendlines.py): daily trend lines + forming pattern. VISUAL / INFORMATIONAL
+# ONLY - nothing in the signal path reads it. Plain constants (not a persisted JSON config):
+# the defaults live in trendlines.DEFAULTS; add a line here to override one,
+# e.g. TA_MIN_TOUCHES = 2 for looser lines. Keys: pivot_n, lookback, min_touches, touch_atr,
+# wick_atr, break_atr, break_recent, min_span, max_pivots, max_stale, max_dist_atr, top_lines,
+# min_gap_atr, min_pattern_bars, min_alternations, flat_atr, flat_width, converge_ratio,
+# diverge_ratio, flag_max_bars, pole_bars, pole_atr, project_bars, atr_period (TA_ + upper case).
+
 # 🆕 (external review, S/R-zones polish): demand/supply zone detector
 # (market_structure.detect_demand_supply_zones()) — previously only lived
 # as getattr(_cfg, "ZONE_...", default) fallbacks in market_structure.py

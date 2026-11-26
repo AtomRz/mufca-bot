@@ -3,6 +3,7 @@ export default {
   ru: {
     'Status': 'Статус',
     'Chart': 'График',
+    'TA': 'ТА',
     'History': 'История',
     'Insights': 'Аналитика',
     'Lab': 'Лаборатория',
@@ -35,6 +36,7 @@ export default {
   ka: {
     'Status': 'სტატუსი',
     'Chart': 'გრაფიკი',
+    'TA': 'TA',
     'History': 'ისტორია',
     'Insights': 'ანალიტიკა',
     'Lab': 'ლაბორატორია',

@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api, connectLive, getAuthToken, clearAuthToken } from './api'
 import StatusPanel from './components/StatusPanel'
 import ChartPanel from './components/ChartPanel'
+import TaPanel from './components/TaPanel'
 import HistoryPanel from './components/HistoryPanel'
 import InsightsPanel from './components/InsightsPanel'
 import BackupPanel from './components/BackupPanel'
@@ -19,6 +20,7 @@ import { ThemeSwitcher } from './theme'
 const TABS = [
   { id: 'status', label: 'Status' },
   { id: 'chart', label: 'Chart' },
+  { id: 'ta', label: 'TA' },
   { id: 'history', label: 'History' },
   { id: 'insights', label: 'Insights' },
   { id: 'lab', label: 'Lab' },
@@ -308,6 +310,9 @@ export default function App() {
             onTfChange={setChartTf}
             onLoadingChange={setChartLoading}
           />
+        )}
+        {tab === 'ta' && (
+          <TaPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} onLoadingChange={setChartLoading} />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} />}

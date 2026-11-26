@@ -69,6 +69,7 @@ import config as _cfg
 from config import TIMEFRAMES, CHOP_THRESHOLD, save_mode, save_htf, save_tp_config, save_filter_toggles, save_tp1_sl_mode, save_discord_notifications_enabled, save_shock_guard_block_entries, save_system_alerts_enabled, save_hurst_window, save_hurst_config
 from signals import make_state, clear_htf_cache
 from chart_data import get_chart_data, get_market_pulse
+import trendlines
 from state import (load_signals_history, save_signals_history, delete_signal_record, analyze_confidence_components,
                    normalize_origin, record_matches_origin, cancel_open_records_for_ticker)
 import push as _push
@@ -1421,6 +1422,26 @@ async def chart(ticker: str, tf: str, limit: int = 200, track: str = "a"):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return data
+
+
+@app.get("/api/ta")
+async def ta(ticker: str, limit: int = 300):
+    """Web "TA" tab: daily candles + automatic trend lines + the forming pattern (trendlines.py).
+    Informational only - nothing in the signal path reads this."""
+    ticker = unquote(ticker).upper().strip()
+    if ticker not in _cfg.TICKERS:
+        raise HTTPException(404, f"{ticker} is not tracked")
+    if not (60 <= limit <= 600):
+        raise HTTPException(400, "limit must be between 60 and 600")
+
+    exchange = core._exchange_ref
+    if exchange is None:
+        raise HTTPException(503, "The bot hasn't connected to the exchange yet, try again in a few seconds")
+
+    try:
+        return await trendlines.get_ta_data(exchange, ticker, _cfg, candles_limit=limit)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 # =====================================================================

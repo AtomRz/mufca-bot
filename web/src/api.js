@@ -101,6 +101,8 @@ export const api = {
     request(
       `/api/chart?ticker=${encodeURIComponent(ticker)}&tf=${tf}&track=${track}&limit=${limit}`,
     ),
+  getTa: (ticker, limit = 300) =>
+    request(`/api/ta?ticker=${encodeURIComponent(ticker)}&limit=${limit}`),
   getConfig: () => request('/api/config'),
   setMode: (mode) =>
     request('/api/config/mode', { method: 'POST', body: JSON.stringify({ mode }) }),

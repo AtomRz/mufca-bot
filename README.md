@@ -1,4 +1,4 @@
-# MUFCA Bot [AtomDC] v4.2.0
+# MUFCA Bot [AtomDC] v4.3.0
 
 A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ETH/USDT (and any custom pairs) across 1h and 4h timeframes, fires signals with adaptive TP/SL, and tracks trade outcomes.
 
@@ -51,6 +51,7 @@ A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ET
 - **Web dashboard** — FastAPI + React, served from the same container on port `8585`. Status, Chart, History, and Insights tabs (all live-updated over WebSocket) — Insights groups on-chain/derivatives bias, order book spread, confidence-component analysis, and the historical-experiment tools (`!tp1sim`/`!compsim` equivalents) under one tab with a sub-nav — plus a Settings panel to edit market mode, HTF bias, CHOP thresholds, adaptive TP, SL-after-TP1 mode, Discord notification toggle, scan/on-chain refresh intervals, all indicator parameters (FRAMA/MFI/Andean/UT Bot), Volume Profile, demand/supply zones, and chart colors — no redeploy needed
 - **Signal & filter lamps** — top-bar indicator showing live MFI/Andean/UT Bot signal state plus every filter's pass/block direction (including an R:R lamp), computed with the exact same functions the scanner itself uses, so the lamps never disagree with what actually opens a trade
 - **NYSE lamp** — top-bar indicator (`GET /api/nyse`, `app/market_hours.py`) for the New York trading day: blue = pre-market (04:00-09:30 ET), green = regular session, yellow = after-hours (to 20:00 ET), dim = closed. Uses the `pandas_market_calendars` NYSE calendar, so exchange holidays, early closes (13:00 ET session / 17:00 ET after-hours) and US daylight saving are handled automatically; the tooltip shows when the state changes next, in your local time and in ET. Informational only — nothing in the signal logic reads it
+- **TA tab (daily trend lines + forming pattern)** — `trendlines.py`, `GET /api/ta`, web dashboard → TA. On the daily candles of each tracked pair it draws an automatic resistance and support line and names the pattern they form (ascending / descending / symmetrical triangle, rising / falling wedge, rising / falling channel, range, bull / bear flag), with the touch points, a dashed projection to the apex, the apex distance, the price position between the lines and a breakout status. Lines are fitted in log-price space through confirmed fractal pivots and need `TA_MIN_TOUCHES` (3) touches, no earlier close beyond them, alternating touches on the two lines and a minimum length; only **closed** daily bars are used, so a line moves only when a new daily bar closes or a new pivot is confirmed. **Informational only** — nothing in the signal path, filters or confidence score reads it, and it has not been measured against trade outcomes (on pure random walks the detector still reports a pattern in roughly one case in five). Thresholds are `TA_*` constants (defaults in `trendlines.DEFAULTS`)
 - **Android push notifications** — Firebase Cloud Messaging, device registration/dedup via the web dashboard's Settings panel or the Android app, test-push endpoint to verify the full server → Firebase → device pipeline
 - **R:R and bar-low/high guard** — skips signals with R:R < 1.5 (configurable via `MIN_RR`) or SL already hit by bar
 - **Trade tracking** — TP1/TP2/SL hit detection, MAE/MFE recording (saved immediately on every change, not throttled), force-close after N bars
@@ -124,6 +125,7 @@ mufca-bot/
 │   ├── push.py               # Android push notifications (Firebase Cloud Messaging)
 │   ├── chart.py              # Candlestick chart (PNG) generation for Discord `!chart`
 │   ├── chart_data.py         # Same indicator data as chart.py, as JSON for the web dashboard
+│   ├── trendlines.py         # Daily trend lines + forming pattern for the web TA tab (informational only)
 │   ├── web_api.py            # FastAPI app — status/chart/config/devices endpoints + WebSocket live feed
 │   ├── embeds.py             # Discord embed builders for signals
 │   ├── discord_commands.py   # All Discord command handlers
@@ -133,7 +135,7 @@ mufca-bot/
 │   ├── src/
 │   │   ├── App.jsx
 │   │   ├── api.js             # REST + WebSocket client
-│   │   └── components/        # StatusPanel, ChartPanel, HistoryPanel, InsightsPanel
+│   │   └── components/        # StatusPanel, ChartPanel, TaPanel, HistoryPanel, InsightsPanel
 │   │                           # (Bias/Spread/Components/Simulate sub-views),
 │   │                           # SettingsPanel, SignalLamps, NyseLamp, LoginScreen
 │   └── package.json
