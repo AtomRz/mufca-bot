@@ -20,6 +20,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy all bot modules from the local 'app' directory into the container
 COPY app/*.py ./
 
+# App version (shown in the dashboard) + the exact commit this image was built from
+COPY VERSION ./VERSION
+ARG GIT_SHA=
+ENV MUFCA_COMMIT=$GIT_SHA
+
 
 COPY --from=frontend /web/dist ./static
 

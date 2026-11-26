@@ -76,6 +76,7 @@ async function request(path, options = {}) {
 
 export const api = {
   getStatus: () => request('/api/status'),
+  getVersion: () => request('/api/version'),
   getOnchain: () => request('/api/onchain'),
   traceOnchain: (exchange, minEth) =>
     request(`/api/onchain/trace?exchange=${encodeURIComponent(exchange)}&min_eth=${encodeURIComponent(minEth)}`),

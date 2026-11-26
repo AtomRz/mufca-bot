@@ -78,6 +78,7 @@ import spread
 import shock_guard
 import market_hours
 import ai_filter
+import app_version
 import shadow as shadow_mod
 import filter_stats as filter_stats_mod
 import sim_jobs
@@ -1143,6 +1144,12 @@ async def cancel_sim_job(job_id: str):
     if not sim_jobs.jobs.cancel(job_id):
         raise HTTPException(404, "No running simulation with that id")
     return {"cancelled": True}
+
+
+@app.get("/api/version")
+async def get_version():
+    """Running version + whether a newer image has been built on GitHub (checked at most hourly)."""
+    return await asyncio.to_thread(app_version.get_info)
 
 
 @app.get("/api/health")

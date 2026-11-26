@@ -43,6 +43,8 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
 
       - name: Delete untagged versions older than 30 days
         env:

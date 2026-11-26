@@ -39,6 +39,7 @@ export default function App() {
   const [pulse, setPulse] = useState(null)
   const [shadow, setShadow] = useState(null)
   const [shock, setShock] = useState(null)
+  const [versionInfo, setVersionInfo] = useState(null)
   const [chartTicker, setChartTicker] = useState(null)
   const [chartTf, setChartTf] = useState('1h')
   const [chartLoading, setChartLoading] = useState(false)
@@ -107,6 +108,16 @@ export default function App() {
     if (!authenticated) return
     loadPulse()
   }, [authenticated, loadPulse])
+
+  // app version + "newer image available" (the backend caches the GitHub check
+  // for an hour, so polling every 30 min is cheap)
+  useEffect(() => {
+    if (!authenticated) return
+    const load = () => api.getVersion().then(setVersionInfo).catch(() => {})
+    load()
+    const id = setInterval(load, 30 * 60 * 1000)
+    return () => clearInterval(id)
+  }, [authenticated])
 
   // 🆕 loadConfig/loadPulse get a new identity on every rerender/pair change —
   // keep fresh versions in a ref so the WS effect below doesn't recreate the
@@ -208,6 +219,23 @@ export default function App() {
           />
           MUFCA
         </div>
+        {versionInfo && (
+          <span
+            className="mode-badge"
+            title={versionInfo.commit ? `${versionInfo.version} · ${versionInfo.commit}` : versionInfo.version}
+          >
+            v{versionInfo.version}
+          </span>
+        )}
+        {versionInfo?.update_available && (
+          <span
+            className="mode-badge"
+            style={{ color: 'var(--accent)', borderColor: 'var(--accent-dim)' }}
+            title={t('A new version is ready: update the container to get it')}
+          >
+            {t('⬆ v{v} available', { v: versionInfo.latest })}
+          </span>
+        )}
         {config && <span className="mode-badge">{config.mode}</span>}
         {config && <span className="mode-badge">HTF {config.htf_bias}</span>}
         {pulse && (

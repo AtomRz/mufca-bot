@@ -531,3 +531,10 @@ SIGTERM/SIGINT → flush signals_history.json + bot_state_snapshot.json to disk 
 GitHub Actions builds a Docker image on push to `main` and deploys to TrueNAS Scale via SSH.
 
 Required secrets: `TRUENAS_HOST`, `TRUENAS_USER`, `TRUENAS_SSH_KEY`.
+
+## Versioning
+
+The version lives in the `VERSION` file (`MAJOR.MINOR.PATCH`). Bump it in the same commit as the change:
+patch for a fix, minor for a new feature, major for a breaking change. The dashboard top bar shows the running
+version (hover for the commit), and an amber `⬆ vX.Y.Z available` badge appears once GitHub Actions has finished
+building a newer image — then just update the container in TrueNAS.
