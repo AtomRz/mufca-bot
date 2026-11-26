@@ -232,6 +232,9 @@ export default function SettingsPanel({ config, onChanged }) {
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
   const [newPair, setNewPair] = useState('')
+  // error of the add-pair form is shown right under the input: the common
+  // banner at the top of Settings is off-screen when the form is far down
+  const [pairError, setPairError] = useState(null)
   const [chopDraft, setChopDraft] = useState({})
   const [hurstWindowDraft, setHurstWindowDraft] = useState({})
   // 🆕 inline two-step removal instead of window.confirm(): an Android WebView
@@ -259,6 +262,26 @@ export default function SettingsPanel({ config, onChanged }) {
     } catch (e) {
       setError(e.message)
       return false
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const addPair = async () => {
+    const ticker = newPair.trim().toUpperCase()
+    if (!ticker) return
+    setBusy('add_pair')
+    setError(null)
+    setPairError(null)
+    try {
+      await api.addPair(ticker)
+      onChanged()
+      setNewPair('')
+    } catch (e) {
+      // backend: 404 "Pair X not found on Gate.io" — show it translated
+      setPairError(/not found on Gate\.io/i.test(e.message)
+        ? t('Pair {pair} not found on Gate.io', { pair: ticker })
+        : e.message)
     } finally {
       setBusy(null)
     }
@@ -677,21 +700,20 @@ export default function SettingsPanel({ config, onChanged }) {
               <input
                 placeholder="DOGE/USDT"
                 value={newPair}
-                onChange={(e) => setNewPair(e.target.value)}
+                onChange={(e) => { setNewPair(e.target.value); setPairError(null) }}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && newPair.trim()) {
-                    run('add_pair', () => api.addPair(newPair.trim())).then((ok) => { if (ok) setNewPair('') })
-                  }
+                  if (e.key === 'Enter' && newPair.trim() && busy !== 'add_pair') addPair()
                 }}
               />
               <button
                 className="btn primary"
                 disabled={!newPair.trim() || busy === 'add_pair'}
-                onClick={() => run('add_pair', () => api.addPair(newPair.trim())).then((ok) => { if (ok) setNewPair('') })}
+                onClick={addPair}
               >
                 {t('Add')}
               </button>
             </div>
+            {pairError && <div className="error-banner" style={{ marginTop: 8, marginBottom: 0 }}>{pairError}</div>}
           </div>
 
           <PushPanel busy={busy} run={run} />
