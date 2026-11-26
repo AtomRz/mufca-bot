@@ -14,6 +14,7 @@ import ShadowLamp from './components/ShadowLamp'
 import ShockLamp from './components/ShockLamp'
 import NyseLamp from './components/NyseLamp'
 import { useI18n, LanguageSwitcher } from './i18n'
+import { ThemeSwitcher } from './theme'
 
 const TABS = [
   { id: 'status', label: 'Status' },
@@ -258,6 +259,7 @@ export default function App() {
           {connStatus === 'connected' ? t('live') : t(connStatus)}
         </span>
         <LanguageSwitcher />
+        <ThemeSwitcher />
         <button
           className="btn"
           style={{ padding: '4px 10px', fontSize: 11 }}

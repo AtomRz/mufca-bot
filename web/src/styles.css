@@ -21,9 +21,41 @@
   --nyse-pre: #4da3ff;     /* NYSE lamp: pre-market (blue); open uses --long (green) */
   --nyse-after: #f5d547;   /* NYSE lamp: after-hours (yellow) */
 
+  --on-accent: #1a1206;    /* text on top of --accent (primary buttons) */
+
+  color-scheme: dark;      /* native controls (select, scrollbars, date pickers) follow the theme */
+
   --font-ui: 'Inter', 'Noto Sans Georgian', system-ui, -apple-system, sans-serif;
   --font-display: 'Space Grotesk', 'Inter', 'Noto Sans Georgian', sans-serif;
   --font-mono: 'IBM Plex Mono', 'Noto Sans Georgian', 'SFMono-Regular', Menlo, monospace;
+}
+
+/* ── Light theme (dark is the default, see :root above) ───────── */
+:root[data-theme='light'] {
+  --bg: #eef1f5;
+  --bg-panel: #ffffff;
+  --bg-panel-raised: #f4f6fa;
+  --border: #d3d9e3;
+  --border-soft: #e4e8ef;
+
+  --text: #1b2330;
+  --text-dim: #566173;
+  --text-faint: #8a93a2;
+
+  --accent: #a65f00;
+  --accent-dim: #f7e4c2;
+
+  --long: #087a56;
+  --long-dim: #d3f3e7;
+  --short: #bd2543;
+  --short-dim: #fbdde3;
+
+  --nyse-pre: #1f6fd1;
+  --nyse-after: #a07c00;
+
+  --on-accent: #ffffff;
+
+  color-scheme: light;
 }
 
 * {
@@ -385,10 +417,10 @@ input {
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #1a1206;
+  color: var(--on-accent);
 }
 .btn.primary:hover {
-  color: #1a1206;
+  color: var(--on-accent);
   opacity: 0.9;
 }
 .btn.danger:hover {
@@ -669,8 +701,35 @@ table.data-table tbody tr:hover .row-delete-btn {
   vertical-align: middle;
 }
 
+/* Theme switcher (sits next to the language switcher) */
+.theme-switch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 6px;
+  line-height: 0;
+  color: var(--text-dim);
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.theme-switch:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.theme-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* Language switcher (top bar and login screen) */
 .lang-switch {
+  color: var(--text-dim);
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   padding: 3px 6px;
   font-size: 11px;
   font-family: var(--font-mono);

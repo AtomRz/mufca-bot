@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MUFCA</title>
+    <script>
+      // apply the saved theme before first paint (no dark flash for light-theme users)
+      try {
+        var th = localStorage.getItem('mufca_theme')
+        if (th === 'light' || th === 'dark') document.documentElement.setAttribute('data-theme', th)
+      } catch (e) {}
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

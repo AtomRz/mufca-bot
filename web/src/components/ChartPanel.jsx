@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { createChart, ColorType, LineStyle } from 'lightweight-charts'
+import { useTheme } from '../theme'
 import { api } from '../api'
 import { useI18n } from '../i18n'
 
@@ -29,6 +30,33 @@ const DEFAULT_COLORS = {
   smc_fvg_bear: '#b07cff',
 }
 
+// Colours that can't come from CSS variables (lightweight-charts options and the overlay
+// canvas) and must differ between the dark and light themes. Series colours the user
+// configures in Settings (candles, FRAMA, zones, ...) are theme-independent.
+const CHART_THEME = {
+  dark: {
+    text: '#7c8797',
+    grid: '#1b222b',
+    border: '#232c3a',
+    vpBar: 'rgba(110,118,129,0.28)',        // volume-profile bars outside the value area
+    label: 'rgba(19,25,34,0.82)',           // backing box of zone labels
+    smcLabel: 'rgba(19,25,34,0.75)',        // backing box of BOS / CHoCH labels
+    entry: '#dde3ec',                       // entry price line
+    choch: null,                            // keep the configured CHoCH colour
+  },
+  light: {
+    text: '#566173',
+    grid: '#e8ecf2',
+    border: '#d3d9e3',
+    vpBar: 'rgba(110,118,129,0.32)',
+    label: 'rgba(255,255,255,0.88)',
+    smcLabel: 'rgba(255,255,255,0.82)',
+    entry: '#1b2330',
+    choch: '#1b2330',                       // the near-white default CHoCH colour is invisible on white
+  },
+}
+const DEFAULT_CHOCH = '#f0f6fc'
+
 function hexToRgba(hex, alpha) {
   const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '')
   if (!m) return hex
@@ -48,6 +76,10 @@ function toLineData(times, values) {
 
 export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticker, tf, onTickerChange, onTfChange, onLoadingChange }) {
   const { t } = useI18n()
+  const { theme } = useTheme()
+  const CT = CHART_THEME[theme] || CHART_THEME.dark
+  const themeRef = useRef(theme)
+  themeRef.current = theme
   // always-current translator for long-lived chart callbacks (canvas draw, price-line titles)
   const tRef = useRef(t)
   tRef.current = t
@@ -66,6 +98,8 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
   const requestIdRef = useRef(0) // 🆕 to ignore stale responses (race condition fix)
 
   const C = useMemo(() => ({ ...DEFAULT_COLORS, ...(colors || {}) }), [colors])
+  // CHoCH keeps the user's colour; only the untouched near-white default is swapped in the light theme
+  const smcChoch = CT.choch && String(C.smc_choch).toLowerCase() === DEFAULT_CHOCH ? CT.choch : C.smc_choch
 
   const load = useCallback(() => {
     if (!ticker) return
@@ -177,7 +211,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
           if (y === null || y < 0 || y > height) continue
           const inVA = vp.val != null && vp.vah != null && b.price >= vp.val && b.price <= vp.vah
           const barWidth = (b.volume / maxVol) * profileWidth
-          ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : 'rgba(110,118,129,0.28)'
+          ctx.fillStyle = inVA ? hexToRgba(C.poc, 0.55) : CT.vpBar
           ctx.fillRect(fromLeft ? edge : edge - barWidth, y - barHeight / 2, barWidth, barHeight)
         }
       }
@@ -199,7 +233,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         const label = `${tt(side.toUpperCase())} ${Math.round(zone.score)} ${tt(String(zone.state).toUpperCase())} T${zone.touches}`
         const textWidth = ctx.measureText(label).width
         const padX = 4, padY = 2
-        ctx.fillStyle = 'rgba(19,25,34,0.82)'
+        ctx.fillStyle = CT.label
         ctx.strokeStyle = color
         ctx.lineWidth = 1
         const boxX = x - textWidth / 2 - padX
@@ -229,7 +263,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         const x = (Math.max(0, x1) + Math.min(width, x2)) / 2
         const textWidth = ctx.measureText(b.text).width
         ctx.textAlign = 'center'
-        ctx.fillStyle = 'rgba(19,25,34,0.75)'
+        ctx.fillStyle = CT.smcLabel
         ctx.fillRect(x - textWidth / 2 - 3, (b.up ? y - 15 : y + 3), textWidth + 6, 12)
         ctx.fillStyle = b.color
         ctx.fillText(b.text, x, b.up ? y - 9 : y + 9)
@@ -243,7 +277,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         ctx.fillText('FVG', Math.max(0, x) + 4, y)
       })
     }
-  }, [C])
+  }, [C, CT])
 
   // Always-fresh ref so mount-once chart subscriptions (below) call the
   // latest closure without needing to resubscribe on every color/data change —
@@ -259,16 +293,16 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
-        textColor: '#7c8797',
+        textColor: CHART_THEME[themeRef.current].text,
         fontFamily: "'IBM Plex Mono', monospace",
         fontSize: 11,
       },
       grid: {
-        vertLines: { color: '#1b222b' },
-        horzLines: { color: '#1b222b' },
+        vertLines: { color: CHART_THEME[themeRef.current].grid },
+        horzLines: { color: CHART_THEME[themeRef.current].grid },
       },
-      rightPriceScale: { borderColor: '#232c3a' },
-      timeScale: { borderColor: '#232c3a', timeVisible: true, rightOffset: 6 },
+      rightPriceScale: { borderColor: CHART_THEME[themeRef.current].border },
+      timeScale: { borderColor: CHART_THEME[themeRef.current].border, timeVisible: true, rightOffset: 6 },
       crosshair: { mode: 0 },
       height: 640,
     })
@@ -325,7 +359,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     const volume = chart.addHistogramSeries({
       priceScaleId: 'volume',
       priceFormat: { type: 'volume' },
-      color: '#232c3a',
+      color: CHART_THEME[themeRef.current].border,
       priceLineVisible: false,
       lastValueVisible: false,
       // 🆕 FIX: without this, the volume scale auto-scales to the actual
@@ -424,6 +458,20 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     s.mfi.applyOptions({ color: C.mfi_line })
     drawVolumeProfile()
   }, [C, drawVolumeProfile])
+
+  // theme changed — restyle the chart chrome in place (the canvas overlay redraws via the
+  // [C, CT] effect above; entry line and SMC colours follow because the data effect re-runs)
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    chart.applyOptions({
+      layout: { textColor: CT.text },
+      grid: { vertLines: { color: CT.grid }, horzLines: { color: CT.grid } },
+      rightPriceScale: { borderColor: CT.border },
+      timeScale: { borderColor: CT.border },
+    })
+    seriesRef.current.volume?.applyOptions({ color: CT.border })
+  }, [CT])
 
   // language changed — retitle price lines / marker and redraw canvas labels (chart is not recreated)
   useEffect(() => {
@@ -598,7 +646,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
       const seg = times.filter((t) => t >= b.start_time && t <= b.end_time)
       if (seg.length < 2) return // the break lies outside the shown candles
       const isChoch = b.kind === 'choch'
-      const color = isChoch ? C.smc_choch : C.smc_bos
+      const color = isChoch ? smcChoch : C.smc_bos
       const line = chartRef.current.addLineSeries({
         color,
         lineWidth: 1,
@@ -638,7 +686,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     let markerSpec = null
     if (data.active_trade) {
       const t = data.active_trade
-      if (t.entry) s.tradeLines.push(addTitled(s.candle, { price: t.entry, color: '#dde3ec', lineWidth: 1, lineStyle: LineStyle.Solid }, (tt) => tt('Entry')))
+      if (t.entry) s.tradeLines.push(addTitled(s.candle, { price: t.entry, color: CT.entry, lineWidth: 1, lineStyle: LineStyle.Solid }, (tt) => tt('Entry')))
       if (t.tp1 && t.tp1 !== t.tp) {
         s.tradeLines.push(addTitled(s.candle, {
           price: t.tp1, color: hexToRgba(C.tp_line, 0.7), lineWidth: 1,
@@ -686,7 +734,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
     lastSelectionKeyRef.current = selectionKey
     drawVolumeProfile()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data])
+  }, [data, theme])
 
   return (
     <div>
@@ -741,7 +789,7 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         {data?.smc_overlay && (
           <>
             <span><span className="legend-dot" style={{ background: C.smc_bos }} />BOS</span>
-            <span><span className="legend-dot" style={{ background: C.smc_choch }} />CHoCH</span>
+            <span><span className="legend-dot" style={{ background: smcChoch }} />CHoCH</span>
             <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bull, 0.6) }} />{t('FVG (bull)')}</span>
             <span><span className="legend-dot" style={{ background: hexToRgba(C.smc_fvg_bear, 0.6) }} />{t('FVG (bear)')}</span>
           </>

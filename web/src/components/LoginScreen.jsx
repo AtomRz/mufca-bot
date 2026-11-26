@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { login } from '../api'
 import { useI18n, LanguageSwitcher } from '../i18n'
+import { ThemeSwitcher } from '../theme'
 
 export default function LoginScreen({ onSuccess }) {
   const { t } = useI18n()
@@ -30,7 +31,7 @@ export default function LoginScreen({ onSuccess }) {
           <span className="pulse live" />
           MUFCA
         </div>
-        <div style={{ position: 'absolute', top: 12, right: 12 }}><LanguageSwitcher /></div>
+        <div style={{ position: 'absolute', top: 12, right: 12, display: 'flex', alignItems: 'center', gap: 6 }}><LanguageSwitcher /><ThemeSwitcher /></div>
         {error && <div className="error-banner">{error}</div>}
         <div className="field">
           <label>{t('Username')}</label>
