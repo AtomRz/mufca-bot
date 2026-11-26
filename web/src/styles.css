@@ -657,7 +657,7 @@ table.data-table tbody tr:hover .row-delete-btn {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
-  margin-bottom: 8px;
+  margin-top: 8px;
   flex-wrap: wrap;
 }
 .legend-dot {

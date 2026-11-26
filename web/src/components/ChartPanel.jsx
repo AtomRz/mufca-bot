@@ -723,6 +723,14 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
 
       {error && <div className="error-banner">{error}</div>}
 
+      <div className="chart-wrap panel" style={{ padding: 8, position: 'relative' }}>
+        <div ref={containerRef} style={{ width: '100%' }} />
+        <canvas
+          ref={canvasRef}
+          style={{ position: 'absolute', top: 8, left: 8, pointerEvents: 'none' }}
+        />
+      </div>
+
       <div className="chart-legend">
         <span><span className="legend-dot" style={{ background: C.frama }} />FRAMA</span>
         <span><span className="legend-dot" style={{ background: C.bb }} />{t('Bollinger')}</span>
@@ -745,14 +753,6 @@ export default function ChartPanel({ pairs, timeframes, lastEvent, colors, ticke
         <span><span className="legend-dot" style={{ background: C.mfi_line }} />MFI</span>
         <span><span className="legend-dot" style={{ background: C.mfi_overbought }} />{t('MFI overbought')}</span>
         <span><span className="legend-dot" style={{ background: C.mfi_oversold }} />{t('MFI oversold')}</span>
-      </div>
-
-      <div className="chart-wrap panel" style={{ padding: 8, position: 'relative' }}>
-        <div ref={containerRef} style={{ width: '100%' }} />
-        <canvas
-          ref={canvasRef}
-          style={{ position: 'absolute', top: 8, left: 8, pointerEvents: 'none' }}
-        />
       </div>
     </div>
   )
