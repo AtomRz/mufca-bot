@@ -218,10 +218,22 @@ input {
   border-bottom: 1px solid var(--border-soft);
   background: var(--bg-panel);
   flex-shrink: 0;
+  /* Грузинские подписи длиннее английских: в горизонтальной ориентации на
+     телефоне вкладки не помещаются, а .app режет overflow-x — до Settings
+     было не добраться. Скроллим сами вкладки, как и топбар. */
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .tab {
   padding: 10px 16px;
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 500;
   color: var(--text-dim);
