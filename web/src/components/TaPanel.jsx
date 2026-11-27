@@ -193,16 +193,26 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
     }
 
     const candles = data.candles
-    s.candle.setData(candles.map((c) => {
-      const base = { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }
-      if (!c.forming) return base
-      // the still-forming daily candle is drawn faded: lines never use it
-      const col = hexToRgba(c.close >= c.open ? C.candle_up : C.candle_down, 0.45)
-      return { ...base, color: col, wickColor: col, borderColor: col }
-    }))
-
     const lastTime = candles[candles.length - 1].time
-    let maxProjTime = lastTime
+    const maxProjTime = (data.lines || []).reduce((m, ln) => Math.max(m, ln.projection?.time || 0), lastTime)
+
+    // lightweight-charts has no calendar axis: the time scale is the union of the bars' timestamps, so a
+    // two-point projection line would add ONE bar. Empty (whitespace) future days under the candle series
+    // give the projection its real length.
+    const future = []
+    for (let tm = lastTime + DAY_S; tm <= maxProjTime; tm += DAY_S) future.push({ time: tm })
+
+    s.candle.setData([
+      ...candles.map((c) => {
+        const base = { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }
+        if (!c.forming) return base
+        // the still-forming daily candle is drawn faded: lines never use it
+        const col = hexToRgba(c.close >= c.open ? C.candle_up : C.candle_down, 0.45)
+        return { ...base, color: col, wickColor: col, borderColor: col }
+      }),
+      ...future,
+    ])
+
     const markers = []
     const candleTimes = new Set(candles.map((c) => c.time))
 
@@ -226,7 +236,6 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
           { time: ln.projection.time, value: ln.projection.price },
         ])
         s.extras.push(proj)
-        maxProjTime = Math.max(maxProjTime, ln.projection.time)
       }
       for (const tp of ln.touch_points || []) {
         if (!candleTimes.has(tp.time)) continue
@@ -257,7 +266,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
     const key = data.symbol
     if (lastSelectionRef.current !== key || !savedRange) {
       const n = candles.length
-      const ahead = Math.max(0, Math.round((maxProjTime - lastTime) / DAY_S))
+      const ahead = future.length
       chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - VIEW_BARS), to: n - 1 + ahead + 4 })
     } else {
       chart.timeScale().setVisibleLogicalRange(savedRange)
