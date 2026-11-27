@@ -22,6 +22,11 @@ change when a new bar closes or a new pivot is confirmed):
     cross inside their common span) is classified by slopes and convergence into
     triangle / wedge / channel / flag / range, with the apex and a
     status (forming, breakout up, breakout down).
+
+Also here (same tab, same informational-only rule): EMA 50 / EMA 200 of the closes and three
+single/two-bar candle patterns (Pin Bar, Engulfing, Inside Bar), see `ema_series`,
+`ma_summary` and `detect_candle_patterns`. They are pure geometry of closed bars: they say
+what the candles look like, not what price will do next.
 """
 from __future__ import annotations
 
@@ -63,6 +68,19 @@ DEFAULTS: Dict[str, float] = {
 }
 
 MIN_BARS = 60  # fewer closed bars than this: nothing is computed
+
+EMA_PERIODS = (50, 200)
+EMA_WARMUP_BARS = 300      # extra daily bars fetched beyond the displayed ones so EMA 200 is settled
+
+# Candle-pattern rules (fixed on purpose, not fitted). ATR is the absolute Wilder ATR(14) of the bar.
+CANDLE = {
+    "min_range_atr": 0.8,      # pin bar / engulfing: the bar's range must be at least this many ATR
+    "pin_body_max": 0.30,      # pin bar: body <= this fraction of the bar's range
+    "pin_wick_min": 0.60,      # pin bar: the long wick >= this fraction of the range ...
+    "pin_nose_max": 0.20,      # ... and the opposite wick <= this fraction of the range
+    "eng_prev_body_min": 0.25, # engulfing: the engulfed (previous) body >= this many ATR
+    "inside_mother_atr": 0.8,  # inside bar: the mother (previous) bar's range >= this many ATR
+}
 
 _CACHE: Dict[tuple, Dict] = {}
 _CACHE_MAX = 16
@@ -263,6 +281,105 @@ def _line_json(c: Dict, ts_s: np.ndarray, bar_s: int, last: int, y_close: np.nda
 
 
 # =====================================================================
+# EMA + candle patterns (informational)
+# =====================================================================
+def _atr_abs(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    prev = np.concatenate(([close[0]], close[:-1]))
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev), np.abs(low - prev)))
+    return pd.Series(tr).ewm(alpha=1.0 / max(1, period), adjust=False).mean().to_numpy()
+
+
+def ema_series(close: np.ndarray, period: int) -> np.ndarray:
+    """Standard EMA (alpha = 2/(period+1), seeded with the first close). The first `period - 1`
+    values are NaN: the seed still dominates there, so they are not drawn."""
+    out = pd.Series(close).ewm(span=period, adjust=False).mean().to_numpy().astype(float)
+    out[:max(0, period - 1)] = np.nan
+    return out
+
+
+def ma_summary(close: np.ndarray, ts_s: np.ndarray, ema: Dict[int, np.ndarray]) -> Dict:
+    """Where the last closed bar sits against EMA 50 / 200 and the latest 50/200 cross."""
+    last = len(close) - 1
+    out: Dict = {"periods": list(EMA_PERIODS)}
+    for per in EMA_PERIODS:
+        v = ema[per][last]
+        out[f"ema{per}"] = None if not math.isfinite(v) else _px(v)
+        out[f"price_vs_ema{per}_pct"] = None if not math.isfinite(v) else round(float((close[last] / v - 1.0) * 100.0), 2)
+    e50, e200 = ema[50], ema[200]
+    out["ema50_vs_ema200"] = None
+    out["cross"] = None
+    ok = np.isfinite(e50) & np.isfinite(e200)
+    if ok[last]:
+        out["ema50_vs_ema200"] = "above" if e50[last] > e200[last] else "below"
+        diff = np.where(ok, e50 - e200, np.nan)
+        sign = np.sign(diff)
+        # last index where the sign differs from the current one = the bar before the latest cross
+        idx = np.where(np.isfinite(sign) & (sign != sign[last]))[0]
+        if len(idx):
+            cross_i = int(idx[-1]) + 1
+            out["cross"] = {
+                "type": "golden" if sign[last] > 0 else "death",
+                "time": int(ts_s[cross_i]),
+                "bars_ago": int(last - cross_i),
+            }
+    return out
+
+
+def detect_candle_patterns(df: pd.DataFrame, since: int = 1) -> List[Dict]:
+    """Pin Bar, Engulfing and Inside Bar on CLOSED bars. Returns [{time, type, dir}], oldest first;
+    dir is 'bull' | 'bear' | 'neutral'. `since` = first bar index that may carry a pattern.
+
+    Rules (all geometric, thresholds in CANDLE):
+      pin bar   - range >= min_range_atr x ATR; body <= 30% of the range; one wick >= 60% of the range
+                  and the opposite wick <= 20%. Long LOWER wick = 'bull' pin, long UPPER wick = 'bear' pin.
+      engulfing - opposite colours; the body of this bar covers the whole previous body (open and close
+                  both at or beyond it, at least one strictly beyond); previous body >= 0.25 ATR and this
+                  bar's range >= min_range_atr x ATR. Green over red = 'bull', red over green = 'bear'.
+      inside    - high < previous high and low > previous low (strictly inside the previous bar's range),
+                  previous bar's range >= 0.8 ATR so a quiet mother bar does not count. Always 'neutral'.
+    A bar can carry both a pin bar and an engulfing (two entries) - never an inside bar and either of those."""
+    o = df["open"].to_numpy(dtype=float)
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
+    c = df["close"].to_numpy(dtype=float)
+    ts = (df["timestamp"].to_numpy(dtype=np.int64) // 1000)
+    atr = _atr_abs(h, l, c)
+    K = CANDLE
+    out: List[Dict] = []
+    for i in range(max(1, since), len(df)):
+        rng = h[i] - l[i]
+        if not (rng > 0 and atr[i] > 0):
+            continue
+        body = abs(c[i] - o[i])
+        upper = h[i] - max(o[i], c[i])
+        lower = min(o[i], c[i]) - l[i]
+        t = int(ts[i])
+        big = rng >= K["min_range_atr"] * atr[i]
+
+        if big and body <= K["pin_body_max"] * rng:
+            if lower >= K["pin_wick_min"] * rng and upper <= K["pin_nose_max"] * rng:
+                out.append({"time": t, "type": "pin_bar", "dir": "bull"})
+            elif upper >= K["pin_wick_min"] * rng and lower <= K["pin_nose_max"] * rng:
+                out.append({"time": t, "type": "pin_bar", "dir": "bear"})
+
+        pb_top, pb_bot = max(o[i - 1], c[i - 1]), min(o[i - 1], c[i - 1])
+        prev_body = pb_top - pb_bot
+        cur_top, cur_bot = max(o[i], c[i]), min(o[i], c[i])
+        prev_red, prev_green = c[i - 1] < o[i - 1], c[i - 1] > o[i - 1]
+        cur_red, cur_green = c[i] < o[i], c[i] > o[i]
+        engulf = (big and prev_body >= K["eng_prev_body_min"] * atr[i - 1]
+                  and cur_top >= pb_top and cur_bot <= pb_bot and (cur_top > pb_top or cur_bot < pb_bot))
+        if engulf and prev_red and cur_green:
+            out.append({"time": t, "type": "engulfing", "dir": "bull"})
+        elif engulf and prev_green and cur_red:
+            out.append({"time": t, "type": "engulfing", "dir": "bear"})
+        elif (h[i] < h[i - 1] and l[i] > l[i - 1]
+              and (h[i - 1] - l[i - 1]) >= K["inside_mother_atr"] * atr[i - 1]):
+            out.append({"time": t, "type": "inside_bar", "dir": "neutral"})
+    return out
+
+
+# =====================================================================
 # Public API
 # =====================================================================
 def analyze(df: pd.DataFrame, **overrides) -> Dict:
@@ -394,8 +511,8 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
     from market_structure import calc_support_resistance
 
     params = params_from_config(cfg)
-    fetch_limit = int(params["lookback"]) + 120
-    bars = await safe_fetch_ohlcv(exchange, symbol, "1d", limit=max(fetch_limit, candles_limit + 20))
+    fetch_limit = max(int(params["lookback"]) + 120, candles_limit + EMA_WARMUP_BARS)
+    bars = await safe_fetch_ohlcv(exchange, symbol, "1d", limit=fetch_limit)
     df = parse_ohlcv(bars)
     if not validate_dataframe(df, min_rows=MIN_BARS + 1):
         raise ValueError(f"Not enough daily data for {symbol}")
@@ -407,6 +524,18 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
         closed, pivot_window=cfg.SR_PIVOT_WINDOW, max_levels=cfg.SR_MAX_LEVELS,
         ref_price=float(closed["close"].iloc[-1]),
     )
+    # EMA + candle patterns on CLOSED bars only (the forming bar never moves them)
+    c_close = closed["close"].to_numpy(dtype=float)
+    c_ts = (closed["timestamp"].to_numpy(dtype=np.int64) // 1000)
+    ema = {per: ema_series(c_close, per) for per in EMA_PERIODS}
+    show_from = len(closed) - max(0, candles_limit - 1)       # closed bars shown = candles_limit - forming bar
+    ema_json = {
+        f"ema{per}": [{"time": int(c_ts[i]), "value": _px(ema[per][i])}
+                      for i in range(max(0, show_from), len(closed)) if math.isfinite(ema[per][i])]
+        for per in EMA_PERIODS
+    }
+    candle_patterns = detect_candle_patterns(closed, since=max(1, show_from))
+
     tail = df.tail(candles_limit)
     n_tail = len(tail)
     candles = [
@@ -428,4 +557,7 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
         "reason": ta["reason"],
         "support": sr["support"],
         "resistance": sr["resistance"],
+        "ema": ema_json,
+        "ma": ma_summary(c_close, c_ts, ema),
+        "candle_patterns": candle_patterns,
     }

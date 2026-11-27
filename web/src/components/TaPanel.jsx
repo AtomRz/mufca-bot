@@ -11,6 +11,10 @@ import { CHART_THEME, DEFAULT_COLORS, hexToRgba } from './ChartPanel'
 const REFRESH_MIN_MS = 60 * 1000 // scan ticks refresh the forming candle, at most once a minute
 const DAY_S = 86400
 const VIEW_BARS = 150 // bars shown on a fresh selection (the user can still scroll back / zoom out)
+const LAYERS_KEY = 'mufca.ta.layers'
+const EMA_COLORS = { ema50: '#f5a524', ema200: '#4f8cff' } // readable on both the dark and the light chart
+const NEUTRAL_MARK = '#8b93a1'
+const CP_SHORT = { pin_bar: 'PIN', engulfing: 'ENG', inside_bar: 'IN' }
 
 function fmtPrice(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return '—'
@@ -35,6 +39,15 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [showSR, setShowSR] = useState(false)
+  const [layers, setLayers] = useState(() => {
+    const def = { ema50: true, ema200: true, candles: true }
+    try { return { ...def, ...(JSON.parse(localStorage.getItem(LAYERS_KEY) || '{}') || {}) } } catch (_) { return def }
+  })
+  const toggleLayer = (k) => setLayers((prev) => {
+    const next = { ...prev, [k]: !prev[k] }
+    try { localStorage.setItem(LAYERS_KEY, JSON.stringify(next)) } catch (_) { /* private mode */ }
+    return next
+  })
 
   const containerRef = useRef(null)
   const chartRef = useRef(null)
@@ -248,6 +261,32 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
         })
       }
     }
+    for (const key of ['ema50', 'ema200']) {
+      const pts = data.ema?.[key]
+      if (!layers[key] || !pts?.length) continue
+      const ser = chart.addLineSeries({
+        color: EMA_COLORS[key], lineWidth: key === 'ema200' ? 2 : 1,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      })
+      ser.setData(pts)
+      s.extras.push(ser)
+    }
+
+    if (layers.candles) {
+      for (const cp of data.candle_patterns || []) {
+        if (!candleTimes.has(cp.time)) continue
+        const bull = cp.dir === 'bull'
+        const bear = cp.dir === 'bear'
+        markers.push({
+          time: cp.time,
+          position: bear ? 'aboveBar' : 'belowBar',
+          color: bull ? C.candle_up : bear ? C.candle_down : NEUTRAL_MARK,
+          shape: bull ? 'arrowUp' : bear ? 'arrowDown' : 'square',
+          text: cp.type === 'inside_bar' ? '' : CP_SHORT[cp.type] || '',
+          size: 1,
+        })
+      }
+    }
     markers.sort((a, b) => a.time - b.time)
     s.candle.setMarkers(markers)
 
@@ -273,7 +312,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
     }
     lastSelectionRef.current = key
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, C, theme, showSR])
+  }, [data, C, theme, showSR, layers])
 
   const pat = data && data.symbol === ticker ? data.pattern : null
   const lines = data && data.symbol === ticker ? data.lines || [] : []
@@ -313,6 +352,15 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
 
   const sinceText = (n) => (n === 0 ? t('on the last closed bar') : t('{n} bars ago', { n }))
 
+  const ma = data && data.symbol === ticker ? data.ma : null
+  const recentPatterns = data && data.symbol === ticker ? [...(data.candle_patterns || [])].reverse().slice(0, 8) : []
+  const candleLabel = (type) => ({
+    pin_bar: t('Pin bar'),
+    engulfing: t('Engulfing'),
+    inside_bar: t('Inside bar'),
+  })[type] || type
+  const dirLabel = (d) => (d === 'bull' ? t('Bullish') : d === 'bear' ? t('Bearish') : t('Neutral'))
+
   const emptyReason = () => {
     switch (data?.reason) {
       case 'no_lines': return t('No valid trend lines on the daily chart right now')
@@ -337,6 +385,11 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
           <button className="active" style={{ cursor: 'default' }}>1D</button>
         </div>
         <div className="seg">
+          <button className={layers.ema50 ? 'active' : ''} onClick={() => toggleLayer('ema50')}>EMA 50</button>
+          <button className={layers.ema200 ? 'active' : ''} onClick={() => toggleLayer('ema200')}>EMA 200</button>
+          <button className={layers.candles ? 'active' : ''} onClick={() => toggleLayer('candles')}>{t('Candle patterns')}</button>
+        </div>
+        <div className="seg">
           <button className={showSR ? 'active' : ''} onClick={() => setShowSR((v) => !v)}>
             {t('S/R levels')}
           </button>
@@ -354,6 +407,9 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
         <span><span className="legend-dot" style={{ background: C.support }} />{t('Support')}</span>
         <span><span className="legend-dot" style={{ background: hexToRgba(C.resistance, 0.7) }} />{t('Projection')}</span>
         <span>● {t('Touches')}</span>
+        {layers.ema50 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema50 }} />EMA 50</span>}
+        {layers.ema200 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema200 }} />EMA 200</span>}
+        {layers.candles && <span>▲▼ PIN · ENG · ■ {t('Inside bar')}</span>}
       </div>
 
       {data && data.symbol === ticker && (
@@ -408,7 +464,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
             )}
           </div>
 
-          <div className="panel">
+          <div className="panel" style={{ marginTop: 0 }}>
             <h3 className="panel-title">{t('Trend lines')}</h3>
             {lines.length ? (
               <div className="table-wrap">
@@ -447,6 +503,79 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
             ) : (
               <div className="empty-state" style={{ padding: '14px 0' }}>{emptyReason()}</div>
             )}
+          </div>
+        </div>
+      )}
+
+      {data && data.symbol === ticker && (
+        <div className="grid-2" style={{ marginTop: 14, alignItems: 'start' }}>
+          <div className="panel">
+            <h3 className="panel-title">{t('Moving averages')}</h3>
+            {ma && (ma.ema50 !== null || ma.ema200 !== null) ? (
+              <>
+                {[50, 200].map((per) => (
+                  <div className="row" key={per}>
+                    <span className="row-label" style={{ color: EMA_COLORS[`ema${per}`] }}>EMA {per}</span>
+                    <span className="row-value">
+                      {ma[`ema${per}`] === null ? '—' : fmtPrice(ma[`ema${per}`])}
+                      {ma[`price_vs_ema${per}_pct`] !== null && ma[`price_vs_ema${per}_pct`] !== undefined && (
+                        <span style={{ marginLeft: 8, color: 'var(--text-dim)' }}>
+                          {t('price {pct} vs EMA', { pct: fmtPct(ma[`price_vs_ema${per}_pct`]) })}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+                {ma.ema50_vs_ema200 && (
+                  <div className="row">
+                    <span className="row-label">EMA 50 / EMA 200</span>
+                    <span className="row-value">{ma.ema50_vs_ema200 === 'above' ? t('EMA 50 above EMA 200') : t('EMA 50 below EMA 200')}</span>
+                  </div>
+                )}
+                {ma.cross && (
+                  <div className="row">
+                    <span className="row-label">{t('Last cross')}</span>
+                    <span className="row-value">
+                      {ma.cross.type === 'golden' ? t('Golden cross') : t('Death cross')}
+                      <span style={{ marginLeft: 8, color: 'var(--text-dim)' }}>
+                        {t('{n} bars ago', { n: ma.cross.bars_ago })} · {fmtDate(ma.cross.time)}
+                      </span>
+                    </span>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty-state" style={{ padding: '14px 0' }}>{t('Not enough daily history')}</div>
+            )}
+          </div>
+
+          <div className="panel" style={{ marginTop: 0 }}>
+            <h3 className="panel-title">{t('Candle patterns')}</h3>
+            {recentPatterns.length ? (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr><th>{t('Date')}</th><th>{t('Pattern')}</th><th>{t('Type')}</th></tr>
+                  </thead>
+                  <tbody>
+                    {recentPatterns.map((cp, i) => (
+                      <tr key={`${cp.time}-${cp.type}-${i}`} style={{ cursor: 'default' }}>
+                        <td>{fmtDate(cp.time)}</td>
+                        <td>{candleLabel(cp.type)}</td>
+                        <td>
+                          <span className={`tag ${cp.dir === 'bull' ? 'long' : cp.dir === 'bear' ? 'short' : 'flat'}`}>{dirLabel(cp.dir)}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state" style={{ padding: '14px 0' }}>{t('No candle patterns in the shown range')}</div>
+            )}
+            <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-faint)' }}>
+              {t('Pin bar: long wick, small body. Engulfing: the body covers the previous body. Inside bar: the range sits inside the previous bar. Bullish / bearish describes the candle shape only, not a forecast.')}
+            </div>
           </div>
         </div>
       )}
