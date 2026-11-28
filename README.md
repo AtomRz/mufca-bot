@@ -1,4 +1,4 @@
-# MUFCA Bot [AtomDC] v4.6.1
+# MUFCA Bot [AtomDC] v4.6.2
 
 A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ETH/USDT (and any custom pairs) across 1h and 4h timeframes, fires signals with adaptive TP/SL, and tracks trade outcomes.
 

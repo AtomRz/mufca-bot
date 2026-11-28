@@ -52,7 +52,7 @@ DEFAULTS: Dict[str, float] = {
     "min_span": 10,          # min bars between the two anchor pivots of a line
     "max_pivots": 14,        # newest pivots per side considered as anchors
     "max_stale": 45,         # max bars since the line's last touch
-    "max_dist_atr": 8.0,     # price must be within this many ATR% of a line
+    "max_dist_atr": 12.0,    # price must be within this many ATR% of a line (8 dropped a valid downtrend line once price fell ~8 ATR away)
     "top_lines": 5,          # candidate lines per side kept for pair selection
     "min_gap_atr": 1.0,      # min width (ATR%) between the two lines over their common span
     "min_pattern_bars": 20,  # min common span of the two lines for a pattern
