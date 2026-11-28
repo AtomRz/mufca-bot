@@ -22,7 +22,8 @@ import time
 from typing import Dict, Optional, Any
 
 import config as _cfg
-from config import DATA_DIR, safe_json_load, safe_json_save
+from config import DATA_DIR
+import storage
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ _ticker_locks: Dict[str, asyncio.Lock] = {}
 # baseline and delay OI-delta analysis by a full cache cycle — same reasoning
 # as onchain.py's exchange-balance baseline.
 _OI_BASELINE_FILE = os.path.join(DATA_DIR, "derivatives_oi_baseline.json")
-_oi_baseline: Dict[str, Dict[str, Any]] = safe_json_load(_OI_BASELINE_FILE, {})
+_oi_baseline: Dict[str, Dict[str, Any]] = storage.doc_load("derivatives_oi_baseline", {}, _OI_BASELINE_FILE)
 
 # 🆕 Throttle for the OI baseline disk write. The in-memory dict is updated
 # on every fetch (needed for accurate deltas), but persisting to disk on
@@ -64,7 +65,7 @@ def clear_derivatives_cache_full():
     full-reset version is actually used (by !reset_cache)."""
     _cache.clear()
     _oi_baseline.clear()
-    safe_json_save(_OI_BASELINE_FILE, {})
+    storage.doc_save("derivatives_oi_baseline", {})
     logger.info("[DERIVATIVES] Full cache cleared (including OI baseline)")
 
 
@@ -75,7 +76,7 @@ def _save_oi_baseline_throttled():
     _oi_baseline_dirty = True
     now = time.time()
     if now - _oi_baseline_last_saved >= _OI_BASELINE_SAVE_INTERVAL:
-        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        storage.doc_save("derivatives_oi_baseline", _oi_baseline)
         _oi_baseline_last_saved = now
         _oi_baseline_dirty = False
 
@@ -85,7 +86,7 @@ def flush_oi_baseline():
     on graceful shutdown so the last in-memory baseline isn't lost."""
     global _oi_baseline_last_saved, _oi_baseline_dirty
     if _oi_baseline_dirty:
-        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        storage.doc_save("derivatives_oi_baseline", _oi_baseline)
         _oi_baseline_last_saved = time.time()
         _oi_baseline_dirty = False
 
@@ -101,7 +102,7 @@ def clear_ticker_cache(ticker: str):
     _ticker_locks.pop(ticker, None)
     had_baseline = _oi_baseline.pop(ticker, None) is not None
     if had_baseline:
-        safe_json_save(_OI_BASELINE_FILE, _oi_baseline)
+        storage.doc_save("derivatives_oi_baseline", _oi_baseline)
     logger.info(f"[DERIVATIVES] Cleared cache/baseline for {ticker}")
 
 

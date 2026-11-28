@@ -3,8 +3,10 @@ SQLite storage layer (stdlib sqlite3 only - nothing to install, one file in DATA
 
 What lives here:
     signals   the signal history, one row per record (was signals_history.json)
-    kv        small named JSON documents, e.g. the open-position snapshot
-              (was bot_state_snapshot.json)
+    kv        small named JSON documents: the open-position snapshot (was
+              bot_state_snapshot.json) and the runtime-state files (shadow signals,
+              spread history, filter stats, on-chain / OI baselines, closure ids,
+              devices) read and written through doc_load / doc_save
 
 What deliberately stays in JSON: the ~40 small hand-editable config files in
 DATA_DIR (hurst_window.json, entry_block.json, ...). They are read by eye and
@@ -30,6 +32,7 @@ SQL injection rules (every function in this file follows them):
        Discord command is rejected early instead of being stored.
 """
 
+import copy
 import json
 import logging
 import os
@@ -53,6 +56,7 @@ _TRACK_RE = re.compile(r"^[a-z0-9_]{1,20}$")
 _EXIT_RE = re.compile(r"^[a-z0-9_]{1,30}$")
 _KV_NAME_RE = re.compile(r"^[a-z0-9_]{1,60}$")
 SIDES = ("long", "short")
+_MISSING = object()  # "no such document" marker for kv_load
 
 # Whitelisted ORDER BY choices (rule 2): the caller's string is only a lookup key.
 _ORDER_BY = {
@@ -386,6 +390,62 @@ def kv_load(name: str, default: Any = None) -> Any:
 def kv_exists(name: str) -> bool:
     _check(name, _KV_NAME_RE, "document name")
     return _conn().execute("SELECT 1 FROM kv WHERE name = ?", (name,)).fetchone() is not None
+
+
+# ── runtime-state documents (replace the small *.json state files) ─────
+def doc_load(name: str, default: Any, legacy_file: Optional[str] = None) -> Any:
+    """Loads the named document, like config.safe_json_load but from the database.
+    The first time a document is asked for and the database has none, the old JSON
+    file (`legacy_file`) is imported, checked, and renamed to *.migrated - never
+    deleted. Never raises: a problem is logged and `default` (a copy) is returned,
+    exactly like the JSON loader behaved."""
+    try:
+        _check(name, _KV_NAME_RE, "document name")
+        if not kv_exists(name) and legacy_file and os.path.exists(legacy_file):
+            _import_legacy_doc(name, legacy_file)
+        data = kv_load(name, _MISSING)
+        if data is _MISSING:
+            return copy.deepcopy(default)
+        if isinstance(default, dict) and not isinstance(data, dict):
+            logger.error(f"[STORAGE] document {name!r} holds {type(data).__name__}, expected an object - using default")
+            return copy.deepcopy(default)
+        if isinstance(default, list) and not isinstance(data, list):
+            logger.error(f"[STORAGE] document {name!r} holds {type(data).__name__}, expected a list - using default")
+            return copy.deepcopy(default)
+        return data
+    except Exception as e:
+        logger.error(f"[STORAGE] failed to load document {name!r}, using default: {e}", exc_info=True)
+        return copy.deepcopy(default)
+
+
+def doc_save(name: str, value: Any) -> None:
+    """Saves the named document (best effort, like config.safe_json_save: a failure
+    is logged, never raised). An unchanged document is not written again."""
+    try:
+        kv_save(name, value)
+    except Exception as e:
+        logger.error(f"Failed to save document {name!r}: {e}", exc_info=True)
+
+
+def _import_legacy_doc(name: str, legacy_file: str) -> None:
+    try:
+        with open(legacy_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        kv_save(name, data)
+        if kv_load(name, _MISSING) != json.loads(json.dumps(data, default=str)):
+            raise StorageError("document did not round-trip")
+        _retire(legacy_file)
+        logger.info(f"[STORAGE] imported {os.path.basename(legacy_file)} into the database")
+    except Exception as e:
+        # the JSON stays where it is; the document is simply absent from the database
+        logger.error(f"[STORAGE] import of {legacy_file} failed, JSON left untouched: {e}", exc_info=True)
+        with _cache_lock:
+            _kv_cache.pop((DB_FILE, name), None)
+        try:
+            with _tx() as conn:
+                conn.execute("DELETE FROM kv WHERE name = ?", (name,))
+        except Exception:
+            pass
 
 
 # ── one-time import from the old JSON files ───────────────────────────
