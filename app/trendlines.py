@@ -74,7 +74,7 @@ EMA_PERIODS = (50, 200)
 EMA_WARMUP_BARS = 400      # extra daily bars fetched beyond the displayed ones (EMA 200 settling, NWE window)
 
 # Nadaraya-Watson Envelope (LuxAlgo-style): Gaussian kernel regression of the closes, bands = fit +/- mult x MAE.
-NWE = {"h": 8.0, "mult": 3.0, "window": 500, "mae_len": 499, "mae_min": 100}
+NWE = {"h": 8.0, "mult": 3.0, "window": 500, "mae_min": 100}   # defaults; the live values come from config (NWE_*)
 
 # Candle-pattern rules (fixed on purpose, not fitted). ATR is the absolute Wilder ATR(14) of the bar.
 CANDLE = {
@@ -454,7 +454,8 @@ def nw_envelope(close: np.ndarray, ts_s: np.ndarray, show_from: int, h: float = 
     num = np.convolve(y_all, ker)[:n]
     den = np.convolve(np.ones(n), ker)[:n]
     mid_c = num / den
-    mae_c = pd.Series(np.abs(y_all - mid_c)).rolling(int(NWE["mae_len"]), min_periods=int(NWE["mae_min"])).mean().to_numpy() * mult
+    mae_len = max(2, window - 1)                                   # 499 for the default 500-bar window, as in the indicator
+    mae_c = pd.Series(np.abs(y_all - mid_c)).rolling(mae_len, min_periods=min(int(NWE["mae_min"]), mae_len // 2)).mean().to_numpy() * mult
 
     return {
         "params": {"h": h, "mult": mult, "window": w_n},
@@ -595,7 +596,8 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
     from market_structure import calc_support_resistance
 
     params = params_from_config(cfg)
-    fetch_limit = max(int(params["lookback"]) + 120, candles_limit + EMA_WARMUP_BARS)
+    nwe_window = int(getattr(cfg, "NWE_WINDOW", None) or NWE["window"])
+    fetch_limit = max(int(params["lookback"]) + 120, candles_limit + max(EMA_WARMUP_BARS, nwe_window - 100))
     bars = await safe_fetch_ohlcv(exchange, symbol, "1d", limit=fetch_limit)
     df = parse_ohlcv(bars)
     if not validate_dataframe(df, min_rows=MIN_BARS + 1):
@@ -619,7 +621,8 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
         for per in EMA_PERIODS
     }
     candle_patterns = detect_candle_patterns(closed, since=max(1, show_from))
-    nwe = nw_envelope(c_close, c_ts, max(0, show_from))
+    nwe = nw_envelope(c_close, c_ts, max(0, show_from), h=getattr(cfg, "NWE_H", None),
+                      mult=getattr(cfg, "NWE_MULT", None), window=getattr(cfg, "NWE_WINDOW", None))
 
     tail = df.tail(candles_limit)
     n_tail = len(tail)

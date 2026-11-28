@@ -298,6 +298,7 @@ export default function SettingsPanel({ config, onChanged }) {
   const saveVp = (field, value) => run(`vp_${field}`, () => api.setVolumeProfile({ [field]: value }))
   const saveZones = (field, value) => run(`zones_${field}`, () => api.setZones({ [field]: value }))
   const saveSmc = (field, value) => run(`smc_${field}`, () => api.setSmcOverlay({ [field]: value }))
+  const saveNwe = (field, value) => run(`nwe_${field}`, () => api.setNwe({ [field]: value }))
 
   return (
     <div>
@@ -960,6 +961,56 @@ export default function SettingsPanel({ config, onChanged }) {
             />
             <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
               {t('Shown on the Chart tab (Discord and web), calculated on closed candles only. Purely visual: the Insights → Simulate "SMC event study" found no tradable edge in these events, so nothing here is read by signals, filters, TP/SL or confidence.')}
+            </p>
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title">{t('NW Envelope (TA tab)')}</h3>
+            <NumberField
+              label="Bandwidth (h)" hint="1–50 bars, Gaussian kernel width; bigger = smoother and slower to react"
+              value={config.nwe?.h ?? 8}
+              min={1} max={50} step={0.5} busyKey="nwe_h" busy={busy}
+              onSave={(v) => saveNwe('h', v)}
+            />
+            <NumberField
+              label="Band multiplier" hint="0.5–10, band half-width = multiplier × mean absolute error"
+              value={config.nwe?.mult ?? 3}
+              min={0.5} max={10} step={0.1} busyKey="nwe_mult" busy={busy}
+              onSave={(v) => saveNwe('mult', v)}
+            />
+            <NumberField
+              label="Window" hint="100–600 closed daily bars the fit and the error are calculated over"
+              value={config.nwe?.window ?? 500}
+              min={100} max={600} busyKey="nwe_window" busy={busy}
+              onSave={(v) => saveNwe('window', v)}
+            />
+            <div className="field">
+              <label title={t('How the upper and lower band lines are drawn.')}>{t('Band line style')}</label>
+              <select
+                value={config.nwe?.style ?? 'dashed'}
+                disabled={busy === 'nwe_style'}
+                onChange={(e) => saveNwe('style', e.target.value)}
+              >
+                <option value="dashed">{t('Dashed')}</option>
+                <option value="dotted">{t('Dotted')}</option>
+                <option value="solid">{t('Solid')}</option>
+              </select>
+            </div>
+            <div className="toggle-row">
+              <span className="row-label" title={t('The regression line in the middle of the envelope (always dotted).')}>
+                {t('Show middle line')}
+              </span>
+              <Toggle
+                checked={config.nwe?.show_mid ?? true}
+                disabled={busy === 'nwe_show_mid'}
+                onChange={(v) => saveNwe('show_mid', v)}
+              />
+            </div>
+            <ColorField label="NWE upper band" value={colors.nwe_upper || '#45d0a5'} onSave={(v) => saveColor('nwe_upper', v)} />
+            <ColorField label="NWE lower band" value={colors.nwe_lower || '#f2637a'} onSave={(v) => saveColor('nwe_lower', v)} />
+            <ColorField label="NWE middle line" value={colors.nwe_mid || '#8b93a1'} onSave={(v) => saveColor('nwe_mid', v)} />
+            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+              {t('Shown on the TA tab (switch the layer on there), calculated on closed daily candles. Purely visual: nothing here is read by signals, filters, TP/SL or confidence. The Smoothing switch is on the TA tab itself.')}
             </p>
           </div>
 

@@ -312,7 +312,7 @@ export default function App() {
           />
         )}
         {tab === 'ta' && (
-          <TaPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} onLoadingChange={setChartLoading} />
+          <TaPanel pairs={config?.pairs} lastEvent={lastEvent} colors={config?.colors} nwe={config?.nwe} onLoadingChange={setChartLoading} />
         )}
         {tab === 'history' && <HistoryPanel lastEvent={lastEvent} />}
         {tab === 'insights' && <InsightsPanel lastEvent={lastEvent} pairs={config?.pairs} timeframes={config?.timeframes} />}

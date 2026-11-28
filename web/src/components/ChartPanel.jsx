@@ -28,6 +28,10 @@ export const DEFAULT_COLORS = {
   smc_choch: '#f0f6fc',
   smc_fvg_bull: '#4aa3ff',
   smc_fvg_bear: '#b07cff',
+  // 🆕 Nadaraya-Watson envelope on the TA tab (configurable in Settings)
+  nwe_upper: '#45d0a5',
+  nwe_lower: '#f2637a',
+  nwe_mid: '#8b93a1',
 }
 
 // Colours that can't come from CSS variables (lightweight-charts options and the overlay

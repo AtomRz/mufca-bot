@@ -850,6 +850,43 @@ SMC_OVERLAY_LOOKBACK = _smc_overlay_config["lookback"]
 SMC_OVERLAY_MAX_BREAKS = _smc_overlay_config["max_breaks"]
 SMC_OVERLAY_MAX_FVGS = _smc_overlay_config["max_fvgs"]
 
+# 🆕 Nadaraya-Watson Envelope on the web TA tab (trendlines.nw_envelope()): the kernel bandwidth,
+# band multiplier and window, plus how the band lines are drawn. The three line colours live with the
+# other chart colours (nwe_upper / nwe_lower / nwe_mid in chart_colors.json). VISUAL ONLY - nothing in the
+# signal path reads it. Same persisted-JSON pattern as the overlays above, editable at runtime via
+# /api/config/nwe; the TA tab simply refetches (no restart, no state reset).
+NWE_FILE = os.path.join(DATA_DIR, "nwe.json")
+NWE_STYLES = ("dashed", "dotted", "solid")
+NWE_LIMITS = {"h": (1.0, 50.0), "mult": (0.5, 10.0), "window": (100, 600)}
+_NWE_DEFAULTS = {
+    "h": 8.0,            # Gaussian kernel bandwidth, in bars (bigger = smoother, slower)
+    "mult": 3.0,         # band half-width = mult x mean absolute error
+    "window": 500,       # closed daily bars the regression / error are calculated over
+    "style": "dashed",   # how the upper / lower band lines are drawn
+    "show_mid": True,    # the regression (middle) line
+}
+
+def load_nwe_config() -> dict:
+    out = _load_typed(NWE_FILE, _NWE_DEFAULTS)
+    for k, (lo, hi) in NWE_LIMITS.items():     # hand-edited file: out-of-range value -> default
+        if not (lo <= out[k] <= hi):
+            logger.error(f"[CONFIG] nwe.json[{k!r}]={out[k]!r} outside {lo}..{hi} - using default")
+            out[k] = _NWE_DEFAULTS[k]
+    if out["style"] not in NWE_STYLES:
+        logger.error(f"[CONFIG] nwe.json['style']={out['style']!r} is not one of {NWE_STYLES} - using default")
+        out["style"] = _NWE_DEFAULTS["style"]
+    return out
+
+def save_nwe_config(data: dict):
+    safe_json_save(NWE_FILE, data)
+
+_nwe_config = load_nwe_config()
+NWE_H = _nwe_config["h"]
+NWE_MULT = _nwe_config["mult"]
+NWE_WINDOW = _nwe_config["window"]
+NWE_STYLE = _nwe_config["style"]
+NWE_SHOW_MID = _nwe_config["show_mid"]
+
 # =====================================================================
 # 📊  VOLUME PROFILE (POC / Value Area)
 # =====================================================================
@@ -1610,6 +1647,10 @@ _COLOR_DEFAULTS = {
     "sl_line": "#f2637a",
     "signal_long": "#45d0a5",
     "signal_short": "#f2637a",
+    # 🆕 Nadaraya-Watson Envelope on the web TA tab
+    "nwe_upper": "#45d0a5",
+    "nwe_lower": "#f2637a",
+    "nwe_mid": "#8b93a1",
 }
 
 def load_colors() -> dict:

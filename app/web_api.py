@@ -28,6 +28,7 @@ Endpoints:
 
 import asyncio
 import logging
+import math
 import re
 import secrets
 import time
@@ -1939,6 +1940,7 @@ async def get_config():
             "min_volume_ratio": _cfg.ZONE_MIN_VOLUME_RATIO,
         },
         "smc_overlay": _smc_overlay_settings(),
+        "nwe": _nwe_settings(),
         "colors": _cfg.CHART_COLORS,
         "timeframes": TIMEFRAMES,
         "pairs": _cfg.TICKERS,
@@ -2896,6 +2898,57 @@ async def set_smc_overlay(body: SmcOverlayIn):
     return _smc_overlay_settings()
 
 
+def _nwe_settings() -> dict:
+    return {
+        "h": _cfg.NWE_H,
+        "mult": _cfg.NWE_MULT,
+        "window": _cfg.NWE_WINDOW,
+        "style": _cfg.NWE_STYLE,
+        "show_mid": _cfg.NWE_SHOW_MID,
+    }
+
+
+class NweIn(BaseModel):
+    h: Optional[float] = None
+    mult: Optional[float] = None
+    window: Optional[int] = None
+    style: Optional[str] = None
+    show_mid: Optional[bool] = None
+
+
+@app.post("/api/config/nwe")
+async def set_nwe(body: NweIn):
+    """Nadaraya-Watson Envelope on the web TA tab. VISUAL ONLY: nothing in the signal path reads it, so
+    nothing needs a state reset - the TA tab refetches and uses the new values."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "At least one field is required")
+
+    # Validate everything first, apply only once everything passes
+    for key, (lo, hi) in _cfg.NWE_LIMITS.items():
+        if key in updates:
+            v = updates[key]
+            if not math.isfinite(v) or not (lo <= v <= hi):
+                raise HTTPException(400, f"{key} must be between {lo} and {hi}")
+    if "style" in updates and updates["style"] not in _cfg.NWE_STYLES:
+        raise HTTPException(400, f"style must be one of {', '.join(_cfg.NWE_STYLES)}")
+
+    if "h" in updates:
+        _cfg.NWE_H = float(updates["h"])
+    if "mult" in updates:
+        _cfg.NWE_MULT = float(updates["mult"])
+    if "window" in updates:
+        _cfg.NWE_WINDOW = int(updates["window"])
+    if "style" in updates:
+        _cfg.NWE_STYLE = updates["style"]
+    if "show_mid" in updates:
+        _cfg.NWE_SHOW_MID = updates["show_mid"]
+
+    _cfg.save_nwe_config(_nwe_settings())
+    await broadcast_event({"type": "config_changed", "key": "nwe"})
+    return _nwe_settings()
+
+
 # =====================================================================
 # 🎨  CHART COLORS — purely visual, no need to reset state
 # =====================================================================
@@ -2917,6 +2970,9 @@ class ColorsIn(BaseModel):
     sl_line: Optional[str] = None
     signal_long: Optional[str] = None
     signal_short: Optional[str] = None
+    nwe_upper: Optional[str] = None
+    nwe_lower: Optional[str] = None
+    nwe_mid: Optional[str] = None
 
 
 @app.post("/api/config/colors")

@@ -264,6 +264,8 @@ export const api = {
     request('/api/config/zones', { method: 'POST', body: JSON.stringify(patch) }),
   setSmcOverlay: (patch) =>
     request('/api/config/smc-overlay', { method: 'POST', body: JSON.stringify(patch) }),
+  setNwe: (patch) =>
+    request('/api/config/nwe', { method: 'POST', body: JSON.stringify(patch) }),
   getHistorySummary: (origin = 'all') => request(`/api/history/summary?origin=${origin}`),
   getHistoryRecords: (ticker, tf, side, track = 'a', limit = 30, origin = 'all') =>
     request(

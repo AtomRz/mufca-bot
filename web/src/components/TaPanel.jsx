@@ -14,7 +14,7 @@ const VIEW_BARS = 150 // bars shown on a fresh selection (the user can still scr
 const LAYERS_KEY = 'mufca.ta.layers'
 const EMA_COLORS = { ema50: '#f5a524', ema200: '#4f8cff' } // readable on both the dark and the light chart
 const NEUTRAL_MARK = '#8b93a1'
-const NWE_COLOR = '#a66bf5' // Nadaraya-Watson envelope: its own hue, apart from the trend lines and the EMAs
+const NWE_LINE_STYLES = { dashed: LineStyle.Dashed, dotted: LineStyle.Dotted, solid: LineStyle.Solid }
 const CP_SHORT = { pin_bar: 'PIN', engulfing: 'ENG', inside_bar: 'IN' }
 
 function fmtPrice(v) {
@@ -30,7 +30,7 @@ function fmtDate(sec) {
   return new Date(sec * 1000).toISOString().slice(0, 10) // UTC, matches the exchange's daily candle
 }
 
-export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
+export default function TaPanel({ pairs, lastEvent, colors, nwe, onLoadingChange }) {
   const { t } = useI18n()
   const { theme } = useTheme()
   const CT = CHART_THEME[theme] || CHART_THEME.dark
@@ -103,6 +103,8 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
   useEffect(() => {
     if (!lastEvent || !ticker || document.hidden) return
     if (lastEvent.type === 'scan_tick' && Date.now() - lastLoadRef.current >= REFRESH_MIN_MS) loadRef.current()
+    // bandwidth / multiplier / window changed in Settings: the envelope has to be recalculated
+    if (lastEvent.type === 'config_changed' && lastEvent.key === 'nwe') loadRef.current()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent])
 
@@ -275,11 +277,18 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
 
     if (layers.nwe && data.nwe) {
       const v = data.nwe[layers.nweSmooth ? 'smooth' : 'causal']
-      for (const [key, width, style] of [['upper', 1, LineStyle.Solid], ['lower', 1, LineStyle.Solid], ['mid', 1, LineStyle.Dotted]]) {
+      const bandStyle = NWE_LINE_STYLES[nwe?.style] ?? LineStyle.Dashed
+      const showMid = nwe?.show_mid ?? true
+      // band lines are 2px so a dash reads as a dash (at 1px lightweight-charts' dashes look like dots)
+      for (const [key, color, style, width] of [
+        ['upper', C.nwe_upper, bandStyle, 2],
+        ['lower', C.nwe_lower, bandStyle, 2],
+        ['mid', C.nwe_mid, LineStyle.Dotted, 1],
+      ]) {
         const pts = v?.[key]
-        if (!pts?.length) continue
+        if (!pts?.length || (key === 'mid' && !showMid)) continue
         const ser = chart.addLineSeries({
-          color: key === 'mid' ? hexToRgba(NWE_COLOR, 0.7) : NWE_COLOR, lineWidth: width, lineStyle: style,
+          color, lineWidth: width, lineStyle: style,
           priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
         })
         ser.setData(pts)
@@ -327,7 +336,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
     }
     lastSelectionRef.current = key
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, C, theme, showSR, layers])
+  }, [data, C, theme, showSR, layers, nwe?.style, nwe?.show_mid])
 
   const pat = data && data.symbol === ticker ? data.pattern : null
   const lines = data && data.symbol === ticker ? data.lines || [] : []
@@ -435,7 +444,11 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
         <span>● {t('Touches')}</span>
         {layers.ema50 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema50 }} />EMA 50</span>}
         {layers.ema200 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema200 }} />EMA 200</span>}
-        {layers.nwe && data?.nwe && <span><span className="legend-dot" style={{ background: NWE_COLOR }} />{t('NW Envelope')}</span>}
+        {layers.nwe && data?.nwe && (
+          <span>
+            <span className="legend-dot" style={{ background: C.nwe_upper }} /><span className="legend-dot" style={{ background: C.nwe_lower, marginLeft: -2 }} />{t('NW Envelope')}
+          </span>
+        )}
         {layers.candles && <span>▲▼ PIN · ENG · ■ {t('Inside bar')}</span>}
       </div>
 
@@ -577,7 +590,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
             {nweSum && (
               <>
                 <div className="row">
-                  <span className="row-label" style={{ color: NWE_COLOR }}>
+                  <span className="row-label" style={{ color: C.nwe_mid }}>
                     {t('NW Envelope')} (h={data.nwe.params.h}, ×{data.nwe.params.mult}, {layers.nweSmooth ? t('smoothed') : t('causal')})
                   </span>
                   <span className="row-value">
