@@ -40,7 +40,6 @@ from config import (
     MIN_TP_PCT,
     MAX_TP_PCT,
     CHOP_THRESHOLD,
-    SIGNALS_HISTORY_FILE,
     ATR_PERIOD,
     save_tickers,
     save_tp_config,
@@ -59,6 +58,7 @@ from signals import (
 import filter_stats
 import history_backup
 import history_tools
+import storage
 import volume_gate
 import smc
 from onchain import (
@@ -3339,7 +3339,7 @@ async def debug_cmd(ctx):
                        for r in history[t][tf].get(s, []) if r["exit_type"] not in ("open", "unfilled"))
 
     lines.append(f"• Signal history: **{total_sigs}** records ({total_closed} closed)")
-    lines.append(f"• History file: **{'Yes' if os.path.exists(SIGNALS_HISTORY_FILE) else 'No'}**")
+    lines.append(f"• History database: **{'Yes' if os.path.exists(storage.DB_FILE) else 'No'}**")
 
     # 🆕 FIX: used to read the legacy "active_trade" key, which only !forcerun
     # still sets — real A/U trades were never counted (always showed 0).
@@ -3404,8 +3404,7 @@ async def reset_cmd(ctx, confirm: str = ""):
     await ctx.send(f"💾 Safety backup of the history: `{reset_backup_id}` (`!restore {reset_backup_id}`)."
                    if reset_backup_id else "⚠️ The safety backup of the history could NOT be written — continuing as confirmed.")
 
-    if os.path.exists(SIGNALS_HISTORY_FILE):
-        os.remove(SIGNALS_HISTORY_FILE)
+    storage.clear_history()
     clear_history_cache()
 
     # BUGFIX BUG-HI002: previously only trade_history/active_trade/bars_in_trade

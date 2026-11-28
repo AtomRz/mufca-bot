@@ -6,11 +6,10 @@ from datetime import datetime, timezone
 import logging
 
 import config as _cfg
+import storage
 from config import (
     SIGNALS_HISTORY_FILE,
     BOT_STATE_FILE,
-    safe_json_load,
-    safe_json_save,
 )
 from utils import round_price
 
@@ -28,7 +27,8 @@ def save_bot_state(state: Dict[str, Dict[str, dict]]):
     separate audit log and already survived restarts on its own; this file
     is specifically "what the bot currently considers open"."""
     try:
-        safe_json_save(BOT_STATE_FILE, state)
+        _migrate_json_once()
+        storage.kv_save("bot_state", state)
     except Exception as e:
         logger.error(f"[STATE] Failed to save state snapshot: {e}", exc_info=True)
 
@@ -39,7 +39,9 @@ def load_bot_state() -> Dict[str, Dict[str, dict]]:
     (bot.py) rebuilds state from scratch via make_state() for any missing
     ticker/tf, same as before."""
     try:
-        return safe_json_load(BOT_STATE_FILE, {})
+        _migrate_json_once()
+        data = storage.kv_load("bot_state", {})
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.error(f"[STATE] Failed to load state snapshot, starting fresh: {e}", exc_info=True)
         return {}
@@ -156,22 +158,47 @@ def clear_history_cache():
         _history_cache = None
 
 
+_json_migrated = False
+
+
+def _migrate_json_once():
+    """First start after the SQLite switch: imports the old signals_history.json /
+    bot_state_snapshot.json into the database (they are renamed to *.migrated, never
+    deleted). A no-op on every later call."""
+    global _json_migrated
+    if _json_migrated:
+        return
+    _json_migrated = True
+    storage.migrate_from_json(SIGNALS_HISTORY_FILE, BOT_STATE_FILE)
+
+
 def load_signals_history() -> Dict:
-    """Loads the signal history from file."""
+    """Loads the signal history (from the SQLite database, cached in memory)."""
     global _history_cache
     with _history_lock:
         if _history_cache is not None:
             return _history_cache
-        _history_cache = safe_json_load(SIGNALS_HISTORY_FILE, {})
+        try:
+            _migrate_json_once()
+            _history_cache = storage.load_history()
+        except Exception as e:
+            # Same rule the JSON loader had: a read problem is logged loudly and the
+            # bot carries on with an empty history. Nothing is cached-and-saved over
+            # the database here, so the stored data is untouched.
+            logger.error(f"[STATE] Failed to load signal history: {e}", exc_info=True)
+            return {}
         return _history_cache
 
 
 def save_signals_history(history: Dict):
-    """Saves the signal history to file."""
+    """Saves the signal history to the SQLite database (one transaction)."""
     global _history_cache
     with _history_lock:
         _history_cache = history
-        safe_json_save(SIGNALS_HISTORY_FILE, history)
+        try:
+            storage.save_history(history)
+        except Exception as e:
+            logger.error(f"Failed to save signal history: {e}", exc_info=True)
 
 
 def _ensure_history_slot(history: Dict, ticker: str, tf: str):

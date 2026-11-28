@@ -1,4 +1,4 @@
-# MUFCA Bot [AtomDC] v4.6.2
+# MUFCA Bot [AtomDC] v4.7.0
 
 A Discord trading signal bot for Gate.io (Spot & Futures). Scans BTC/USDT and ETH/USDT (and any custom pairs) across 1h and 4h timeframes, fires signals with adaptive TP/SL, and tracks trade outcomes.
 
@@ -116,6 +116,7 @@ mufca-bot/
 │   ├── walk_forward.py        # Rolling walk-forward check of the filter tuner + audit of pinned filter sets (!walkfwd, /api/walkfwd)
 │   ├── smc.py                 # Smart Money Concepts: the !smcsim event study (sweeps, BOS/CHoCH, FVG vs. any-bar baseline) and the chart overlay of BOS/CHoCH lines and open FVGs; research / visual only
 │   ├── ai_filter.py           # Gemini "second opinion" on each new signal (informational only): market snapshot, request, verdict parsing, !aistats statistics
+│   ├── storage.py             # SQLite storage (mufca.db): signal history + position snapshot, parameterized SQL only, one-time import from the old JSON files
 │   ├── shadow.py              # Shadow tracking of entries an Entry switch blocked (outcome replay, kept out of signals_history)
 │   ├── market_hours.py        # NYSE session state (pre / open / after-hours / closed, holidays, early closes) for the top-bar NYSE lamp
 │   ├── filter_stats.py        # Live entry-filter funnel counters (which filter rejected how many raw triggers)
@@ -224,8 +225,7 @@ All files are stored in `/app/data/` — mount this path as a host volume to per
 
 | File | Purpose |
 |---|---|
-| `signals_history.json` | Historical MFE/MAE data for adaptive TP/SL |
-| `bot_state_snapshot.json` | Active position snapshot — survives non-graceful restarts (OOM kill, `docker stop -t 0`) |
+| `mufca.db` | SQLite database: the signal history (MFE/MAE data for adaptive TP/SL) and the active position snapshot. Replaced `signals_history.json` / `bot_state_snapshot.json`, which are imported automatically on the first start and kept as `*.migrated` (your rollback) |
 | `mode.json` | Spot / Futures mode |
 | `htf_bias.json` | Active HTF timeframe |
 | `ut_ha.json` | UT Bot Heikin Ashi toggle |
@@ -523,7 +523,7 @@ main.py (single asyncio event loop)
 │       └── broadcast_event()           — pushes signal/tp1_hit/scan_tick to web dashboard over WebSocket
 └── Web API (uvicorn, port 8585) — reads the same state/config, no duplicate fetches
 
-SIGTERM/SIGINT → flush signals_history.json + bot_state_snapshot.json to disk → close Discord connection → exit
+SIGTERM/SIGINT → flush the signal history + position snapshot to mufca.db → close Discord connection → exit
 ```
 
 ---
