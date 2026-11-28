@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 import config as _cfg
-from config import safe_json_load, safe_json_save
+import storage
 from utils import round_price
 
 logger = logging.getLogger(__name__)
@@ -47,11 +47,11 @@ Bar = Tuple[int, float, float, float]
 
 
 def load_shadow_history() -> Dict:
-    return safe_json_load(SHADOW_FILE, {})
+    return storage.doc_load("shadow_signals", {}, SHADOW_FILE)
 
 
 def _save(history: Dict):
-    safe_json_save(SHADOW_FILE, history)
+    storage.doc_save("shadow_signals", history)
 
 
 def _pct(side: str, entry: float, price: float) -> float:

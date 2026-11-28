@@ -29,7 +29,8 @@ import time
 from typing import Dict, List, Optional
 
 import config as _cfg
-from config import DATA_DIR, safe_json_load, safe_json_save
+from config import DATA_DIR
+import storage
 from derivatives import _to_swap_symbol
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _sanitize_history(raw) -> Dict[str, List[float]]:
     return out
 
 
-_history: Dict[str, List[float]] = _sanitize_history(safe_json_load(_cfg.SPREAD_HISTORY_FILE, {}))
+_history: Dict[str, List[float]] = _sanitize_history(storage.doc_load("spread_history", {}, _cfg.SPREAD_HISTORY_FILE))
 
 # 🆕 FIX: get_spread_snapshot() is also called by !spread and by the web
 # dashboard's /api/spread (polled), and every call used to append a sample.
@@ -80,7 +81,7 @@ def _save_history_throttled():
     _history_dirty = True
     now = time.time()
     if now - _history_last_saved >= _cfg.SPREAD_HISTORY_SAVE_INTERVAL:
-        safe_json_save(_cfg.SPREAD_HISTORY_FILE, _history)
+        storage.doc_save("spread_history", _history)
         _history_last_saved = now
         _history_dirty = False
 
@@ -90,7 +91,7 @@ def flush_spread_history():
     on graceful shutdown so the last in-memory history isn't lost."""
     global _history_last_saved, _history_dirty
     if _history_dirty:
-        safe_json_save(_cfg.SPREAD_HISTORY_FILE, _history)
+        storage.doc_save("spread_history", _history)
         _history_last_saved = time.time()
         _history_dirty = False
 
@@ -102,7 +103,7 @@ def clear_ticker_cache(ticker: str):
     _last_sample_ts.pop(ticker, None)
     had_history = _history.pop(ticker, None) is not None
     if had_history:
-        safe_json_save(_cfg.SPREAD_HISTORY_FILE, _history)
+        storage.doc_save("spread_history", _history)
     logger.info(f"[SPREAD] Cleared history for {ticker}")
 
 

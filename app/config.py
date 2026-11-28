@@ -1623,10 +1623,12 @@ ONCHAIN_BIAS_CACHE_FILE = os.path.join(DATA_DIR, "onchain_bias_cache.json")
 
 def load_onchain_bias_cache() -> dict:
     """Returns {"bias": dict|None, "last_fetch": float}."""
-    return safe_json_load(ONCHAIN_BIAS_CACHE_FILE, {"bias": None, "last_fetch": 0.0})
+    import storage  # lazy: storage imports this module
+    return storage.doc_load("onchain_bias_cache", {"bias": None, "last_fetch": 0.0}, ONCHAIN_BIAS_CACHE_FILE)
 
 def save_onchain_bias_cache(bias: Optional[dict], last_fetch: float):
-    safe_json_save(ONCHAIN_BIAS_CACHE_FILE, {"bias": bias, "last_fetch": last_fetch})
+    import storage
+    storage.doc_save("onchain_bias_cache", {"bias": bias, "last_fetch": last_fetch})
 
 # =====================================================================
 # 🎨  CHART COLORS (web UI + !chart) — configurable from Settings
@@ -1677,10 +1679,12 @@ DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
 
 def load_devices() -> dict:
     """{fcm_token: {"device_name": str, "registered_at": iso str}}"""
-    return safe_json_load(DEVICES_FILE, {})
+    import storage
+    return storage.doc_load("devices", {}, DEVICES_FILE)
 
 def save_devices(data: dict):
-    safe_json_save(DEVICES_FILE, data)
+    import storage
+    storage.doc_save("devices", data)
 
 # =====================================================================
 # 🎯  ADAPTIVE TP

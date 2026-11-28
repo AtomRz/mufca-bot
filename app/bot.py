@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 import discord
@@ -11,6 +10,7 @@ from typing import Optional, Dict
 import ccxt
 
 import config as _cfg
+import storage
 from config import (
     DISCORD_TOKEN,
     CHANNEL_NAME,
@@ -180,11 +180,8 @@ def _load_closure_notified() -> dict:
     reliably keeps the last _CLOSURE_NOTIFIED_MAX IDs by the order they
     were actually added.
     """
-    try:
-        with open(_closure_notified_file, "r") as f:
-            return dict.fromkeys(json.load(f))
-    except Exception:
-        return {}
+    data = storage.doc_load("closure_notified", [], _closure_notified_file)
+    return dict.fromkeys(data) if isinstance(data, list) else {}
 
 def _save_closure_notified(notified: dict):
     """Save notified trade IDs. Trimmed to the last _CLOSURE_NOTIFIED_MAX (by insertion order) so the file doesn't grow forever."""
@@ -192,10 +189,7 @@ def _save_closure_notified(notified: dict):
         ids = list(notified.keys())
         if len(ids) > _CLOSURE_NOTIFIED_MAX:
             ids = ids[-_CLOSURE_NOTIFIED_MAX:]
-        temp = _closure_notified_file + ".tmp"
-        with open(temp, "w") as f:
-            json.dump(ids, f)
-        os.replace(temp, _closure_notified_file)
+        storage.doc_save("closure_notified", ids)
     except Exception as e:
         logger.warning(f"Failed to save closure notifications: {e}")
 

@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import config as _cfg
-from config import safe_json_load, safe_json_save
+import storage
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _sanitize(raw) -> Dict:
     return out
 
 
-_stats: Dict = _sanitize(safe_json_load(_cfg.FILTER_STATS_FILE, {}))
+_stats: Dict = _sanitize(storage.doc_load("filter_stats", {}, _cfg.FILTER_STATS_FILE))
 if _stats["since"] is None:
     _stats["since"] = datetime.now(timezone.utc).isoformat()
 
@@ -95,7 +95,7 @@ def _save_throttled() -> None:
     _dirty = True
     now = time.time()
     if now - _last_saved >= _cfg.FILTER_STATS_SAVE_INTERVAL:
-        safe_json_save(_cfg.FILTER_STATS_FILE, _stats)
+        storage.doc_save("filter_stats", _stats)
         _last_saved = now
         _dirty = False
 
@@ -104,7 +104,7 @@ def flush() -> None:
     """Immediate save regardless of the throttle - call on graceful shutdown."""
     global _last_saved, _dirty
     if _dirty:
-        safe_json_save(_cfg.FILTER_STATS_FILE, _stats)
+        storage.doc_save("filter_stats", _stats)
         _last_saved = time.time()
         _dirty = False
 
@@ -162,7 +162,7 @@ def reset() -> None:
     _stats["pairs"] = {}
     _stats["since"] = datetime.now(timezone.utc).isoformat()
     _last_bar.clear()
-    safe_json_save(_cfg.FILTER_STATS_FILE, _stats)
+    storage.doc_save("filter_stats", _stats)
     _last_saved = time.time()
     _dirty = False
     logger.info("[FILTER_STATS] counters reset")

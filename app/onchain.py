@@ -26,6 +26,7 @@ from config import (
     safe_json_save,
 )
 import config as _cfg
+import storage
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,7 @@ _ONCHAIN_BASELINE_FILE = os.path.join(DATA_DIR, "onchain_baseline.json")
 # is dropped here, so the first cycle after the upgrade is a clean "first_run"
 # and no manual !reset_cache is needed.
 _prev_balances: Dict[str, Optional[float]] = {
-    k: v for k, v in safe_json_load(_ONCHAIN_BASELINE_FILE, {}).items() if k in _WALLET_KEYS
+    k: v for k, v in storage.doc_load("onchain_baseline", {}, _ONCHAIN_BASELINE_FILE).items() if k in _WALLET_KEYS
 }
 
 # 🆕 Timestamp of the last baseline snapshot — needed to normalize the
@@ -215,14 +216,14 @@ _prev_balances: Dict[str, Optional[float]] = {
 # exchange transactions (hot/cold rebalancing) and produced false "large"
 # triggers. See get_eth_flow_delta().
 _ONCHAIN_BASELINE_TS_FILE = os.path.join(DATA_DIR, "onchain_baseline_ts.json")
-_prev_balances_ts: float = safe_json_load(_ONCHAIN_BASELINE_TS_FILE, {}).get("ts", 0.0)
+_prev_balances_ts: float = storage.doc_load("onchain_baseline_ts", {}, _ONCHAIN_BASELINE_TS_FILE).get("ts", 0.0)
 
 # Exchange-wallet anomaly state (see config.ONCHAIN_ANOMALY_*). Persisted so a
 # container restart in the middle of an incident doesn't silently re-enable the
 # "outflow = bullish" reading for a wallet that was just drained.
 #   {"until": <epoch seconds>, "events": [ {exchange, prev_eth, curr_eth, ...}, ... ]}
 _ONCHAIN_ANOMALY_FILE = os.path.join(DATA_DIR, "onchain_anomaly.json")
-_anomaly_state: Dict[str, Any] = safe_json_load(_ONCHAIN_ANOMALY_FILE, {})
+_anomaly_state: Dict[str, Any] = storage.doc_load("onchain_anomaly", {}, _ONCHAIN_ANOMALY_FILE)
 
 
 def _cache_get(key: str) -> Optional[Any]:
@@ -249,9 +250,9 @@ def clear_onchain_cache_full():
     _prev_balances_ts = 0.0
     _anomaly_state.clear()
     # Otherwise the baseline would just get pulled back from the on-disk file on the next scan.
-    safe_json_save(_ONCHAIN_BASELINE_FILE, {})
-    safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": 0.0})
-    safe_json_save(_ONCHAIN_ANOMALY_FILE, {})
+    storage.doc_save("onchain_baseline", {})
+    storage.doc_save("onchain_baseline_ts", {"ts": 0.0})
+    storage.doc_save("onchain_anomaly", {})
     logger.info("[ONCHAIN] Full cache cleared (including baseline balances)")
 
 # =====================================================================
@@ -401,8 +402,8 @@ async def get_eth_flow_delta() -> Dict:
     if baseline_is_empty:
         _prev_balances.update(curr_balances)
         _prev_balances_ts = now
-        safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
-        safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
+        storage.doc_save("onchain_baseline", _prev_balances)
+        storage.doc_save("onchain_baseline_ts", {"ts": _prev_balances_ts})
         logger.info("[ONCHAIN] First run: saved baseline balances, delta will be available on next cycle.")
         return {
             "delta_eth": 0.0,
@@ -512,8 +513,8 @@ async def get_eth_flow_delta() -> Dict:
             _prev_balances[name] = curr
     if fully_refreshed:
         _prev_balances_ts = now
-    safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
-    safe_json_save(_ONCHAIN_BASELINE_TS_FILE, {"ts": _prev_balances_ts})
+    storage.doc_save("onchain_baseline", _prev_balances)
+    storage.doc_save("onchain_baseline_ts", {"ts": _prev_balances_ts})
 
     # Classify — thresholds normalized to the actual window length
     threshold_large = ONCHAIN_FLOW_THRESHOLD_LARGE_ETH * scale
@@ -544,7 +545,7 @@ async def get_eth_flow_delta() -> Dict:
     if anomalies:
         _anomaly_state["until"] = now + _cfg.ONCHAIN_ANOMALY_HOLD_SECONDS
         _anomaly_state["events"] = anomalies
-        safe_json_save(_ONCHAIN_ANOMALY_FILE, _anomaly_state)
+        storage.doc_save("onchain_anomaly", _anomaly_state)
 
     anomaly = None
     anomaly_until = float(_anomaly_state.get("until", 0.0) or 0.0)
@@ -945,7 +946,7 @@ def remove_tracked_wallet(exchange: str, address: str) -> Dict[str, Any]:
         _wallet_overrides["removed"].append(addr)
     _commit_wallet_edit()
     _prev_balances.pop(addr, None)
-    safe_json_save(_ONCHAIN_BASELINE_FILE, _prev_balances)
+    storage.doc_save("onchain_baseline", _prev_balances)
     logger.info(f"[ONCHAIN] Wallet removed from the UI: {ex} / {label} / {addr}")
     return {"exchange": ex, "address": addr, "label": label, "tracked": len(EXCHANGE_ETH_ADDRESSES[ex])}
 
