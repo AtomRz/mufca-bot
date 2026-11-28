@@ -183,8 +183,7 @@ function BackupsSection({ refreshKey, onHistoryChanged }) {
     <div className="panel">
       <h3 className="panel-title">{t('Saved backups of the signal history')}</h3>
       <p style={{ ...small, marginBottom: 12 }}>
-        {rich(t('A backup is a full copy of {file}. One is taken automatically on start and then every {hours} h when something changed; a safety copy is also taken right before a restore, a fill, a backfill, tagging, a {reset} or a delete. The newest {keep} automatic/safety copies are kept; manual ones are never deleted automatically. They live in {dir} — the same volume as the history, so use Download for a copy that survives losing the volume.'), {
-          file: <code>signals_history.json</code>,
+        {rich(t('A backup is a full copy of the signal history. One is taken automatically on start and then every {hours} h when something changed; a safety copy is also taken right before a restore, a fill, a backfill, tagging, a {reset} or a delete. The newest {keep} automatic/safety copies are kept; manual ones are never deleted automatically. They live in {dir} — the same volume as the history, so use Download for a copy that survives losing the volume.'), {
           hours: data?.interval_hours ?? '…',
           reset: <code>!reset</code>,
           keep: data?.keep_auto ?? '…',
