@@ -469,7 +469,7 @@ async def remove_cmd(ctx, ticker: str = ""):
 
 @core.bot.command(name="delsignals")
 async def delsignals_cmd(ctx, ticker: str = "", tf: str = "", confirm: str = ""):
-    """Deletes signal history (signals_history.json) for a specific pair.
+    """Deletes the signal history for a specific pair.
 
     !delsignals SOL/USDT           — preview (all timeframes)
     !delsignals SOL/USDT yes       — delete all timeframes
@@ -543,7 +543,7 @@ async def _send_long(ctx, msg: str):
 
 @core.bot.command(name="backup")
 async def backup_cmd(ctx, *, note: str = ""):
-    """Saves a manual backup of signals_history.json (never deleted automatically)."""
+    """Saves a manual backup of the signal history (never deleted automatically)."""
     try:
         meta = history_backup.create_backup("manual", note)
     except Exception as e:

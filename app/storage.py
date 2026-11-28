@@ -15,6 +15,9 @@ The rest of the bot still sees the same nested dict
 so state.py keeps its in-memory cache and every `rec["exit_type"] = ...` style
 mutation keeps working. This module only changes where that dict is persisted.
 
+Writes are incremental: save_history upserts only new/changed records and deletes only
+the ones that vanished; kv_save skips a document that is identical to what is stored.
+
 SQL injection rules (every function in this file follows them):
     1. Values are ALWAYS bound parameters (`?`). No f-strings / concatenation / %
        formatting ever builds SQL text from data.
@@ -82,6 +85,16 @@ def _check_side(side: Any) -> str:
 _local = threading.local()
 _init_lock = threading.Lock()
 _initialized_path: Optional[str] = None
+
+# Write-side caches, so a save only touches what actually changed.
+#   _row_cache: (ticker, tf, side, pos) -> payload text as it is stored right now
+#   _kv_cache:  (db path, name)         -> payload text as it is stored right now
+# They are only ever updated AFTER a transaction has committed, and only by this
+# process (the bot is the single writer of mufca.db).
+_cache_lock = threading.RLock()
+_row_cache: Optional[Dict[Tuple[str, str, str, int], str]] = None
+_row_cache_path: Optional[str] = None
+_kv_cache: Dict[Tuple[str, str], str] = {}
 
 
 def _connect() -> sqlite3.Connection:
@@ -195,11 +208,32 @@ def _row_params(ticker: str, tf: str, side: str, pos: int, rec: Dict) -> Tuple:
     )
 
 
+_UPSERT_SQL = (
+    "INSERT INTO signals (ticker, tf, side, pos, track, ts, exit_type, payload) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(ticker, tf, side, pos) DO UPDATE SET "
+    "track = excluded.track, ts = excluded.ts, "
+    "exit_type = excluded.exit_type, payload = excluded.payload"
+)
+
+
+def _stored_rows(conn: sqlite3.Connection) -> Dict[Tuple[str, str, str, int], str]:
+    """What the table holds right now (used once, to prime the write cache)."""
+    return {
+        (t, f, sd, pos): payload
+        for t, f, sd, pos, payload in conn.execute(
+            "SELECT ticker, tf, side, pos, payload FROM signals"
+        )
+    }
+
+
 def save_history(history: Dict) -> int:
-    """Replaces the stored history with `history` in ONE transaction: a crash or a
-    concurrent reader sees either the old history or the new one, never half.
-    Returns the number of records written."""
-    rows: List[Tuple] = []
+    """Makes the stored history equal to `history`, writing ONLY what changed:
+    new or edited records are upserted, records that disappeared are deleted, and a
+    save with no changes touches nothing. All of it is one transaction, so a crash
+    or a concurrent reader sees either the old history or the new one, never half.
+    Returns the number of records in the history."""
+    new_rows: Dict[Tuple[str, str, str, int], Tuple] = {}
     for ticker, tfs in (history or {}).items():
         if not isinstance(tfs, dict):
             continue
@@ -211,15 +245,27 @@ def save_history(history: Dict) -> int:
             for side in SIDES:
                 for pos, rec in enumerate(sides.get(side) or []):
                     if isinstance(rec, dict):
-                        rows.append(_row_params(ticker, tf, side, pos, rec))
-    with _tx() as conn:
-        conn.execute("DELETE FROM signals")
-        conn.executemany(
-            "INSERT INTO signals (ticker, tf, side, pos, track, ts, exit_type, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-    return len(rows)
+                        new_rows[(ticker, tf, side, pos)] = _row_params(ticker, tf, side, pos, rec)
+
+    global _row_cache, _row_cache_path
+    with _cache_lock:
+        conn = _conn()
+        if _row_cache is None or _row_cache_path != DB_FILE:
+            _row_cache, _row_cache_path = _stored_rows(conn), DB_FILE
+        old = _row_cache
+        changed = [p for k, p in new_rows.items() if old.get(k) != p[7]]
+        removed = [k for k in old if k not in new_rows]
+        if changed or removed:
+            with _tx() as c:
+                if removed:
+                    c.executemany(
+                        "DELETE FROM signals WHERE ticker = ? AND tf = ? AND side = ? AND pos = ?",
+                        removed,
+                    )
+                if changed:
+                    c.executemany(_UPSERT_SQL, changed)
+        _row_cache = {k: p[7] for k, p in new_rows.items()}
+    return len(new_rows)
 
 
 def load_history() -> Dict:
@@ -297,8 +343,11 @@ def query_signals(
 
 def clear_history() -> None:
     """Deletes every signal record (the `!reset yes` path)."""
-    with _tx() as conn:
-        conn.execute("DELETE FROM signals")
+    global _row_cache, _row_cache_path
+    with _cache_lock:
+        with _tx() as conn:
+            conn.execute("DELETE FROM signals")
+        _row_cache, _row_cache_path = {}, DB_FILE
 
 
 def has_history() -> bool:
@@ -310,12 +359,16 @@ def kv_save(name: str, value: Any) -> None:
     _check(name, _KV_NAME_RE, "document name")
     payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
     now = datetime.now(timezone.utc).isoformat()
-    with _tx() as conn:
-        conn.execute(
-            "INSERT INTO kv (name, value, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (name, payload, now),
-        )
+    with _cache_lock:
+        if _kv_cache.get((DB_FILE, name)) == payload:
+            return  # identical to what is stored - nothing to write
+        with _tx() as conn:
+            conn.execute(
+                "INSERT INTO kv (name, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (name, payload, now),
+            )
+        _kv_cache[(DB_FILE, name)] = payload
 
 
 def kv_load(name: str, default: Any = None) -> Any:
