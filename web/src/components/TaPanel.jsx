@@ -14,7 +14,8 @@ const VIEW_BARS = 150 // bars shown on a fresh selection (the user can still scr
 const LAYERS_KEY = 'mufca.ta.layers'
 const EMA_COLORS = { ema50: '#f5a524', ema200: '#4f8cff' } // readable on both the dark and the light chart
 const NEUTRAL_MARK = '#8b93a1'
-const NWE_LINE_STYLES = { dashed: LineStyle.Dashed, dotted: LineStyle.Dotted, solid: LineStyle.Solid }
+// 1px lines: the plain Dashed pattern (2px on / 2px off) reads as dots at that width, so 'dashed' is the long one
+const NWE_LINE_STYLES = { dashed: LineStyle.LargeDashed, dotted: LineStyle.Dotted, solid: LineStyle.Solid }
 const CP_SHORT = { pin_bar: 'PIN', engulfing: 'ENG', inside_bar: 'IN' }
 
 function fmtPrice(v) {
@@ -277,12 +278,11 @@ export default function TaPanel({ pairs, lastEvent, colors, nwe, onLoadingChange
 
     if (layers.nwe && data.nwe) {
       const v = data.nwe[layers.nweSmooth ? 'smooth' : 'causal']
-      const bandStyle = NWE_LINE_STYLES[nwe?.style] ?? LineStyle.Dashed
+      const bandStyle = NWE_LINE_STYLES[nwe?.style] ?? LineStyle.LargeDashed
       const showMid = nwe?.show_mid ?? true
-      // band lines are 2px so a dash reads as a dash (at 1px lightweight-charts' dashes look like dots)
       for (const [key, color, style, width] of [
-        ['upper', C.nwe_upper, bandStyle, 2],
-        ['lower', C.nwe_lower, bandStyle, 2],
+        ['upper', C.nwe_upper, bandStyle, 1],
+        ['lower', C.nwe_lower, bandStyle, 1],
         ['mid', C.nwe_mid, LineStyle.Dotted, 1],
       ]) {
         const pts = v?.[key]
