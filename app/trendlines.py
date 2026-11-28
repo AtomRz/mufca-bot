@@ -23,7 +23,8 @@ change when a new bar closes or a new pivot is confirmed):
     triangle / wedge / channel / flag / range, with the apex and a
     status (forming, breakout up, breakout down).
 
-Also here (same tab, same informational-only rule): EMA 50 / EMA 200 of the closes and three
+Also here (same tab, same informational-only rule): a Nadaraya-Watson Envelope (`nw_envelope`: the
+smoothed/repainting variant as on TradingView, and a causal variant), EMA 50 / EMA 200 of the closes and three
 single/two-bar candle patterns (Pin Bar, Engulfing, Inside Bar), see `ema_series`,
 `ma_summary` and `detect_candle_patterns`. They are pure geometry of closed bars: they say
 what the candles look like, not what price will do next.
@@ -70,7 +71,10 @@ DEFAULTS: Dict[str, float] = {
 MIN_BARS = 60  # fewer closed bars than this: nothing is computed
 
 EMA_PERIODS = (50, 200)
-EMA_WARMUP_BARS = 300      # extra daily bars fetched beyond the displayed ones so EMA 200 is settled
+EMA_WARMUP_BARS = 400      # extra daily bars fetched beyond the displayed ones (EMA 200 settling, NWE window)
+
+# Nadaraya-Watson Envelope (LuxAlgo-style): Gaussian kernel regression of the closes, bands = fit +/- mult x MAE.
+NWE = {"h": 8.0, "mult": 3.0, "window": 500, "mae_len": 499, "mae_min": 100}
 
 # Candle-pattern rules (fixed on purpose, not fitted). ATR is the absolute Wilder ATR(14) of the bar.
 CANDLE = {
@@ -379,6 +383,86 @@ def detect_candle_patterns(df: pd.DataFrame, since: int = 1) -> List[Dict]:
     return out
 
 
+def _nwe_side(close: np.ndarray, ts_s: np.ndarray, mid: np.ndarray, mae: np.ndarray, show_from: int,
+              base: int = 0) -> Dict:
+    """Serialise one NWE variant. `mid`/`mae` are aligned with close[base:]; points before `show_from`
+    (absolute bar index) are dropped."""
+    up, lo = mid + mae, mid - mae
+    pts = {"mid": [], "upper": [], "lower": []}
+    for k in range(len(mid)):
+        i = base + k
+        if i < show_from or not (math.isfinite(mid[k]) and math.isfinite(mae[k])):
+            continue
+        t = int(ts_s[i])
+        pts["mid"].append({"time": t, "value": _px(mid[k])})
+        pts["upper"].append({"time": t, "value": _px(up[k])})
+        pts["lower"].append({"time": t, "value": _px(lo[k])})
+    last = len(close) - 1
+    kl = last - base
+    summary = None
+    if 0 <= kl < len(mid) and math.isfinite(mid[kl]) and math.isfinite(mae[kl]):
+        c, u, l_ = float(close[last]), float(up[kl]), float(lo[kl])
+        if c > u:
+            pos, pct = "above", None
+        elif c < l_:
+            pos, pct = "below", None
+        else:
+            pos, pct = "inside", round((c - l_) / (u - l_), 3) if u > l_ else None
+        summary = {
+            "mid": _px(mid[kl]), "upper": _px(u), "lower": _px(l_), "half_width": _px(mae[kl]),
+            "position": pos, "position_pct": pct,
+            "dist_to_upper_pct": round((u / c - 1.0) * 100.0, 2),
+            "dist_to_lower_pct": round((l_ / c - 1.0) * 100.0, 2),
+        }
+    return {**pts, "summary": summary}
+
+
+def nw_envelope(close: np.ndarray, ts_s: np.ndarray, show_from: int, h: float = None, mult: float = None,
+                window: int = None) -> Optional[Dict]:
+    """Nadaraya-Watson Envelope on raw closes (as the TradingView indicator does): a Gaussian-kernel
+    regression w(k) = exp(-k^2 / (2 h^2)) and bands = fit +/- mult x mean|close - fit|.
+
+    'smooth'  (the indicator's "repainting smoothing" mode): every bar of the last `window` closed bars is
+              fitted with a kernel that looks both ways inside that window, and the band half-width is one
+              number, mult x MAE over the window. The fit of the newest bars therefore CHANGES when a new
+              bar closes (that is what 'repainting' means) - the curve is smooth but not final.
+    'causal'  (endpoint): each bar's fit uses only that bar and earlier ones, the half-width is a rolling
+              mult x SMA(|close - fit|, 499). A drawn value never changes later, but it lags more and
+              the newest bars are noisier.
+    Returns None with fewer than `mae_min` closes."""
+    h = float(NWE["h"] if h is None else h)
+    mult = float(NWE["mult"] if mult is None else mult)
+    window = int(NWE["window"] if window is None else window)
+    n = len(close)
+    if n < NWE["mae_min"] or not np.isfinite(close).all():
+        return None
+    y_all = close.astype(float)
+
+    # smooth: both-sided kernel inside the last `window` closes
+    w_n = min(window, n)
+    base = n - w_n
+    y = y_all[base:]
+    idx = np.arange(w_n)
+    d = (idx[:, None] - idx[None, :]).astype(float)
+    wgt = np.exp(-(d * d) / (2.0 * h * h))
+    mid_s = (wgt @ y) / wgt.sum(axis=1)
+    mae_s = np.full(w_n, float(np.mean(np.abs(y - mid_s))) * mult)
+
+    # causal: one-sided kernel (truncated at 6h, weight there < 1e-7) + rolling MAE
+    kmax = int(math.ceil(6 * h))
+    ker = np.exp(-(np.arange(kmax + 1, dtype=float) ** 2) / (2.0 * h * h))
+    num = np.convolve(y_all, ker)[:n]
+    den = np.convolve(np.ones(n), ker)[:n]
+    mid_c = num / den
+    mae_c = pd.Series(np.abs(y_all - mid_c)).rolling(int(NWE["mae_len"]), min_periods=int(NWE["mae_min"])).mean().to_numpy() * mult
+
+    return {
+        "params": {"h": h, "mult": mult, "window": w_n},
+        "smooth": _nwe_side(y_all, ts_s, mid_s, mae_s, show_from, base=base),
+        "causal": _nwe_side(y_all, ts_s, mid_c, mae_c, show_from, base=0),
+    }
+
+
 # =====================================================================
 # Public API
 # =====================================================================
@@ -535,6 +619,7 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
         for per in EMA_PERIODS
     }
     candle_patterns = detect_candle_patterns(closed, since=max(1, show_from))
+    nwe = nw_envelope(c_close, c_ts, max(0, show_from))
 
     tail = df.tail(candles_limit)
     n_tail = len(tail)
@@ -560,4 +645,5 @@ async def get_ta_data(exchange, symbol: str, cfg, candles_limit: int = 300) -> D
         "ema": ema_json,
         "ma": ma_summary(c_close, c_ts, ema),
         "candle_patterns": candle_patterns,
+        "nwe": nwe,
     }

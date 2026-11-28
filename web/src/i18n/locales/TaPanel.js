@@ -74,6 +74,18 @@ export default {
     'Last cross': 'Последнее пересечение',
     'Golden cross': 'Золотой крест',
     'Death cross': 'Крест смерти',
+    'NW Envelope': 'NW Envelope (Надарая — Уотсона)',
+    'Smoothing': 'Сглаживание',
+    'Smoothing on: the kernel looks both ways inside the window, so the newest bars are redrawn when a new bar closes (as on TradingView). Off: only past bars are used and nothing is redrawn.':
+      'Сглаживание включено: ядро смотрит в обе стороны внутри окна, поэтому последние бары перерисовываются при закрытии нового (как на TradingView). Выключено: используются только прошлые бары, ничего не перерисовывается.',
+    'smoothed': 'сглаженный',
+    'causal': 'каузальный',
+    'Above the upper band': 'Выше верхней границы',
+    'Below the lower band': 'Ниже нижней границы',
+    'Inside the bands': 'Внутри границ',
+    'Upper / lower band': 'Верхняя / нижняя граница',
+    'Smoothing redraws the newest bars when a new daily bar closes; switch it off for a version that never changes.':
+      'Сглаживание перерисовывает последние бары при закрытии нового дневного бара; выключи его, чтобы линия никогда не менялась.',
   },
   ka: {
     'S/R levels': 'S/R დონეები',
@@ -148,5 +160,17 @@ export default {
     'Last cross': 'ბოლო გადაკვეთა',
     'Golden cross': 'ოქროს ჯვარი',
     'Death cross': 'სიკვდილის ჯვარი',
+    'NW Envelope': 'NW Envelope (ნადარაია — უოტსონი)',
+    'Smoothing': 'გასწორება',
+    'Smoothing on: the kernel looks both ways inside the window, so the newest bars are redrawn when a new bar closes (as on TradingView). Off: only past bars are used and nothing is redrawn.':
+      'გასწორება ჩართულია: ბირთვი ფანჯარაში ორივე მიმართულებით იყურება, ამიტომ ბოლო ბარები ახალი ბარის დახურვისას თავიდან იხატება (როგორც TradingView-ზე). გამორთული: გამოიყენება მხოლოდ წინა ბარები და არაფერი იხატება თავიდან.',
+    'smoothed': 'გასწორებული',
+    'causal': 'კაუზალური',
+    'Above the upper band': 'ზედა საზღვარს ზემოთ',
+    'Below the lower band': 'ქვედა საზღვარს ქვემოთ',
+    'Inside the bands': 'საზღვრებს შორის',
+    'Upper / lower band': 'ზედა / ქვედა საზღვარი',
+    'Smoothing redraws the newest bars when a new daily bar closes; switch it off for a version that never changes.':
+      'გასწორება ბოლო ბარებს თავიდან ხატავს ახალი დღიური ბარის დახურვისას; გამორთე, რომ ხაზი არასდროს შეიცვალოს.',
   },
 }

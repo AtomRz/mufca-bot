@@ -14,6 +14,7 @@ const VIEW_BARS = 150 // bars shown on a fresh selection (the user can still scr
 const LAYERS_KEY = 'mufca.ta.layers'
 const EMA_COLORS = { ema50: '#f5a524', ema200: '#4f8cff' } // readable on both the dark and the light chart
 const NEUTRAL_MARK = '#8b93a1'
+const NWE_COLOR = '#a66bf5' // Nadaraya-Watson envelope: its own hue, apart from the trend lines and the EMAs
 const CP_SHORT = { pin_bar: 'PIN', engulfing: 'ENG', inside_bar: 'IN' }
 
 function fmtPrice(v) {
@@ -40,7 +41,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
   const [error, setError] = useState(null)
   const [showSR, setShowSR] = useState(false)
   const [layers, setLayers] = useState(() => {
-    const def = { ema50: true, ema200: true, candles: true }
+    const def = { ema50: true, ema200: true, candles: true, nwe: false, nweSmooth: true }
     try { return { ...def, ...(JSON.parse(localStorage.getItem(LAYERS_KEY) || '{}') || {}) } } catch (_) { return def }
   })
   const toggleLayer = (k) => setLayers((prev) => {
@@ -272,6 +273,20 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
       s.extras.push(ser)
     }
 
+    if (layers.nwe && data.nwe) {
+      const v = data.nwe[layers.nweSmooth ? 'smooth' : 'causal']
+      for (const [key, width, style] of [['upper', 1, LineStyle.Solid], ['lower', 1, LineStyle.Solid], ['mid', 1, LineStyle.Dotted]]) {
+        const pts = v?.[key]
+        if (!pts?.length) continue
+        const ser = chart.addLineSeries({
+          color: key === 'mid' ? hexToRgba(NWE_COLOR, 0.7) : NWE_COLOR, lineWidth: width, lineStyle: style,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        ser.setData(pts)
+        s.extras.push(ser)
+      }
+    }
+
     if (layers.candles) {
       for (const cp of data.candle_patterns || []) {
         if (!candleTimes.has(cp.time)) continue
@@ -354,6 +369,8 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
 
   const ma = data && data.symbol === ticker ? data.ma : null
   const recentPatterns = data && data.symbol === ticker ? [...(data.candle_patterns || [])].reverse().slice(0, 8) : []
+  const nweView = data && data.symbol === ticker && data.nwe ? data.nwe[layers.nweSmooth ? 'smooth' : 'causal'] : null
+  const nweSum = nweView?.summary || null
   const candleLabel = (type) => ({
     pin_bar: t('Pin bar'),
     engulfing: t('Engulfing'),
@@ -390,6 +407,15 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
           <button className={layers.candles ? 'active' : ''} onClick={() => toggleLayer('candles')}>{t('Candle patterns')}</button>
         </div>
         <div className="seg">
+          <button className={layers.nwe ? 'active' : ''} onClick={() => toggleLayer('nwe')}>{t('NW Envelope')}</button>
+          {layers.nwe && (
+            <button className={layers.nweSmooth ? 'active' : ''} onClick={() => toggleLayer('nweSmooth')}
+              title={t('Smoothing on: the kernel looks both ways inside the window, so the newest bars are redrawn when a new bar closes (as on TradingView). Off: only past bars are used and nothing is redrawn.')}>
+              {t('Smoothing')}
+            </button>
+          )}
+        </div>
+        <div className="seg">
           <button className={showSR ? 'active' : ''} onClick={() => setShowSR((v) => !v)}>
             {t('S/R levels')}
           </button>
@@ -409,6 +435,7 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
         <span>● {t('Touches')}</span>
         {layers.ema50 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema50 }} />EMA 50</span>}
         {layers.ema200 && <span><span className="legend-dot" style={{ background: EMA_COLORS.ema200 }} />EMA 200</span>}
+        {layers.nwe && data?.nwe && <span><span className="legend-dot" style={{ background: NWE_COLOR }} />{t('NW Envelope')}</span>}
         {layers.candles && <span>▲▼ PIN · ENG · ■ {t('Inside bar')}</span>}
       </div>
 
@@ -546,6 +573,34 @@ export default function TaPanel({ pairs, lastEvent, colors, onLoadingChange }) {
               </>
             ) : (
               <div className="empty-state" style={{ padding: '14px 0' }}>{t('Not enough daily history')}</div>
+            )}
+            {nweSum && (
+              <>
+                <div className="row">
+                  <span className="row-label" style={{ color: NWE_COLOR }}>
+                    {t('NW Envelope')} (h={data.nwe.params.h}, ×{data.nwe.params.mult}, {layers.nweSmooth ? t('smoothed') : t('causal')})
+                  </span>
+                  <span className="row-value">
+                    {nweSum.position === 'above' ? t('Above the upper band')
+                      : nweSum.position === 'below' ? t('Below the lower band')
+                        : t('Inside the bands')}
+                    {nweSum.position === 'inside' && nweSum.position_pct !== null && (
+                      <span style={{ marginLeft: 8, color: 'var(--text-dim)' }}>{t('{pct}% of the way', { pct: Math.round(nweSum.position_pct * 100) })}</span>
+                    )}
+                  </span>
+                </div>
+                <div className="row">
+                  <span className="row-label">{t('Upper / lower band')}</span>
+                  <span className="row-value">
+                    {fmtPrice(nweSum.upper)} ({fmtPct(nweSum.dist_to_upper_pct)}) / {fmtPrice(nweSum.lower)} ({fmtPct(nweSum.dist_to_lower_pct)})
+                  </span>
+                </div>
+                {layers.nweSmooth && (
+                  <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-faint)' }}>
+                    {t('Smoothing redraws the newest bars when a new daily bar closes; switch it off for a version that never changes.')}
+                  </div>
+                )}
+              </>
             )}
           </div>
 
